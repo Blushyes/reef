@@ -11,6 +11,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let size = f.area();
@@ -129,7 +130,10 @@ fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
             Style::default().fg(Color::DarkGray).bg(bg)
         };
         let span = Span::styled(label, style);
-        let w = label.len() as u16;
+        // Hit-registry uses terminal columns (display width), not bytes — tab
+        // labels contain wide glyphs (📁, ⑂) so UnicodeWidthStr::width is
+        // required to keep click zones aligned with the rendered text.
+        let w = UnicodeWidthStr::width(label) as u16;
 
         app.hit_registry.register_row(x, area.y, w, ClickAction::SwitchTab(*tab));
         x += w;
@@ -145,7 +149,7 @@ fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // Fill rest of row
     let remaining = (area.width as usize).saturating_sub(x.saturating_sub(area.x) as usize);
     let keys_hint = " 1:Files 2:Git 3:Graph";
-    let pad = remaining.saturating_sub(keys_hint.len());
+    let pad = remaining.saturating_sub(UnicodeWidthStr::width(keys_hint));
     spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bg)));
     spans.push(Span::styled(keys_hint, Style::default().fg(Color::DarkGray).bg(bg)));
 

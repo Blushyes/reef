@@ -9,9 +9,10 @@
       { "id": "git.status", "title": "Git", "slot": "sidebar", "icon": "⎇" }
     ],
     "keybindings": [
-      { "key": "s", "command": "git.stage",   "when": "panel == git.status" },
-      { "key": "u", "command": "git.unstage", "when": "panel == git.status" },
-      { "key": "r", "command": "git.refresh", "when": "panel == git.status" }
+      { "key": "s", "command": "git.stage",      "when": "panel == git.status" },
+      { "key": "u", "command": "git.unstage",    "when": "panel == git.status" },
+      { "key": "r", "command": "git.refresh",    "when": "panel == git.status" },
+      { "key": "t", "command": "git.toggleTree", "when": "panel == git.status" }
     ],
     "commands": [
       { "id": "git.stage",         "title": "暂存文件" },
@@ -19,7 +20,9 @@
       { "id": "git.refresh",       "title": "刷新 Git 状态" },
       { "id": "git.selectFile",    "title": "选择文件" },
       { "id": "git.toggleStaged",  "title": "折叠/展开暂存区" },
-      { "id": "git.toggleUnstaged","title": "折叠/展开更改区" }
+      { "id": "git.toggleUnstaged","title": "折叠/展开更改区" },
+      { "id": "git.toggleTree",    "title": "切换列表/树形视图" },
+      { "id": "git.toggleDir",     "title": "折叠/展开目录" }
     ]
   }
 }

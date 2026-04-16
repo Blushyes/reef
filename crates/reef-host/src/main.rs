@@ -194,6 +194,7 @@ fn handle_key_git(key: event::KeyEvent, app: &mut App) {
                 if app.selected_file.is_some() { app.load_diff(); }
             }
         }
+        KeyCode::Char('t') => { app.route_key_to_plugin("t"); }
         KeyCode::Char('m') => { app.toggle_diff_layout(); }
         KeyCode::Char('f') => { app.toggle_diff_mode(); }
         _ => {}

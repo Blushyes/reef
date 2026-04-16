@@ -1,4 +1,5 @@
 mod git;
+mod tree;
 
 use git::{FileStatus, GitRepo};
 
@@ -6,6 +7,7 @@ use reef_protocol::{
     read_message, write_message, Color, InitializeResult, RenderResult, RpcMessage,
     Span, StyledLine,
 };
+use std::collections::HashSet;
 use std::io::{self, BufReader, Write};
 
 fn main() {
@@ -109,6 +111,8 @@ struct PluginState {
     selected: Option<SelectedFile>,
     staged_collapsed: bool,
     unstaged_collapsed: bool,
+    tree_mode: bool,
+    collapsed_dirs: HashSet<String>,
 }
 
 struct SelectedFile {
@@ -126,6 +130,8 @@ impl PluginState {
             selected: None,
             staged_collapsed: false,
             unstaged_collapsed: false,
+            tree_mode: false,
+            collapsed_dirs: HashSet::new(),
         }
     }
 
@@ -141,6 +147,16 @@ impl PluginState {
         let mut lines: Vec<StyledLine> = Vec::new();
         let max_path = (width as usize).saturating_sub(8);
 
+        // View mode toggle
+        let mode_label = if self.tree_mode { "视图: 树形" } else { "视图: 列表" };
+        lines.push(
+            StyledLine::new(vec![
+                Span::new(mode_label).fg(Color::named("darkGray")),
+            ])
+            .on_click("git.toggleTree", serde_json::Value::Null),
+        );
+        lines.push(StyledLine::plain(""));
+
         // Staged section
         if !self.staged.is_empty() {
             let arrow = if self.staged_collapsed { "›" } else { "⌄" };
@@ -151,12 +167,7 @@ impl PluginState {
             ]).on_click("git.toggleStaged", serde_json::Value::Null));
 
             if !self.staged_collapsed {
-                for file in &self.staged {
-                    let is_selected = self.selected.as_ref()
-                        .map(|s| s.path == file.path && s.is_staged)
-                        .unwrap_or(false);
-                    lines.push(file_row(&file.path, file.status, true, max_path, is_selected));
-                }
+                self.render_files(&self.staged, true, max_path, &mut lines);
             }
             lines.push(StyledLine::plain(""));
         }
@@ -170,12 +181,7 @@ impl PluginState {
         ]).on_click("git.toggleUnstaged", serde_json::Value::Null));
 
         if !self.unstaged_collapsed {
-            for file in &self.unstaged {
-                let is_selected = self.selected.as_ref()
-                    .map(|s| s.path == file.path && !s.is_staged)
-                    .unwrap_or(false);
-                lines.push(file_row(&file.path, file.status, false, max_path, is_selected));
-            }
+            self.render_files(&self.unstaged, false, max_path, &mut lines);
             if self.unstaged.is_empty() {
                 lines.push(StyledLine::new(vec![
                     Span::new("  无文件").fg(Color::named("darkGray")),
@@ -184,6 +190,51 @@ impl PluginState {
         }
 
         lines
+    }
+
+    fn render_files(
+        &self,
+        files: &[git::FileEntry],
+        is_staged: bool,
+        max_path: usize,
+        out: &mut Vec<StyledLine>,
+    ) {
+        if self.tree_mode {
+            let t = tree::build(files);
+            let selected = self.selected.as_ref();
+            let mut renderer = |entry: &git::FileEntry, depth: usize, out: &mut Vec<StyledLine>| {
+                let is_selected = selected
+                    .map(|s| s.path == entry.path && s.is_staged == is_staged)
+                    .unwrap_or(false);
+                let indent = "  ".repeat(depth);
+                let basename = entry.path.rsplit('/').next().unwrap_or(&entry.path);
+                out.push(file_row(
+                    &entry.path,
+                    basename,
+                    entry.status,
+                    is_staged,
+                    max_path,
+                    is_selected,
+                    &indent,
+                ));
+            };
+            tree::flatten(&t, is_staged, &self.collapsed_dirs, out, &mut renderer);
+        } else {
+            for file in files {
+                let is_selected = self.selected.as_ref()
+                    .map(|s| s.path == file.path && s.is_staged == is_staged)
+                    .unwrap_or(false);
+                out.push(file_row(
+                    &file.path,
+                    &file.path,
+                    file.status,
+                    is_staged,
+                    max_path,
+                    is_selected,
+                    "  ",
+                ));
+            }
+        }
     }
 
     fn handle_event(&mut self, params: Option<&serde_json::Value>, writer: &mut impl Write) -> bool {
@@ -224,6 +275,11 @@ impl PluginState {
                 self.request_status_render(writer);
                 true
             }
+            "t" => {
+                self.tree_mode = !self.tree_mode;
+                self.request_status_render(writer);
+                true
+            }
             _ => false,
         }
     }
@@ -248,6 +304,25 @@ impl PluginState {
             "git.toggleUnstaged" => {
                 self.unstaged_collapsed = !self.unstaged_collapsed;
                 self.request_status_render(writer);
+                true
+            }
+            "git.toggleTree" => {
+                self.tree_mode = !self.tree_mode;
+                self.request_status_render(writer);
+                true
+            }
+            "git.toggleDir" => {
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let is_staged = args.get("staged").and_then(|v| v.as_bool()).unwrap_or(false);
+                if !path.is_empty() {
+                    let key = tree::collapsed_key(is_staged, path);
+                    if self.collapsed_dirs.contains(&key) {
+                        self.collapsed_dirs.remove(&key);
+                    } else {
+                        self.collapsed_dirs.insert(key);
+                    }
+                    self.request_status_render(writer);
+                }
                 true
             }
             "git.stage" => {
@@ -302,7 +377,15 @@ impl PluginState {
 
 // ─── File row builder ─────────────────────────────────────────────────────────
 
-fn file_row(path: &str, status: FileStatus, is_staged: bool, max_path: usize, is_selected: bool) -> StyledLine {
+fn file_row(
+    path: &str,
+    display: &str,
+    status: FileStatus,
+    is_staged: bool,
+    max_path: usize,
+    is_selected: bool,
+    indent: &str,
+) -> StyledLine {
     let status_color = match status {
         FileStatus::Modified  => Color::named("yellow"),
         FileStatus::Added     => Color::named("green"),
@@ -315,16 +398,16 @@ fn file_row(path: &str, status: FileStatus, is_staged: bool, max_path: usize, is
     let button_color = if is_staged { Color::named("red") } else { Color::named("green") };
     let button_cmd  = if is_staged { "git.unstage" } else { "git.stage" };
 
-    let display_path = if path.len() > max_path {
-        format!("...{}", &path[path.len().saturating_sub(max_path.saturating_sub(3))..])
+    let display_path = if display.len() > max_path {
+        format!("...{}", &display[display.len().saturating_sub(max_path.saturating_sub(3))..])
     } else {
-        path.to_string()
+        display.to_string()
     };
 
     let sel_bg = Color::rgb(40, 60, 100);
 
     let mut spans = vec![
-        Span::new("  "),
+        Span::new(indent.to_string()),
         Span::new(display_path).fg(Color::named("white")),
         Span::new(format!(" {} ", status_label)).fg(status_color),
         Span::new(button).fg(button_color).bold()

@@ -37,6 +37,7 @@ pub struct App {
 
     // Control
     pub should_quit: bool,
+    pub select_mode: bool, // mouse capture disabled for text selection
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +65,7 @@ impl App {
             hit_registry: HitTestRegistry::new(),
             hover_row: None,
             should_quit: false,
+            select_mode: false,
         };
         app.refresh_status();
         Ok(app)

@@ -90,6 +90,25 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let staged_count = app.staged_files.len();
     let unstaged_count = app.unstaged_files.len();
 
+    if app.select_mode {
+        // Select mode — full-width indicator
+        let hint = Line::from(vec![
+            Span::styled(
+                " SELECT ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  拖拽鼠标选择文字，按 v 退出选择模式",
+                Style::default().fg(Color::Yellow).bg(Color::Rgb(30, 30, 40)),
+            ),
+        ]);
+        f.render_widget(hint, area);
+        return;
+    }
+
     let status = Line::from(vec![
         Span::styled(
             format!(" 暂存: {} ", staged_count),
@@ -104,7 +123,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
             Style::default().bg(Color::Rgb(30, 30, 40)),
         ),
         Span::styled(
-            " q:退出 Tab:切换 ↑↓:导航 s:暂存 u:取消暂存 ",
+            " q:退出 Tab:切换 ↑↓:导航 s:暂存 u:取消暂存 v:选择文字 ",
             Style::default()
                 .fg(Color::DarkGray)
                 .bg(Color::Rgb(30, 30, 40)),

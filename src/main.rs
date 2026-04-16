@@ -57,9 +57,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
-                Event::Key(key) => handle_key(key, &mut app),
-                Event::Mouse(mouse) => handle_mouse(mouse, &mut app, &terminal),
-                Event::Resize(_, _) => {} // ratatui handles this
+                Event::Key(key) => {
+                    // v toggles select mode regardless of active panel
+                    if key.code == KeyCode::Char('v')
+                        && key.modifiers.is_empty()
+                    {
+                        app.select_mode = !app.select_mode;
+                        if app.select_mode {
+                            execute!(terminal.backend_mut(), DisableMouseCapture)?;
+                        } else {
+                            execute!(terminal.backend_mut(), EnableMouseCapture)?;
+                        }
+                    } else {
+                        handle_key(key, &mut app);
+                    }
+                }
+                Event::Mouse(mouse) => {
+                    if !app.select_mode {
+                        handle_mouse(mouse, &mut app, &terminal);
+                    }
+                }
+                Event::Resize(_, _) => {}
                 _ => {}
             }
         }

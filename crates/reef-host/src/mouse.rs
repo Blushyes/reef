@@ -1,3 +1,4 @@
+use crate::app::Tab;
 use ratatui::layout::Rect;
 use serde_json;
 
@@ -9,6 +10,8 @@ pub enum ClickAction {
     ToggleStaged,
     ToggleUnstaged,
     StartDragSplit,
+    SwitchTab(Tab),
+    TreeClick(usize),
     /// Invoke a plugin command (from a StyledLine click_command).
     PluginCommand {
         command: String,

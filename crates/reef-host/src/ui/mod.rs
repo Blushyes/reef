@@ -1,8 +1,11 @@
 pub mod diff_panel;
 pub mod file_panel;
+pub mod file_preview_panel;
+pub mod file_tree_panel;
 pub mod plugin_panel;
 
-use crate::app::App;
+use crate::app::{App, Tab};
+use crate::mouse::ClickAction;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -17,16 +20,18 @@ pub fn render(f: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // title
+            Constraint::Length(1), // tab bar
             Constraint::Min(3),    // body
             Constraint::Length(1), // status
         ])
         .split(size);
 
     render_title_bar(f, app, main_layout[0]);
+    render_tab_bar(f, app, main_layout[1]);
 
-    // Body: left sidebar + divider + right editor
-    let left_width = (main_layout[1].width as u32 * app.split_percent as u32 / 100) as u16;
-    let left_width = left_width.max(10).min(main_layout[1].width.saturating_sub(20));
+    // Body: left + right
+    let left_width = (main_layout[2].width as u32 * app.split_percent as u32 / 100) as u16;
+    let left_width = left_width.max(10).min(main_layout[2].width.saturating_sub(20));
 
     let body_layout = Layout::default()
         .direction(Direction::Horizontal)
@@ -34,20 +39,27 @@ pub fn render(f: &mut Frame, app: &mut App) {
             Constraint::Length(left_width),
             Constraint::Min(20),
         ])
-        .split(main_layout[1]);
-
-    render_sidebar(f, app, body_layout[0]);
+        .split(main_layout[2]);
 
     // Drag zone on the split border
     let split_x = body_layout[0].x + body_layout[0].width.saturating_sub(1);
     app.hit_registry.register(
         Rect::new(split_x, body_layout[0].y, 2, body_layout[0].height),
-        crate::mouse::ClickAction::StartDragSplit,
+        ClickAction::StartDragSplit,
     );
 
-    render_editor(f, app, body_layout[1]);
+    match app.active_tab {
+        Tab::Git => {
+            render_sidebar(f, app, body_layout[0]);
+            render_editor(f, app, body_layout[1]);
+        }
+        Tab::Files => {
+            file_tree_panel::render(f, app, body_layout[0]);
+            file_preview_panel::render(f, app, body_layout[1]);
+        }
+    }
 
-    render_status_bar(f, app, main_layout[2]);
+    render_status_bar(f, app, main_layout[3]);
 
     if app.show_help {
         render_help(f, size);
@@ -91,6 +103,47 @@ fn render_editor(f: &mut Frame, app: &mut App, area: Rect) {
         // Fallback: legacy diff panel
         diff_panel::render(f, app, area);
     }
+}
+
+fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
+    let bg = Color::Rgb(30, 30, 40);
+    let tabs: &[(Tab, &str)] = &[
+        (Tab::Files, " 📁 Files "),
+        (Tab::Git,   " ⎇ Git "),
+    ];
+
+    let mut spans: Vec<Span> = Vec::new();
+    let mut x = area.x;
+
+    for (i, (tab, label)) in tabs.iter().enumerate() {
+        let is_active = app.active_tab == *tab;
+        let style = if is_active {
+            Style::default().fg(Color::White).bg(Color::Rgb(60, 60, 80)).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray).bg(bg)
+        };
+        let span = Span::styled(*label, style);
+        let w = label.len() as u16;
+
+        app.hit_registry.register_row(x, area.y, w, ClickAction::SwitchTab(*tab));
+        x += w;
+        spans.push(span);
+
+        // Separator between tabs
+        if i < tabs.len() - 1 {
+            spans.push(Span::styled("│", Style::default().fg(Color::DarkGray).bg(bg)));
+            x += 1;
+        }
+    }
+
+    // Fill rest of row
+    let remaining = (area.width as usize).saturating_sub(x.saturating_sub(area.x) as usize);
+    let keys_hint = " 1:Files 2:Git";
+    let pad = remaining.saturating_sub(keys_hint.len());
+    spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bg)));
+    spans.push(Span::styled(keys_hint, Style::default().fg(Color::DarkGray).bg(bg)));
+
+    f.render_widget(Line::from(spans), area);
 }
 
 fn render_title_bar(f: &mut Frame, app: &App, area: Rect) {

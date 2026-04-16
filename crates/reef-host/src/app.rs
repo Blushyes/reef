@@ -1,12 +1,19 @@
+use crate::file_tree::{self, FileTree, PreviewContent};
 use crate::git::{DiffContent, FileEntry, GitRepo};
 use crate::mouse::{ClickAction, HitTestRegistry};
 use crate::plugin::manager::PluginManager;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Panel {
+pub enum Tab {
+    Git,
     Files,
-    Diff,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Panel {
+    Files, // left
+    Diff,  // right
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,27 +31,30 @@ pub enum DiffMode {
 pub struct App {
     pub repo: GitRepo,
 
-    // File state
+    // Tab
+    pub active_tab: Tab,
+    pub active_panel: Panel,
+
+    // ── Git tab state ──
     pub staged_files: Vec<FileEntry>,
     pub unstaged_files: Vec<FileEntry>,
-
-    // UI state
     pub selected_file: Option<SelectedFile>,
-    pub active_panel: Panel,
     pub diff_content: Option<DiffContent>,
     pub diff_layout: DiffLayout,
     pub diff_mode: DiffMode,
-
-    // Sections
     pub staged_collapsed: bool,
     pub unstaged_collapsed: bool,
-
-    // Scroll
     pub file_scroll: usize,
     pub diff_scroll: usize,
 
+    // ── Files tab state ──
+    pub file_tree: FileTree,
+    pub preview_content: Option<PreviewContent>,
+    pub tree_scroll: usize,
+    pub preview_scroll: usize,
+
     // Layout
-    pub split_percent: u16, // 0-100, left panel width percentage
+    pub split_percent: u16,
     pub dragging_split: bool,
 
     // Mouse
@@ -54,7 +64,7 @@ pub struct App {
 
     // Plugin system
     pub plugin_manager: PluginManager,
-    pub active_sidebar_panel: Option<String>, // panel id
+    pub active_sidebar_panel: Option<String>,
 
     // Control
     pub should_quit: bool,
@@ -71,13 +81,16 @@ pub struct SelectedFile {
 impl App {
     pub fn new() -> Result<Self, git2::Error> {
         let repo = GitRepo::open()?;
+        let workdir = repo.workdir_path().unwrap_or_else(|| PathBuf::from("."));
+        let file_tree = FileTree::new(&workdir);
         let (saved_layout, saved_mode) = load_prefs();
         let mut app = Self {
             repo,
+            active_tab: Tab::Files,
+            active_panel: Panel::Files,
             staged_files: Vec::new(),
             unstaged_files: Vec::new(),
             selected_file: None,
-            active_panel: Panel::Files,
             diff_content: None,
             diff_layout: saved_layout,
             diff_mode: saved_mode,
@@ -85,6 +98,10 @@ impl App {
             unstaged_collapsed: false,
             file_scroll: 0,
             diff_scroll: 0,
+            file_tree,
+            preview_content: None,
+            tree_scroll: 0,
+            preview_scroll: 0,
             split_percent: 30,
             dragging_split: false,
             hit_registry: HitTestRegistry::new(),
@@ -106,6 +123,8 @@ impl App {
         self.staged_files = staged;
         self.unstaged_files = unstaged;
 
+        self.file_tree.refresh_git_statuses(&self.staged_files, &self.unstaged_files);
+
         // Reconcile selection: check both lists so is_staged stays correct
         // even if the plugin staged/unstaged via a key event that the host
         // didn't directly observe.
@@ -119,6 +138,15 @@ impl App {
             } else {
                 self.selected_file = None;
                 self.diff_content = None;
+            }
+        }
+    }
+
+    pub fn load_preview(&mut self) {
+        if let Some(entry) = self.file_tree.selected_entry() {
+            if !entry.is_dir {
+                self.preview_content = file_tree::load_preview(&self.file_tree.root, &entry.path);
+                self.preview_scroll = 0;
             }
         }
     }
@@ -188,6 +216,19 @@ impl App {
 
     pub fn handle_action(&mut self, action: ClickAction) {
         match action {
+            ClickAction::SwitchTab(tab) => {
+                self.active_tab = tab;
+            }
+            ClickAction::TreeClick(index) => {
+                self.file_tree.selected = index;
+                if let Some(entry) = self.file_tree.entries.get(index) {
+                    if entry.is_dir {
+                        self.file_tree.toggle_expand(index);
+                    } else {
+                        self.load_preview();
+                    }
+                }
+            }
             ClickAction::SelectFile { path, staged } => {
                 self.select_file(&path, staged);
             }

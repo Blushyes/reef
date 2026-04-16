@@ -1,5 +1,5 @@
 use git2::{DiffOptions, Repository, StatusOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
@@ -63,6 +63,10 @@ impl GitRepo {
     pub fn open() -> Result<Self, git2::Error> {
         let repo = Repository::discover(".")?;
         Ok(Self { repo })
+    }
+
+    pub fn workdir_path(&self) -> Option<PathBuf> {
+        self.repo.workdir().map(|p| p.to_path_buf())
     }
 
     pub fn branch_name(&self) -> String {

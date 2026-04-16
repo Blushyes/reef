@@ -1,11 +1,12 @@
 mod app;
+mod file_tree;
 mod git;
 mod mouse;
 mod plugin;
 mod renderer;
 mod ui;
 
-use app::{App, Panel};
+use app::{App, Panel, Tab};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers,
@@ -130,44 +131,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn handle_key(key: event::KeyEvent, app: &mut App) {
+    // Global keys (work on all tabs)
     match key.code {
-        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Char('q') => { app.should_quit = true; return; }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.should_quit = true;
+            app.should_quit = true; return;
         }
+        KeyCode::Char('1') => { app.active_tab = Tab::Files; return; }
+        KeyCode::Char('2') => { app.active_tab = Tab::Git; return; }
         KeyCode::Tab => {
             app.active_panel = match app.active_panel {
                 Panel::Files => Panel::Diff,
                 Panel::Diff => Panel::Files,
             };
+            return;
         }
+        KeyCode::Char('h') => { app.show_help = true; return; }
+        _ => {}
+    }
+
+    match app.active_tab {
+        Tab::Git => handle_key_git(key, app),
+        Tab::Files => handle_key_files(key, app),
+    }
+}
+
+fn handle_key_git(key: event::KeyEvent, app: &mut App) {
+    match key.code {
         KeyCode::Up | KeyCode::Char('k') => match app.active_panel {
             Panel::Files => app.navigate_files(-1),
-            Panel::Diff => {
-                app.diff_scroll = app.diff_scroll.saturating_sub(1);
-            }
+            Panel::Diff => { app.diff_scroll = app.diff_scroll.saturating_sub(1); }
         },
         KeyCode::Down | KeyCode::Char('j') => match app.active_panel {
             Panel::Files => app.navigate_files(1),
-            Panel::Diff => {
-                app.diff_scroll += 1;
-            }
+            Panel::Diff => { app.diff_scroll += 1; }
         },
         KeyCode::PageUp => match app.active_panel {
             Panel::Files => app.navigate_files(-10),
-            Panel::Diff => {
-                app.diff_scroll = app.diff_scroll.saturating_sub(20);
-            }
+            Panel::Diff => { app.diff_scroll = app.diff_scroll.saturating_sub(20); }
         },
         KeyCode::PageDown => match app.active_panel {
             Panel::Files => app.navigate_files(10),
-            Panel::Diff => {
-                app.diff_scroll += 20;
-            }
+            Panel::Diff => { app.diff_scroll += 20; }
         },
         KeyCode::Char('s') => {
             if !app.route_key_to_plugin("s") {
-                // fallback: no plugin active
                 if let Some(ref sel) = app.selected_file.clone() {
                     if !sel.is_staged { app.stage_file(&sel.path); }
                 }
@@ -186,14 +194,54 @@ fn handle_key(key: event::KeyEvent, app: &mut App) {
                 if app.selected_file.is_some() { app.load_diff(); }
             }
         }
-        KeyCode::Char('h') => {
-            app.show_help = true;
+        KeyCode::Char('m') => { app.toggle_diff_layout(); }
+        KeyCode::Char('f') => { app.toggle_diff_mode(); }
+        _ => {}
+    }
+}
+
+fn handle_key_files(key: event::KeyEvent, app: &mut App) {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => match app.active_panel {
+            Panel::Files => {
+                app.file_tree.navigate(-1);
+                app.load_preview();
+            }
+            Panel::Diff => { app.preview_scroll = app.preview_scroll.saturating_sub(1); }
+        },
+        KeyCode::Down | KeyCode::Char('j') => match app.active_panel {
+            Panel::Files => {
+                app.file_tree.navigate(1);
+                app.load_preview();
+            }
+            Panel::Diff => { app.preview_scroll += 1; }
+        },
+        KeyCode::PageUp => match app.active_panel {
+            Panel::Files => {
+                app.file_tree.navigate(-10);
+                app.load_preview();
+            }
+            Panel::Diff => { app.preview_scroll = app.preview_scroll.saturating_sub(20); }
+        },
+        KeyCode::PageDown => match app.active_panel {
+            Panel::Files => {
+                app.file_tree.navigate(10);
+                app.load_preview();
+            }
+            Panel::Diff => { app.preview_scroll += 20; }
+        },
+        KeyCode::Enter => {
+            let idx = app.file_tree.selected;
+            if let Some(entry) = app.file_tree.entries.get(idx) {
+                if entry.is_dir {
+                    app.file_tree.toggle_expand(idx);
+                }
+            }
+            app.load_preview();
         }
-        KeyCode::Char('m') => {
-            app.toggle_diff_layout();
-        }
-        KeyCode::Char('f') => {
-            app.toggle_diff_mode();
+        KeyCode::Char('r') => {
+            app.file_tree.rebuild();
+            app.refresh_status(); // re-syncs git decorations
         }
         _ => {}
     }
@@ -223,22 +271,33 @@ fn handle_mouse<B: ratatui::backend::Backend>(
             }
         }
         MouseEventKind::ScrollUp => {
-            // Determine which panel based on mouse position
             let total_width = terminal.size().map(|s| s.width).unwrap_or(80);
             let split_x = total_width * app.split_percent / 100;
-            if mouse.column < split_x {
-                app.file_scroll = app.file_scroll.saturating_sub(3);
-            } else {
-                app.diff_scroll = app.diff_scroll.saturating_sub(3);
+            let is_left = mouse.column < split_x;
+            match app.active_tab {
+                Tab::Git => {
+                    if is_left { app.file_scroll = app.file_scroll.saturating_sub(3); }
+                    else { app.diff_scroll = app.diff_scroll.saturating_sub(3); }
+                }
+                Tab::Files => {
+                    if is_left { app.tree_scroll = app.tree_scroll.saturating_sub(3); }
+                    else { app.preview_scroll = app.preview_scroll.saturating_sub(3); }
+                }
             }
         }
         MouseEventKind::ScrollDown => {
             let total_width = terminal.size().map(|s| s.width).unwrap_or(80);
             let split_x = total_width * app.split_percent / 100;
-            if mouse.column < split_x {
-                app.file_scroll += 3;
-            } else {
-                app.diff_scroll += 3;
+            let is_left = mouse.column < split_x;
+            match app.active_tab {
+                Tab::Git => {
+                    if is_left { app.file_scroll += 3; }
+                    else { app.diff_scroll += 3; }
+                }
+                Tab::Files => {
+                    if is_left { app.tree_scroll += 3; }
+                    else { app.preview_scroll += 3; }
+                }
             }
         }
         MouseEventKind::Moved => {

@@ -10,7 +10,7 @@ path = "src/main.rs"
 [dependencies]
 reef-protocol = { path = "../reef-protocol" }
 crossterm     = "0.29.0"
-git2          = "0.20.4"
+git2          = { version = "0.20.4", default-features = false }
 ratatui       = "0.30.0"
 similar       = "3.1.0"
 unicode-width = "0.2.2"

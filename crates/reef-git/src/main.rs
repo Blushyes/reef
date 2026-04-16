@@ -1,5 +1,6 @@
 mod git;
 mod tree;
+mod watcher;
 
 use git::{FileStatus, GitRepo};
 
@@ -8,15 +9,44 @@ use reef_protocol::{
     Span, StyledLine,
 };
 use std::collections::HashSet;
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufReader, Stdout};
+use std::sync::{Arc, Mutex};
+
+/// Thread-safe stdout wrapper. Holds a mutex so the fs-watcher thread and the
+/// main loop can both emit JSON-RPC messages without interleaving frames.
+#[derive(Clone)]
+pub struct Writer {
+    inner: Arc<Mutex<Stdout>>,
+}
+
+impl Writer {
+    pub fn new(stdout: Stdout) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(stdout)),
+        }
+    }
+
+    pub fn send(&self, msg: &RpcMessage) {
+        if let Ok(mut w) = self.inner.lock() {
+            let _ = write_message(&mut *w, msg);
+        }
+    }
+}
 
 fn main() {
     let stdin = io::stdin();
-    let stdout = io::stdout();
     let mut reader = BufReader::new(stdin.lock());
-    let mut writer = stdout.lock();
+    let writer = Writer::new(io::stdout());
 
     let mut state = PluginState::new();
+
+    if let Some(ref repo) = state.repo {
+        if let Some(workdir) = repo.workdir() {
+            let workdir = workdir.to_path_buf();
+            let gitdir = repo.gitdir().to_path_buf();
+            watcher::spawn(workdir, gitdir, writer.clone());
+        }
+    }
 
     loop {
         let msg = match read_message(&mut reader) {
@@ -36,8 +66,7 @@ fn main() {
                     plugin_version: "0.1.0".to_string(),
                 })
                 .unwrap();
-                let resp = RpcMessage::response(msg.id.unwrap_or(0), result);
-                let _ = write_message(&mut writer, &resp);
+                writer.send(&RpcMessage::response(msg.id.unwrap_or(0), result));
             }
 
             "reef/render" => {
@@ -73,26 +102,23 @@ fn main() {
                     total_lines: total,
                 })
                 .unwrap();
-                let resp = RpcMessage::response(id, result);
-                let _ = write_message(&mut writer, &resp);
+                writer.send(&RpcMessage::response(id, result));
             }
 
             "reef/event" => {
                 let id = msg.id.unwrap_or(0);
                 let params = msg.params.as_ref();
-                let consumed = state.handle_event(params, &mut writer);
+                let consumed = state.handle_event(params, &writer);
                 let result = serde_json::json!({ "consumed": consumed });
-                let resp = RpcMessage::response(id, result);
-                let _ = write_message(&mut writer, &resp);
+                writer.send(&RpcMessage::response(id, result));
             }
 
             "reef/command" => {
                 let id = msg.id.unwrap_or(0);
                 let params = msg.params.as_ref();
-                let success = state.handle_command(params, &mut writer);
+                let success = state.handle_command(params, &writer);
                 let result = serde_json::json!({ "success": success });
-                let resp = RpcMessage::response(id, result);
-                let _ = write_message(&mut writer, &resp);
+                writer.send(&RpcMessage::response(id, result));
             }
 
             "reef/shutdown" => break,
@@ -237,7 +263,7 @@ impl PluginState {
         }
     }
 
-    fn handle_event(&mut self, params: Option<&serde_json::Value>, writer: &mut impl Write) -> bool {
+    fn handle_event(&mut self, params: Option<&serde_json::Value>, writer: &Writer) -> bool {
         let event = params.and_then(|p| p.get("event"));
         let key = event
             .and_then(|e| e.get("key"))
@@ -284,7 +310,7 @@ impl PluginState {
         }
     }
 
-    fn handle_command(&mut self, params: Option<&serde_json::Value>, writer: &mut impl Write) -> bool {
+    fn handle_command(&mut self, params: Option<&serde_json::Value>, writer: &Writer) -> bool {
         let id = params.and_then(|p| p.get("id")).and_then(|v| v.as_str()).unwrap_or("");
         let args = params.and_then(|p| p.get("args")).cloned().unwrap_or_default();
 
@@ -361,17 +387,18 @@ impl PluginState {
         }
     }
 
-    fn request_status_render(&self, writer: &mut impl Write) {
-        let msg = RpcMessage::notification(
+    fn request_status_render(&self, writer: &Writer) {
+        writer.send(&RpcMessage::notification(
             "reef/requestRender",
             serde_json::json!({ "panel_id": "git.status" }),
-        );
-        let _ = write_message(writer, &msg);
+        ));
     }
 
-    fn notify_status_changed(&self, writer: &mut impl Write) {
-        let msg = RpcMessage::notification("reef/statusChanged", serde_json::json!({}));
-        let _ = write_message(writer, &msg);
+    fn notify_status_changed(&self, writer: &Writer) {
+        writer.send(&RpcMessage::notification(
+            "reef/statusChanged",
+            serde_json::json!({}),
+        ));
     }
 }
 

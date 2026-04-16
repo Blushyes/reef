@@ -88,6 +88,14 @@ impl GitRepo {
             .unwrap_or_else(|| "repo".into())
     }
 
+    pub fn workdir(&self) -> Option<&Path> {
+        self.repo.workdir()
+    }
+
+    pub fn gitdir(&self) -> &Path {
+        self.repo.path()
+    }
+
     pub fn get_status(&self) -> (Vec<FileEntry>, Vec<FileEntry>) {
         let mut staged = Vec::new();
         let mut unstaged = Vec::new();

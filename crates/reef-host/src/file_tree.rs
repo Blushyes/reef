@@ -17,6 +17,7 @@ pub struct PreviewContent {
     pub file_path: String,
     pub lines: Vec<String>,
     pub is_binary: bool,
+    pub highlighted: Option<Vec<Vec<(ratatui::style::Style, String)>>>,
 }
 
 /// Manages the file tree state.
@@ -178,6 +179,7 @@ pub fn load_preview(root: &Path, rel_path: &Path) -> Option<PreviewContent> {
             file_path: rel_path.to_string_lossy().to_string(),
             lines: Vec::new(),
             is_binary: true,
+            highlighted: None,
         });
     }
 
@@ -191,9 +193,17 @@ pub fn load_preview(root: &Path, rel_path: &Path) -> Option<PreviewContent> {
         lines
     };
 
+    let rel_str = rel_path.to_string_lossy().to_string();
+    let highlighted = if raw.len() <= 512 * 1024 && lines.len() <= 5_000 {
+        crate::highlight::highlight_file(&rel_str, &lines)
+    } else {
+        None
+    };
+
     Some(PreviewContent {
-        file_path: rel_path.to_string_lossy().to_string(),
+        file_path: rel_str,
         lines,
         is_binary: false,
+        highlighted,
     })
 }

@@ -1,6 +1,7 @@
 mod app;
 mod file_tree;
 mod git;
+mod highlight;
 mod mouse;
 mod plugin;
 mod renderer;

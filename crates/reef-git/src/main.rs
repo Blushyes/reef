@@ -12,6 +12,7 @@ use reef_protocol::{
 use std::collections::HashSet;
 use std::io::{self, BufReader, Stdout};
 use std::sync::{Arc, Mutex};
+use unicode_width::UnicodeWidthStr;
 
 /// Thread-safe stdout wrapper. Holds a mutex so the fs-watcher thread and the
 /// main loop can both emit JSON-RPC messages without interleaving frames.
@@ -189,12 +190,15 @@ impl PluginState {
 
         // Staged section
         if !self.staged.is_empty() {
-            let arrow = if self.staged_collapsed { "›" } else { "⌄" };
-            lines.push(StyledLine::new(vec![
-                Span::new(format!("{} ", arrow)).fg(Color::named("white")),
-                Span::new("暂存的更改").fg(Color::named("white")).bold(),
-                Span::new(format!("  {}", self.staged.len())).fg(Color::named("green")),
-            ]).on_click("git.toggleStaged", serde_json::Value::Null));
+            lines.push(section_header(
+                self.staged_collapsed,
+                "暂存的更改",
+                self.staged.len(),
+                Color::named("green"),
+                "git.toggleStaged",
+                Some(("取消全部", "git.unstageAll", Color::named("red"))),
+                width,
+            ));
 
             if !self.staged_collapsed {
                 self.render_files(&self.staged, true, max_path, &mut lines);
@@ -203,12 +207,20 @@ impl PluginState {
         }
 
         // Unstaged section
-        let arrow = if self.unstaged_collapsed { "›" } else { "⌄" };
-        lines.push(StyledLine::new(vec![
-            Span::new(format!("{} ", arrow)).fg(Color::named("white")),
-            Span::new("更改").fg(Color::named("white")).bold(),
-            Span::new(format!("  {}", self.unstaged.len())).fg(Color::named("blue")),
-        ]).on_click("git.toggleUnstaged", serde_json::Value::Null));
+        let unstaged_button = if self.unstaged.is_empty() {
+            None
+        } else {
+            Some(("暂存全部", "git.stageAll", Color::named("green")))
+        };
+        lines.push(section_header(
+            self.unstaged_collapsed,
+            "更改",
+            self.unstaged.len(),
+            Color::named("blue"),
+            "git.toggleUnstaged",
+            unstaged_button,
+            width,
+        ));
 
         if !self.unstaged_collapsed {
             self.render_files(&self.unstaged, false, max_path, &mut lines);
@@ -389,6 +401,42 @@ impl PluginState {
                 }
                 true
             }
+            "git.stageAll" => {
+                if let Some(ref repo) = self.repo {
+                    let paths: Vec<String> =
+                        self.unstaged.iter().map(|f| f.path.clone()).collect();
+                    for p in &paths {
+                        let _ = repo.stage_file(p);
+                    }
+                    if let Some(ref mut sel) = self.selected {
+                        if paths.iter().any(|p| p == &sel.path) {
+                            sel.is_staged = true;
+                        }
+                    }
+                    self.refresh();
+                    self.notify_status_changed(writer);
+                    self.request_status_render(writer);
+                }
+                true
+            }
+            "git.unstageAll" => {
+                if let Some(ref repo) = self.repo {
+                    let paths: Vec<String> =
+                        self.staged.iter().map(|f| f.path.clone()).collect();
+                    for p in &paths {
+                        let _ = repo.unstage_file(p);
+                    }
+                    if let Some(ref mut sel) = self.selected {
+                        if paths.iter().any(|p| p == &sel.path) {
+                            sel.is_staged = false;
+                        }
+                    }
+                    self.refresh();
+                    self.notify_status_changed(writer);
+                    self.request_status_render(writer);
+                }
+                true
+            }
             _ => false,
         }
     }
@@ -430,6 +478,8 @@ fn file_row(
     let button = if is_staged { "−" } else { "+" };
     let button_color = if is_staged { Color::named("red") } else { Color::named("green") };
     let button_cmd  = if is_staged { "git.unstage" } else { "git.stage" };
+    // Double-click anywhere on the row toggles staging (stage/unstage).
+    let dbl_cmd = if is_staged { "git.unstage" } else { "git.stage" };
 
     let display_path = if display.len() > max_path {
         format!("...{}", &display[display.len().saturating_sub(max_path.saturating_sub(3))..])
@@ -454,4 +504,47 @@ fn file_row(
 
     StyledLine::new(spans)
         .on_click("git.selectFile", serde_json::json!({ "path": path, "staged": is_staged }))
+        .on_dbl_click(dbl_cmd, serde_json::json!({ "path": path }))
+}
+
+// ─── Section header builder ───────────────────────────────────────────────────
+
+/// Build a collapsible section header with an optional right-aligned action button.
+fn section_header(
+    collapsed: bool,
+    label: &str,
+    count: usize,
+    count_color: Color,
+    toggle_cmd: &str,
+    action: Option<(&str, &str, Color)>,
+    width: u16,
+) -> StyledLine {
+    let arrow = if collapsed { "›" } else { "⌄" };
+    let prefix = format!("{} ", arrow);
+    let count_str = format!("  {}", count);
+
+    // Compute right-side padding so the action button sits at the panel's edge.
+    let button_text = action.as_ref().map(|(t, _, _)| format!(" {} ", t));
+    let used = prefix.width() + label.width() + count_str.width()
+        + button_text.as_deref().map(str::width).unwrap_or(0);
+    let padding = (width as usize).saturating_sub(used);
+
+    let mut spans = vec![
+        Span::new(prefix).fg(Color::named("white")),
+        Span::new(label.to_string()).fg(Color::named("white")).bold(),
+        Span::new(count_str).fg(count_color),
+    ];
+    if padding > 0 {
+        spans.push(Span::new(" ".repeat(padding)));
+    }
+    if let (Some(text), Some((_, cmd, color))) = (button_text, action) {
+        spans.push(
+            Span::new(text)
+                .fg(color)
+                .bold()
+                .on_click(cmd, serde_json::Value::Null),
+        );
+    }
+
+    StyledLine::new(spans).on_click(toggle_cmd, serde_json::Value::Null)
 }

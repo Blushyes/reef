@@ -56,25 +56,29 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, panel_id: &str, focused:
         let line = to_ratatui_line(styled_line, hover);
         f.render_widget(line, Rect::new(area.x, y, area.width, 1));
 
-        // Register click zones per-span; span-level click overrides line-level for that region
+        // Register click zones per-span. Span-level click overrides line-level
+        // for that region; dbl-click falls back to line-level independently so
+        // a span with only `click_command` can still inherit the row's dbl.
         let mut span_x = area.x;
         for span in &styled_line.spans {
             let span_w = UnicodeWidthStr::width(span.text.as_str()) as u16;
             if span_w > 0 {
-                let action = if let Some(ref cmd) = span.click_command {
-                    Some(ClickAction::PluginCommand {
-                        command: cmd.clone(),
-                        args: span.click_args.clone().unwrap_or(serde_json::Value::Null),
-                    })
-                } else if let Some(ref cmd) = styled_line.click_command {
-                    Some(ClickAction::PluginCommand {
-                        command: cmd.clone(),
-                        args: styled_line.click_args.clone().unwrap_or(serde_json::Value::Null),
-                    })
-                } else {
-                    None
+                let (cmd, cmd_args) = match &span.click_command {
+                    Some(c) => (Some(c.clone()), span.click_args.clone()),
+                    None => (styled_line.click_command.clone(), styled_line.click_args.clone()),
                 };
-                if let Some(action) = action {
+                let (dbl, dbl_args) = match &span.dbl_click_command {
+                    Some(c) => (Some(c.clone()), span.dbl_click_args.clone()),
+                    None => (styled_line.dbl_click_command.clone(), styled_line.dbl_click_args.clone()),
+                };
+
+                if cmd.is_some() || dbl.is_some() {
+                    let action = ClickAction::PluginCommand {
+                        command: cmd.unwrap_or_default(),
+                        args: cmd_args.unwrap_or(serde_json::Value::Null),
+                        dbl_command: dbl,
+                        dbl_args,
+                    };
                     app.hit_registry.register_row(span_x, y, span_w, action);
                 }
             }

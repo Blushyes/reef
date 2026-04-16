@@ -35,6 +35,11 @@ pub struct Span {
     pub click_command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub click_args: Option<serde_json::Value>,
+    /// Per-span double-click command (falls back to line-level dbl_click_command).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dbl_click_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dbl_click_args: Option<serde_json::Value>,
 }
 
 impl Span {
@@ -50,6 +55,11 @@ impl Span {
         self.click_args = Some(args);
         self
     }
+    pub fn on_dbl_click(mut self, command: impl Into<String>, args: serde_json::Value) -> Self {
+        self.dbl_click_command = Some(command.into());
+        self.dbl_click_args = Some(args);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -60,6 +70,11 @@ pub struct StyledLine {
     pub click_command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub click_args: Option<serde_json::Value>,
+    /// 双击整行触发的命令（可选）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dbl_click_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dbl_click_args: Option<serde_json::Value>,
 }
 
 impl StyledLine {
@@ -72,6 +87,11 @@ impl StyledLine {
     pub fn on_click(mut self, command: impl Into<String>, args: serde_json::Value) -> Self {
         self.click_command = Some(command.into());
         self.click_args = Some(args);
+        self
+    }
+    pub fn on_dbl_click(mut self, command: impl Into<String>, args: serde_json::Value) -> Self {
+        self.dbl_click_command = Some(command.into());
+        self.dbl_click_args = Some(args);
         self
     }
 }

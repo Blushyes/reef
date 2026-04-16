@@ -270,6 +270,13 @@ impl PluginManager {
             .collect()
     }
 
+    /// Mark every panel as needing a re-render on the next frame.
+    pub fn invalidate_panels(&mut self) {
+        for panel in &mut self.panels {
+            panel.needs_render = true;
+        }
+    }
+
     /// Send shutdown notification to all plugins.
     pub fn shutdown(&mut self) {
         for proc in self.processes.values_mut() {

@@ -3,6 +3,7 @@ use crate::git::{DiffContent, FileEntry, GitRepo};
 use crate::mouse::{ClickAction, HitTestRegistry};
 use crate::plugin::manager::PluginManager;
 use std::path::PathBuf;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -73,6 +74,8 @@ pub struct App {
     pub hit_registry: HitTestRegistry,
     pub hover_row: Option<u16>,
     pub hover_col: Option<u16>,
+    /// (timestamp, column, row) of the last mouse-down — used to detect double-clicks.
+    pub last_click: Option<(Instant, u16, u16)>,
 
     // Plugin system
     pub plugin_manager: PluginManager,
@@ -119,6 +122,7 @@ impl App {
             hit_registry: HitTestRegistry::new(),
             hover_row: None,
             hover_col: None,
+            last_click: None,
             plugin_manager: PluginManager::new(),
             active_sidebar_panel: None,
             should_quit: false,
@@ -226,6 +230,38 @@ impl App {
         }
     }
 
+    pub fn stage_all(&mut self) {
+        let paths: Vec<String> = self.unstaged_files.iter().map(|f| f.path.clone()).collect();
+        for p in &paths {
+            let _ = self.repo.stage_file(p);
+        }
+        if let Some(ref mut sel) = self.selected_file {
+            if paths.iter().any(|p| p == &sel.path) {
+                sel.is_staged = true;
+            }
+        }
+        self.refresh_status();
+        self.load_diff();
+        // fs watcher will re-invalidate plugin panels shortly, but invalidate
+        // now so the sidebar updates without waiting on the debounce.
+        self.plugin_manager.invalidate_panels();
+    }
+
+    pub fn unstage_all(&mut self) {
+        let paths: Vec<String> = self.staged_files.iter().map(|f| f.path.clone()).collect();
+        for p in &paths {
+            let _ = self.repo.unstage_file(p);
+        }
+        if let Some(ref mut sel) = self.selected_file {
+            if paths.iter().any(|p| p == &sel.path) {
+                sel.is_staged = false;
+            }
+        }
+        self.refresh_status();
+        self.load_diff();
+        self.plugin_manager.invalidate_panels();
+    }
+
     pub fn handle_action(&mut self, action: ClickAction) {
         match action {
             ClickAction::SwitchTab(tab) => {
@@ -259,7 +295,7 @@ impl App {
             ClickAction::StartDragSplit => {
                 self.dragging_split = true;
             }
-            ClickAction::PluginCommand { command, args } => {
+            ClickAction::PluginCommand { command, args, .. } => {
                 // Keep host state in sync for known selection commands
                 if command == "git.selectFile" {
                     if let (Some(path), Some(staged)) = (
@@ -291,6 +327,10 @@ impl App {
                         self.unstage_file(path);
                     }
                     self.plugin_manager.execute_command(&command, args);
+                } else if command == "git.stageAll" {
+                    self.stage_all();
+                } else if command == "git.unstageAll" {
+                    self.unstage_all();
                 } else {
                     self.plugin_manager.execute_command(&command, args);
                 }

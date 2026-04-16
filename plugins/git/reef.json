@@ -17,6 +17,8 @@
     "commands": [
       { "id": "git.stage",         "title": "暂存文件" },
       { "id": "git.unstage",       "title": "取消暂存" },
+      { "id": "git.stageAll",      "title": "暂存全部" },
+      { "id": "git.unstageAll",    "title": "取消全部暂存" },
       { "id": "git.refresh",       "title": "刷新 Git 状态" },
       { "id": "git.selectFile",    "title": "选择文件" },
       { "id": "git.toggleStaged",  "title": "折叠/展开暂存区" },

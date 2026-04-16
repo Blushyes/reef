@@ -13,9 +13,12 @@ pub enum ClickAction {
     SwitchTab(Tab),
     TreeClick(usize),
     /// Invoke a plugin command (from a StyledLine click_command).
+    /// `dbl_command`/`dbl_args`, if present, are fired on double-click instead.
     PluginCommand {
         command: String,
         args: serde_json::Value,
+        dbl_command: Option<String>,
+        dbl_args: Option<serde_json::Value>,
     },
 }
 

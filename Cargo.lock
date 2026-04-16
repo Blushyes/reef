@@ -1355,6 +1355,7 @@ dependencies = [
  "notify",
  "reef-protocol",
  "serde_json",
+ "unicode-width",
 ]
 
 [[package]]

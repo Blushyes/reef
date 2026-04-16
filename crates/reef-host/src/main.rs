@@ -19,7 +19,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io;
 use std::panic;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set up panic hook to restore terminal
@@ -266,9 +268,42 @@ fn handle_mouse<B: ratatui::backend::Backend>(
 ) {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            let now = Instant::now();
+            let is_double = matches!(
+                app.last_click,
+                Some((t, c, r))
+                    if c == mouse.column
+                        && r == mouse.row
+                        && now.duration_since(t) < DOUBLE_CLICK_WINDOW
+            );
+
             if let Some(action) = app.hit_registry.hit_test(mouse.column, mouse.row) {
-                app.handle_action(action);
+                // On double-click: if the region carries a dbl action, swap to it
+                // and run through handle_action so host-side side effects fire.
+                let effective = if is_double {
+                    if let crate::mouse::ClickAction::PluginCommand {
+                        dbl_command: Some(ref cmd),
+                        ref dbl_args,
+                        ..
+                    } = action
+                    {
+                        crate::mouse::ClickAction::PluginCommand {
+                            command: cmd.clone(),
+                            args: dbl_args.clone().unwrap_or(serde_json::Value::Null),
+                            dbl_command: None,
+                            dbl_args: None,
+                        }
+                    } else {
+                        action
+                    }
+                } else {
+                    action
+                };
+                app.handle_action(effective);
             }
+
+            // Reset tracking on every genuine second click so triple-clicks don't chain.
+            app.last_click = if is_double { None } else { Some((now, mouse.column, mouse.row)) };
         }
         MouseEventKind::Up(MouseButton::Left) => {
             app.dragging_split = false;

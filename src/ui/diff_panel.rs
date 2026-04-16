@@ -3,6 +3,7 @@ use crate::git::{DiffContent, LineTag};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 use ratatui::widgets::{Block, Padding};
 use ratatui::Frame;
 
@@ -128,14 +129,10 @@ fn render_diff(f: &mut Frame, app: &App, area: Rect, diff: &DiffContent) {
                     .map(|n| format!("{:>5}", n))
                     .unwrap_or_else(|| "     ".to_string());
 
-                // Truncate text to fit
+                // Truncate text to fit (respecting unicode display width)
                 let gutter_width = 15; // " XXXXX  XXXXX  "
                 let max_text = (area.width as usize).saturating_sub(gutter_width);
-                let display_text = if text.len() > max_text {
-                    &text[..max_text]
-                } else {
-                    text
-                };
+                let display_text = truncate_to_width(text, max_text);
 
                 let line = Line::from(vec![
                     Span::styled(
@@ -154,7 +151,7 @@ fn render_diff(f: &mut Frame, app: &App, area: Rect, diff: &DiffContent) {
                     Span::styled(
                         " ".repeat(
                             max_text
-                                .saturating_sub(display_text.len())
+                                .saturating_sub(UnicodeWidthStr::width(display_text))
                                 .min(area.width as usize),
                         ),
                         Style::default().bg(bg),
@@ -176,4 +173,17 @@ enum DiffDisplayLine {
         new_lineno: Option<u32>,
         text: String,
     },
+}
+
+/// Truncate a string to fit within `max_width` display columns.
+fn truncate_to_width(s: &str, max_width: usize) -> &str {
+    let mut width = 0;
+    for (i, c) in s.char_indices() {
+        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if width + cw > max_width {
+            return &s[..i];
+        }
+        width += cw;
+    }
+    s
 }

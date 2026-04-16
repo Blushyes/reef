@@ -6,6 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
@@ -26,7 +27,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         }
 
         // Section header
-        let arrow = if app.staged_collapsed { "▶" } else { "▼" };
+        let arrow = if app.staged_collapsed { "›" } else { "⌄" };
         let count = app.staged_files.len();
         let header = Line::from(vec![
             Span::styled(
@@ -72,7 +73,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let arrow = if app.unstaged_collapsed { "▶" } else { "▼" };
+    let arrow = if app.unstaged_collapsed { "›" } else { "⌄" };
     let count = app.unstaged_files.len();
     let header = Line::from(vec![
         Span::styled(format!("{} ", arrow), Style::default().fg(Color::White)),
@@ -145,22 +146,24 @@ fn render_file_row(
         Color::Green
     };
 
-    // Truncate path to fit
+    // Truncate path to fit (respecting unicode display width)
     let status_label = status.label();
     // Layout: "  filename.ext    M [+]"
     //          2 + path + gap + status(1) + space + button(3)
     let reserved = 8; // "  " + " M" + " [+]"
     let max_path_len = (area.width as usize).saturating_sub(reserved);
-    let display_path = if path.len() > max_path_len {
+    let path_display_width = UnicodeWidthStr::width(path);
+    let display_path = if path_display_width > max_path_len {
         // Show the end of the path with "..."
-        let start = path.len() - max_path_len.saturating_sub(3);
-        format!("...{}", &path[start..])
+        let truncated = truncate_start_to_width(path, max_path_len.saturating_sub(3));
+        format!("...{}", truncated)
     } else {
         path.to_string()
     };
 
-    let path_width = max_path_len;
-    let padded_path = format!("{:<width$}", display_path, width = path_width);
+    let display_path_width = UnicodeWidthStr::width(display_path.as_str());
+    let pad = max_path_len.saturating_sub(display_path_width);
+    let padded_path = format!("{}{}", display_path, " ".repeat(pad));
 
     let line = Line::from(vec![
         Span::styled("  ", Style::default().bg(bg)),
@@ -203,4 +206,24 @@ fn render_file_row(
     };
     app.hit_registry
         .register_row(button_x, y, 3, button_action);
+}
+
+/// Take the last `max_width` display columns of a string.
+fn truncate_start_to_width(s: &str, max_width: usize) -> &str {
+    let total = UnicodeWidthStr::width(s);
+    if total <= max_width {
+        return s;
+    }
+    let skip = total - max_width;
+    let mut width = 0;
+    for (i, c) in s.char_indices() {
+        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        width += cw;
+        if width >= skip {
+            // Return from next char boundary
+            let next = i + c.len_utf8();
+            return &s[next..];
+        }
+    }
+    s
 }

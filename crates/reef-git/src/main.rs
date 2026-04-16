@@ -1,15 +1,17 @@
 mod git;
+mod graph;
 mod prefs;
 mod tree;
 mod watcher;
 
-use git::{FileStatus, GitRepo};
+use git::{CommitDetail, DiffContent, FileStatus, GitRepo, LineTag, RefLabel};
 
 use reef_protocol::{
     read_message, write_message, Color, InitializeResult, RenderResult, RpcMessage,
     Span, StyledLine,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufReader, Stdout};
 use std::sync::{Arc, Mutex};
 use unicode_width::UnicodeWidthStr;
@@ -92,10 +94,19 @@ fn main() {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as u32;
 
-                // Pull fresh git state on every render so fs-watcher-triggered
-                // re-renders pick up the latest working tree / index changes.
-                state.refresh();
-                let lines = state.render_status(width);
+                let lines = match panel_id.as_str() {
+                    "git.graph" => {
+                        state.refresh_graph();
+                        state.render_graph(width)
+                    }
+                    "git.commitDetail" => state.render_commit_detail(width),
+                    _ => {
+                        // Pull fresh git state on every render so fs-watcher-triggered
+                        // re-renders pick up the latest working tree / index changes.
+                        state.refresh();
+                        state.render_status(width)
+                    }
+                };
                 let total = lines.len();
                 let visible: Vec<_> = lines.into_iter()
                     .skip(scroll as usize)
@@ -144,7 +155,24 @@ struct PluginState {
     unstaged_collapsed: bool,
     tree_mode: bool,
     collapsed_dirs: HashSet<String>,
+
+    // ── Graph panel state ──
+    graph_rows: Vec<graph::GraphRow>,
+    ref_map: HashMap<String, Vec<RefLabel>>,
+    /// (HEAD oid, refs-hash). refresh_graph skips rebuild when unchanged, so
+    /// working-tree fs events (which fire `statusChanged`) don't trigger a
+    /// full revwalk.
+    graph_cache_key: Option<(String, u64)>,
+    graph_selected_idx: usize,
+    selected_commit: Option<String>,
+    commit_detail: Option<CommitDetail>,
+    /// (file path, diff) for the currently-selected file inside the
+    /// currently-selected commit. None means "no file selected, show only
+    /// the commit summary".
+    commit_file_diff: Option<(String, DiffContent)>,
 }
+
+const GRAPH_COMMIT_LIMIT: usize = 500;
 
 struct SelectedFile {
     path: String,
@@ -163,6 +191,13 @@ impl PluginState {
             unstaged_collapsed: false,
             tree_mode: prefs::load_tree_mode(),
             collapsed_dirs: HashSet::new(),
+            graph_rows: Vec::new(),
+            ref_map: HashMap::new(),
+            graph_cache_key: None,
+            graph_selected_idx: 0,
+            selected_commit: None,
+            commit_detail: None,
+            commit_file_diff: None,
         }
     }
 
@@ -172,6 +207,183 @@ impl PluginState {
             self.staged = s;
             self.unstaged = u;
         }
+    }
+
+    /// Rebuild the commit graph iff HEAD or any ref moved since the last build.
+    /// Fs events that only touch the working tree don't invalidate the cache.
+    fn refresh_graph(&mut self) {
+        let Some(ref repo) = self.repo else {
+            self.graph_rows.clear();
+            self.ref_map.clear();
+            self.graph_cache_key = None;
+            return;
+        };
+
+        let head = repo.head_oid().unwrap_or_default();
+        let refs = repo.list_refs();
+        let refs_hash = hash_ref_map(&refs);
+        let key = (head, refs_hash);
+
+        if self.graph_cache_key.as_ref() == Some(&key) {
+            // Nothing ref-y changed; reuse cached rows & refs.
+            return;
+        }
+
+        let commits = repo.list_commits(GRAPH_COMMIT_LIMIT);
+        let rows = graph::build_graph(&commits);
+
+        // Clamp selection if the graph got shorter (e.g. reset --hard).
+        if self.graph_selected_idx >= rows.len() {
+            self.graph_selected_idx = rows.len().saturating_sub(1);
+        }
+        // Sync selected_commit to the row at the current index.
+        self.selected_commit = rows.get(self.graph_selected_idx).map(|r| r.commit.oid.clone());
+
+        self.graph_rows = rows;
+        self.ref_map = refs;
+        self.graph_cache_key = Some(key);
+
+        // Re-load detail for the newly-selected commit (idx may have shifted
+        // if the graph shrank, or selected_commit may no longer exist).
+        self.load_commit_detail();
+    }
+
+    /// (Re)load commit detail for `selected_commit`. Clears detail + any
+    /// previously-selected file diff whenever the target commit changes.
+    fn load_commit_detail(&mut self) {
+        self.commit_detail = match (&self.repo, &self.selected_commit) {
+            (Some(repo), Some(oid)) => repo.get_commit(oid),
+            _ => None,
+        };
+        self.commit_file_diff = None;
+    }
+
+    fn load_commit_file_diff(&mut self, path: &str) {
+        self.commit_file_diff = match (&self.repo, &self.selected_commit) {
+            (Some(repo), Some(oid)) => repo
+                .get_commit_file_diff(oid, path, 3)
+                .map(|diff| (path.to_string(), diff)),
+            _ => None,
+        };
+    }
+
+    fn render_commit_detail(&self, width: u16) -> Vec<StyledLine> {
+        let Some(detail) = &self.commit_detail else {
+            return vec![StyledLine::new(vec![
+                Span::new("  选择一个 commit 查看详情").fg(Color::named("darkGray")),
+            ])];
+        };
+
+        let info = &detail.info;
+        let max_msg = (width as usize).saturating_sub(4);
+        let max_path = (width as usize).saturating_sub(6);
+        let mut lines = Vec::new();
+
+        lines.push(StyledLine::new(vec![
+            Span::new("commit ").fg(Color::named("darkGray")),
+            Span::new(info.oid.clone()).fg(Color::named("yellow")).bold(),
+        ]));
+        lines.push(StyledLine::new(vec![
+            Span::new("Author: ").fg(Color::named("darkGray")),
+            Span::new(format!("{} <{}>", info.author_name, info.author_email))
+                .fg(Color::named("white")),
+        ]));
+        lines.push(StyledLine::new(vec![
+            Span::new("Date:   ").fg(Color::named("darkGray")),
+            Span::new(format_timestamp(info.time)).fg(Color::named("white")),
+        ]));
+
+        // Inline ref labels if the commit is named by HEAD/branches/tags.
+        if let Some(labels) = self.ref_map.get(&info.oid) {
+            let mut spans: Vec<Span> = vec![Span::new("Refs:   ").fg(Color::named("darkGray"))];
+            for label in labels {
+                spans.push(ref_label_span(label));
+                spans.push(Span::new(" "));
+            }
+            lines.push(StyledLine::new(spans));
+        }
+
+        lines.push(StyledLine::plain(""));
+
+        // Commit message (indented 4 cols, one line per newline)
+        for raw in detail.message.lines() {
+            let mut msg = raw.to_string();
+            truncate_in_place(&mut msg, max_msg);
+            lines.push(StyledLine::new(vec![
+                Span::new("    "),
+                Span::new(msg).fg(Color::named("white")),
+            ]));
+        }
+
+        lines.push(StyledLine::plain(""));
+        lines.push(StyledLine::new(vec![
+            Span::new(format!("Changed files ({})", detail.files.len()))
+                .fg(Color::named("green"))
+                .bold(),
+        ]));
+
+        let selected_file = self.commit_file_diff.as_ref().map(|(p, _)| p.as_str());
+        let sel_bg = Color::rgb(40, 60, 100);
+
+        for file in &detail.files {
+            let status_color = match file.status {
+                FileStatus::Modified => "yellow",
+                FileStatus::Added => "green",
+                FileStatus::Deleted => "red",
+                FileStatus::Renamed => "cyan",
+                FileStatus::Untracked => "green",
+            };
+            let mut path = file.path.clone();
+            truncate_in_place(&mut path, max_path);
+
+            let is_selected = selected_file == Some(file.path.as_str());
+            let mut spans = vec![
+                Span::new("  "),
+                Span::new(format!("{} ", file.status.label())).fg(Color::named(status_color)),
+                Span::new(path).fg(Color::named("white")),
+            ];
+            if is_selected {
+                spans = spans.into_iter().map(|s| s.bg(sel_bg.clone())).collect();
+            }
+            lines.push(
+                StyledLine::new(spans).on_click(
+                    "git.selectCommitFile",
+                    serde_json::json!({ "oid": info.oid, "path": file.path }),
+                ),
+            );
+        }
+
+        // Selected file's diff (inline, below the file list).
+        if let Some((_, diff)) = &self.commit_file_diff {
+            lines.push(StyledLine::plain(""));
+            append_diff_lines(&mut lines, diff);
+        }
+
+        lines
+    }
+
+    fn render_graph(&self, width: u16) -> Vec<StyledLine> {
+        if self.graph_rows.is_empty() {
+            return vec![StyledLine::new(vec![
+                Span::new("  无 commit").fg(Color::named("darkGray")),
+            ])];
+        }
+
+        let show_meta = width >= 60;
+        let max_subject = (width as usize).saturating_sub(if show_meta { 40 } else { 14 });
+        let head_oid = self.repo.as_ref().and_then(|r| r.head_oid());
+
+        let mut lines = Vec::with_capacity(self.graph_rows.len());
+        for (idx, row) in self.graph_rows.iter().enumerate() {
+            lines.push(self.graph_row_line(
+                row,
+                idx == self.graph_selected_idx,
+                show_meta,
+                max_subject,
+                head_oid.as_deref(),
+            ));
+        }
+        lines
     }
 
     fn render_status(&self, width: u16) -> Vec<StyledLine> {
@@ -280,11 +492,19 @@ impl PluginState {
     }
 
     fn handle_event(&mut self, params: Option<&serde_json::Value>, writer: &Writer) -> bool {
+        let panel_id = params
+            .and_then(|p| p.get("panel_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let event = params.and_then(|p| p.get("event"));
         let key = event
             .and_then(|e| e.get("key"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
+
+        if panel_id == "git.graph" {
+            return self.handle_graph_key(key, writer);
+        }
 
         match key {
             "s" => {
@@ -437,6 +657,45 @@ impl PluginState {
                 }
                 true
             }
+            "git.graph.next" => { self.move_graph_selection(1, writer); true }
+            "git.graph.prev" => { self.move_graph_selection(-1, writer); true }
+            "git.selectCommit" => {
+                let oid = args.get("oid").and_then(|v| v.as_str()).unwrap_or("");
+                if !oid.is_empty() {
+                    if let Some(idx) = self.graph_rows.iter().position(|r| r.commit.oid == oid) {
+                        self.graph_selected_idx = idx;
+                        self.selected_commit = Some(oid.to_string());
+                        self.load_commit_detail();
+                        self.request_graph_render(writer);
+                        self.request_commit_detail_render(writer);
+                    }
+                }
+                true
+            }
+            "git.selectCommitFile" => {
+                let oid = args.get("oid").and_then(|v| v.as_str()).unwrap_or("");
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                if !oid.is_empty() && !path.is_empty() {
+                    // If a different commit was clicked, switch commit first.
+                    if self.selected_commit.as_deref() != Some(oid) {
+                        if let Some(idx) = self.graph_rows.iter().position(|r| r.commit.oid == oid)
+                        {
+                            self.graph_selected_idx = idx;
+                        }
+                        self.selected_commit = Some(oid.to_string());
+                        self.load_commit_detail();
+                    }
+                    self.load_commit_file_diff(path);
+                    self.request_commit_detail_render(writer);
+                }
+                true
+            }
+            "git.graph.refresh" => {
+                self.graph_cache_key = None;
+                self.refresh_graph();
+                self.request_graph_render(writer);
+                true
+            }
             _ => false,
         }
     }
@@ -448,11 +707,59 @@ impl PluginState {
         ));
     }
 
+    fn request_graph_render(&self, writer: &Writer) {
+        writer.send(&RpcMessage::notification(
+            "reef/requestRender",
+            serde_json::json!({ "panel_id": "git.graph" }),
+        ));
+    }
+
+    fn request_commit_detail_render(&self, writer: &Writer) {
+        writer.send(&RpcMessage::notification(
+            "reef/requestRender",
+            serde_json::json!({ "panel_id": "git.commitDetail" }),
+        ));
+    }
+
     fn notify_status_changed(&self, writer: &Writer) {
         writer.send(&RpcMessage::notification(
             "reef/statusChanged",
             serde_json::json!({}),
         ));
+    }
+
+    fn handle_graph_key(&mut self, key: &str, writer: &Writer) -> bool {
+        match key {
+            "j" | "ArrowDown" => {
+                self.move_graph_selection(1, writer);
+                true
+            }
+            "k" | "ArrowUp" => {
+                self.move_graph_selection(-1, writer);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn move_graph_selection(&mut self, delta: i32, writer: &Writer) {
+        if self.graph_rows.is_empty() {
+            return;
+        }
+        let last = self.graph_rows.len() - 1;
+        let current = self.graph_selected_idx as i32;
+        let next = (current + delta).clamp(0, last as i32) as usize;
+        if next == self.graph_selected_idx {
+            return;
+        }
+        self.graph_selected_idx = next;
+        self.selected_commit = self
+            .graph_rows
+            .get(next)
+            .map(|r| r.commit.oid.clone());
+        self.load_commit_detail();
+        self.request_graph_render(writer);
+        self.request_commit_detail_render(writer);
     }
 }
 
@@ -547,4 +854,250 @@ fn section_header(
     }
 
     StyledLine::new(spans).on_click(toggle_cmd, serde_json::Value::Null)
+}
+
+// ─── Graph row rendering ──────────────────────────────────────────────────────
+
+impl PluginState {
+    fn graph_row_line(
+        &self,
+        row: &graph::GraphRow,
+        selected: bool,
+        show_meta: bool,
+        max_subject: usize,
+        head_oid: Option<&str>,
+    ) -> StyledLine {
+        let oid = row.commit.oid.clone();
+        let sel_bg = Color::rgb(40, 60, 100);
+        let is_head = head_oid == Some(oid.as_str());
+
+        let mut spans: Vec<Span> = Vec::new();
+
+        // Per-col glyph with horizontal fill for merge/fork connectors.
+        let glyphs = render_lane_chars(row);
+        for (col, ch) in glyphs.iter().enumerate() {
+            let color = lane_color_for(col);
+            let mut span = Span::new(ch.to_string()).fg(color);
+            if col == row.node_col && *ch == '●' && is_head {
+                span = span.bold();
+            } else if *ch == '●' {
+                span = span.dim();
+            }
+            spans.push(span);
+        }
+        spans.push(Span::new(" "));
+
+        // Short oid
+        spans.push(
+            Span::new(row.commit.short_oid.clone())
+                .fg(Color::named("yellow"))
+                .dim(),
+        );
+        spans.push(Span::new(" "));
+
+        if show_meta {
+            let mut author = row.commit.author_name.clone();
+            truncate_in_place(&mut author, 12);
+            spans.push(
+                Span::new(format!("{:<12}", author)).fg(Color::named("cyan")),
+            );
+            spans.push(Span::new(" "));
+
+            let rel = relative_time(row.commit.time);
+            spans.push(
+                Span::new(format!("{:>4}", rel)).fg(Color::named("darkGray")),
+            );
+            spans.push(Span::new(" "));
+        }
+
+        // Ref labels (HEAD, branches, tags) before subject
+        if let Some(labels) = self.ref_map.get(&oid) {
+            for label in labels {
+                spans.push(ref_label_span(label));
+                spans.push(Span::new(" "));
+            }
+        }
+
+        // Subject
+        let mut subject = row.commit.subject.clone();
+        truncate_in_place(&mut subject, max_subject);
+        spans.push(Span::new(subject).fg(Color::named("white")));
+
+        if selected {
+            spans = spans
+                .into_iter()
+                .map(|s| s.bg(sel_bg.clone()))
+                .collect();
+        }
+
+        StyledLine::new(spans).on_click("git.selectCommit", serde_json::json!({ "oid": oid }))
+    }
+}
+
+/// Compute the per-column glyph for a row, filling horizontal connectors
+/// (`─`) across Empty cells that sit between a Merge/Fork cell and the
+/// node column it links to.
+fn render_lane_chars(row: &graph::GraphRow) -> Vec<char> {
+    let mut glyphs: Vec<char> = row
+        .cells
+        .iter()
+        .enumerate()
+        .map(|(col, cell)| match cell {
+            graph::LaneCell::Empty => ' ',
+            graph::LaneCell::Pass => '│',
+            graph::LaneCell::Node => '●',
+            graph::LaneCell::Merge { from } => {
+                if col < *from { '├' } else { '┤' }
+            }
+            graph::LaneCell::Fork { to } => {
+                if col < *to { '╭' } else { '╮' }
+            }
+        })
+        .collect();
+
+    // Fill horizontal connectors between each merge/fork cell and its target
+    for (col, cell) in row.cells.iter().enumerate() {
+        let target = match cell {
+            graph::LaneCell::Merge { from } => Some(*from),
+            graph::LaneCell::Fork { to } => Some(*to),
+            _ => None,
+        };
+        let Some(target) = target else { continue };
+        let (lo, hi) = if col < target {
+            (col + 1, target)
+        } else {
+            (target + 1, col)
+        };
+        for k in lo..hi {
+            if matches!(row.cells.get(k), Some(graph::LaneCell::Empty)) {
+                glyphs[k] = '─';
+            }
+        }
+    }
+
+    glyphs
+}
+
+/// Render a DiffContent into styled lines: one header span per hunk, then
+/// per-line `+`/`-`/` ` with green/red/default coloring. Minimal version — no
+/// line numbers (plain unified patch look).
+fn append_diff_lines(out: &mut Vec<StyledLine>, diff: &DiffContent) {
+    for hunk in &diff.hunks {
+        out.push(StyledLine::new(vec![
+            Span::new(hunk.header.clone()).fg(Color::named("cyan")),
+        ]));
+        for line in &hunk.lines {
+            let (prefix, fg) = match line.tag {
+                LineTag::Added => ("+", "green"),
+                LineTag::Removed => ("-", "red"),
+                LineTag::Context => (" ", "white"),
+            };
+            out.push(StyledLine::new(vec![
+                Span::new(prefix.to_string()).fg(Color::named(fg)),
+                Span::new(line.content.clone()).fg(Color::named(fg)),
+            ]));
+        }
+    }
+}
+
+fn ref_label_span(label: &RefLabel) -> Span {
+    let (text, fg, bg) = match label {
+        RefLabel::Head => (" HEAD ".to_string(), "black", "cyan"),
+        RefLabel::Branch(n) => (format!(" {} ", n), "black", "green"),
+        RefLabel::RemoteBranch(n) => (format!(" {} ", n), "white", "darkGray"),
+        RefLabel::Tag(n) => (format!(" tag: {} ", n), "black", "yellow"),
+    };
+    Span::new(text)
+        .fg(Color::named(fg))
+        .bg(Color::named(bg))
+        .bold()
+}
+
+/// Truncate a string (in-place) to at most `max` Unicode chars, appending `…`.
+fn truncate_in_place(s: &mut String, max: usize) {
+    if max == 0 {
+        s.clear();
+        return;
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return;
+    }
+    let kept: String = chars.into_iter().take(max.saturating_sub(1)).collect();
+    *s = format!("{}…", kept);
+}
+
+fn lane_color_for(col: usize) -> Color {
+    // Rotate through a small palette so parallel lanes get distinct colors.
+    const PALETTE: &[&str] = &["cyan", "magenta", "green", "yellow", "blue", "red"];
+    Color::named(PALETTE[col % PALETTE.len()])
+}
+
+/// Format a unix timestamp (seconds since epoch, UTC) as "YYYY-MM-DD HH:MM:SS UTC".
+/// Uses Howard Hinnant's civil_from_days conversion; no external deps.
+fn format_timestamp(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let h = tod / 3600;
+    let m = (tod % 3600) / 60;
+    let s = tod % 60;
+    let (y, mo, d) = days_to_ymd(days);
+    format!("{y}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02} UTC")
+}
+
+/// Civil-from-days algorithm (Howard Hinnant). Days are counted from 1970-01-01.
+fn days_to_ymd(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = if m <= 2 { y + 1 } else { y };
+    (year, m, d)
+}
+
+/// Compute a short relative-time string ("2h", "3d", "5mo", "1y") from a
+/// unix timestamp. Seconds/minutes collapse to "now" / "Nm".
+fn relative_time(author_time: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(author_time);
+    let diff = (now - author_time).max(0);
+    if diff < 60 {
+        "now".into()
+    } else if diff < 3600 {
+        format!("{}m", diff / 60)
+    } else if diff < 86_400 {
+        format!("{}h", diff / 3600)
+    } else if diff < 86_400 * 30 {
+        format!("{}d", diff / 86_400)
+    } else if diff < 86_400 * 365 {
+        format!("{}mo", diff / (86_400 * 30))
+    } else {
+        format!("{}y", diff / (86_400 * 365))
+    }
+}
+
+/// Stable hash of the ref map — used as part of the graph cache key.
+fn hash_ref_map(map: &HashMap<String, Vec<RefLabel>>) -> u64 {
+    let mut entries: Vec<(&String, &Vec<RefLabel>)> = map.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (oid, labels) in entries {
+        oid.hash(&mut hasher);
+        for label in labels {
+            match label {
+                RefLabel::Head => 0u8.hash(&mut hasher),
+                RefLabel::Branch(n) => { 1u8.hash(&mut hasher); n.hash(&mut hasher); }
+                RefLabel::RemoteBranch(n) => { 2u8.hash(&mut hasher); n.hash(&mut hasher); }
+                RefLabel::Tag(n) => { 3u8.hash(&mut hasher); n.hash(&mut hasher); }
+            }
+        }
+    }
+    hasher.finish()
 }

@@ -166,6 +166,31 @@ fn handle_key(key: event::KeyEvent, app: &mut App) {
     match app.active_tab {
         Tab::Git => handle_key_git(key, app),
         Tab::Files => handle_key_files(key, app),
+        Tab::Graph => handle_key_graph(key, app),
+    }
+}
+
+fn handle_key_graph(key: event::KeyEvent, app: &mut App) {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => match app.active_panel {
+            Panel::Files => { app.route_key_to_plugin("k"); }
+            Panel::Diff => scroll_panel(app, "git.commitDetail", -1),
+        },
+        KeyCode::Down | KeyCode::Char('j') => match app.active_panel {
+            Panel::Files => { app.route_key_to_plugin("j"); }
+            Panel::Diff => scroll_panel(app, "git.commitDetail", 1),
+        },
+        KeyCode::PageUp => match app.active_panel {
+            Panel::Files => { for _ in 0..10 { app.route_key_to_plugin("k"); } }
+            Panel::Diff => scroll_panel(app, "git.commitDetail", -20),
+        },
+        KeyCode::PageDown => match app.active_panel {
+            Panel::Files => { for _ in 0..10 { app.route_key_to_plugin("j"); } }
+            Panel::Diff => scroll_panel(app, "git.commitDetail", 20),
+        },
+        KeyCode::Enter => { app.route_key_to_plugin("Enter"); }
+        KeyCode::Char('r') => { app.route_key_to_plugin("r"); }
+        _ => {}
     }
 }
 
@@ -323,12 +348,16 @@ fn handle_mouse<B: ratatui::backend::Backend>(
             let is_left = mouse.column < split_x;
             match app.active_tab {
                 Tab::Git => {
-                    if is_left { app.file_scroll = app.file_scroll.saturating_sub(3); }
+                    if is_left { scroll_sidebar_plugin(app, -3); }
                     else { app.diff_scroll = app.diff_scroll.saturating_sub(3); }
                 }
                 Tab::Files => {
                     if is_left { app.tree_scroll = app.tree_scroll.saturating_sub(3); }
                     else { app.preview_scroll = app.preview_scroll.saturating_sub(3); }
+                }
+                Tab::Graph => {
+                    if is_left { scroll_panel(app, "git.graph", -3); }
+                    else { scroll_panel(app, "git.commitDetail", -3); }
                 }
             }
         }
@@ -338,12 +367,16 @@ fn handle_mouse<B: ratatui::backend::Backend>(
             let is_left = mouse.column < split_x;
             match app.active_tab {
                 Tab::Git => {
-                    if is_left { app.file_scroll += 3; }
+                    if is_left { scroll_sidebar_plugin(app, 3); }
                     else { app.diff_scroll += 3; }
                 }
                 Tab::Files => {
                     if is_left { app.tree_scroll += 3; }
                     else { app.preview_scroll += 3; }
+                }
+                Tab::Graph => {
+                    if is_left { scroll_panel(app, "git.graph", 3); }
+                    else { scroll_panel(app, "git.commitDetail", 3); }
                 }
             }
         }
@@ -353,4 +386,26 @@ fn handle_mouse<B: ratatui::backend::Backend>(
         }
         _ => {}
     }
+}
+
+/// Apply a scroll delta to the sidebar's currently-active plugin panel.
+/// Delta is in lines; positive scrolls down, negative scrolls up.
+fn scroll_sidebar_plugin(app: &mut App, delta: i32) {
+    let Some(panel_id) = app.active_sidebar_panel.clone() else { return };
+    let entry = app.panel_scroll.entry(panel_id).or_insert(0);
+    *entry = if delta < 0 {
+        entry.saturating_sub(delta.unsigned_abs() as usize)
+    } else {
+        entry.saturating_add(delta as usize)
+    };
+}
+
+/// Apply a scroll delta to a specific plugin panel by id.
+fn scroll_panel(app: &mut App, panel_id: &str, delta: i32) {
+    let entry = app.panel_scroll.entry(panel_id.to_string()).or_insert(0);
+    *entry = if delta < 0 {
+        entry.saturating_sub(delta.unsigned_abs() as usize)
+    } else {
+        entry.saturating_add(delta as usize)
+    };
 }

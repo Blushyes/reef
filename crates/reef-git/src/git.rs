@@ -1,4 +1,5 @@
-use git2::{DiffOptions, Repository, StatusOptions};
+use git2::{DiffOptions, Repository, Sort, StatusOptions};
+use std::collections::HashMap;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +60,34 @@ pub enum LineTag {
     Context,
     Added,
     Removed,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommitInfo {
+    pub oid: String,
+    pub short_oid: String,
+    pub parents: Vec<String>,
+    pub author_name: String,
+    pub author_email: String,
+    pub time: i64,
+    pub subject: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommitDetail {
+    pub info: CommitInfo,
+    pub message: String,
+    pub committer_name: String,
+    pub committer_time: i64,
+    pub files: Vec<FileEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefLabel {
+    Head,
+    Branch(String),
+    RemoteBranch(String),
+    Tag(String),
 }
 
 pub struct GitRepo {
@@ -347,5 +376,189 @@ impl GitRepo {
             }
         }
         Ok(())
+    }
+
+    // ── commit history / refs ──────────────────────────────────────────────
+
+    pub fn head_oid(&self) -> Option<String> {
+        self.repo
+            .head()
+            .ok()?
+            .peel_to_commit()
+            .ok()
+            .map(|c| c.id().to_string())
+    }
+
+    /// Walk up to `limit` commits reachable from all branches/tags/HEAD, in
+    /// topological + time order (child before parent, newest first).
+    pub fn list_commits(&self, limit: usize) -> Vec<CommitInfo> {
+        let Ok(mut walk) = self.repo.revwalk() else { return Vec::new() };
+        let _ = walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME);
+
+        // Seed from local branches, remote branches, tags (peeled), and HEAD.
+        // push_glob dereferences annotated tags; non-commit targets are skipped.
+        let _ = walk.push_glob("refs/heads/*");
+        let _ = walk.push_glob("refs/remotes/*");
+        let _ = walk.push_glob("refs/tags/*");
+        let _ = walk.push_head();
+
+        let mut out = Vec::with_capacity(limit.min(256));
+        for oid in walk.flatten().take(limit) {
+            let Ok(commit) = self.repo.find_commit(oid) else { continue };
+            out.push(commit_to_info(&commit));
+        }
+        out
+    }
+
+    /// Map oid (hex) → list of ref labels pointing at that commit. HEAD is
+    /// inserted separately using the current HEAD commit oid.
+    pub fn list_refs(&self) -> HashMap<String, Vec<RefLabel>> {
+        let mut map: HashMap<String, Vec<RefLabel>> = HashMap::new();
+
+        if let Ok(refs) = self.repo.references() {
+            for r in refs.flatten() {
+                let Some(oid) = r
+                    .peel(git2::ObjectType::Commit)
+                    .ok()
+                    .map(|o| o.id().to_string())
+                else {
+                    continue;
+                };
+                let Some(name) = r.name() else { continue };
+
+                let label = if let Some(rest) = name.strip_prefix("refs/heads/") {
+                    RefLabel::Branch(rest.to_string())
+                } else if let Some(rest) = name.strip_prefix("refs/remotes/") {
+                    // Skip HEAD symlinks like `origin/HEAD` — they duplicate another branch.
+                    if rest.ends_with("/HEAD") {
+                        continue;
+                    }
+                    RefLabel::RemoteBranch(rest.to_string())
+                } else if let Some(rest) = name.strip_prefix("refs/tags/") {
+                    RefLabel::Tag(rest.to_string())
+                } else {
+                    continue;
+                };
+
+                map.entry(oid).or_default().push(label);
+            }
+        }
+
+        if let Some(head_oid) = self.head_oid() {
+            map.entry(head_oid).or_default().insert(0, RefLabel::Head);
+        }
+
+        map
+    }
+
+    pub fn get_commit(&self, oid_str: &str) -> Option<CommitDetail> {
+        let oid = git2::Oid::from_str(oid_str).ok()?;
+        let commit = self.repo.find_commit(oid).ok()?;
+        let info = commit_to_info(&commit);
+        let message = commit.message().unwrap_or("").to_string();
+        let committer = commit.committer();
+        let committer_name = committer.name().unwrap_or("").to_string();
+        let committer_time = committer.when().seconds();
+
+        let files = self.commit_files(&commit);
+
+        Some(CommitDetail {
+            info,
+            message,
+            committer_name,
+            committer_time,
+            files,
+        })
+    }
+
+    pub fn get_commit_file_diff(
+        &self,
+        oid_str: &str,
+        path: &str,
+        context_lines: u32,
+    ) -> Option<DiffContent> {
+        let oid = git2::Oid::from_str(oid_str).ok()?;
+        let commit = self.repo.find_commit(oid).ok()?;
+        let new_tree = commit.tree().ok()?;
+        // Merge commits: diff against first parent (simplest reasonable choice).
+        let parent_tree = commit.parents().next().and_then(|p| p.tree().ok());
+
+        let mut opts = DiffOptions::new();
+        opts.pathspec(path).context_lines(context_lines);
+
+        let diff = self
+            .repo
+            .diff_tree_to_tree(parent_tree.as_ref(), Some(&new_tree), Some(&mut opts))
+            .ok()?;
+
+        self.parse_git2_diff(&diff, path)
+    }
+
+    /// Compute the list of files changed by this commit (vs first parent, or
+    /// vs empty tree for the initial commit).
+    fn commit_files(&self, commit: &git2::Commit) -> Vec<FileEntry> {
+        let Ok(new_tree) = commit.tree() else { return Vec::new() };
+        let parent_tree = commit.parents().next().and_then(|p| p.tree().ok());
+
+        let diff = match self
+            .repo
+            .diff_tree_to_tree(parent_tree.as_ref(), Some(&new_tree), None)
+        {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut files = Vec::new();
+        diff.foreach(
+            &mut |delta, _progress| {
+                let path = delta
+                    .new_file()
+                    .path()
+                    .or_else(|| delta.old_file().path())
+                    .and_then(|p| p.to_str())
+                    .map(String::from);
+                if let Some(path) = path {
+                    let status = match delta.status() {
+                        git2::Delta::Added => FileStatus::Added,
+                        git2::Delta::Deleted => FileStatus::Deleted,
+                        git2::Delta::Renamed | git2::Delta::Copied => FileStatus::Renamed,
+                        git2::Delta::Untracked => FileStatus::Untracked,
+                        _ => FileStatus::Modified,
+                    };
+                    files.push(FileEntry { path, status });
+                }
+                true
+            },
+            None,
+            None,
+            None,
+        )
+        .ok();
+
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        files
+    }
+}
+
+fn commit_to_info(commit: &git2::Commit) -> CommitInfo {
+    let oid = commit.id().to_string();
+    let short_oid = oid.chars().take(7).collect::<String>();
+    let parents = commit.parent_ids().map(|p| p.to_string()).collect();
+    let author = commit.author();
+    let author_name = author.name().unwrap_or("").to_string();
+    let author_email = author.email().unwrap_or("").to_string();
+    let time = author.when().seconds();
+    let subject = commit
+        .summary()
+        .unwrap_or("")
+        .to_string();
+    CommitInfo {
+        oid,
+        short_oid,
+        parents,
+        author_name,
+        author_email,
+        time,
+        subject,
     }
 }

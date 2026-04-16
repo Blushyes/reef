@@ -2,6 +2,7 @@ use crate::file_tree::{self, FileTree, PreviewContent};
 use crate::git::{DiffContent, FileEntry, GitRepo};
 use crate::mouse::{ClickAction, HitTestRegistry};
 use crate::plugin::manager::PluginManager;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -9,16 +10,18 @@ use std::time::Instant;
 pub enum Tab {
     Git,
     Files,
+    Graph,
 }
 
 impl Tab {
     /// Canonical ordering shared by the tab bar renderer and the digit shortcut.
-    pub const ALL: &'static [Tab] = &[Tab::Files, Tab::Git];
+    pub const ALL: &'static [Tab] = &[Tab::Files, Tab::Git, Tab::Graph];
 
     pub fn label(self) -> &'static str {
         match self {
             Tab::Files => " 📁 Files ",
             Tab::Git => " ⎇ Git ",
+            Tab::Graph => " ⑂ Graph ",
         }
     }
 }
@@ -80,6 +83,9 @@ pub struct App {
     // Plugin system
     pub plugin_manager: PluginManager,
     pub active_sidebar_panel: Option<String>,
+    /// Per-plugin-panel scroll offsets, keyed by panel_id. Host-native panels
+    /// (file_tree, file_preview, legacy diff/file) keep their own scalars.
+    pub panel_scroll: HashMap<String, usize>,
 
     // Control
     pub should_quit: bool,
@@ -125,6 +131,7 @@ impl App {
             last_click: None,
             plugin_manager: PluginManager::new(),
             active_sidebar_panel: None,
+            panel_scroll: HashMap::new(),
             should_quit: false,
             select_mode: false,
             show_help: false,
@@ -296,6 +303,10 @@ impl App {
                 self.dragging_split = true;
             }
             ClickAction::PluginCommand { command, args, .. } => {
+                // Reset commit-detail scroll so a new commit starts at the top.
+                if command == "git.selectCommit" {
+                    self.panel_scroll.insert("git.commitDetail".into(), 0);
+                }
                 // Keep host state in sync for known selection commands
                 if command == "git.selectFile" {
                     if let (Some(path), Some(staged)) = (
@@ -398,9 +409,11 @@ impl App {
 
     /// Returns the plugin panel_id for the currently focused panel, if any.
     pub fn focused_plugin_panel(&self) -> Option<String> {
-        match self.active_panel {
-            Panel::Files => self.active_sidebar_panel.clone(),
-            Panel::Diff => None, // diff is host-native, no plugin panel
+        match (self.active_tab, self.active_panel) {
+            (Tab::Graph, Panel::Files) => Some("git.graph".into()),
+            (Tab::Graph, Panel::Diff) => Some("git.commitDetail".into()),
+            (_, Panel::Files) => self.active_sidebar_panel.clone(),
+            (_, Panel::Diff) => None, // diff is host-native, no plugin panel
         }
     }
 

@@ -7,24 +7,15 @@ use unicode_width::UnicodeWidthStr;
 
 /// Render a plugin panel identified by `panel_id` into `area`.
 pub fn render(f: &mut Frame, app: &mut App, area: Rect, panel_id: &str, focused: bool) {
-    let is_diff_panel = app.plugin_manager.panels.iter()
-        .find(|p| p.decl.id == panel_id)
-        .map(|p| p.decl.slot == reef_protocol::PanelSlot::Editor)
-        .unwrap_or(false);
-
     // Determine current scroll and clamp it using total_lines from the last render.
-    let raw_scroll = if is_diff_panel { app.diff_scroll } else { app.file_scroll };
+    let raw_scroll = app.panel_scroll.get(panel_id).copied().unwrap_or(0);
     let total_lines = app.plugin_manager.panels.iter()
         .find(|p| p.decl.id == panel_id)
         .and_then(|p| p.last_render.as_ref())
         .map(|r| r.total_lines)
         .unwrap_or(usize::MAX); // unknown → don't clamp yet
     let clamped = raw_scroll.min(total_lines.saturating_sub(area.height as usize));
-    if is_diff_panel {
-        app.diff_scroll = clamped;
-    } else {
-        app.file_scroll = clamped;
-    }
+    app.panel_scroll.insert(panel_id.to_string(), clamped);
     let scroll = clamped as u32;
 
     // Request render if content is stale OR the scroll offset changed.

@@ -57,6 +57,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
             file_tree_panel::render(f, app, body_layout[0]);
             file_preview_panel::render(f, app, body_layout[1]);
         }
+        Tab::Graph => {
+            render_sidebar_panel(f, app, body_layout[0], "git.graph");
+            render_editor_panel(f, app, body_layout[1], "git.commitDetail");
+        }
     }
 
     render_status_bar(f, app, main_layout[3]);
@@ -68,41 +72,45 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
 /// Left sidebar: shows the active plugin panel, falling back to the legacy file panel.
 fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
-    // Draw border on the right edge
+    if let Some(panel_id) = app.active_sidebar_panel.clone() {
+        render_sidebar_panel(f, app, area, &panel_id);
+    } else {
+        // Fallback: legacy hard-coded panel
+        let block = Block::default()
+            .borders(Borders::RIGHT)
+            .border_style(Style::default().fg(Color::DarkGray));
+        f.render_widget(block, area);
+        file_panel::render(f, app, area);
+    }
+}
+
+/// Render a specific plugin-contributed sidebar panel into `area`, wrapping it
+/// in the shared right-border + 1-col padding chrome.
+fn render_sidebar_panel(f: &mut Frame, app: &mut App, area: Rect, panel_id: &str) {
     let block = Block::default()
         .borders(Borders::RIGHT)
         .border_style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Add 1-col left padding
     let padded = Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(1), inner.height);
-
-    if let Some(panel_id) = app.active_sidebar_panel.clone() {
-        // Plugin-rendered sidebar
-        let focused = matches!(app.active_panel, crate::app::Panel::Files);
-        plugin_panel::render(f, app, padded, &panel_id, focused);
-    } else {
-        // Fallback: legacy hard-coded panel
-        file_panel::render(f, app, area);
-    }
+    let focused = matches!(app.active_panel, crate::app::Panel::Files);
+    plugin_panel::render(f, app, padded, panel_id, focused);
 }
 
-/// Right editor: shows the active editor plugin panel, falling back to legacy diff panel.
-fn render_editor(f: &mut Frame, app: &mut App, area: Rect) {
-    // Find the first editor-slot plugin panel
-    let editor_panel_id = app.plugin_manager.panels.iter()
-        .find(|p| p.decl.slot == reef_protocol::PanelSlot::Editor)
-        .map(|p| p.decl.id.clone());
 
-    if let Some(panel_id) = editor_panel_id {
-        let focused = matches!(app.active_panel, crate::app::Panel::Diff);
-        let inner = Rect::new(area.x + 1, area.y, area.width.saturating_sub(1), area.height);
-        plugin_panel::render(f, app, inner, &panel_id, focused);
-    } else {
-        // Fallback: legacy diff panel
-        diff_panel::render(f, app, area);
-    }
+/// Right editor for Tab::Git — always renders the host-native diff panel. We
+/// deliberately don't scan for editor-slot plugin panels here, because
+/// `git.commitDetail` (also an editor-slot panel) is Tab::Graph's.
+fn render_editor(f: &mut Frame, app: &mut App, area: Rect) {
+    diff_panel::render(f, app, area);
+}
+
+/// Render a specific plugin-contributed editor panel, with 1-col left padding.
+fn render_editor_panel(f: &mut Frame, app: &mut App, area: Rect, panel_id: &str) {
+    let focused = matches!(app.active_panel, crate::app::Panel::Diff);
+    let inner = Rect::new(area.x + 1, area.y, area.width.saturating_sub(1), area.height);
+    plugin_panel::render(f, app, inner, panel_id, focused);
 }
 
 fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
@@ -136,7 +144,7 @@ fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Fill rest of row
     let remaining = (area.width as usize).saturating_sub(x.saturating_sub(area.x) as usize);
-    let keys_hint = " 1:Files 2:Git";
+    let keys_hint = " 1:Files 2:Git 3:Graph";
     let pad = remaining.saturating_sub(keys_hint.len());
     spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bg)));
     spans.push(Span::styled(keys_hint, Style::default().fg(Color::DarkGray).bg(bg)));

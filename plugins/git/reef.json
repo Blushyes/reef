@@ -2,7 +2,7 @@
   "name": "git",
   "version": "0.1.0",
   "description": "Git status, diff, stage/unstage",
-  "main": "./reef-git",
+  "main": "../../target/release/reef-git",
   "activation_events": ["onPanel:git.status"],
   "contributes": {
     "panels": [

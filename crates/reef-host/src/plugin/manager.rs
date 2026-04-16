@@ -1,0 +1,256 @@
+use super::process::PluginProcess;
+use reef_protocol::{
+    CommandParams, CommandResult, EventParams, EventResult, InitializeParams,
+    OpenFileParams, NotifyParams, PanelDecl, PanelSlot, PluginManifest,
+    RenderParams, RenderResult, RpcMessage,
+};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+/// A plugin panel registered by a plugin, with cached render result.
+pub struct ManagedPanel {
+    pub decl: PanelDecl,
+    pub plugin_name: String,
+    pub last_render: Option<RenderResult>,
+    pub needs_render: bool,
+}
+
+/// Pending plugin→host request that needs a response.
+pub struct PendingRequest {
+    pub plugin_name: String,
+    pub id: u64,
+    pub method: String,
+    pub params: serde_json::Value,
+}
+
+pub struct PluginManager {
+    processes: HashMap<String, PluginProcess>,
+    pub panels: Vec<ManagedPanel>,   // ordered: sidebar panels in registration order
+    /// Events raised by plugins for the host to act on this frame.
+    pub pending_host_requests: Vec<PendingRequest>,
+    pub notifications: Vec<NotifyParams>,
+}
+
+impl PluginManager {
+    pub fn new() -> Self {
+        Self {
+            processes: HashMap::new(),
+            panels: Vec::new(),
+            pending_host_requests: Vec::new(),
+            notifications: Vec::new(),
+        }
+    }
+
+    /// Discover and load all plugins from a directory.
+    /// Each subdirectory with a reef.json is considered a plugin.
+    pub fn load_from_dir(&mut self, dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let manifest_path = entry.path().join("reef.json");
+            if manifest_path.exists() {
+                if let Err(e) = self.load_plugin(&manifest_path) {
+                    eprintln!("[reef] failed to load plugin at {:?}: {}", manifest_path, e);
+                }
+            }
+        }
+    }
+
+    /// Load a single plugin from its manifest path.
+    pub fn load_plugin(&mut self, manifest_path: &Path) -> std::io::Result<()> {
+        let content = std::fs::read_to_string(manifest_path)?;
+        let manifest: PluginManifest = serde_json::from_str(&content)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        let plugin_dir = manifest_path.parent().unwrap();
+        let exe = resolve_exe(&manifest.main, plugin_dir);
+
+        let mut proc = PluginProcess::spawn(&manifest.name, &exe)?;
+
+        // Send initialize
+        let params = serde_json::to_value(InitializeParams {
+            reef_version: env!("CARGO_PKG_VERSION").to_string(),
+        }).unwrap();
+        proc.send_request("reef/initialize", params)?;
+
+        // Register panels declared in manifest
+        for panel in &manifest.contributes.panels {
+            self.panels.push(ManagedPanel {
+                decl: panel.clone(),
+                plugin_name: manifest.name.clone(),
+                last_render: None,
+                needs_render: true,
+            });
+        }
+
+        self.processes.insert(manifest.name.clone(), proc);
+        Ok(())
+    }
+
+    /// Called each frame: drain all plugin messages and update state.
+    pub fn tick(&mut self) {
+        self.pending_host_requests.clear();
+        self.notifications.clear();
+
+        let names: Vec<String> = self.processes.keys().cloned().collect();
+        for name in names {
+            let Some(proc) = self.processes.get_mut(&name) else { continue };
+            let messages = proc.drain_messages();
+            for msg in messages {
+                self.handle_message(&name.clone(), msg);
+            }
+        }
+    }
+
+    fn handle_message(&mut self, plugin_name: &str, msg: RpcMessage) {
+        if msg.is_response() {
+            // Response to a host request (e.g., render result)
+            // Method is empty for responses; match by id stored in inflight map
+            // For now, we use method="" convention — see note below.
+            // We handle render responses via method tag embedded in a wrapper.
+            // Actually, we store pending render requests and correlate by id.
+            // Simple approach: plugin responses to render carry result.panel_id.
+            if let Some(result_val) = &msg.result {
+                // Try to deserialize as RenderResult
+                if let Ok(render_result) = serde_json::from_value::<RenderResult>(result_val.clone()) {
+                    // Update cached render for this panel
+                    for panel in &mut self.panels {
+                        if panel.plugin_name == plugin_name
+                            && panel.decl.id == render_result.panel_id
+                        {
+                            panel.last_render = Some(render_result);
+                            panel.needs_render = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // Plugin-initiated requests / notifications
+        let method = msg.method.as_str();
+        let params = msg.params.clone().unwrap_or(serde_json::Value::Null);
+
+        match method {
+            "reef/requestRender" => {
+                if let Some(panel_id) = params.get("panel_id").and_then(|v| v.as_str()) {
+                    for panel in &mut self.panels {
+                        if panel.plugin_name == plugin_name && panel.decl.id == panel_id {
+                            panel.needs_render = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            "reef/notify" => {
+                if let Ok(n) = serde_json::from_value::<NotifyParams>(params) {
+                    self.notifications.push(n);
+                }
+            }
+            "reef/openFile" | "reef/executeCommand" => {
+                if let Some(id) = msg.id {
+                    self.pending_host_requests.push(PendingRequest {
+                        plugin_name: plugin_name.to_string(),
+                        id,
+                        method: method.to_string(),
+                        params: msg.params.unwrap_or_default(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Request a render from the plugin owning `panel_id`.
+    pub fn request_render(&mut self, panel_id: &str, width: u16, height: u16, focused: bool) {
+        let plugin_name = self.panels.iter()
+            .find(|p| p.decl.id == panel_id)
+            .map(|p| p.plugin_name.clone());
+
+        if let Some(name) = plugin_name {
+            if let Some(proc) = self.processes.get_mut(&name) {
+                let params = serde_json::to_value(RenderParams {
+                    panel_id: panel_id.to_string(),
+                    width,
+                    height,
+                    focused,
+                }).unwrap();
+                let _ = proc.send_request("reef/render", params);
+            }
+        }
+    }
+
+    /// Forward a key event to the plugin owning `panel_id`.
+    /// Returns true if the plugin consumed it.
+    pub fn send_key_event(
+        &mut self,
+        panel_id: &str,
+        key: &str,
+        modifiers: Vec<String>,
+    ) -> bool {
+        let plugin_name = self.panels.iter()
+            .find(|p| p.decl.id == panel_id)
+            .map(|p| p.plugin_name.clone());
+
+        if let Some(name) = plugin_name {
+            if let Some(proc) = self.processes.get_mut(&name) {
+                let params = serde_json::to_value(EventParams {
+                    panel_id: panel_id.to_string(),
+                    event: reef_protocol::InputEvent::Key {
+                        key: key.to_string(),
+                        modifiers,
+                    },
+                }).unwrap();
+                let _ = proc.send_request("reef/event", params);
+                // Optimistic: assume consumed; plugin can correct on next tick
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Execute a command on the plugin that registered it.
+    pub fn execute_command(&mut self, command_id: &str, args: serde_json::Value) {
+        // Find which plugin owns this command (by prefix matching plugin name)
+        let plugin_name = command_id.split('.').next().map(|s| s.to_string());
+        if let Some(name) = plugin_name {
+            if let Some(proc) = self.processes.get_mut(&name) {
+                let params = serde_json::to_value(CommandParams {
+                    id: command_id.to_string(),
+                    args,
+                }).unwrap();
+                let _ = proc.send_request("reef/command", params);
+            }
+        }
+    }
+
+    /// Respond to a pending plugin→host request.
+    pub fn respond_to_plugin(&mut self, req: &PendingRequest, result: serde_json::Value) {
+        if let Some(proc) = self.processes.get_mut(&req.plugin_name) {
+            let _ = proc.send_response(req.id, result);
+        }
+    }
+
+    /// Sidebar panels in order.
+    pub fn sidebar_panels(&self) -> Vec<&ManagedPanel> {
+        self.panels.iter()
+            .filter(|p| p.decl.slot == PanelSlot::Sidebar)
+            .collect()
+    }
+
+    /// Send shutdown notification to all plugins.
+    pub fn shutdown(&mut self) {
+        for proc in self.processes.values_mut() {
+            let _ = proc.send_notification("reef/shutdown", serde_json::Value::Null);
+        }
+    }
+}
+
+fn resolve_exe(main: &str, plugin_dir: &Path) -> String {
+    let p = if main.starts_with("./") || main.starts_with("../") {
+        plugin_dir.join(main)
+    } else {
+        PathBuf::from(main)
+    };
+    p.to_string_lossy().into_owned()
+}

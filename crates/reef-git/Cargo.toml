@@ -1,0 +1,13 @@
+[package]
+name = "reef-git"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "reef-git"
+path = "src/main.rs"
+
+[dependencies]
+reef-protocol = { path = "../reef-protocol" }
+git2          = "0.20.4"
+serde_json    = { workspace = true }

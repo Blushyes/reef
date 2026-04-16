@@ -463,17 +463,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gv"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "git2",
- "ratatui",
- "similar",
- "unicode-width",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1259,6 +1248,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags 2.11.1",
+]
+
+[[package]]
+name = "reef-git"
+version = "0.1.0"
+dependencies = [
+ "git2",
+ "reef-protocol",
+ "serde_json",
+]
+
+[[package]]
+name = "reef-host"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "git2",
+ "ratatui",
+ "reef-protocol",
+ "serde",
+ "serde_json",
+ "similar",
+ "unicode-width",
+]
+
+[[package]]
+name = "reef-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

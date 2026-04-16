@@ -1,0 +1,18 @@
+[package]
+name = "reef-host"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "reef"
+path = "src/main.rs"
+
+[dependencies]
+reef-protocol = { path = "../reef-protocol" }
+crossterm     = "0.29.0"
+git2          = "0.20.4"
+ratatui       = "0.30.0"
+similar       = "3.1.0"
+unicode-width = "0.2.2"
+serde         = { workspace = true }
+serde_json    = { workspace = true }

@@ -1,0 +1,11 @@
+[package]
+name = "gv"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossterm = "0.29.0"
+git2 = "0.20.4"
+ratatui = "0.30.0"
+similar = "3.1.0"
+unicode-width = "0.2.2"

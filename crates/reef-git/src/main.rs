@@ -297,12 +297,12 @@ impl PluginState {
             }
             "git.toggleStaged" => {
                 self.staged_collapsed = !self.staged_collapsed;
-                self.request_render(writer);
+                self.request_status_render(writer);
                 true
             }
             "git.toggleUnstaged" => {
                 self.unstaged_collapsed = !self.unstaged_collapsed;
-                self.request_render(writer);
+                self.request_status_render(writer);
                 true
             }
             "git.stage" => {
@@ -332,6 +332,17 @@ impl PluginState {
     }
 
     fn request_render(&self, writer: &mut impl Write) {
+        // Always refresh both panels — status list and diff view
+        for panel_id in ["git.status", "git.diff"] {
+            let msg = RpcMessage::notification(
+                "reef/requestRender",
+                serde_json::json!({ "panel_id": panel_id }),
+            );
+            let _ = write_message(writer, &msg);
+        }
+    }
+
+    fn request_status_render(&self, writer: &mut impl Write) {
         let msg = RpcMessage::notification(
             "reef/requestRender",
             serde_json::json!({ "panel_id": "git.status" }),

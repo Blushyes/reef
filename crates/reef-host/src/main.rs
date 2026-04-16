@@ -145,17 +145,24 @@ fn handle_key(key: event::KeyEvent, app: &mut App) {
             }
         },
         KeyCode::Char('s') => {
-            if let Some(ref sel) = app.selected_file.clone() {
-                if !sel.is_staged {
-                    app.stage_file(&sel.path);
+            if !app.route_key_to_plugin("s") {
+                // fallback: no plugin active
+                if let Some(ref sel) = app.selected_file.clone() {
+                    if !sel.is_staged { app.stage_file(&sel.path); }
                 }
             }
         }
         KeyCode::Char('u') => {
-            if let Some(ref sel) = app.selected_file.clone() {
-                if sel.is_staged {
-                    app.unstage_file(&sel.path);
+            if !app.route_key_to_plugin("u") {
+                if let Some(ref sel) = app.selected_file.clone() {
+                    if sel.is_staged { app.unstage_file(&sel.path); }
                 }
+            }
+        }
+        KeyCode::Char('r') => {
+            if !app.route_key_to_plugin("r") {
+                app.refresh_status();
+                if app.selected_file.is_some() { app.load_diff(); }
             }
         }
         KeyCode::Char('h') => {
@@ -166,13 +173,6 @@ fn handle_key(key: event::KeyEvent, app: &mut App) {
         }
         KeyCode::Char('f') => {
             app.toggle_diff_mode();
-        }
-        KeyCode::Char('r') => {
-            // Refresh
-            app.refresh_status();
-            if app.selected_file.is_some() {
-                app.load_diff();
-            }
         }
         _ => {}
     }

@@ -262,6 +262,28 @@ impl App {
         self.select_file(path, *staged);
     }
 
+    /// Returns the plugin panel_id for the currently focused panel, if any.
+    pub fn focused_plugin_panel(&self) -> Option<String> {
+        match self.active_panel {
+            Panel::Files => self.active_sidebar_panel.clone(),
+            Panel::Diff => self
+                .plugin_manager
+                .panels
+                .iter()
+                .find(|p| p.decl.slot == reef_protocol::PanelSlot::Editor)
+                .map(|p| p.decl.id.clone()),
+        }
+    }
+
+    /// Route a key event to the plugin that owns the currently focused panel.
+    /// Returns true if the event was forwarded to a plugin.
+    pub fn route_key_to_plugin(&mut self, key: &str) -> bool {
+        let Some(panel_id) = self.focused_plugin_panel() else {
+            return false;
+        };
+        self.plugin_manager.send_key_event(&panel_id, key, vec![])
+    }
+
     /// Discover and start plugins from known locations.
     pub fn load_plugins(&mut self) {
         // 1. Built-in plugins shipped alongside the binary

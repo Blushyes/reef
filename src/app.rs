@@ -1,5 +1,6 @@
 use crate::git::{DiffContent, FileEntry, GitRepo};
 use crate::mouse::{ClickAction, HitTestRegistry};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
@@ -64,6 +65,7 @@ pub struct SelectedFile {
 impl App {
     pub fn new() -> Result<Self, git2::Error> {
         let repo = GitRepo::open()?;
+        let (saved_layout, saved_mode) = load_prefs();
         let mut app = Self {
             repo,
             staged_files: Vec::new(),
@@ -71,8 +73,8 @@ impl App {
             selected_file: None,
             active_panel: Panel::Files,
             diff_content: None,
-            diff_layout: DiffLayout::Unified,
-            diff_mode: DiffMode::Compact,
+            diff_layout: saved_layout,
+            diff_mode: saved_mode,
             staged_collapsed: false,
             unstaged_collapsed: false,
             file_scroll: 0,
@@ -133,6 +135,7 @@ impl App {
             DiffLayout::SideBySide => DiffLayout::Unified,
         };
         self.diff_scroll = 0;
+        save_prefs(self.diff_layout, self.diff_mode);
     }
 
     pub fn toggle_diff_mode(&mut self) {
@@ -142,6 +145,7 @@ impl App {
         };
         self.diff_scroll = 0;
         self.load_diff();
+        save_prefs(self.diff_layout, self.diff_mode);
     }
 
     pub fn stage_file(&mut self, path: &str) {
@@ -245,5 +249,57 @@ impl App {
 
         let (path, staged) = &items[new_idx];
         self.select_file(path, *staged);
+    }
+}
+
+// ─── Prefs persistence ────────────────────────────────────────────────────────
+
+fn prefs_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let dir = PathBuf::from(home).join(".config").join("gv");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("prefs"))
+}
+
+fn load_prefs() -> (DiffLayout, DiffMode) {
+    let default = (DiffLayout::Unified, DiffMode::Compact);
+    let path = match prefs_path() {
+        Some(p) => p,
+        None => return default,
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return default,
+    };
+    let mut layout = DiffLayout::Unified;
+    let mut mode = DiffMode::Compact;
+    for line in content.lines() {
+        if let Some(val) = line.strip_prefix("layout=") {
+            layout = match val.trim() {
+                "side_by_side" => DiffLayout::SideBySide,
+                _ => DiffLayout::Unified,
+            };
+        } else if let Some(val) = line.strip_prefix("mode=") {
+            mode = match val.trim() {
+                "full_file" => DiffMode::FullFile,
+                _ => DiffMode::Compact,
+            };
+        }
+    }
+    (layout, mode)
+}
+
+fn save_prefs(layout: DiffLayout, mode: DiffMode) {
+    if let Some(path) = prefs_path() {
+        let layout_str = match layout {
+            DiffLayout::Unified => "unified",
+            DiffLayout::SideBySide => "side_by_side",
+        };
+        let mode_str = match mode {
+            DiffMode::Compact => "compact",
+            DiffMode::FullFile => "full_file",
+        };
+        let content = format!("layout={}\nmode={}\n", layout_str, mode_str);
+        let _ = std::fs::write(path, content);
     }
 }

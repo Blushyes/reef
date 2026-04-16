@@ -10,6 +10,18 @@ pub enum Tab {
     Files,
 }
 
+impl Tab {
+    /// Canonical ordering shared by the tab bar renderer and the digit shortcut.
+    pub const ALL: &'static [Tab] = &[Tab::Files, Tab::Git];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::Files => " 📁 Files ",
+            Tab::Git => " ⎇ Git ",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
     Files, // left

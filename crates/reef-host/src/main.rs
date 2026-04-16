@@ -137,9 +137,20 @@ fn handle_key(key: event::KeyEvent, app: &mut App) {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.should_quit = true; return;
         }
-        KeyCode::Char('1') => { app.active_tab = Tab::Files; return; }
-        KeyCode::Char('2') => { app.active_tab = Tab::Git; return; }
+        KeyCode::Char(c) if matches!(c, '1'..='9') => {
+            let idx = (c as u8 - b'1') as usize;
+            if let Some(&tab) = Tab::ALL.get(idx) {
+                app.active_tab = tab;
+            }
+            return;
+        }
         KeyCode::Tab => {
+            let tabs = Tab::ALL;
+            let cur = tabs.iter().position(|&t| t == app.active_tab).unwrap_or(0);
+            app.active_tab = tabs[(cur + 1) % tabs.len()];
+            return;
+        }
+        KeyCode::BackTab => {
             app.active_panel = match app.active_panel {
                 Panel::Files => Panel::Diff,
                 Panel::Diff => Panel::Files,

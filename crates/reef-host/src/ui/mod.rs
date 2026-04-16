@@ -107,22 +107,20 @@ fn render_editor(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let bg = Color::Rgb(30, 30, 40);
-    let tabs: &[(Tab, &str)] = &[
-        (Tab::Files, " 📁 Files "),
-        (Tab::Git,   " ⎇ Git "),
-    ];
+    let tabs = Tab::ALL;
 
     let mut spans: Vec<Span> = Vec::new();
     let mut x = area.x;
 
-    for (i, (tab, label)) in tabs.iter().enumerate() {
+    for (i, tab) in tabs.iter().enumerate() {
+        let label = tab.label();
         let is_active = app.active_tab == *tab;
         let style = if is_active {
             Style::default().fg(Color::White).bg(Color::Rgb(60, 60, 80)).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray).bg(bg)
         };
-        let span = Span::styled(*label, style);
+        let span = Span::styled(label, style);
         let w = label.len() as u16;
 
         app.hit_registry.register_row(x, area.y, w, ClickAction::SwitchTab(*tab));
@@ -230,7 +228,9 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
 fn render_help(f: &mut Frame, screen: Rect) {
     let entries: &[(&str, &str)] = &[
         ("q / Ctrl+C",   "退出"),
-        ("Tab",          "切换焦点面板（侧边栏 ↔ 编辑区）"),
+        ("Tab",          "切换顶部标签页（Files ↔ Git）"),
+        ("Shift+Tab",    "切换焦点面板（侧边栏 ↔ 编辑区）"),
+        ("1 … 9",        "跳转到第 N 个标签页"),
         ("↑ / k",        "向上导航 / 向上滚动"),
         ("↓ / j",        "向下导航 / 向下滚动"),
         ("PageUp",       "快速向上翻页"),
@@ -238,6 +238,7 @@ fn render_help(f: &mut Frame, screen: Rect) {
         ("s",            "暂存当前选中文件"),
         ("u",            "取消暂存当前选中文件"),
         ("r",            "刷新状态"),
+        ("t",            "切换 Git 文件列表视图（列表 ↔ 树形）"),
         ("m",            "切换 Diff 布局（上下 ↔ 左右）"),
         ("f",            "切换 Diff 模式（局部 ↔ 全量）"),
         ("v",            "文字选择模式"),

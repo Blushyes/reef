@@ -13,6 +13,9 @@ pub struct ManagedPanel {
     pub plugin_name: String,
     pub last_render: Option<RenderResult>,
     pub needs_render: bool,
+    /// Scroll offset used in the most recent render request.
+    /// u32::MAX means "never rendered" — guarantees first render always fires.
+    pub last_render_scroll: u32,
 }
 
 /// Pending plugin→host request that needs a response.
@@ -29,6 +32,9 @@ pub struct PluginManager {
     /// Events raised by plugins for the host to act on this frame.
     pub pending_host_requests: Vec<PendingRequest>,
     pub notifications: Vec<NotifyParams>,
+    /// Set when a plugin signals git status has changed (staging/unstaging/refresh).
+    pub status_refresh_needed: bool,
+
 }
 
 impl PluginManager {
@@ -38,6 +44,7 @@ impl PluginManager {
             panels: Vec::new(),
             pending_host_requests: Vec::new(),
             notifications: Vec::new(),
+            status_refresh_needed: false,
         }
     }
 
@@ -79,6 +86,7 @@ impl PluginManager {
                 plugin_name: manifest.name.clone(),
                 last_render: None,
                 needs_render: true,
+                last_render_scroll: u32::MAX,
             });
         }
 
@@ -90,6 +98,7 @@ impl PluginManager {
     pub fn tick(&mut self) {
         self.pending_host_requests.clear();
         self.notifications.clear();
+        self.status_refresh_needed = false;
 
         let names: Vec<String> = self.processes.keys().cloned().collect();
         for name in names {
@@ -99,20 +108,14 @@ impl PluginManager {
                 self.handle_message(&name.clone(), msg);
             }
         }
+
     }
 
     fn handle_message(&mut self, plugin_name: &str, msg: RpcMessage) {
         if msg.is_response() {
-            // Response to a host request (e.g., render result)
-            // Method is empty for responses; match by id stored in inflight map
-            // For now, we use method="" convention — see note below.
-            // We handle render responses via method tag embedded in a wrapper.
-            // Actually, we store pending render requests and correlate by id.
-            // Simple approach: plugin responses to render carry result.panel_id.
             if let Some(result_val) = &msg.result {
                 // Try to deserialize as RenderResult
                 if let Ok(render_result) = serde_json::from_value::<RenderResult>(result_val.clone()) {
-                    // Update cached render for this panel
                     for panel in &mut self.panels {
                         if panel.plugin_name == plugin_name
                             && panel.decl.id == render_result.panel_id
@@ -142,6 +145,10 @@ impl PluginManager {
                     }
                 }
             }
+            // Plugin explicitly signals that git state changed (after stage/unstage).
+            "reef/statusChanged" => {
+                self.status_refresh_needed = true;
+            }
             "reef/notify" => {
                 if let Ok(n) = serde_json::from_value::<NotifyParams>(params) {
                     self.notifications.push(n);
@@ -162,7 +169,7 @@ impl PluginManager {
     }
 
     /// Request a render from the plugin owning `panel_id`.
-    pub fn request_render(&mut self, panel_id: &str, width: u16, height: u16, focused: bool) {
+    pub fn request_render(&mut self, panel_id: &str, width: u16, height: u16, focused: bool, scroll: u32) {
         let plugin_name = self.panels.iter()
             .find(|p| p.decl.id == panel_id)
             .map(|p| p.plugin_name.clone());
@@ -174,7 +181,17 @@ impl PluginManager {
                     width,
                     height,
                     focused,
+                    scroll,
                 }).unwrap();
+                // Clear needs_render BEFORE sending so we don't flood the plugin
+                // with duplicate render requests while waiting for the response.
+                for panel in &mut self.panels {
+                    if panel.plugin_name == name && panel.decl.id == panel_id {
+                        panel.needs_render = false;
+                        panel.last_render_scroll = scroll;
+                        break;
+                    }
+                }
                 let _ = proc.send_request("reef/render", params);
             }
         }
@@ -207,6 +224,15 @@ impl PluginManager {
             }
         }
         false
+    }
+
+    /// Notify the plugin about file selection (for sidebar highlight).
+    /// The plugin no longer handles diff rendering, so this is lightweight.
+    pub fn queue_select_file(&mut self, path: &str, staged: bool) {
+        self.execute_command(
+            "git.selectFile",
+            serde_json::json!({ "path": path, "staged": staged }),
+        );
     }
 
     /// Execute a command on the plugin that registered it.

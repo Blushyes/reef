@@ -58,13 +58,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.tick_plugins();
         terminal.draw(|f| ui::render(f, &mut app))?;
 
-        if event::poll(Duration::from_millis(100))? {
+        // Block until at least one event arrives (or 16ms timeout for ~60fps)
+        if !event::poll(Duration::from_millis(16))? {
+            continue;
+        }
+
+        // Snapshot selection before processing events
+        let sel_before = app.selected_file.as_ref().map(|s| (s.path.clone(), s.is_staged));
+
+        // Drain ALL pending events so rapid key repeats don't queue plugin commands
+        loop {
             match event::read()? {
                 Event::Key(key) => {
                     // v toggles select mode regardless of active panel
-                    if key.code == KeyCode::Char('v')
-                        && key.modifiers.is_empty()
-                    {
+                    if key.code == KeyCode::Char('v') && key.modifiers.is_empty() {
                         app.select_mode = !app.select_mode;
                         if app.select_mode {
                             execute!(terminal.backend_mut(), DisableMouseCapture)?;
@@ -72,7 +79,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             execute!(terminal.backend_mut(), EnableMouseCapture)?;
                         }
                     } else if app.show_help {
-                        // Any key closes help
                         app.show_help = false;
                     } else {
                         handle_key(key, &mut app);
@@ -85,6 +91,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Event::Resize(_, _) => {}
                 _ => {}
+            }
+            // Stop draining if no more events are immediately available
+            if !event::poll(Duration::from_millis(0))? {
+                break;
+            }
+        }
+
+        // After draining, sync selection state
+        let sel_after = app.selected_file.as_ref().map(|s| (s.path.clone(), s.is_staged));
+        if sel_after != sel_before {
+            // Load diff natively in the host (no plugin round-trip)
+            app.load_diff();
+            // Notify plugin so the sidebar highlights the selected file
+            if let Some(ref sel) = app.selected_file.clone() {
+                app.plugin_manager.queue_select_file(&sel.path, sel.is_staged);
             }
         }
 
@@ -222,6 +243,7 @@ fn handle_mouse<B: ratatui::backend::Backend>(
         }
         MouseEventKind::Moved => {
             app.hover_row = Some(mouse.row);
+            app.hover_col = Some(mouse.column);
         }
         _ => {}
     }

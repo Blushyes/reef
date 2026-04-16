@@ -6,8 +6,7 @@
   "activation_events": ["onPanel:git.status"],
   "contributes": {
     "panels": [
-      { "id": "git.status", "title": "Git", "slot": "sidebar", "icon": "⎇" },
-      { "id": "git.diff",   "title": "Diff", "slot": "editor", "icon": "±" }
+      { "id": "git.status", "title": "Git", "slot": "sidebar", "icon": "⎇" }
     ],
     "keybindings": [
       { "key": "s", "command": "git.stage",   "when": "panel == git.status" },

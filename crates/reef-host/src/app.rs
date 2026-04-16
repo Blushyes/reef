@@ -50,6 +50,7 @@ pub struct App {
     // Mouse
     pub hit_registry: HitTestRegistry,
     pub hover_row: Option<u16>,
+    pub hover_col: Option<u16>,
 
     // Plugin system
     pub plugin_manager: PluginManager,
@@ -88,6 +89,7 @@ impl App {
             dragging_split: false,
             hit_registry: HitTestRegistry::new(),
             hover_row: None,
+            hover_col: None,
             plugin_manager: PluginManager::new(),
             active_sidebar_panel: None,
             should_quit: false,
@@ -104,14 +106,17 @@ impl App {
         self.staged_files = staged;
         self.unstaged_files = unstaged;
 
-        // If selected file no longer exists in either list, clear selection
-        if let Some(ref sel) = self.selected_file {
-            let still_exists = if sel.is_staged {
-                self.staged_files.iter().any(|f| f.path == sel.path)
+        // Reconcile selection: check both lists so is_staged stays correct
+        // even if the plugin staged/unstaged via a key event that the host
+        // didn't directly observe.
+        if let Some(ref mut sel) = self.selected_file {
+            let in_staged = self.staged_files.iter().any(|f| f.path == sel.path);
+            let in_unstaged = self.unstaged_files.iter().any(|f| f.path == sel.path);
+            if in_staged {
+                sel.is_staged = true;
+            } else if in_unstaged {
+                sel.is_staged = false;
             } else {
-                self.unstaged_files.iter().any(|f| f.path == sel.path)
-            };
-            if !still_exists {
                 self.selected_file = None;
                 self.diff_content = None;
             }
@@ -202,7 +207,40 @@ impl App {
                 self.dragging_split = true;
             }
             ClickAction::PluginCommand { command, args } => {
-                self.plugin_manager.execute_command(&command, args);
+                // Keep host state in sync for known selection commands
+                if command == "git.selectFile" {
+                    if let (Some(path), Some(staged)) = (
+                        args.get("path").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        args.get("staged").and_then(|v| v.as_bool()),
+                    ) {
+                        self.selected_file = Some(SelectedFile { path, is_staged: staged });
+                        self.diff_scroll = 0;
+                        self.load_diff();
+                    }
+                }
+                // Sync collapsed state so navigate_files skips collapsed sections correctly
+                if command == "git.toggleStaged" {
+                    self.staged_collapsed = !self.staged_collapsed;
+                }
+                if command == "git.toggleUnstaged" {
+                    self.unstaged_collapsed = !self.unstaged_collapsed;
+                }
+                // Stage/unstage: host executes directly so its state is
+                // immediately consistent; also forward to plugin so its
+                // sidebar refreshes.
+                if command == "git.stage" {
+                    if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                        self.stage_file(path);
+                    }
+                    self.plugin_manager.execute_command(&command, args);
+                } else if command == "git.unstage" {
+                    if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                        self.unstage_file(path);
+                    }
+                    self.plugin_manager.execute_command(&command, args);
+                } else {
+                    self.plugin_manager.execute_command(&command, args);
+                }
             }
         }
     }
@@ -258,20 +296,18 @@ impl App {
             current_idx.saturating_sub((-delta) as usize)
         };
 
-        let (path, staged) = &items[new_idx];
-        self.select_file(path, *staged);
+        let (path, staged) = items[new_idx].clone();
+        // Only update host selection state; caller is responsible for syncing to plugin
+        // so rapid key repeats can be coalesced into a single command.
+        self.selected_file = Some(SelectedFile { path, is_staged: staged });
+        self.diff_scroll = 0;
     }
 
     /// Returns the plugin panel_id for the currently focused panel, if any.
     pub fn focused_plugin_panel(&self) -> Option<String> {
         match self.active_panel {
             Panel::Files => self.active_sidebar_panel.clone(),
-            Panel::Diff => self
-                .plugin_manager
-                .panels
-                .iter()
-                .find(|p| p.decl.slot == reef_protocol::PanelSlot::Editor)
-                .map(|p| p.decl.id.clone()),
+            Panel::Diff => None, // diff is host-native, no plugin panel
         }
     }
 
@@ -326,6 +362,14 @@ impl App {
     /// Called every frame: let plugin manager process incoming messages.
     pub fn tick_plugins(&mut self) {
         self.plugin_manager.tick();
+
+        // If the plugin refreshed its git state (after staging/unstaging), sync host file list
+        if self.plugin_manager.status_refresh_needed {
+            // statusChanged only fires on stage/unstage (not file selection),
+            // so a synchronous refresh here is acceptable — it's user-initiated.
+            self.refresh_status();
+            self.load_diff();
+        }
 
         // Handle plugin→host requests
         let requests: Vec<_> = self.plugin_manager.pending_host_requests.drain(..).collect();

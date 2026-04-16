@@ -169,6 +169,11 @@ impl GitRepo {
     }
 
     fn get_staged_diff(&self, path: &str, context_lines: u32) -> Option<DiffContent> {
+        // Force-reload index — the plugin process may have written a new index.
+        if let Ok(mut idx) = self.repo.index() {
+            let _ = idx.read(true);
+        }
+
         // Staged: compare HEAD to index
         let head_tree = self.repo.head().ok()?.peel_to_tree().ok();
         let mut opts = DiffOptions::new();
@@ -183,6 +188,11 @@ impl GitRepo {
     }
 
     fn get_unstaged_diff(&self, path: &str, context_lines: u32) -> Option<DiffContent> {
+        // Force-reload index — the plugin process may have written a new index.
+        if let Ok(mut idx) = self.repo.index() {
+            let _ = idx.read(true);
+        }
+
         // Check if file is untracked — use similar for full-file diff
         let statuses = self.repo.statuses(None).ok()?;
         for entry in statuses.iter() {

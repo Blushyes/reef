@@ -30,6 +30,11 @@ pub struct Span {
     pub dim: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub italic: Option<bool>,
+    /// Per-span click command (overrides the line-level click_command for this span's region).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub click_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub click_args: Option<serde_json::Value>,
 }
 
 impl Span {
@@ -40,6 +45,11 @@ impl Span {
     pub fn bg(mut self, c: Color) -> Self { self.bg = Some(c); self }
     pub fn bold(mut self) -> Self { self.bold = Some(true); self }
     pub fn dim(mut self) -> Self { self.dim = Some(true); self }
+    pub fn on_click(mut self, command: impl Into<String>, args: serde_json::Value) -> Self {
+        self.click_command = Some(command.into());
+        self.click_args = Some(args);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -207,6 +217,9 @@ pub struct RenderParams {
     pub width: u16,
     pub height: u16,
     pub focused: bool,
+    /// First visible line (0-based). Plugin should return `height` lines starting here.
+    #[serde(default)]
+    pub scroll: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

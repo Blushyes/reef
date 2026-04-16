@@ -3,11 +3,17 @@ use ratatui::style::{Color as TColor, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 /// Convert a reef StyledLine into a ratatui Line.
-pub fn to_ratatui_line(sl: &StyledLine) -> Line<'static> {
+/// `hover` applies a subtle bg tint to spans that don't already have a bg color.
+pub fn to_ratatui_line(sl: &StyledLine, hover: bool) -> Line<'static> {
+    let hover_bg = TColor::Rgb(40, 40, 50);
     let spans: Vec<Span<'static>> = sl.spans.iter().map(|s| {
         let mut style = Style::default();
         if let Some(ref fg) = s.fg { style = style.fg(to_tcolor(fg)); }
-        if let Some(ref bg) = s.bg { style = style.bg(to_tcolor(bg)); }
+        if let Some(ref bg) = s.bg {
+            style = style.bg(to_tcolor(bg));
+        } else if hover {
+            style = style.bg(hover_bg);
+        }
         if s.bold == Some(true) { style = style.add_modifier(Modifier::BOLD); }
         if s.dim  == Some(true) { style = style.add_modifier(Modifier::DIM); }
         Span::styled(s.text.clone(), style)

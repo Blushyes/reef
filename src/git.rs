@@ -86,6 +86,12 @@ impl GitRepo {
         let mut staged = Vec::new();
         let mut unstaged = Vec::new();
 
+        // Force-reload index from disk so we always see the latest staged changes.
+        // Without this, git2's in-memory index cache can lag behind what was just written.
+        if let Ok(mut idx) = self.repo.index() {
+            let _ = idx.read(true);
+        }
+
         let mut opts = StatusOptions::new();
         opts.include_untracked(true)
             .recurse_untracked_dirs(true)

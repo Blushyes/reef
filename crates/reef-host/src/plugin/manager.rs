@@ -145,9 +145,15 @@ impl PluginManager {
                     }
                 }
             }
-            // Plugin explicitly signals that git state changed (after stage/unstage).
+            // Plugin signals git state changed (after stage/unstage, or fs watcher).
             "reef/statusChanged" => {
                 self.status_refresh_needed = true;
+                // Invalidate the sender's panels so they re-render with fresh state.
+                for panel in &mut self.panels {
+                    if panel.plugin_name == plugin_name {
+                        panel.needs_render = true;
+                    }
+                }
             }
             "reef/notify" => {
                 if let Ok(n) = serde_json::from_value::<NotifyParams>(params) {

@@ -91,6 +91,9 @@ fn main() {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as u32;
 
+                // Pull fresh git state on every render so fs-watcher-triggered
+                // re-renders pick up the latest working tree / index changes.
+                state.refresh();
                 let lines = state.render_status(width);
                 let total = lines.len();
                 let visible: Vec<_> = lines.into_iter()

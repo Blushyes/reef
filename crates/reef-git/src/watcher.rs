@@ -27,14 +27,10 @@ fn run(workdir: PathBuf, gitdir: PathBuf, writer: Writer) {
             let _ = tx.send(res);
         }) {
             Ok(w) => w,
-            Err(e) => {
-                eprintln!("[reef-git] watcher init failed: {e}");
-                return;
-            }
+            Err(_) => return,
         };
 
-    if let Err(e) = watcher.watch(&workdir, RecursiveMode::Recursive) {
-        eprintln!("[reef-git] watcher.watch failed: {e}");
+    if watcher.watch(&workdir, RecursiveMode::Recursive).is_err() {
         return;
     }
 
@@ -51,7 +47,7 @@ fn run(workdir: PathBuf, gitdir: PathBuf, writer: Writer) {
                     pending = true;
                 }
             }
-            Ok(Err(_)) => {} // notify backend hiccup, ignore
+            Ok(Err(_)) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if pending {
                     pending = false;

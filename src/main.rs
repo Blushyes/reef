@@ -68,6 +68,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             execute!(terminal.backend_mut(), EnableMouseCapture)?;
                         }
+                    } else if app.show_help {
+                        // Any key closes help
+                        app.show_help = false;
                     } else {
                         handle_key(key, &mut app);
                     }
@@ -148,6 +151,15 @@ fn handle_key(key: event::KeyEvent, app: &mut App) {
                     app.unstage_file(&sel.path);
                 }
             }
+        }
+        KeyCode::Char('h') => {
+            app.show_help = true;
+        }
+        KeyCode::Char('m') => {
+            app.toggle_diff_layout();
+        }
+        KeyCode::Char('f') => {
+            app.toggle_diff_mode();
         }
         KeyCode::Char('r') => {
             // Refresh

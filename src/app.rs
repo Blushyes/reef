@@ -7,6 +7,18 @@ pub enum Panel {
     Diff,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffLayout {
+    Unified,    // 上下统一视图
+    SideBySide, // 左右对比视图
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffMode {
+    Compact,  // 只显示变更区域 ± context
+    FullFile, // 显示整个文件
+}
+
 pub struct App {
     pub repo: GitRepo,
 
@@ -18,6 +30,8 @@ pub struct App {
     pub selected_file: Option<SelectedFile>,
     pub active_panel: Panel,
     pub diff_content: Option<DiffContent>,
+    pub diff_layout: DiffLayout,
+    pub diff_mode: DiffMode,
 
     // Sections
     pub staged_collapsed: bool,
@@ -38,6 +52,7 @@ pub struct App {
     // Control
     pub should_quit: bool,
     pub select_mode: bool, // mouse capture disabled for text selection
+    pub show_help: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +71,8 @@ impl App {
             selected_file: None,
             active_panel: Panel::Files,
             diff_content: None,
+            diff_layout: DiffLayout::Unified,
+            diff_mode: DiffMode::Compact,
             staged_collapsed: false,
             unstaged_collapsed: false,
             file_scroll: 0,
@@ -66,6 +83,7 @@ impl App {
             hover_row: None,
             should_quit: false,
             select_mode: false,
+            show_help: false,
         };
         app.refresh_status();
         Ok(app)
@@ -101,8 +119,29 @@ impl App {
 
     pub fn load_diff(&mut self) {
         if let Some(ref sel) = self.selected_file {
-            self.diff_content = self.repo.get_diff(&sel.path, sel.is_staged);
+            let context = match self.diff_mode {
+                DiffMode::FullFile => 9999,
+                DiffMode::Compact => 3,
+            };
+            self.diff_content = self.repo.get_diff(&sel.path, sel.is_staged, context);
         }
+    }
+
+    pub fn toggle_diff_layout(&mut self) {
+        self.diff_layout = match self.diff_layout {
+            DiffLayout::Unified => DiffLayout::SideBySide,
+            DiffLayout::SideBySide => DiffLayout::Unified,
+        };
+        self.diff_scroll = 0;
+    }
+
+    pub fn toggle_diff_mode(&mut self) {
+        self.diff_mode = match self.diff_mode {
+            DiffMode::Compact => DiffMode::FullFile,
+            DiffMode::FullFile => DiffMode::Compact,
+        };
+        self.diff_scroll = 0;
+        self.load_diff();
     }
 
     pub fn stage_file(&mut self, path: &str) {

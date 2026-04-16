@@ -160,19 +160,19 @@ impl GitRepo {
         (staged, unstaged)
     }
 
-    pub fn get_diff(&self, path: &str, staged: bool) -> Option<DiffContent> {
+    pub fn get_diff(&self, path: &str, staged: bool, context_lines: u32) -> Option<DiffContent> {
         if staged {
-            self.get_staged_diff(path)
+            self.get_staged_diff(path, context_lines)
         } else {
-            self.get_unstaged_diff(path)
+            self.get_unstaged_diff(path, context_lines)
         }
     }
 
-    fn get_staged_diff(&self, path: &str) -> Option<DiffContent> {
+    fn get_staged_diff(&self, path: &str, context_lines: u32) -> Option<DiffContent> {
         // Staged: compare HEAD to index
         let head_tree = self.repo.head().ok()?.peel_to_tree().ok();
         let mut opts = DiffOptions::new();
-        opts.pathspec(path);
+        opts.pathspec(path).context_lines(context_lines);
 
         let diff = self
             .repo
@@ -182,7 +182,7 @@ impl GitRepo {
         self.parse_git2_diff(&diff, path)
     }
 
-    fn get_unstaged_diff(&self, path: &str) -> Option<DiffContent> {
+    fn get_unstaged_diff(&self, path: &str, context_lines: u32) -> Option<DiffContent> {
         // Check if file is untracked — use similar for full-file diff
         let statuses = self.repo.statuses(None).ok()?;
         for entry in statuses.iter() {
@@ -193,7 +193,7 @@ impl GitRepo {
 
         // Unstaged: compare index to workdir
         let mut opts = DiffOptions::new();
-        opts.pathspec(path);
+        opts.pathspec(path).context_lines(context_lines);
 
         let diff = self
             .repo

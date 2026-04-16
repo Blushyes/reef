@@ -1,4 +1,5 @@
 mod git;
+mod prefs;
 mod tree;
 mod watcher;
 
@@ -156,7 +157,7 @@ impl PluginState {
             selected: None,
             staged_collapsed: false,
             unstaged_collapsed: false,
-            tree_mode: false,
+            tree_mode: prefs::load_tree_mode(),
             collapsed_dirs: HashSet::new(),
         }
     }
@@ -303,6 +304,7 @@ impl PluginState {
             }
             "t" => {
                 self.tree_mode = !self.tree_mode;
+                prefs::save_tree_mode(self.tree_mode);
                 self.request_status_render(writer);
                 true
             }
@@ -334,6 +336,7 @@ impl PluginState {
             }
             "git.toggleTree" => {
                 self.tree_mode = !self.tree_mode;
+                prefs::save_tree_mode(self.tree_mode);
                 self.request_status_render(writer);
                 true
             }

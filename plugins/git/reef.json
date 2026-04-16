@@ -1,0 +1,26 @@
+{
+  "name": "git",
+  "version": "0.1.0",
+  "description": "Git status, diff, stage/unstage",
+  "main": "./reef-git",
+  "activation_events": ["onPanel:git.status"],
+  "contributes": {
+    "panels": [
+      { "id": "git.status", "title": "Git", "slot": "sidebar", "icon": "⎇" },
+      { "id": "git.diff",   "title": "Diff", "slot": "editor", "icon": "±" }
+    ],
+    "keybindings": [
+      { "key": "s", "command": "git.stage",   "when": "panel == git.status" },
+      { "key": "u", "command": "git.unstage", "when": "panel == git.status" },
+      { "key": "r", "command": "git.refresh", "when": "panel == git.status" }
+    ],
+    "commands": [
+      { "id": "git.stage",         "title": "暂存文件" },
+      { "id": "git.unstage",       "title": "取消暂存" },
+      { "id": "git.refresh",       "title": "刷新 Git 状态" },
+      { "id": "git.selectFile",    "title": "选择文件" },
+      { "id": "git.toggleStaged",  "title": "折叠/展开暂存区" },
+      { "id": "git.toggleUnstaged","title": "折叠/展开更改区" }
+    ]
+  }
+}

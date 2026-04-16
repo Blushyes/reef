@@ -201,6 +201,9 @@ impl App {
             ClickAction::StartDragSplit => {
                 self.dragging_split = true;
             }
+            ClickAction::PluginCommand { command, args } => {
+                self.plugin_manager.execute_command(&command, args);
+            }
         }
     }
 
@@ -266,7 +269,25 @@ impl App {
             let builtin = exe.parent().unwrap_or(std::path::Path::new(".")).join("plugins");
             self.plugin_manager.load_from_dir(&builtin);
         }
-        // 2. User plugins in ~/.config/reef/plugins/
+
+        // 2. Dev mode: look for plugins/ next to the workspace root
+        //    (covers `cargo run` from the project directory)
+        if self.plugin_manager.panels.is_empty() {
+            let dev_paths = [
+                // workspace root / plugins/
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent().unwrap_or(std::path::Path::new("."))
+                    .parent().unwrap_or(std::path::Path::new("."))
+                    .join("plugins"),
+            ];
+            for path in &dev_paths {
+                if path.exists() {
+                    self.plugin_manager.load_from_dir(path);
+                }
+            }
+        }
+
+        // 3. User plugins in ~/.config/reef/plugins/
         if let Ok(home) = std::env::var("HOME") {
             let user = PathBuf::from(home).join(".config").join("reef").join("plugins");
             self.plugin_manager.load_from_dir(&user);

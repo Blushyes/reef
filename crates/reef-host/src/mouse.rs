@@ -1,4 +1,5 @@
 use ratatui::layout::Rect;
+use serde_json;
 
 #[derive(Debug, Clone)]
 pub enum ClickAction {
@@ -8,6 +9,11 @@ pub enum ClickAction {
     ToggleStaged,
     ToggleUnstaged,
     StartDragSplit,
+    /// Invoke a plugin command (from a StyledLine click_command).
+    PluginCommand {
+        command: String,
+        args: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone)]

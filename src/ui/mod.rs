@@ -63,7 +63,7 @@ fn render_title_bar(f: &mut Frame, app: &App, area: Rect) {
 
     let title = Line::from(vec![
         Span::styled(
-            " gv ",
+            " reef ",
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Blue)

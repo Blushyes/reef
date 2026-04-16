@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 DisableMouseCapture
             )?;
             eprintln!("错误: 无法打开 Git 仓库: {}", e);
-            eprintln!("请在 Git 仓库目录中运行 gv");
+            eprintln!("请在 Git 仓库目录中运行 reef");
             std::process::exit(1);
         }
     };

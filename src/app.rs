@@ -256,7 +256,7 @@ impl App {
 
 fn prefs_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    let dir = PathBuf::from(home).join(".config").join("gv");
+    let dir = PathBuf::from(home).join(".config").join("reef");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join("prefs"))
 }

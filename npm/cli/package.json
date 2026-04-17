@@ -1,0 +1,31 @@
+{
+  "name": "@reef-tui/cli",
+  "version": "0.0.0",
+  "description": "Reef — a terminal UI for Git and code review",
+  "bin": {
+    "reef": "bin/reef.js"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Blushyes/reef.git"
+  },
+  "homepage": "https://github.com/Blushyes/reef#readme",
+  "bugs": {
+    "url": "https://github.com/Blushyes/reef/issues"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=16"
+  },
+  "optionalDependencies": {
+    "@reef-tui/cli-darwin-arm64": "0.0.0",
+    "@reef-tui/cli-darwin-x64": "0.0.0",
+    "@reef-tui/cli-linux-arm64": "0.0.0",
+    "@reef-tui/cli-linux-x64": "0.0.0",
+    "@reef-tui/cli-win32-x64": "0.0.0"
+  }
+}

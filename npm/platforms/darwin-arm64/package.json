@@ -1,0 +1,13 @@
+{
+  "name": "@reef-tui/cli-darwin-arm64",
+  "version": "0.0.0",
+  "description": "Reef CLI native binary for macOS arm64",
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "files": ["bin"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Blushyes/reef.git"
+  },
+  "license": "MIT"
+}

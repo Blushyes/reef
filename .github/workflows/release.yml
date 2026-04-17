@@ -1,0 +1,211 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            target: aarch64-apple-darwin
+            os: macos-14
+            bin: reef
+            use_cross: false
+          - platform: darwin-x64
+            target: x86_64-apple-darwin
+            os: macos-13
+            bin: reef
+            use_cross: false
+          - platform: linux-x64
+            target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            bin: reef
+            use_cross: false
+          - platform: linux-arm64
+            target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            bin: reef
+            use_cross: true
+          - platform: win32-x64
+            target: x86_64-pc-windows-msvc
+            os: windows-latest
+            bin: reef.exe
+            use_cross: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --locked --git https://github.com/cross-rs/cross
+
+      - name: Build (cargo)
+        if: '!matrix.use_cross'
+        run: cargo build --release --locked --target ${{ matrix.target }} -p reef-host
+        shell: bash
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release --locked --target ${{ matrix.target }} -p reef-host
+        shell: bash
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p staged
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "staged/${{ matrix.bin }}"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reef-${{ matrix.platform }}
+          path: staged/${{ matrix.bin }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-platform-packages:
+    name: Publish @reef-tui/cli-${{ matrix.platform }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            bin: reef
+          - platform: darwin-x64
+            bin: reef
+          - platform: linux-arm64
+            bin: reef
+          - platform: linux-x64
+            bin: reef
+          - platform: win32-x64
+            bin: reef.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Derive version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: reef-${{ matrix.platform }}
+          path: npm/platforms/${{ matrix.platform }}/bin
+
+      - name: Mark binary executable
+        if: matrix.platform != 'win32-x64'
+        run: chmod +x "npm/platforms/${{ matrix.platform }}/bin/${{ matrix.bin }}"
+
+      - name: Set version in package.json
+        working-directory: npm/platforms/${{ matrix.platform }}
+        run: npm version --no-git-tag-version --allow-same-version "${{ steps.version.outputs.version }}"
+
+      - name: Publish to npm
+        working-directory: npm/platforms/${{ matrix.platform }}
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-main-package:
+    name: Publish @reef-tui/cli
+    needs: publish-platform-packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Derive version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Sync versions in package.json
+        working-directory: npm/cli
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const v = process.env.VERSION;
+            const p = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            p.version = v;
+            for (const k of Object.keys(p.optionalDependencies || {})) {
+              p.optionalDependencies[k] = v;
+            }
+            fs.writeFileSync("package.json", JSON.stringify(p, null, 2) + "\n");
+          '
+
+      - name: Publish to npm
+        working-directory: npm/cli
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  github-release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package archives
+        shell: bash
+        run: |
+          mkdir -p dist
+          cd artifacts
+          for dir in */; do
+            name="${dir%/}"
+            case "$name" in
+              *win32*)
+                (cd "$dir" && zip -j "../../dist/${name}.zip" *)
+                ;;
+              *)
+                chmod +x "$dir"/*
+                tar -C "$dir" -czf "../dist/${name}.tar.gz" .
+                ;;
+            esac
+          done
+          ls -la ../dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true

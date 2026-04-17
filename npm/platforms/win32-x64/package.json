@@ -1,0 +1,13 @@
+{
+  "name": "@reef-tui/cli-win32-x64",
+  "version": "0.0.0",
+  "description": "Reef CLI native binary for Windows x64",
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "files": ["bin"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Blushyes/reef.git"
+  },
+  "license": "MIT"
+}

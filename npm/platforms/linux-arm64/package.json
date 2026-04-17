@@ -1,0 +1,13 @@
+{
+  "name": "@reef-tui/cli-linux-arm64",
+  "version": "0.0.0",
+  "description": "Reef CLI native binary for Linux arm64 (glibc)",
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "files": ["bin"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Blushyes/reef.git"
+  },
+  "license": "MIT"
+}

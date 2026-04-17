@@ -155,6 +155,9 @@ struct PluginState {
     unstaged_collapsed: bool,
     tree_mode: bool,
     collapsed_dirs: HashSet<String>,
+    /// Path of the unstaged file pending discard confirmation. While set, the
+    /// status panel shows a confirmation banner and `y`/`Esc` are intercepted.
+    confirm_discard: Option<String>,
 
     // ── Graph panel state ──
     graph_rows: Vec<graph::GraphRow>,
@@ -191,6 +194,7 @@ impl PluginState {
             unstaged_collapsed: false,
             tree_mode: prefs::load_tree_mode(),
             collapsed_dirs: HashSet::new(),
+            confirm_discard: None,
             graph_rows: Vec::new(),
             ref_map: HashMap::new(),
             graph_cache_key: None,
@@ -388,7 +392,35 @@ impl PluginState {
 
     fn render_status(&self, width: u16) -> Vec<StyledLine> {
         let mut lines: Vec<StyledLine> = Vec::new();
-        let max_path = (width as usize).saturating_sub(8);
+        // Slightly narrower budget to accommodate the extra ↺ discard button on unstaged rows.
+        let max_path = (width as usize).saturating_sub(10);
+
+        // ── Confirmation banner ──────────────────────────────────────────────
+        if let Some(ref path) = self.confirm_discard {
+            let mut display = path.clone();
+            truncate_in_place(&mut display, max_path);
+            lines.push(StyledLine::new(vec![
+                Span::new("  ⚠ 还原 ").fg(Color::named("yellow")).bold(),
+                Span::new(display).fg(Color::named("white")).bold(),
+                Span::new("？（不可撤销）").fg(Color::named("yellow")),
+            ]));
+            lines.push(StyledLine::new(vec![
+                Span::new("  "),
+                Span::new(" 确认还原 ")
+                    .fg(Color::named("black"))
+                    .bg(Color::named("red"))
+                    .bold()
+                    .on_click("git.discardConfirm", serde_json::Value::Null),
+                Span::new("  "),
+                Span::new(" 取消 ")
+                    .fg(Color::named("white"))
+                    .bg(Color::named("darkGray"))
+                    .on_click("git.discardCancel", serde_json::Value::Null),
+                Span::new("  "),
+                Span::new("(y / Esc)").fg(Color::named("darkGray")),
+            ]));
+            lines.push(StyledLine::plain(""));
+        }
 
         // View mode toggle
         let mode_label = if self.tree_mode { "视图: 树形" } else { "视图: 列表" };
@@ -531,6 +563,49 @@ impl PluginState {
                 }
                 true
             }
+            "d" => {
+                // Enter discard confirmation for the selected unstaged tracked file.
+                let path = self
+                    .selected
+                    .as_ref()
+                    .filter(|s| !s.is_staged)
+                    .and_then(|sel| {
+                        self.unstaged
+                            .iter()
+                            .find(|f| f.path == sel.path)
+                            .map(|f| f.path.clone())
+                    });
+                if let Some(path) = path {
+                    self.confirm_discard = Some(path);
+                    self.request_status_render(writer);
+                }
+                true
+            }
+            "y" => {
+                if let Some(path) = self.confirm_discard.take() {
+                    if let Some(ref repo) = self.repo {
+                        let _ = repo.restore_file(&path);
+                        if self.selected.as_ref().map(|s| s.path == path).unwrap_or(false) {
+                            self.selected = None;
+                        }
+                        self.refresh();
+                        self.notify_status_changed(writer);
+                        self.request_status_render(writer);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            "n" | "Escape" => {
+                if self.confirm_discard.is_some() {
+                    self.confirm_discard = None;
+                    self.request_status_render(writer);
+                    true
+                } else {
+                    false
+                }
+            }
             "r" => {
                 self.refresh();
                 self.notify_status_changed(writer);
@@ -556,6 +631,7 @@ impl PluginState {
                 let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let is_staged = args.get("staged").and_then(|v| v.as_bool()).unwrap_or(false);
                 self.selected = Some(SelectedFile { path, is_staged });
+                self.confirm_discard = None;
                 self.request_status_render(writer);
                 true
             }
@@ -619,6 +695,34 @@ impl PluginState {
                         self.request_status_render(writer);
                     }
                 }
+                true
+            }
+            "git.discardPrompt" => {
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if !path.is_empty() {
+                    self.selected = Some(SelectedFile { path: path.clone(), is_staged: false });
+                    self.confirm_discard = Some(path);
+                    self.request_status_render(writer);
+                }
+                true
+            }
+            "git.discardConfirm" => {
+                if let Some(path) = self.confirm_discard.take() {
+                    if let Some(ref repo) = self.repo {
+                        let _ = repo.restore_file(&path);
+                        if self.selected.as_ref().map(|s| s.path == path).unwrap_or(false) {
+                            self.selected = None;
+                        }
+                        self.refresh();
+                        self.notify_status_changed(writer);
+                        self.request_status_render(writer);
+                    }
+                }
+                true
+            }
+            "git.discardCancel" => {
+                self.confirm_discard = None;
+                self.request_status_render(writer);
                 true
             }
             "git.stageAll" => {
@@ -804,6 +908,16 @@ fn file_row(
             .on_click(button_cmd, serde_json::json!({ "path": path })),
         Span::new(" "),
     ];
+
+    // Discard button — only for unstaged files.
+    if !is_staged {
+        spans.push(
+            Span::new("↺")
+                .fg(Color::named("red"))
+                .on_click("git.discardPrompt", serde_json::json!({ "path": path })),
+        );
+        spans.push(Span::new(" "));
+    }
 
     if is_selected {
         spans = spans.into_iter().map(|s| s.bg(sel_bg.clone())).collect();

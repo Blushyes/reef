@@ -378,6 +378,35 @@ impl GitRepo {
         Ok(())
     }
 
+    /// Restore a working-tree file to its HEAD state (like `git restore <file>`).
+    /// For untracked files that have no HEAD counterpart, the file is deleted.
+    /// Does not touch the index.
+    pub fn restore_file(&self, path: &str) -> Result<(), git2::Error> {
+        let workdir = self
+            .repo
+            .workdir()
+            .ok_or_else(|| git2::Error::from_str("no workdir"))?;
+
+        let in_head = self
+            .repo
+            .head()
+            .ok()
+            .and_then(|h| h.peel_to_commit().ok())
+            .and_then(|c| c.tree().ok())
+            .and_then(|t| t.get_path(Path::new(path)).ok())
+            .is_some();
+
+        if in_head {
+            let head_tree = self.repo.head()?.peel_to_commit()?.tree()?;
+            let mut opts = git2::build::CheckoutBuilder::new();
+            opts.force().update_index(false).path(path);
+            self.repo.checkout_tree(head_tree.as_object(), Some(&mut opts))
+        } else {
+            std::fs::remove_file(workdir.join(path))
+                .map_err(|e| git2::Error::from_str(&e.to_string()))
+        }
+    }
+
     // ── commit history / refs ──────────────────────────────────────────────
 
     pub fn head_oid(&self) -> Option<String> {

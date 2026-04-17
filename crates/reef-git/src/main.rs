@@ -158,6 +158,37 @@ struct PluginState {
     /// currently-selected commit. None means "no file selected, show only
     /// the commit summary".
     commit_file_diff: Option<(String, DiffContent)>,
+    /// Layout for the inline commit-file diff (mirrors Git-tab's `m` toggle).
+    commit_diff_layout: DiffLayout,
+    /// Mode for the inline commit-file diff (mirrors Git-tab's `f` toggle).
+    commit_diff_mode: DiffMode,
+    /// Tree vs. flat view for the Changed-files list in commit detail.
+    commit_files_tree_mode: bool,
+    /// Collapsed directories inside the commit-detail tree view. Kept
+    /// separate from `collapsed_dirs` (status panel) so the two views don't
+    /// share collapse state. Keyed by full path, no staged/unstaged prefix.
+    commit_files_collapsed: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffLayout {
+    Unified,    // 上下
+    SideBySide, // 左右
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffMode {
+    Compact,  // 局部（3 行 context）
+    FullFile, // 全量
+}
+
+impl DiffMode {
+    fn context_lines(self) -> u32 {
+        match self {
+            DiffMode::Compact => 3,
+            DiffMode::FullFile => 9999,
+        }
+    }
 }
 
 const GRAPH_COMMIT_LIMIT: usize = 500;
@@ -190,6 +221,16 @@ impl PluginState {
             selected_commit: None,
             commit_detail: None,
             commit_file_diff: None,
+            commit_diff_layout: match prefs::load_commit_diff_layout() {
+                "side_by_side" => DiffLayout::SideBySide,
+                _ => DiffLayout::Unified,
+            },
+            commit_diff_mode: match prefs::load_commit_diff_mode() {
+                "full_file" => DiffMode::FullFile,
+                _ => DiffMode::Compact,
+            },
+            commit_files_tree_mode: prefs::load_commit_files_tree_mode(),
+            commit_files_collapsed: HashSet::new(),
         }
     }
 
@@ -253,12 +294,22 @@ impl PluginState {
     }
 
     fn load_commit_file_diff(&mut self, path: &str) {
+        let context = self.commit_diff_mode.context_lines();
         self.commit_file_diff = match (&self.repo, &self.selected_commit) {
             (Some(repo), Some(oid)) => repo
-                .get_commit_file_diff(oid, path, 3)
+                .get_commit_file_diff(oid, path, context)
                 .map(|diff| (path.to_string(), diff)),
             _ => None,
         };
+    }
+
+    /// Reload the currently-selected commit file's diff (used after toggling
+    /// `commit_diff_mode`, since that changes the context-lines argument).
+    fn reload_commit_file_diff(&mut self) {
+        let path = self.commit_file_diff.as_ref().map(|(p, _)| p.clone());
+        if let Some(path) = path {
+            self.load_commit_file_diff(&path);
+        }
     }
 
     fn render_commit_detail(&self, width: u16) -> Vec<StyledLine> {
@@ -312,45 +363,48 @@ impl PluginState {
         }
 
         lines.push(StyledLine::plain(""));
+        let view_label = if self.commit_files_tree_mode {
+            "树形"
+        } else {
+            "列表"
+        };
         lines.push(StyledLine::new(vec![
             Span::new(format!("Changed files ({})", detail.files.len()))
                 .fg(Color::named("green"))
                 .bold(),
+            Span::new(format!("  [{}]  t 切换", view_label))
+                .fg(Color::named("darkGray"))
+                .on_click("git.toggleCommitFilesView", serde_json::Value::Null),
         ]));
 
-        let selected_file = self.commit_file_diff.as_ref().map(|(p, _)| p.as_str());
-        let sel_bg = Color::rgb(40, 60, 100);
+        let ctx = CommitFilesCtx {
+            selected_file: self.commit_file_diff.as_ref().map(|(p, _)| p.as_str()),
+            sel_bg: Color::rgb(40, 60, 100),
+            max_path,
+            commit_oid: &info.oid,
+            collapsed: &self.commit_files_collapsed,
+        };
 
-        for file in &detail.files {
-            let status_color = match file.status {
-                FileStatus::Modified => "yellow",
-                FileStatus::Added => "green",
-                FileStatus::Deleted => "red",
-                FileStatus::Renamed => "cyan",
-                FileStatus::Untracked => "green",
-            };
-            let mut path = file.path.clone();
-            truncate_in_place(&mut path, max_path);
-
-            let is_selected = selected_file == Some(file.path.as_str());
-            let mut spans = vec![
-                Span::new("  "),
-                Span::new(format!("{} ", file.status.label())).fg(Color::named(status_color)),
-                Span::new(path).fg(Color::named("white")),
-            ];
-            if is_selected {
-                spans = spans.into_iter().map(|s| s.bg(sel_bg.clone())).collect();
+        if self.commit_files_tree_mode {
+            let nodes = tree::build(&detail.files);
+            render_commit_file_tree(&nodes, 1, &ctx, &mut lines);
+        } else {
+            for file in &detail.files {
+                lines.push(commit_file_row(file, &file.path, "  ", &ctx));
             }
-            lines.push(StyledLine::new(spans).on_click(
-                "git.selectCommitFile",
-                serde_json::json!({ "oid": info.oid, "path": file.path }),
-            ));
         }
 
         // Selected file's diff (inline, below the file list).
-        if let Some((_, diff)) = &self.commit_file_diff {
+        if let Some((path, diff)) = &self.commit_file_diff {
             lines.push(StyledLine::plain(""));
-            append_diff_lines(&mut lines, diff, width);
+            lines.push(diff_header_line(
+                path,
+                self.commit_diff_layout,
+                self.commit_diff_mode,
+                width,
+            ));
+            lines.push(diff_separator_line(width));
+            append_diff_lines(&mut lines, diff, self.commit_diff_layout, width);
         }
 
         lines
@@ -623,6 +677,10 @@ impl PluginState {
 
         if panel_id == "git.graph" {
             return self.handle_graph_key(key, writer);
+        }
+
+        if panel_id == "git.commitDetail" {
+            return self.handle_commit_detail_key(key, writer);
         }
 
         match key {
@@ -1003,6 +1061,21 @@ impl PluginState {
                 self.request_graph_render(writer);
                 true
             }
+            "git.toggleCommitDir" => {
+                if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                    if !self.commit_files_collapsed.remove(path) {
+                        self.commit_files_collapsed.insert(path.to_string());
+                    }
+                    self.request_commit_detail_render(writer);
+                }
+                true
+            }
+            "git.toggleCommitFilesView" => {
+                self.commit_files_tree_mode = !self.commit_files_tree_mode;
+                prefs::save_commit_files_tree_mode(self.commit_files_tree_mode);
+                self.request_commit_detail_render(writer);
+                true
+            }
             _ => false,
         }
     }
@@ -1069,6 +1142,43 @@ impl PluginState {
         }
     }
 
+    fn handle_commit_detail_key(&mut self, key: &str, writer: &Writer) -> bool {
+        match key {
+            "m" => {
+                self.commit_diff_layout = match self.commit_diff_layout {
+                    DiffLayout::Unified => DiffLayout::SideBySide,
+                    DiffLayout::SideBySide => DiffLayout::Unified,
+                };
+                prefs::save_commit_diff_layout(match self.commit_diff_layout {
+                    DiffLayout::Unified => "unified",
+                    DiffLayout::SideBySide => "side_by_side",
+                });
+                self.request_commit_detail_render(writer);
+                true
+            }
+            "f" => {
+                self.commit_diff_mode = match self.commit_diff_mode {
+                    DiffMode::Compact => DiffMode::FullFile,
+                    DiffMode::FullFile => DiffMode::Compact,
+                };
+                prefs::save_commit_diff_mode(match self.commit_diff_mode {
+                    DiffMode::Compact => "compact",
+                    DiffMode::FullFile => "full_file",
+                });
+                self.reload_commit_file_diff();
+                self.request_commit_detail_render(writer);
+                true
+            }
+            "t" => {
+                self.commit_files_tree_mode = !self.commit_files_tree_mode;
+                prefs::save_commit_files_tree_mode(self.commit_files_tree_mode);
+                self.request_commit_detail_render(writer);
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn move_graph_selection(&mut self, delta: i32, writer: &Writer) {
         if self.graph_rows.is_empty() {
             return;
@@ -1084,6 +1194,100 @@ impl PluginState {
         self.load_commit_detail();
         self.request_graph_render(writer);
         self.request_commit_detail_render(writer);
+    }
+}
+
+// ─── Commit-detail file rows / tree walker ────────────────────────────────────
+
+/// Shared rendering context for the Changed-files list in commit detail. Bundled
+/// so `commit_file_row` / `render_commit_file_tree` stay below clippy's
+/// too-many-arguments threshold.
+struct CommitFilesCtx<'a> {
+    selected_file: Option<&'a str>,
+    sel_bg: Color,
+    max_path: usize,
+    commit_oid: &'a str,
+    collapsed: &'a HashSet<String>,
+}
+
+fn commit_file_row(
+    file: &git::FileEntry,
+    display_path: &str,
+    indent: &str,
+    ctx: &CommitFilesCtx,
+) -> StyledLine {
+    let status_color = match file.status {
+        FileStatus::Modified => "yellow",
+        FileStatus::Added => "green",
+        FileStatus::Deleted => "red",
+        FileStatus::Renamed => "cyan",
+        FileStatus::Untracked => "green",
+    };
+    let mut display = display_path.to_string();
+    truncate_in_place(&mut display, ctx.max_path);
+
+    let mut spans = vec![
+        Span::new(indent.to_string()),
+        Span::new(format!("{} ", file.status.label())).fg(Color::named(status_color)),
+        Span::new(display).fg(Color::named("white")),
+    ];
+    if ctx.selected_file == Some(file.path.as_str()) {
+        spans = spans.into_iter().map(|s| s.bg(ctx.sel_bg.clone())).collect();
+    }
+    StyledLine::new(spans).on_click(
+        "git.selectCommitFile",
+        serde_json::json!({ "oid": ctx.commit_oid, "path": file.path }),
+    )
+}
+
+fn render_commit_file_tree(
+    nodes: &std::collections::BTreeMap<String, tree::Node>,
+    depth: usize,
+    ctx: &CommitFilesCtx,
+    out: &mut Vec<StyledLine>,
+) {
+    let mut entries: Vec<(&String, &tree::Node)> = nodes.iter().collect();
+    // Dirs first, then files; case-insensitive name order within each group
+    // — same convention as the status panel's tree view.
+    entries.sort_by(|a, b| {
+        let a_dir = matches!(a.1, tree::Node::Dir { .. });
+        let b_dir = matches!(b.1, tree::Node::Dir { .. });
+        match (a_dir, b_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
+        }
+    });
+
+    for (name, node) in entries {
+        match node {
+            tree::Node::Dir { path, children } => {
+                let is_collapsed = ctx.collapsed.contains(path);
+                let arrow = if is_collapsed { "›" } else { "⌄" };
+                let indent = "  ".repeat(depth);
+                out.push(
+                    StyledLine::new(vec![
+                        Span::new(indent),
+                        Span::new(format!("{} ", arrow)).fg(Color::named("darkGray")),
+                        Span::new(format!("{}/", name))
+                            .fg(Color::named("cyan"))
+                            .bold(),
+                    ])
+                    .on_click(
+                        "git.toggleCommitDir",
+                        serde_json::json!({ "path": path }),
+                    ),
+                );
+                if !is_collapsed {
+                    render_commit_file_tree(children, depth + 1, ctx, out);
+                }
+            }
+            tree::Node::File(entry) => {
+                let basename = entry.path.rsplit('/').next().unwrap_or(&entry.path);
+                let indent = "  ".repeat(depth);
+                out.push(commit_file_row(entry, basename, &indent, ctx));
+            }
+        }
     }
 }
 
@@ -1343,8 +1547,22 @@ fn render_lane_chars(row: &graph::GraphRow) -> Vec<char> {
 /// Gutter is " NNNNN  NNNNN  " (old/new line numbers) — matches the host's
 /// Git-tab diff panel so both views feel identical.
 const DIFF_GUTTER_WIDTH: usize = 15;
+/// Narrower single-side gutter used in the split view: " NNNNN ".
+const SBS_GUTTER_WIDTH: usize = 7;
 
-fn append_diff_lines(out: &mut Vec<StyledLine>, diff: &DiffContent, width: u16) {
+fn append_diff_lines(
+    out: &mut Vec<StyledLine>,
+    diff: &DiffContent,
+    layout: DiffLayout,
+    width: u16,
+) {
+    match layout {
+        DiffLayout::Unified => append_unified_diff(out, diff, width),
+        DiffLayout::SideBySide => append_side_by_side_diff(out, diff, width),
+    }
+}
+
+fn append_unified_diff(out: &mut Vec<StyledLine>, diff: &DiffContent, width: u16) {
     let added_bg = Color::rgb(0, 40, 0);
     let removed_bg = Color::rgb(60, 0, 0);
 
@@ -1388,6 +1606,203 @@ fn append_diff_lines(out: &mut Vec<StyledLine>, diff: &DiffContent, width: u16) 
             out.push(StyledLine::new(vec![gutter, marker, text, padding]));
         }
     }
+}
+
+fn append_side_by_side_diff(out: &mut Vec<StyledLine>, diff: &DiffContent, width: u16) {
+    // Reserve 1 col for the center divider; split the rest evenly.
+    let half = width.saturating_sub(1) / 2;
+    let right_w = width.saturating_sub(half + 1);
+
+    for (i, hunk) in diff.hunks.iter().enumerate() {
+        if i > 0 {
+            out.push(StyledLine::new(vec![
+                Span::new(format!(" {:>5}  ⋯", "")).fg(Color::named("darkGray")),
+            ]));
+        }
+        out.push(StyledLine::new(vec![
+            Span::new(format!(" {:>5}  {}", "", hunk.header))
+                .fg(Color::named("cyan"))
+                .dim(),
+        ]));
+
+        for row in pair_hunk_lines(hunk) {
+            out.push(render_sbs_row(&row, half, right_w));
+        }
+    }
+}
+
+fn render_sbs_row(row: &SbsRow, half_w: u16, right_w: u16) -> StyledLine {
+    let added_bg = Color::rgb(0, 40, 0);
+    let removed_bg = Color::rgb(60, 0, 0);
+
+    let mut spans = Vec::with_capacity(7);
+    let (left_fg, left_bg) = side_style(row.left_tag, &added_bg, &removed_bg);
+    let (right_fg, right_bg) = side_style(row.right_tag, &added_bg, &removed_bg);
+
+    push_sbs_half(
+        &mut spans,
+        row.left_no,
+        &row.left_text,
+        left_fg,
+        left_bg,
+        half_w,
+    );
+    spans.push(Span::new("│").fg(Color::named("darkGray")));
+    push_sbs_half(
+        &mut spans,
+        row.right_no,
+        &row.right_text,
+        right_fg,
+        right_bg,
+        right_w,
+    );
+
+    StyledLine::new(spans)
+}
+
+fn push_sbs_half(
+    spans: &mut Vec<Span>,
+    lineno: Option<u32>,
+    text: &str,
+    fg: Color,
+    bg: Option<Color>,
+    width: u16,
+) {
+    let content_w = (width as usize).saturating_sub(SBS_GUTTER_WIDTH);
+    let trimmed = truncate_to_display_width(text, content_w);
+    let pad = content_w.saturating_sub(UnicodeWidthStr::width(trimmed));
+
+    let mut gutter =
+        Span::new(format!(" {} ", fmt_diff_lineno(lineno))).fg(Color::named("darkGray"));
+    let mut body = Span::new(trimmed.to_string()).fg(fg);
+    let mut padding = Span::new(" ".repeat(pad));
+    if let Some(bg) = bg {
+        gutter = gutter.bg(bg.clone());
+        body = body.bg(bg.clone());
+        padding = padding.bg(bg);
+    }
+    spans.push(gutter);
+    spans.push(body);
+    spans.push(padding);
+}
+
+fn side_style(tag: LineTag, added_bg: &Color, removed_bg: &Color) -> (Color, Option<Color>) {
+    match tag {
+        LineTag::Added => (Color::named("green"), Some(added_bg.clone())),
+        LineTag::Removed => (Color::named("red"), Some(removed_bg.clone())),
+        LineTag::Context => (Color::named("white"), None),
+    }
+}
+
+struct SbsRow {
+    left_tag: LineTag,
+    left_no: Option<u32>,
+    left_text: String,
+    right_tag: LineTag,
+    right_no: Option<u32>,
+    right_text: String,
+}
+
+/// Pair consecutive removed/added lines into side-by-side rows. Unmatched
+/// removals show an empty right column, unmatched additions show an empty
+/// left column, context lines appear on both sides.
+fn pair_hunk_lines(hunk: &crate::git::DiffHunk) -> Vec<SbsRow> {
+    let mut rows = Vec::new();
+    let mut pending_removed: Vec<(Option<u32>, String)> = Vec::new();
+
+    for line in &hunk.lines {
+        match line.tag {
+            LineTag::Removed => {
+                pending_removed.push((line.old_lineno, line.content.clone()));
+            }
+            LineTag::Added => {
+                if let Some((old_no, old_text)) = (!pending_removed.is_empty())
+                    .then(|| pending_removed.remove(0))
+                {
+                    rows.push(SbsRow {
+                        left_tag: LineTag::Removed,
+                        left_no: old_no,
+                        left_text: old_text,
+                        right_tag: LineTag::Added,
+                        right_no: line.new_lineno,
+                        right_text: line.content.clone(),
+                    });
+                } else {
+                    rows.push(SbsRow {
+                        left_tag: LineTag::Context,
+                        left_no: None,
+                        left_text: String::new(),
+                        right_tag: LineTag::Added,
+                        right_no: line.new_lineno,
+                        right_text: line.content.clone(),
+                    });
+                }
+            }
+            LineTag::Context => {
+                for (old_no, old_text) in pending_removed.drain(..) {
+                    rows.push(SbsRow {
+                        left_tag: LineTag::Removed,
+                        left_no: old_no,
+                        left_text: old_text,
+                        right_tag: LineTag::Context,
+                        right_no: None,
+                        right_text: String::new(),
+                    });
+                }
+                rows.push(SbsRow {
+                    left_tag: LineTag::Context,
+                    left_no: line.old_lineno,
+                    left_text: line.content.clone(),
+                    right_tag: LineTag::Context,
+                    right_no: line.new_lineno,
+                    right_text: line.content.clone(),
+                });
+            }
+        }
+    }
+
+    for (old_no, old_text) in pending_removed.drain(..) {
+        rows.push(SbsRow {
+            left_tag: LineTag::Removed,
+            left_no: old_no,
+            left_text: old_text,
+            right_tag: LineTag::Context,
+            right_no: None,
+            right_text: String::new(),
+        });
+    }
+
+    rows
+}
+
+/// Header above the inline commit-file diff. Mirrors the Git-tab's
+/// "path  [上下][局部]  m/f 切换" hint so the keybindings are discoverable.
+fn diff_header_line(path: &str, layout: DiffLayout, mode: DiffMode, width: u16) -> StyledLine {
+    let layout_label = match layout {
+        DiffLayout::Unified => "上下",
+        DiffLayout::SideBySide => "左右",
+    };
+    let mode_label = match mode {
+        DiffMode::Compact => "局部",
+        DiffMode::FullFile => "全量",
+    };
+    let tag_str = format!("  [{}][{}]  m/f 切换", layout_label, mode_label);
+    let tag_w = UnicodeWidthStr::width(tag_str.as_str());
+    let path_max = (width as usize).saturating_sub(tag_w);
+    let path_display = truncate_to_display_width(path, path_max);
+
+    StyledLine::new(vec![
+        Span::new(path_display.to_string())
+            .fg(Color::named("white"))
+            .bold(),
+        Span::new(tag_str).fg(Color::named("darkGray")),
+    ])
+}
+
+fn diff_separator_line(width: u16) -> StyledLine {
+    StyledLine::new(vec![
+        Span::new("─".repeat(width as usize)).fg(Color::named("darkGray")),
+    ])
 }
 
 fn fmt_diff_lineno(n: Option<u32>) -> String {
@@ -1817,7 +2232,7 @@ mod tests {
             }],
         };
         let mut out = Vec::new();
-        super::append_diff_lines(&mut out, &diff, 80);
+        super::append_diff_lines(&mut out, &diff, super::DiffLayout::Unified, 80);
         assert_eq!(out.len(), 1);
         // Hunk header now lives in a gutter-padded cyan-dim span so it aligns
         // with the +/- rows below it.
@@ -1907,7 +2322,7 @@ mod tests {
             }],
         };
         let mut out = Vec::new();
-        super::append_diff_lines(&mut out, &diff, 80);
+        super::append_diff_lines(&mut out, &diff, super::DiffLayout::Unified, 80);
         // 1 header + 3 content lines. Each content row is 4 spans:
         // [gutter, "+/-/ ", content, padding].
         assert_eq!(out.len(), 4);
@@ -1955,11 +2370,58 @@ mod tests {
             ],
         };
         let mut out = Vec::new();
-        super::append_diff_lines(&mut out, &diff, 80);
+        super::append_diff_lines(&mut out, &diff, super::DiffLayout::Unified, 80);
         // header-1, separator, header-2
         assert_eq!(out.len(), 3);
         assert!(out[1].spans[0].text.contains("⋯"));
         assert_eq!(out[1].spans[0].fg, Some(Color::named("darkGray")));
+    }
+
+    #[test]
+    fn append_diff_lines_side_by_side_pairs_remove_and_add() {
+        use crate::git::{DiffContent, DiffHunk, DiffLine, LineTag as GitLineTag};
+        let diff = DiffContent {
+            file_path: "foo.rs".into(),
+            hunks: vec![DiffHunk {
+                header: "@@ @@".into(),
+                lines: vec![
+                    DiffLine {
+                        tag: GitLineTag::Removed,
+                        content: "old".into(),
+                        old_lineno: Some(1),
+                        new_lineno: None,
+                    },
+                    DiffLine {
+                        tag: GitLineTag::Added,
+                        content: "new".into(),
+                        old_lineno: None,
+                        new_lineno: Some(1),
+                    },
+                ],
+            }],
+        };
+        let mut out = Vec::new();
+        super::append_diff_lines(&mut out, &diff, super::DiffLayout::SideBySide, 80);
+        // 1 header + 1 paired row; the paired row renders a single line with a
+        // `│` divider between the removed (left) and added (right) halves.
+        assert_eq!(out.len(), 2);
+        let row = &out[1];
+        let has_divider = row.spans.iter().any(|s| s.text == "│");
+        assert!(has_divider, "side-by-side row should contain a divider span");
+        let joined: String = row.spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(joined.contains("old"));
+        assert!(joined.contains("new"));
+    }
+
+    #[test]
+    fn diff_header_line_surfaces_layout_and_mode_hints() {
+        let line =
+            super::diff_header_line("foo.rs", super::DiffLayout::SideBySide, super::DiffMode::FullFile, 80);
+        let joined: String = line.spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(joined.starts_with("foo.rs"));
+        assert!(joined.contains("[左右]"));
+        assert!(joined.contains("[全量]"));
+        assert!(joined.contains("m/f"));
     }
 
     // ── push_indicator_line ──────────────────────────────────────────────────

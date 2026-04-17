@@ -200,6 +200,21 @@ fn handle_key_graph(key: event::KeyEvent, app: &mut App) {
         KeyCode::Char('r') => {
             app.route_key_to_plugin("r");
         }
+        // m/f/t always target the commit-detail panel regardless of focus —
+        // they configure the inline diff / changed-files view, which is only
+        // meaningful there. t toggles the Changed-files tree/flat layout.
+        KeyCode::Char('m') => {
+            app.plugin_manager
+                .send_key_event("git.commitDetail", "m", vec![]);
+        }
+        KeyCode::Char('f') => {
+            app.plugin_manager
+                .send_key_event("git.commitDetail", "f", vec![]);
+        }
+        KeyCode::Char('t') => {
+            app.plugin_manager
+                .send_key_event("git.commitDetail", "t", vec![]);
+        }
         _ => {}
     }
 }

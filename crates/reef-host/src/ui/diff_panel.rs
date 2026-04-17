@@ -362,3 +362,166 @@ fn truncate_to_width(s: &str, max_width: usize) -> &str {
     }
     s
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::{DiffHunk, DiffLine, LineTag};
+
+    fn make_line(tag: LineTag, content: &str, old_no: Option<u32>, new_no: Option<u32>) -> DiffLine {
+        DiffLine { tag, content: content.to_string(), old_lineno: old_no, new_lineno: new_no }
+    }
+
+    fn make_hunk(header: &str, lines: Vec<DiffLine>) -> DiffHunk {
+        DiffHunk { header: header.to_string(), lines }
+    }
+
+    fn count_rows(v: &[SbsDisplayLine]) -> usize {
+        v.iter().filter(|l| matches!(l, SbsDisplayLine::Row(_))).count()
+    }
+
+    fn get_rows(v: &[SbsDisplayLine]) -> Vec<&SbsRow> {
+        v.iter().filter_map(|l| if let SbsDisplayLine::Row(r) = l { Some(r) } else { None }).collect()
+    }
+
+    // ── line_style ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn line_style_added() {
+        let (prefix, fg, _bg) = line_style(LineTag::Added);
+        assert_eq!(prefix, "+");
+        assert_eq!(fg, Color::Green);
+    }
+
+    #[test]
+    fn line_style_removed() {
+        let (prefix, fg, _bg) = line_style(LineTag::Removed);
+        assert_eq!(prefix, "-");
+        assert_eq!(fg, Color::Red);
+    }
+
+    #[test]
+    fn line_style_context() {
+        let (prefix, _fg, _bg) = line_style(LineTag::Context);
+        assert_eq!(prefix, " ");
+    }
+
+    // ── fmt_lineno ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn fmt_lineno_none_is_five_spaces() {
+        assert_eq!(fmt_lineno(None), "     ");
+    }
+
+    #[test]
+    fn fmt_lineno_small_is_right_aligned() {
+        assert_eq!(fmt_lineno(Some(1)), "    1");
+        assert_eq!(fmt_lineno(Some(42)), "   42");
+    }
+
+    #[test]
+    fn fmt_lineno_large_fills_field() {
+        assert_eq!(fmt_lineno(Some(99999)), "99999");
+    }
+
+    // ── truncate_to_width ────────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_to_width_ascii_within_limit() {
+        assert_eq!(truncate_to_width("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_to_width_ascii_exact() {
+        assert_eq!(truncate_to_width("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_to_width_ascii_over_limit() {
+        assert_eq!(truncate_to_width("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_to_width_cjk() {
+        // Each CJK char is width 2; max_width=4 → two chars fit
+        assert_eq!(truncate_to_width("你好世界", 4), "你好");
+    }
+
+    #[test]
+    fn truncate_to_width_cjk_within_limit() {
+        assert_eq!(truncate_to_width("你好", 4), "你好");
+    }
+
+    // ── build_sbs_lines ──────────────────────────────────────────────────────
+
+    #[test]
+    fn build_sbs_lines_starts_with_hunk_header() {
+        let hunk = make_hunk("@@ -1,2 +1,2 @@", vec![]);
+        let lines = build_sbs_lines(&hunk);
+        assert!(matches!(lines.first(), Some(SbsDisplayLine::HunkHeader(_))));
+    }
+
+    #[test]
+    fn build_sbs_lines_context_appears_on_both_sides() {
+        let hunk = make_hunk("@@ @@", vec![
+            make_line(LineTag::Context, "same", Some(1), Some(1)),
+        ]);
+        let lines = build_sbs_lines(&hunk);
+        let rows = get_rows(&lines);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].left_tag, LineTag::Context);
+        assert_eq!(rows[0].right_tag, LineTag::Context);
+        assert_eq!(rows[0].left_text, "same");
+        assert_eq!(rows[0].right_text, "same");
+    }
+
+    #[test]
+    fn build_sbs_lines_add_only_has_empty_left() {
+        let hunk = make_hunk("@@ @@", vec![
+            make_line(LineTag::Added, "new line", None, Some(1)),
+        ]);
+        let lines = build_sbs_lines(&hunk);
+        let rows = get_rows(&lines);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].left_tag, LineTag::Context);
+        assert!(rows[0].left_text.is_empty());
+        assert_eq!(rows[0].right_tag, LineTag::Added);
+        assert_eq!(rows[0].right_text, "new line");
+    }
+
+    #[test]
+    fn build_sbs_lines_remove_only_has_empty_right() {
+        let hunk = make_hunk("@@ @@", vec![
+            make_line(LineTag::Removed, "old line", Some(1), None),
+        ]);
+        let lines = build_sbs_lines(&hunk);
+        let rows = get_rows(&lines);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].left_tag, LineTag::Removed);
+        assert_eq!(rows[0].left_text, "old line");
+        assert_eq!(rows[0].right_tag, LineTag::Context);
+        assert!(rows[0].right_text.is_empty());
+    }
+
+    #[test]
+    fn build_sbs_lines_remove_then_add_are_paired() {
+        let hunk = make_hunk("@@ @@", vec![
+            make_line(LineTag::Removed, "old", Some(1), None),
+            make_line(LineTag::Added, "new", None, Some(1)),
+        ]);
+        let lines = build_sbs_lines(&hunk);
+        let rows = get_rows(&lines);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].left_text, "old");
+        assert_eq!(rows[0].right_text, "new");
+    }
+
+    #[test]
+    fn build_sbs_lines_multiple_context_rows() {
+        let hunk = make_hunk("@@ @@", vec![
+            make_line(LineTag::Context, "line1", Some(1), Some(1)),
+            make_line(LineTag::Context, "line2", Some(2), Some(2)),
+        ]);
+        assert_eq!(count_rows(&build_sbs_lines(&hunk)), 2);
+    }
+}

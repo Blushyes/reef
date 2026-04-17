@@ -138,5 +138,38 @@ mod tests {
         );
         assert!(result.is_some(), "shebang should resolve python");
     }
+
+    #[test]
+    fn highlight_empty_lines_returns_empty_vec() {
+        let result = highlight_file("foo.rs", &[]);
+        // A known syntax with zero lines should return Some([])
+        assert!(matches!(result, Some(ref v) if v.is_empty()), "empty input → Some([])");
+    }
+
+    #[test]
+    fn highlight_unknown_extension_returns_none() {
+        assert!(highlight_file("foo.xyz", &["hello".to_string()]).is_none());
+    }
+
+    #[test]
+    fn highlight_returns_same_line_count() {
+        let lines: Vec<String> = (0..10).map(|i| format!("let x{} = {};", i, i)).collect();
+        let result = highlight_file("foo.rs", &lines).expect("rust must highlight");
+        assert_eq!(result.len(), lines.len());
+    }
+
+    #[test]
+    fn highlight_many_lines_all_returned() {
+        // highlight_file has no line-count limit — all lines are processed
+        let lines: Vec<String> = (0..100).map(|i| format!("let x{i} = {i};")).collect();
+        let result = highlight_file("foo.rs", &lines).expect("rust must highlight");
+        assert_eq!(result.len(), 100);
+    }
+
+    #[test]
+    fn highlight_toml_file_recognized() {
+        let lines = vec!["[package]".to_string(), "name = \"reef\"".to_string()];
+        assert!(highlight_file("Cargo.toml", &lines).is_some(), "toml should be recognized");
+    }
 }
 

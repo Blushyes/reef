@@ -312,3 +312,155 @@ fn resolve_exe(main: &str, plugin_dir: &Path) -> String {
     };
     p.to_string_lossy().into_owned()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reef_protocol::{PanelDecl, PanelSlot, RpcMessage};
+
+    fn sidebar_panel(id: &str, plugin: &str) -> ManagedPanel {
+        ManagedPanel {
+            decl: PanelDecl { id: id.into(), title: id.into(), slot: PanelSlot::Sidebar, icon: None },
+            plugin_name: plugin.into(),
+            last_render: None,
+            needs_render: false,
+            last_render_scroll: u32::MAX,
+        }
+    }
+
+    fn editor_panel(id: &str, plugin: &str) -> ManagedPanel {
+        ManagedPanel {
+            decl: PanelDecl { id: id.into(), title: id.into(), slot: PanelSlot::Editor, icon: None },
+            plugin_name: plugin.into(),
+            last_render: None,
+            needs_render: false,
+            last_render_scroll: u32::MAX,
+        }
+    }
+
+    // ── new ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn new_is_empty() {
+        let m = PluginManager::new();
+        assert!(m.panels.is_empty());
+        assert!(m.pending_host_requests.is_empty());
+        assert!(m.notifications.is_empty());
+        assert!(!m.status_refresh_needed);
+        assert!(m.help_entries.is_empty());
+    }
+
+    // ── sidebar_panels ───────────────────────────────────────────────────────
+
+    #[test]
+    fn sidebar_panels_filters_out_editor_panels() {
+        let mut m = PluginManager::new();
+        m.panels.push(sidebar_panel("git.status", "git"));
+        m.panels.push(editor_panel("git.diff", "git"));
+        m.panels.push(sidebar_panel("git.graph", "git"));
+        let sidebar = m.sidebar_panels();
+        assert_eq!(sidebar.len(), 2);
+        assert!(sidebar.iter().all(|p| p.decl.slot == PanelSlot::Sidebar));
+    }
+
+    #[test]
+    fn sidebar_panels_empty_when_no_panels() {
+        let m = PluginManager::new();
+        assert!(m.sidebar_panels().is_empty());
+    }
+
+    // ── invalidate_panels ────────────────────────────────────────────────────
+
+    #[test]
+    fn invalidate_panels_marks_all_needs_render() {
+        let mut m = PluginManager::new();
+        m.panels.push(sidebar_panel("p1", "plugin"));
+        m.panels.push(sidebar_panel("p2", "plugin"));
+        m.panels[0].needs_render = false;
+        m.panels[1].needs_render = false;
+        m.invalidate_panels();
+        assert!(m.panels.iter().all(|p| p.needs_render));
+    }
+
+    // ── resolve_exe ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_exe_relative_joined_with_dir() {
+        let dir = Path::new("/plugins/myplugin");
+        let result = resolve_exe("./plugin", dir);
+        assert!(result.contains("myplugin"), "should be joined with plugin_dir");
+        assert!(result.contains("plugin"));
+    }
+
+    #[test]
+    fn resolve_exe_parent_relative() {
+        let dir = Path::new("/plugins/myplugin");
+        let result = resolve_exe("../bin/plugin", dir);
+        assert!(result.contains("plugins"), "parent-relative path joined with dir");
+    }
+
+    #[test]
+    fn resolve_exe_absolute_unchanged() {
+        let dir = Path::new("/some/dir");
+        let result = resolve_exe("/usr/bin/my-plugin", dir);
+        assert_eq!(result, "/usr/bin/my-plugin");
+    }
+
+    // ── handle_message: reef/requestRender ───────────────────────────────────
+
+    #[test]
+    fn handle_message_request_render_marks_panel_needs_render() {
+        let mut m = PluginManager::new();
+        m.panels.push(sidebar_panel("git.status", "git"));
+        m.panels[0].needs_render = false;
+
+        let msg = RpcMessage {
+            jsonrpc: "2.0".into(),
+            id: None,
+            method: "reef/requestRender".into(),
+            params: Some(serde_json::json!({"panel_id": "git.status"})),
+            result: None,
+            error: None,
+        };
+        m.handle_message("git", msg);
+        assert!(m.panels[0].needs_render);
+    }
+
+    #[test]
+    fn handle_message_request_render_wrong_plugin_no_effect() {
+        let mut m = PluginManager::new();
+        m.panels.push(sidebar_panel("git.status", "git"));
+        m.panels[0].needs_render = false;
+
+        let msg = RpcMessage {
+            jsonrpc: "2.0".into(),
+            id: None,
+            method: "reef/requestRender".into(),
+            params: Some(serde_json::json!({"panel_id": "git.status"})),
+            result: None,
+            error: None,
+        };
+        // Message arrives from "other" plugin, not "git"
+        m.handle_message("other", msg);
+        assert!(!m.panels[0].needs_render, "wrong plugin should not mark panel");
+    }
+
+    #[test]
+    fn handle_message_status_changed_sets_flag_and_invalidates() {
+        let mut m = PluginManager::new();
+        m.panels.push(sidebar_panel("git.status", "git"));
+        m.panels[0].needs_render = false;
+
+        let msg = RpcMessage {
+            jsonrpc: "2.0".into(),
+            id: None,
+            method: "reef/statusChanged".into(),
+            params: Some(serde_json::json!({})),
+            result: None,
+            error: None,
+        };
+        m.handle_message("git", msg);
+        assert!(m.status_refresh_needed);
+        assert!(m.panels[0].needs_render);
+    }
+}

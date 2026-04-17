@@ -203,4 +203,100 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].cells, vec![LaneCell::Node]);
     }
+
+    #[test]
+    fn empty_input() {
+        assert!(build_graph(&[]).is_empty());
+    }
+
+    #[test]
+    fn single_commit_no_parent() {
+        let rows = build_graph(&[c("root", &[])]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].node_col, 0);
+        assert_eq!(rows[0].cells, vec![LaneCell::Node]);
+    }
+
+    #[test]
+    fn multiple_roots_reuse_lane() {
+        // Two independent root commits. After "a" finishes, lane 0 is freed,
+        // so "b" should also land on lane 0.
+        let rows = build_graph(&[c("a", &[]), c("b", &[])]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].node_col, 0);
+        assert_eq!(rows[1].node_col, 0);
+        assert_eq!(rows[1].cells, vec![LaneCell::Node]);
+    }
+
+    #[test]
+    fn octopus_merge_three_parents() {
+        // M has 3 parents: p1, p2, p3 — should fork into 3 lanes.
+        let commits = vec![
+            c("m", &["p1", "p2", "p3"]),
+            c("p1", &[]),
+            c("p2", &[]),
+            c("p3", &[]),
+        ];
+        let rows = build_graph(&commits);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].node_col, 0);
+        assert_eq!(rows[0].cells.len(), 3);
+        let fork_count = rows[0].cells.iter()
+            .filter(|&&c| matches!(c, LaneCell::Fork { .. }))
+            .count();
+        assert_eq!(fork_count, 2, "two extra parents should produce two Fork cells");
+    }
+
+    #[test]
+    fn two_parallel_branches_then_common_ancestor() {
+        // a→c and b→c: two branches, same root c
+        let commits = vec![c("a", &["c"]), c("b", &["c"]), c("c", &[])];
+        let rows = build_graph(&commits);
+        assert_eq!(rows.len(), 3);
+        // a and b on different lanes
+        assert_ne!(rows[0].node_col, rows[1].node_col);
+        // c merges both
+        let merge_count = rows[2].cells.iter()
+            .filter(|&&c| matches!(c, LaneCell::Merge { .. }))
+            .count();
+        assert_eq!(merge_count, 1);
+    }
+
+    #[test]
+    fn lane_reuse_after_merge() {
+        // After L and R merge into C, the freed lane gets reused by D.
+        let commits = vec![
+            c("m", &["l", "r"]),
+            c("l", &["c"]),
+            c("r", &["c"]),
+            c("c", &["d"]),
+            c("d", &[]),
+        ];
+        let rows = build_graph(&commits);
+        assert_eq!(rows.len(), 5);
+        // d should be alone on lane 0
+        assert_eq!(rows[4].node_col, 0);
+        assert_eq!(rows[4].cells, vec![LaneCell::Node]);
+    }
+
+    #[test]
+    fn node_col_matches_node_cell() {
+        // For every row, cells[node_col] must be LaneCell::Node.
+        let commits = vec![
+            c("m", &["l", "r"]),
+            c("l", &["c"]),
+            c("r", &["c"]),
+            c("c", &[]),
+        ];
+        for row in build_graph(&commits) {
+            assert_eq!(
+                row.cells[row.node_col],
+                LaneCell::Node,
+                "commit {} node_col={} but cell is {:?}",
+                row.commit.oid,
+                row.node_col,
+                row.cells[row.node_col]
+            );
+        }
+    }
 }

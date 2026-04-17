@@ -28,6 +28,20 @@ impl FileStatus {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::FileStatus;
+
+    #[test]
+    fn file_status_label_all_variants() {
+        assert_eq!(FileStatus::Modified.label(), "M");
+        assert_eq!(FileStatus::Added.label(), "A");
+        assert_eq!(FileStatus::Deleted.label(), "D");
+        assert_eq!(FileStatus::Renamed.label(), "R");
+        assert_eq!(FileStatus::Untracked.label(), "U");
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DiffContent {
     pub file_path: String,

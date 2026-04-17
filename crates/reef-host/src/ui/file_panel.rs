@@ -232,3 +232,30 @@ fn truncate_start_to_width(s: &str, max_width: usize) -> &str {
     }
     s
 }
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_start_to_width;
+
+    #[test]
+    fn truncate_start_within_limit_returns_whole() {
+        assert_eq!(truncate_start_to_width("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_start_exact_limit_returns_whole() {
+        assert_eq!(truncate_start_to_width("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_start_keeps_tail() {
+        // Keep the last 5 columns of "long/path/file.rs" (17 cols)
+        assert_eq!(truncate_start_to_width("long/path/file.rs", 5), "le.rs");
+    }
+
+    #[test]
+    fn truncate_start_cjk_width() {
+        // Each CJK char is width 2; "你好世界" is width 8. Keep last 4 → "世界"
+        assert_eq!(truncate_start_to_width("你好世界", 4), "世界");
+    }
+}

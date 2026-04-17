@@ -337,3 +337,230 @@ pub fn read_message(reader: &mut impl BufRead) -> io::Result<RpcMessage> {
     serde_json::from_slice(&buf)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    // ── Color ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn color_named_constructor() {
+        assert_eq!(Color::named("red"), Color::Named("red".to_string()));
+    }
+
+    #[test]
+    fn color_rgb_constructor() {
+        assert_eq!(Color::rgb(1, 2, 3), Color::Rgb([1, 2, 3]));
+    }
+
+    #[test]
+    fn color_named_serialization() {
+        let json = serde_json::to_string(&Color::named("green")).unwrap();
+        assert_eq!(json, "\"green\"");
+    }
+
+    #[test]
+    fn color_rgb_serialization() {
+        let json = serde_json::to_string(&Color::rgb(10, 20, 30)).unwrap();
+        assert_eq!(json, "[10,20,30]");
+    }
+
+    // ── Span ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn span_new_sets_text() {
+        let s = Span::new("hello");
+        assert_eq!(s.text, "hello");
+        assert!(s.fg.is_none());
+        assert!(s.bold.is_none());
+    }
+
+    #[test]
+    fn span_builder_chain() {
+        let s = Span::new("x")
+            .fg(Color::named("red"))
+            .bg(Color::named("blue"))
+            .bold()
+            .dim();
+        assert_eq!(s.fg, Some(Color::named("red")));
+        assert_eq!(s.bg, Some(Color::named("blue")));
+        assert_eq!(s.bold, Some(true));
+        assert_eq!(s.dim, Some(true));
+    }
+
+    #[test]
+    fn span_on_click_sets_fields() {
+        let s = Span::new("x").on_click("cmd", serde_json::json!({"k": "v"}));
+        assert_eq!(s.click_command, Some("cmd".to_string()));
+        assert_eq!(s.click_args, Some(serde_json::json!({"k": "v"})));
+        assert!(s.dbl_click_command.is_none());
+    }
+
+    #[test]
+    fn span_on_dbl_click_sets_fields() {
+        let s = Span::new("x").on_dbl_click("dcmd", serde_json::json!(null));
+        assert_eq!(s.dbl_click_command, Some("dcmd".to_string()));
+        assert!(s.click_command.is_none());
+    }
+
+    #[test]
+    fn span_default_all_none() {
+        let s = Span::default();
+        assert!(s.text.is_empty());
+        assert!(s.fg.is_none());
+        assert!(s.bold.is_none());
+        assert!(s.italic.is_none());
+        assert!(s.click_command.is_none());
+        assert!(s.dbl_click_command.is_none());
+    }
+
+    // ── StyledLine ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn styled_line_plain_single_span() {
+        let line = StyledLine::plain("hello");
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.spans[0].text, "hello");
+        assert!(line.spans[0].fg.is_none());
+        assert!(line.click_command.is_none());
+    }
+
+    #[test]
+    fn styled_line_new_stores_spans() {
+        let line = StyledLine::new(vec![Span::new("a"), Span::new("b")]);
+        assert_eq!(line.spans.len(), 2);
+        assert_eq!(line.spans[0].text, "a");
+        assert_eq!(line.spans[1].text, "b");
+    }
+
+    #[test]
+    fn styled_line_on_click() {
+        let line = StyledLine::plain("x").on_click("cmd", serde_json::json!(42));
+        assert_eq!(line.click_command, Some("cmd".to_string()));
+        assert_eq!(line.click_args, Some(serde_json::json!(42)));
+        assert!(line.dbl_click_command.is_none());
+    }
+
+    #[test]
+    fn styled_line_on_dbl_click() {
+        let line = StyledLine::plain("x").on_dbl_click("dcmd", serde_json::json!(null));
+        assert_eq!(line.dbl_click_command, Some("dcmd".to_string()));
+        assert!(line.click_command.is_none());
+    }
+
+    // ── RpcMessage ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn rpc_request_fields() {
+        let msg = RpcMessage::request(5, "test/method", serde_json::json!({"key": "val"}));
+        assert_eq!(msg.jsonrpc, "2.0");
+        assert_eq!(msg.id, Some(5));
+        assert_eq!(msg.method, "test/method");
+        assert_eq!(msg.params, Some(serde_json::json!({"key": "val"})));
+        assert!(msg.result.is_none());
+        assert!(msg.error.is_none());
+    }
+
+    #[test]
+    fn rpc_notification_no_id() {
+        let msg = RpcMessage::notification("test/notify", serde_json::json!({}));
+        assert_eq!(msg.jsonrpc, "2.0");
+        assert!(msg.id.is_none());
+        assert_eq!(msg.method, "test/notify");
+        assert!(msg.result.is_none());
+    }
+
+    #[test]
+    fn rpc_response_fields() {
+        let msg = RpcMessage::response(7, serde_json::json!("ok"));
+        assert_eq!(msg.id, Some(7));
+        assert_eq!(msg.result, Some(serde_json::json!("ok")));
+        assert!(msg.error.is_none());
+        assert!(msg.params.is_none());
+    }
+
+    #[test]
+    fn rpc_is_response_for_response_message() {
+        assert!(RpcMessage::response(1, serde_json::json!(null)).is_response());
+    }
+
+    #[test]
+    fn rpc_is_response_false_for_request() {
+        assert!(!RpcMessage::request(1, "m", serde_json::json!({})).is_response());
+    }
+
+    #[test]
+    fn rpc_is_response_false_for_notification() {
+        assert!(!RpcMessage::notification("m", serde_json::json!({})).is_response());
+    }
+
+    // ── write_message / read_message ─────────────────────────────────────────
+
+    #[test]
+    fn write_then_read_roundtrip() {
+        let original = RpcMessage::request(42, "reef/render", serde_json::json!({"panel_id": "test"}));
+        let mut buf = Vec::new();
+        write_message(&mut buf, &original).unwrap();
+        let mut cursor = Cursor::new(buf);
+        let decoded = read_message(&mut cursor).unwrap();
+        assert_eq!(decoded.id, original.id);
+        assert_eq!(decoded.method, original.method);
+        assert_eq!(decoded.params, original.params);
+    }
+
+    #[test]
+    fn write_message_produces_content_length_header() {
+        let msg = RpcMessage::notification("ping", serde_json::json!({}));
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.starts_with("Content-Length: "), "expected Content-Length header");
+        assert!(s.contains("\r\n\r\n"), "expected CRLF separator");
+    }
+
+    #[test]
+    fn read_message_ignores_extra_headers() {
+        let body = r#"{"jsonrpc":"2.0","method":"ping","params":null}"#;
+        let raw = format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let mut cursor = Cursor::new(raw.into_bytes());
+        let msg = read_message(&mut cursor).unwrap();
+        assert_eq!(msg.method, "ping");
+    }
+
+    // ── Manifest / Decl serialization ────────────────────────────────────────
+
+    #[test]
+    fn rpc_error_fields() {
+        let err = RpcError { code: -32600, message: "Invalid Request".to_string() };
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(json.contains("-32600"));
+        assert!(json.contains("Invalid Request"));
+    }
+
+    #[test]
+    fn panel_decl_slot_serialization() {
+        let decl = PanelDecl {
+            id: "git.status".into(),
+            title: "Git".into(),
+            slot: PanelSlot::Sidebar,
+            icon: None,
+        };
+        let json = serde_json::to_value(&decl).unwrap();
+        assert_eq!(json["slot"], "sidebar");
+        assert_eq!(json["id"], "git.status");
+    }
+
+    #[test]
+    fn panel_slot_variants_serialize() {
+        assert_eq!(serde_json::to_value(PanelSlot::Sidebar).unwrap(), "sidebar");
+        assert_eq!(serde_json::to_value(PanelSlot::Editor).unwrap(), "editor");
+        assert_eq!(serde_json::to_value(PanelSlot::Overlay).unwrap(), "overlay");
+        assert_eq!(serde_json::to_value(PanelSlot::Statusbar).unwrap(), "statusbar");
+    }
+}

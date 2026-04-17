@@ -207,3 +207,121 @@ pub fn load_preview(root: &Path, rel_path: &Path) -> Option<PreviewContent> {
         highlighted,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::{FileEntry, FileStatus};
+
+    fn make_entry(path: &str, status: FileStatus) -> FileEntry {
+        FileEntry { path: path.to_string(), status }
+    }
+
+    fn make_tree_with_entries(entries: Vec<TreeEntry>) -> FileTree {
+        FileTree {
+            root: PathBuf::from("/nonexistent"),
+            entries,
+            selected: 0,
+            expanded: HashSet::new(),
+            git_statuses: std::collections::HashMap::new(),
+        }
+    }
+
+    fn dummy_entry(name: &str) -> TreeEntry {
+        TreeEntry {
+            path: PathBuf::from(name),
+            name: name.to_string(),
+            depth: 0,
+            is_dir: false,
+            is_expanded: false,
+            git_status: None,
+        }
+    }
+
+    // ── navigate ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn navigate_forward() {
+        let mut tree = make_tree_with_entries(vec![dummy_entry("a"), dummy_entry("b"), dummy_entry("c")]);
+        tree.navigate(1);
+        assert_eq!(tree.selected, 1);
+    }
+
+    #[test]
+    fn navigate_backward_at_zero_stays_zero() {
+        let mut tree = make_tree_with_entries(vec![dummy_entry("a"), dummy_entry("b")]);
+        tree.navigate(-1);
+        assert_eq!(tree.selected, 0);
+    }
+
+    #[test]
+    fn navigate_clamps_at_end() {
+        let mut tree = make_tree_with_entries(vec![dummy_entry("a"), dummy_entry("b"), dummy_entry("c")]);
+        tree.navigate(9999);
+        assert_eq!(tree.selected, 2);
+    }
+
+    #[test]
+    fn navigate_no_op_on_empty() {
+        let mut tree = make_tree_with_entries(vec![]);
+        tree.navigate(1);
+        assert_eq!(tree.selected, 0); // no crash, stays at 0
+    }
+
+    // ── selected_entry ───────────────────────────────────────────────────────
+
+    #[test]
+    fn selected_entry_empty_returns_none() {
+        let tree = make_tree_with_entries(vec![]);
+        assert!(tree.selected_entry().is_none());
+    }
+
+    #[test]
+    fn selected_entry_returns_correct_entry() {
+        let mut tree = make_tree_with_entries(vec![
+            dummy_entry("file0.rs"),
+            dummy_entry("file1.rs"),
+            dummy_entry("file2.rs"),
+        ]);
+        tree.selected = 2;
+        assert_eq!(tree.selected_entry().unwrap().name, "file2.rs");
+    }
+
+    // ── refresh_git_statuses ─────────────────────────────────────────────────
+
+    #[test]
+    fn refresh_git_statuses_clears_previous() {
+        let mut tree = make_tree_with_entries(vec![]);
+        tree.git_statuses.insert("old.rs".to_string(), 'X');
+        tree.refresh_git_statuses(&[], &[]);
+        assert!(tree.git_statuses.is_empty());
+    }
+
+    #[test]
+    fn refresh_git_statuses_inserts_staged_files() {
+        let mut tree = make_tree_with_entries(vec![]);
+        let staged = vec![make_entry("src/main.rs", FileStatus::Modified)];
+        tree.refresh_git_statuses(&staged, &[]);
+        let ch = tree.git_statuses.get("src/main.rs").copied();
+        assert_eq!(ch, Some('M'));
+    }
+
+    #[test]
+    fn refresh_git_statuses_propagates_to_parent_dir() {
+        let mut tree = make_tree_with_entries(vec![]);
+        let staged = vec![make_entry("src/main.rs", FileStatus::Added)];
+        tree.refresh_git_statuses(&staged, &[]);
+        // Parent directory "src" should have been given the propagated marker
+        assert!(tree.git_statuses.contains_key("src"), "parent dir should appear in git_statuses");
+    }
+
+    #[test]
+    fn refresh_git_statuses_unstaged_does_not_overwrite_staged() {
+        let mut tree = make_tree_with_entries(vec![]);
+        let staged = vec![make_entry("a.rs", FileStatus::Added)];
+        let unstaged = vec![make_entry("a.rs", FileStatus::Modified)];
+        // staged sets 'A'; unstaged uses or_insert so 'A' stays
+        tree.refresh_git_statuses(&staged, &unstaged);
+        assert_eq!(tree.git_statuses.get("a.rs").copied(), Some('A'));
+    }
+}

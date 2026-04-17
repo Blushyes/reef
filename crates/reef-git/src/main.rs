@@ -1215,3 +1215,283 @@ fn hash_ref_map(map: &HashMap<String, Vec<RefLabel>>) -> u64 {
     }
     hasher.finish()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        truncate_in_place, days_to_ymd, format_timestamp,
+        lane_color_for, hash_ref_map, render_lane_chars,
+    };
+    use crate::graph::{GraphRow, LaneCell};
+    use crate::git::{CommitInfo, RefLabel};
+    use reef_protocol::Color;
+    use std::collections::HashMap;
+
+    fn blank_commit() -> CommitInfo {
+        CommitInfo {
+            oid: String::new(),
+            short_oid: String::new(),
+            parents: vec![],
+            author_name: String::new(),
+            author_email: String::new(),
+            time: 0,
+            subject: String::new(),
+        }
+    }
+
+    fn row(cells: Vec<LaneCell>, node_col: usize) -> GraphRow {
+        GraphRow { cells, node_col, commit: blank_commit() }
+    }
+
+    // ── truncate_in_place ────────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_no_change_when_within_limit() {
+        let mut s = "hello".to_string();
+        truncate_in_place(&mut s, 8);
+        assert_eq!(s, "hello");
+    }
+
+    #[test]
+    fn truncate_no_change_at_exact_limit() {
+        let mut s = "hello".to_string();
+        truncate_in_place(&mut s, 5);
+        assert_eq!(s, "hello");
+    }
+
+    #[test]
+    fn truncate_over_limit_appends_ellipsis() {
+        let mut s = "hello world".to_string();
+        truncate_in_place(&mut s, 8);
+        assert_eq!(s, "hello w…");
+    }
+
+    #[test]
+    fn truncate_max_zero_clears_string() {
+        let mut s = "hello".to_string();
+        truncate_in_place(&mut s, 0);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn truncate_multibyte_chars() {
+        let mut s = "你好世界".to_string();
+        truncate_in_place(&mut s, 3);
+        assert_eq!(s, "你好…");
+    }
+
+    // ── days_to_ymd ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn days_to_ymd_epoch() {
+        assert_eq!(days_to_ymd(0), (1970, 1, 1));
+    }
+
+    #[test]
+    fn days_to_ymd_one_day_after_epoch() {
+        assert_eq!(days_to_ymd(1), (1970, 1, 2));
+    }
+
+    #[test]
+    fn days_to_ymd_known_date_2020_01_01() {
+        // 2020-01-01 = day 18262 since epoch
+        assert_eq!(days_to_ymd(18262), (2020, 1, 1));
+    }
+
+    #[test]
+    fn days_to_ymd_leap_day_2000_02_29() {
+        // 2000-02-29 = day 11016 since epoch
+        assert_eq!(days_to_ymd(11016), (2000, 2, 29));
+    }
+
+    // ── format_timestamp ─────────────────────────────────────────────────────
+
+    #[test]
+    fn format_timestamp_epoch() {
+        assert_eq!(format_timestamp(0), "1970-01-01 00:00:00 UTC");
+    }
+
+    #[test]
+    fn format_timestamp_known() {
+        // 2020-01-01 00:00:00 UTC = 1577836800
+        assert_eq!(format_timestamp(1577836800), "2020-01-01 00:00:00 UTC");
+    }
+
+    #[test]
+    fn format_timestamp_with_time() {
+        // 1970-01-01 01:02:03 UTC = 3723
+        assert_eq!(format_timestamp(3723), "1970-01-01 01:02:03 UTC");
+    }
+
+    // ── lane_color_for ───────────────────────────────────────────────────────
+
+    #[test]
+    fn lane_color_for_col_zero() {
+        assert_eq!(lane_color_for(0), Color::named("cyan"));
+    }
+
+    #[test]
+    fn lane_color_for_cycles_back() {
+        // Palette has 6 entries; col 6 should equal col 0
+        assert_eq!(lane_color_for(6), lane_color_for(0));
+    }
+
+    #[test]
+    fn lane_color_for_all_distinct_in_one_cycle() {
+        let colors: Vec<Color> = (0..6).map(lane_color_for).collect();
+        for i in 0..6 {
+            for j in (i + 1)..6 {
+                assert_ne!(colors[i], colors[j], "cols {} and {} should differ", i, j);
+            }
+        }
+    }
+
+    // ── hash_ref_map ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn hash_ref_map_empty_is_stable() {
+        let h1 = hash_ref_map(&HashMap::new());
+        let h2 = hash_ref_map(&HashMap::new());
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn hash_ref_map_same_content_same_hash() {
+        let mut m1: HashMap<String, Vec<RefLabel>> = HashMap::new();
+        m1.insert("abc".to_string(), vec![RefLabel::Head]);
+        let mut m2 = m1.clone();
+        m2.insert("abc".to_string(), vec![RefLabel::Head]);
+        assert_eq!(hash_ref_map(&m1), hash_ref_map(&m2));
+    }
+
+    #[test]
+    fn hash_ref_map_different_content_different_hash() {
+        let mut m1: HashMap<String, Vec<RefLabel>> = HashMap::new();
+        m1.insert("abc".to_string(), vec![RefLabel::Head]);
+        let mut m2: HashMap<String, Vec<RefLabel>> = HashMap::new();
+        m2.insert("abc".to_string(), vec![RefLabel::Branch("main".to_string())]);
+        assert_ne!(hash_ref_map(&m1), hash_ref_map(&m2));
+    }
+
+    // ── render_lane_chars ────────────────────────────────────────────────────
+
+    #[test]
+    fn render_lane_chars_empty_cells() {
+        assert!(render_lane_chars(&row(vec![], 0)).is_empty());
+    }
+
+    #[test]
+    fn render_lane_chars_single_node() {
+        let r = row(vec![LaneCell::Node], 0);
+        assert_eq!(render_lane_chars(&r), vec!['●']);
+    }
+
+    #[test]
+    fn render_lane_chars_node_and_pass() {
+        let r = row(vec![LaneCell::Node, LaneCell::Pass], 0);
+        assert_eq!(render_lane_chars(&r), vec!['●', '│']);
+    }
+
+    #[test]
+    fn render_lane_chars_pass_and_node() {
+        let r = row(vec![LaneCell::Pass, LaneCell::Node], 1);
+        assert_eq!(render_lane_chars(&r), vec!['│', '●']);
+    }
+
+    #[test]
+    fn render_lane_chars_node_and_fork_right() {
+        // Fork at col 1, to col 0 (node is to the left)
+        let r = row(vec![LaneCell::Node, LaneCell::Fork { to: 0 }], 0);
+        // Fork{to} where col(1) > to(0) → '╮'
+        assert_eq!(render_lane_chars(&r), vec!['●', '╮']);
+    }
+
+    #[test]
+    fn render_lane_chars_merge_fills_horizontal() {
+        // Node at col 0, Empty at col 1, Merge{from:0} at col 2
+        let r = row(
+            vec![LaneCell::Node, LaneCell::Empty, LaneCell::Merge { from: 0 }],
+            0,
+        );
+        let glyphs = render_lane_chars(&r);
+        // Merge at col 2, from 0: col(2) > from(0) → '┤'; gap at col 1 filled with '─'
+        assert_eq!(glyphs, vec!['●', '─', '┤']);
+    }
+
+    // ── ref_label_span ───────────────────────────────────────────────────────
+
+    #[test]
+    fn ref_label_span_head() {
+        let span = super::ref_label_span(&RefLabel::Head);
+        assert_eq!(span.text, " HEAD ");
+        assert_eq!(span.fg, Some(Color::named("black")));
+        assert_eq!(span.bg, Some(Color::named("cyan")));
+        assert_eq!(span.bold, Some(true));
+    }
+
+    #[test]
+    fn ref_label_span_branch() {
+        let span = super::ref_label_span(&RefLabel::Branch("main".into()));
+        assert_eq!(span.text, " main ");
+        assert_eq!(span.bg, Some(Color::named("green")));
+    }
+
+    #[test]
+    fn ref_label_span_remote_branch() {
+        let span = super::ref_label_span(&RefLabel::RemoteBranch("origin/main".into()));
+        assert_eq!(span.text, " origin/main ");
+        assert_eq!(span.bg, Some(Color::named("darkGray")));
+    }
+
+    #[test]
+    fn ref_label_span_tag() {
+        let span = super::ref_label_span(&RefLabel::Tag("v1.0".into()));
+        assert_eq!(span.text, " tag: v1.0 ");
+        assert_eq!(span.bg, Some(Color::named("yellow")));
+    }
+
+    // ── append_diff_lines ────────────────────────────────────────────────────
+
+    #[test]
+    fn append_diff_lines_hunk_header_is_cyan() {
+        use crate::git::{DiffContent, DiffHunk, DiffLine, LineTag as GitLineTag};
+        let diff = DiffContent {
+            file_path: "foo.rs".into(),
+            hunks: vec![DiffHunk {
+                header: "@@ -1,3 +1,3 @@".into(),
+                lines: vec![],
+            }],
+        };
+        let mut out = Vec::new();
+        super::append_diff_lines(&mut out, &diff);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].spans[0].text, "@@ -1,3 +1,3 @@");
+        assert_eq!(out[0].spans[0].fg, Some(Color::named("cyan")));
+    }
+
+    #[test]
+    fn append_diff_lines_colors_by_tag() {
+        use crate::git::{DiffContent, DiffHunk, DiffLine, LineTag as GitLineTag};
+        let diff = DiffContent {
+            file_path: "foo.rs".into(),
+            hunks: vec![DiffHunk {
+                header: "@@ @@".into(),
+                lines: vec![
+                    DiffLine { tag: GitLineTag::Added,   content: "add".into(), old_lineno: None, new_lineno: Some(1) },
+                    DiffLine { tag: GitLineTag::Removed, content: "rm".into(),  old_lineno: Some(1), new_lineno: None },
+                    DiffLine { tag: GitLineTag::Context, content: "ctx".into(), old_lineno: Some(2), new_lineno: Some(2) },
+                ],
+            }],
+        };
+        let mut out = Vec::new();
+        super::append_diff_lines(&mut out, &diff);
+        // 1 header + 3 content lines
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[1].spans[0].text, "+");
+        assert_eq!(out[1].spans[0].fg, Some(Color::named("green")));
+        assert_eq!(out[2].spans[0].text, "-");
+        assert_eq!(out[2].spans[0].fg, Some(Color::named("red")));
+        assert_eq!(out[3].spans[0].text, " ");
+        assert_eq!(out[3].spans[0].fg, Some(Color::named("white")));
+    }
+}

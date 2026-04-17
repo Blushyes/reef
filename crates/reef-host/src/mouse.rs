@@ -71,3 +71,57 @@ impl HitTestRegistry {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_has_no_regions() {
+        let r = HitTestRegistry::new();
+        assert!(r.hit_test(0, 0).is_none());
+    }
+
+    #[test]
+    fn hit_test_returns_registered_action() {
+        let mut r = HitTestRegistry::new();
+        r.register_row(10, 5, 20, ClickAction::ToggleStaged);
+        assert!(matches!(r.hit_test(15, 5), Some(ClickAction::ToggleStaged)));
+    }
+
+    #[test]
+    fn hit_test_misses_outside_rect() {
+        let mut r = HitTestRegistry::new();
+        r.register_row(10, 5, 20, ClickAction::ToggleStaged);
+        assert!(r.hit_test(9, 5).is_none(), "col just to the left");
+        assert!(r.hit_test(30, 5).is_none(), "col at right edge (exclusive)");
+        assert!(r.hit_test(15, 4).is_none(), "row above");
+        assert!(r.hit_test(15, 6).is_none(), "row below (single-row region)");
+    }
+
+    #[test]
+    fn hit_test_later_region_takes_priority() {
+        let mut r = HitTestRegistry::new();
+        r.register_row(0, 0, 10, ClickAction::ToggleStaged);
+        r.register_row(0, 0, 10, ClickAction::ToggleUnstaged);
+        // Later registration should win on overlap
+        assert!(matches!(r.hit_test(5, 0), Some(ClickAction::ToggleUnstaged)));
+    }
+
+    #[test]
+    fn clear_removes_all_regions() {
+        let mut r = HitTestRegistry::new();
+        r.register_row(0, 0, 10, ClickAction::ToggleStaged);
+        r.clear();
+        assert!(r.hit_test(5, 0).is_none());
+    }
+
+    #[test]
+    fn hit_test_inclusive_left_exclusive_right() {
+        let mut r = HitTestRegistry::new();
+        r.register_row(10, 0, 5, ClickAction::ToggleStaged); // cols 10..15
+        assert!(r.hit_test(10, 0).is_some(), "left edge is inclusive");
+        assert!(r.hit_test(14, 0).is_some(), "last valid col");
+        assert!(r.hit_test(15, 0).is_none(), "right edge is exclusive");
+    }
+}

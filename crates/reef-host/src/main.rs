@@ -245,6 +245,28 @@ fn handle_key_git(key: event::KeyEvent, app: &mut App) {
                 app.diff_scroll += 20;
             }
         },
+        KeyCode::Left if app.active_panel == Panel::Diff => {
+            let step = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                10
+            } else {
+                1
+            };
+            app.diff_h_scroll = app.diff_h_scroll.saturating_sub(step);
+        }
+        KeyCode::Right if app.active_panel == Panel::Diff => {
+            let step = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                10
+            } else {
+                1
+            };
+            app.diff_h_scroll = app.diff_h_scroll.saturating_add(step);
+        }
+        KeyCode::Home if app.active_panel == Panel::Diff => {
+            app.diff_h_scroll = 0;
+        }
+        KeyCode::End if app.active_panel == Panel::Diff => {
+            app.diff_h_scroll = usize::MAX; // render 自动钳到实际最大值
+        }
         KeyCode::Char('s') => {
             if !app.route_key_to_plugin("s") {
                 if let Some(ref sel) = app.selected_file.clone() {
@@ -322,6 +344,28 @@ fn handle_key_files(key: event::KeyEvent, app: &mut App) {
                 app.preview_scroll += 20;
             }
         },
+        KeyCode::Left if app.active_panel == Panel::Diff => {
+            let step = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                10
+            } else {
+                1
+            };
+            app.preview_h_scroll = app.preview_h_scroll.saturating_sub(step);
+        }
+        KeyCode::Right if app.active_panel == Panel::Diff => {
+            let step = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                10
+            } else {
+                1
+            };
+            app.preview_h_scroll = app.preview_h_scroll.saturating_add(step);
+        }
+        KeyCode::Home if app.active_panel == Panel::Diff => {
+            app.preview_h_scroll = 0;
+        }
+        KeyCode::End if app.active_panel == Panel::Diff => {
+            app.preview_h_scroll = usize::MAX;
+        }
         KeyCode::Enter => {
             let idx = app.file_tree.selected;
             if let Some(entry) = app.file_tree.entries.get(idx) {
@@ -400,6 +444,11 @@ fn handle_mouse<B: ratatui::backend::Backend>(
         }
         MouseEventKind::ScrollUp => {
             let total_width = terminal.size().map(|s| s.width).unwrap_or(80);
+            // Shift + 滚轮 = 横向滚动（兼容不发 ScrollLeft/Right 的终端）
+            if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                apply_horizontal_scroll(app, mouse.column, total_width, -3);
+                return;
+            }
             let split_x = total_width * app.split_percent / 100;
             let is_left = mouse.column < split_x;
             match app.active_tab {
@@ -428,6 +477,10 @@ fn handle_mouse<B: ratatui::backend::Backend>(
         }
         MouseEventKind::ScrollDown => {
             let total_width = terminal.size().map(|s| s.width).unwrap_or(80);
+            if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                apply_horizontal_scroll(app, mouse.column, total_width, 3);
+                return;
+            }
             let split_x = total_width * app.split_percent / 100;
             let is_left = mouse.column < split_x;
             match app.active_tab {
@@ -453,6 +506,14 @@ fn handle_mouse<B: ratatui::backend::Backend>(
                     }
                 }
             }
+        }
+        MouseEventKind::ScrollLeft => {
+            let total_width = terminal.size().map(|s| s.width).unwrap_or(80);
+            apply_horizontal_scroll(app, mouse.column, total_width, -3);
+        }
+        MouseEventKind::ScrollRight => {
+            let total_width = terminal.size().map(|s| s.width).unwrap_or(80);
+            apply_horizontal_scroll(app, mouse.column, total_width, 3);
         }
         MouseEventKind::Moved => {
             app.hover_row = Some(mouse.row);
@@ -483,5 +544,27 @@ fn scroll_panel(app: &mut App, panel_id: &str, delta: i32) {
         entry.saturating_sub(delta.unsigned_abs() as usize)
     } else {
         entry.saturating_add(delta as usize)
+    };
+}
+
+/// Apply a horizontal-scroll delta (in display columns) to the preview / diff
+/// panel under the cursor. Events landing on the left sidebar or on the Graph
+/// tab's plugin-owned panel are ignored — the Graph panel needs a protocol
+/// extension for horizontal scroll which we haven't done yet.
+fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: i32) {
+    let split_x = total_width * app.split_percent / 100;
+    let is_left = column < split_x;
+    if is_left {
+        return;
+    }
+    let target = match app.active_tab {
+        Tab::Files => &mut app.preview_h_scroll,
+        Tab::Git => &mut app.diff_h_scroll,
+        Tab::Graph => return,
+    };
+    *target = if delta < 0 {
+        target.saturating_sub(delta.unsigned_abs() as usize)
+    } else {
+        target.saturating_add(delta as usize)
     };
 }

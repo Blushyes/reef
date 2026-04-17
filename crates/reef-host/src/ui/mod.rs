@@ -3,6 +3,7 @@ pub mod file_panel;
 pub mod file_preview_panel;
 pub mod file_tree_panel;
 pub mod plugin_panel;
+pub mod text;
 
 use crate::app::{App, Tab};
 use crate::mouse::ClickAction;
@@ -319,6 +320,10 @@ fn render_help(f: &mut Frame, screen: Rect, plugin_entries: &[crate::plugin::man
         ("↓ / j", "向下导航 / 向下滚动"),
         ("PageUp", "快速向上翻页"),
         ("PageDown", "快速向下翻页"),
+        ("← / →", "横向滚动（Diff/预览 面板聚焦时）"),
+        ("Shift+← / Shift+→", "横向快速滚动（10 列）"),
+        ("Home / End", "回到行首 / 跳到行尾"),
+        ("Shift+滚轮 / 触控板横划", "鼠标横向滚动"),
         ("m", "切换 Diff 布局（上下 ↔ 左右）"),
         ("f", "切换 Diff 模式（局部 ↔ 全量）"),
         ("v", "文字选择模式"),
@@ -335,7 +340,7 @@ fn render_help(f: &mut Frame, screen: Rect, plugin_entries: &[crate::plugin::man
             0
         };
 
-    let popup_w = 62u16;
+    let popup_w = 72u16;
     let popup_h = total_rows as u16 + 4;
     let x = screen.x + screen.width.saturating_sub(popup_w) / 2;
     let y = screen.y + screen.height.saturating_sub(popup_h) / 2;
@@ -357,7 +362,7 @@ fn render_help(f: &mut Frame, screen: Rect, plugin_entries: &[crate::plugin::man
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let key_col = 15usize;
+    let key_col = 24usize;
     let mut row_y = inner.y;
 
     for (key, desc) in core_entries {

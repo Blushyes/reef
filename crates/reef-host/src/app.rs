@@ -64,12 +64,14 @@ pub struct App {
     pub unstaged_collapsed: bool,
     pub file_scroll: usize,
     pub diff_scroll: usize,
+    pub diff_h_scroll: usize,
 
     // ── Files tab state ──
     pub file_tree: FileTree,
     pub preview_content: Option<PreviewContent>,
     pub tree_scroll: usize,
     pub preview_scroll: usize,
+    pub preview_h_scroll: usize,
 
     // Layout
     pub split_percent: u16,
@@ -129,10 +131,12 @@ impl App {
             unstaged_collapsed: false,
             file_scroll: 0,
             diff_scroll: 0,
+            diff_h_scroll: 0,
             file_tree,
             preview_content: None,
             tree_scroll: 0,
             preview_scroll: 0,
+            preview_h_scroll: 0,
             split_percent: 30,
             dragging_split: false,
             hit_registry: HitTestRegistry::new(),
@@ -203,6 +207,7 @@ impl App {
                 self.preview_content = new_content;
                 if !same_file {
                     self.preview_scroll = 0;
+                    self.preview_h_scroll = 0;
                 }
             }
         }
@@ -214,6 +219,7 @@ impl App {
             is_staged,
         });
         self.diff_scroll = 0;
+        self.diff_h_scroll = 0;
         self.load_diff();
     }
 
@@ -236,6 +242,7 @@ impl App {
             DiffLayout::SideBySide => DiffLayout::Unified,
         };
         self.diff_scroll = 0;
+        self.diff_h_scroll = 0;
         save_prefs(self.diff_layout, self.diff_mode);
     }
 
@@ -245,6 +252,7 @@ impl App {
             DiffMode::FullFile => DiffMode::Compact,
         };
         self.diff_scroll = 0;
+        self.diff_h_scroll = 0;
         self.load_diff();
         save_prefs(self.diff_layout, self.diff_mode);
     }
@@ -371,6 +379,7 @@ impl App {
                             is_staged: staged,
                         });
                         self.diff_scroll = 0;
+                        self.diff_h_scroll = 0;
                         self.load_diff();
                     }
                 }
@@ -464,6 +473,7 @@ impl App {
             is_staged: staged,
         });
         self.diff_scroll = 0;
+        self.diff_h_scroll = 0;
     }
 
     /// Returns the plugin panel_id for the currently focused panel, if any.

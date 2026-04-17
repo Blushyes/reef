@@ -1,10 +1,12 @@
 use crate::app::App;
 use crate::file_tree::PreviewContent;
+use crate::ui::text::{clip_spans, skip_n_columns, truncate_to_width};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding};
+use unicode_width::UnicodeWidthStr;
 
 pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default().padding(Padding::new(1, 1, 0, 0));
@@ -95,6 +97,19 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewCon
     let gutter_w = 6usize; // " NNNNN "
     let content_w = (area.width as usize).saturating_sub(gutter_w);
 
+    // Clamp horizontal scroll against the widest line currently in view.
+    let max_visible_w: usize = preview
+        .lines
+        .iter()
+        .skip(app.preview_scroll)
+        .take(content_height)
+        .map(|l| UnicodeWidthStr::width(l.as_str()))
+        .max()
+        .unwrap_or(0);
+    let max_h = max_visible_w.saturating_sub(content_w);
+    app.preview_h_scroll = app.preview_h_scroll.min(max_h);
+    let h = app.preview_h_scroll;
+
     for (i, line) in preview.lines.iter().skip(app.preview_scroll).enumerate() {
         let cy = y + i as u16;
         if cy >= max_y {
@@ -110,9 +125,10 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewCon
 
         let mut spans = vec![gutter];
         match preview.highlighted.as_ref().and_then(|h| h.get(real_idx)) {
-            Some(tokens) => spans.extend(truncate_spans(tokens, content_w)),
+            Some(tokens) => spans.extend(clip_spans(tokens, h, content_w)),
             None => {
-                let display = truncate_to_width(line, content_w);
+                let shifted = skip_n_columns(line, h);
+                let display = truncate_to_width(shifted, content_w);
                 spans.push(Span::styled(display, Style::default().fg(Color::Gray)));
             }
         }
@@ -120,54 +136,4 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewCon
         let rendered = Line::from(spans);
         f.render_widget(rendered, Rect::new(area.x, cy, area.width, 1));
     }
-}
-
-/// Truncate a string to fit within `max_width` display columns.
-fn truncate_to_width(s: &str, max_width: usize) -> &str {
-    let mut width = 0;
-    for (i, c) in s.char_indices() {
-        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-        if width + cw > max_width {
-            return &s[..i];
-        }
-        width += cw;
-    }
-    s
-}
-
-/// Truncate a sequence of styled tokens to fit within `max_width` display columns.
-fn truncate_spans<'a>(tokens: &'a [(Style, String)], max_width: usize) -> Vec<Span<'a>> {
-    let mut out = Vec::with_capacity(tokens.len());
-    let mut width = 0usize;
-    for (style, text) in tokens {
-        if width >= max_width {
-            break;
-        }
-        let remaining = max_width - width;
-        let mut tok_w = 0usize;
-        let mut cut: Option<usize> = None;
-        for (i, c) in text.char_indices() {
-            let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-            if tok_w + cw > remaining {
-                cut = Some(i);
-                break;
-            }
-            tok_w += cw;
-        }
-        match cut {
-            Some(i) => {
-                if i > 0 {
-                    out.push(Span::styled(&text[..i], *style));
-                }
-                break;
-            }
-            None => {
-                if !text.is_empty() {
-                    out.push(Span::styled(text.as_str(), *style));
-                }
-                width += tok_w;
-            }
-        }
-    }
-    out
 }

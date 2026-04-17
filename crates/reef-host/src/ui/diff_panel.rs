@@ -1,5 +1,6 @@
 use crate::app::{App, DiffLayout};
 use crate::git::{DiffContent, DiffHunk, LineTag};
+use crate::ui::text::{skip_n_columns, truncate_to_width};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -7,19 +8,21 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding};
 use unicode_width::UnicodeWidthStr;
 
-pub fn render(f: &mut Frame, app: &App, area: Rect) {
+pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default().padding(Padding::new(1, 1, 0, 0));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    match &app.diff_content {
-        None => render_empty(f, inner),
+    match app.diff_content.take() {
+        None => {
+            render_empty(f, inner);
+        }
         Some(diff) => {
-            let diff = diff.clone();
             match app.diff_layout {
                 DiffLayout::Unified => render_unified(f, app, inner, &diff),
                 DiffLayout::SideBySide => render_side_by_side(f, app, inner, &diff),
             }
+            app.diff_content = Some(diff);
         }
     }
 }
@@ -39,7 +42,7 @@ fn render_empty(f: &mut Frame, area: Rect) {
 
 // ─── Unified view ────────────────────────────────────────────────────────────
 
-fn render_unified(f: &mut Frame, app: &App, area: Rect, diff: &DiffContent) {
+fn render_unified(f: &mut Frame, app: &mut App, area: Rect, diff: &DiffContent) {
     let mut y = area.y;
     let max_y = area.y + area.height;
 
@@ -62,17 +65,36 @@ fn render_unified(f: &mut Frame, app: &App, area: Rect, diff: &DiffContent) {
         }
     }
 
+    let gutter_width = 15usize; // " XXXXX  XXXXX  "
+    let content_w = (area.width as usize).saturating_sub(gutter_width);
+    let visible_rows = max_y.saturating_sub(y) as usize;
+
+    // Clamp horizontal scroll against the widest Content line currently in view.
+    let max_visible_w: usize = all_lines
+        .iter()
+        .skip(app.diff_scroll)
+        .take(visible_rows)
+        .filter_map(|dl| match dl {
+            UnifiedLine::Content { text, .. } => Some(UnicodeWidthStr::width(text.as_str())),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let max_h = max_visible_w.saturating_sub(content_w);
+    app.diff_h_scroll = app.diff_h_scroll.min(max_h);
+    let h = app.diff_h_scroll;
+
     let scroll = app.diff_scroll;
     for dl in all_lines.iter().skip(scroll) {
         if y >= max_y {
             break;
         }
-        render_unified_line(f, area, y, dl);
+        render_unified_line(f, area, y, dl, h);
         y += 1;
     }
 }
 
-fn render_unified_line(f: &mut Frame, area: Rect, y: u16, dl: &UnifiedLine) {
+fn render_unified_line(f: &mut Frame, area: Rect, y: u16, dl: &UnifiedLine, h_scroll: usize) {
     match dl {
         UnifiedLine::Separator => {
             let line = Line::from(Span::styled(
@@ -100,7 +122,8 @@ fn render_unified_line(f: &mut Frame, area: Rect, y: u16, dl: &UnifiedLine) {
 
             let gutter_width = 15usize; // " XXXXX  XXXXX  "
             let max_text = (area.width as usize).saturating_sub(gutter_width);
-            let display_text = truncate_to_width(text, max_text);
+            let shifted = skip_n_columns(text, h_scroll);
+            let display_text = truncate_to_width(shifted, max_text);
             let pad = max_text.saturating_sub(UnicodeWidthStr::width(display_text));
 
             let line = Line::from(vec![
@@ -222,7 +245,7 @@ fn build_sbs_lines(hunk: &DiffHunk) -> Vec<SbsDisplayLine> {
     rows
 }
 
-fn render_side_by_side(f: &mut Frame, app: &App, area: Rect, diff: &DiffContent) {
+fn render_side_by_side(f: &mut Frame, app: &mut App, area: Rect, diff: &DiffContent) {
     let mut y = area.y;
     let max_y = area.y + area.height;
 
@@ -240,6 +263,31 @@ fn render_side_by_side(f: &mut Frame, app: &App, area: Rect, diff: &DiffContent)
     // Half width: leave 1 col for center divider
     let half_w = (area.width.saturating_sub(1)) / 2;
     let right_w = area.width.saturating_sub(half_w + 1);
+
+    // Gutter: " XXXXX " = 7 cols per side
+    let gutter = 7usize;
+    let left_content_w = (half_w as usize).saturating_sub(gutter);
+    let right_content_w = (right_w as usize).saturating_sub(gutter);
+    let visible_rows = max_y.saturating_sub(y) as usize;
+
+    // Clamp horizontal scroll against the widest text column in view (either side).
+    let max_visible_w: usize = all_lines
+        .iter()
+        .skip(app.diff_scroll)
+        .take(visible_rows)
+        .filter_map(|dl| match dl {
+            SbsDisplayLine::Row(row) => Some(
+                UnicodeWidthStr::width(row.left_text.as_str())
+                    .max(UnicodeWidthStr::width(row.right_text.as_str())),
+            ),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let side_content_w = left_content_w.min(right_content_w);
+    let max_h = max_visible_w.saturating_sub(side_content_w);
+    app.diff_h_scroll = app.diff_h_scroll.min(max_h);
+    let h = app.diff_h_scroll;
 
     let scroll = app.diff_scroll;
     for dl in all_lines.iter().skip(scroll) {
@@ -266,14 +314,22 @@ fn render_side_by_side(f: &mut Frame, app: &App, area: Rect, diff: &DiffContent)
                 f.render_widget(line, Rect::new(area.x, y, area.width, 1));
             }
             SbsDisplayLine::Row(row) => {
-                render_sbs_row(f, area, y, row, half_w, right_w);
+                render_sbs_row(f, area, y, row, half_w, right_w, h);
             }
         }
         y += 1;
     }
 }
 
-fn render_sbs_row(f: &mut Frame, area: Rect, y: u16, row: &SbsRow, half_w: u16, right_w: u16) {
+fn render_sbs_row(
+    f: &mut Frame,
+    area: Rect,
+    y: u16,
+    row: &SbsRow,
+    half_w: u16,
+    right_w: u16,
+    h_scroll: usize,
+) {
     // Gutter: " XXXXX " = 7 cols
     let gutter = 7usize;
 
@@ -281,7 +337,8 @@ fn render_sbs_row(f: &mut Frame, area: Rect, y: u16, row: &SbsRow, half_w: u16, 
     let left_content_w = (half_w as usize).saturating_sub(gutter);
     let (_, left_fg, left_bg) = line_style(row.left_tag);
     let left_no = fmt_lineno(row.left_no);
-    let left_text = truncate_to_width(&row.left_text, left_content_w);
+    let left_shifted = skip_n_columns(&row.left_text, h_scroll);
+    let left_text = truncate_to_width(left_shifted, left_content_w);
     let left_pad = left_content_w.saturating_sub(UnicodeWidthStr::width(left_text));
 
     let left_line = Line::from(vec![
@@ -306,7 +363,8 @@ fn render_sbs_row(f: &mut Frame, area: Rect, y: u16, row: &SbsRow, half_w: u16, 
     let right_content_w = (right_w as usize).saturating_sub(gutter);
     let (_, right_fg, right_bg) = line_style(row.right_tag);
     let right_no = fmt_lineno(row.right_no);
-    let right_text = truncate_to_width(&row.right_text, right_content_w);
+    let right_shifted = skip_n_columns(&row.right_text, h_scroll);
+    let right_text = truncate_to_width(right_shifted, right_content_w);
     let right_pad = right_content_w.saturating_sub(UnicodeWidthStr::width(right_text));
 
     let right_line = Line::from(vec![
@@ -386,19 +444,6 @@ fn line_style(tag: LineTag) -> (&'static str, Color, Color) {
 fn fmt_lineno(n: Option<u32>) -> String {
     n.map(|v| format!("{:>5}", v))
         .unwrap_or_else(|| "     ".to_string())
-}
-
-/// Truncate a string to fit within `max_width` display columns.
-fn truncate_to_width(s: &str, max_width: usize) -> &str {
-    let mut width = 0;
-    for (i, c) in s.char_indices() {
-        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-        if width + cw > max_width {
-            return &s[..i];
-        }
-        width += cw;
-    }
-    s
 }
 
 #[cfg(test)]
@@ -483,34 +528,6 @@ mod tests {
     #[test]
     fn fmt_lineno_large_fills_field() {
         assert_eq!(fmt_lineno(Some(99999)), "99999");
-    }
-
-    // ── truncate_to_width ────────────────────────────────────────────────────
-
-    #[test]
-    fn truncate_to_width_ascii_within_limit() {
-        assert_eq!(truncate_to_width("hello", 10), "hello");
-    }
-
-    #[test]
-    fn truncate_to_width_ascii_exact() {
-        assert_eq!(truncate_to_width("hello", 5), "hello");
-    }
-
-    #[test]
-    fn truncate_to_width_ascii_over_limit() {
-        assert_eq!(truncate_to_width("hello world", 5), "hello");
-    }
-
-    #[test]
-    fn truncate_to_width_cjk() {
-        // Each CJK char is width 2; max_width=4 → two chars fit
-        assert_eq!(truncate_to_width("你好世界", 4), "你好");
-    }
-
-    #[test]
-    fn truncate_to_width_cjk_within_limit() {
-        assert_eq!(truncate_to_width("你好", 4), "你好");
     }
 
     // ── build_sbs_lines ──────────────────────────────────────────────────────

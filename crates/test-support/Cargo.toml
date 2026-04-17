@@ -1,0 +1,15 @@
+[package]
+name = "test-support"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+reef-protocol = { path = "../reef-protocol" }
+reef-git      = { path = "../reef-git" }
+git2          = { version = "0.20.4", default-features = false }
+tempfile      = "3"
+serde_json    = { workspace = true }

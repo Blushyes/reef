@@ -1,0 +1,24 @@
+---
+source: crates/reef-host/tests/ui_snapshots.rs
+expression: output
+---
+ reef  [TMPDIR]  ⎇ master
+ 📁  Files │ ⎇ Git │ ⑂ Graph                                1:Files 2:Git 3:Graph
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │                 选 择 一 个 文 件 查 看  diff
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                     q:退 出  Tab:切 换  s:暂 存  u:取 消  r:刷 新  h:帮 助

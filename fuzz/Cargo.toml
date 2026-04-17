@@ -1,0 +1,32 @@
+[package]
+name = "reef-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary     = { version = "1", features = ["derive"] }
+reef-protocol = { path = "../crates/reef-protocol" }
+reef-git      = { path = "../crates/reef-git" }
+
+[[bin]]
+name = "read_message"
+path = "fuzz_targets/read_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "build_graph"
+path = "fuzz_targets/build_graph.rs"
+test = false
+doc = false
+bench = false
+
+# This crate is excluded from the workspace via workspace's default-members.
+# Run fuzz targets with `cargo +nightly fuzz run <target>` from this directory.
+[workspace]

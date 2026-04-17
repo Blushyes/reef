@@ -14,7 +14,6 @@ path = "src/main.rs"
 [dependencies]
 reef-protocol = { path = "../reef-protocol" }
 git2          = { version = "0.20.4", default-features = false }
-notify        = "6"
 serde_json    = { workspace = true }
 unicode-width = "0.2.2"
 

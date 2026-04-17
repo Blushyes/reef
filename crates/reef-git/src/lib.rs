@@ -6,7 +6,6 @@ pub mod git;
 pub mod graph;
 pub mod prefs;
 pub mod tree;
-pub mod watcher;
 pub mod writer;
 
 pub use writer::Writer;

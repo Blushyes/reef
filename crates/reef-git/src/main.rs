@@ -1,6 +1,6 @@
 use reef_git::git::{CommitDetail, DiffContent, FileStatus, GitRepo, LineTag, RefLabel};
 use reef_git::writer::Writer;
-use reef_git::{git, graph, prefs, tree, watcher};
+use reef_git::{git, graph, prefs, tree};
 
 use reef_protocol::{
     Color, InitializeResult, RenderResult, RpcMessage, Span, StyledLine, read_message,
@@ -16,14 +16,6 @@ fn main() {
     let writer = Writer::new(io::stdout());
 
     let mut state = PluginState::new();
-
-    if let Some(ref repo) = state.repo {
-        if let Some(workdir) = repo.workdir() {
-            let workdir = workdir.to_path_buf();
-            let gitdir = repo.gitdir().to_path_buf();
-            watcher::spawn(workdir, gitdir, writer.clone());
-        }
-    }
 
     loop {
         let msg = match read_message(&mut reader) {
@@ -148,8 +140,7 @@ struct PluginState {
     graph_rows: Vec<graph::GraphRow>,
     ref_map: HashMap<String, Vec<RefLabel>>,
     /// (HEAD oid, refs-hash). refresh_graph skips rebuild when unchanged, so
-    /// working-tree fs events (which fire `statusChanged`) don't trigger a
-    /// full revwalk.
+    /// working-tree fs events that prompt a re-render don't trigger a full revwalk.
     graph_cache_key: Option<(String, u64)>,
     graph_selected_idx: usize,
     selected_commit: Option<String>,

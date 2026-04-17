@@ -1,9 +1,11 @@
 use crate::file_tree::{self, FileTree, PreviewContent};
+use crate::fs_watcher;
 use crate::git::{DiffContent, FileEntry, GitRepo};
 use crate::mouse::{ClickAction, HitTestRegistry};
 use crate::plugin::manager::PluginManager;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +89,10 @@ pub struct App {
     /// (file_tree, file_preview, legacy diff/file) keep their own scalars.
     pub panel_scroll: HashMap<String, usize>,
 
+    /// Host-owned fs watcher channel. `None` when the watcher couldn't start —
+    /// the sender inside the thread was dropped so `try_recv` returns `Disconnected`.
+    pub fs_watcher_rx: Option<mpsc::Receiver<()>>,
+
     // Control
     pub should_quit: bool,
     pub select_mode: bool,
@@ -107,6 +113,7 @@ impl App {
             .and_then(|r| r.workdir_path())
             .unwrap_or_else(|| PathBuf::from("."));
         let file_tree = FileTree::new(&workdir);
+        let fs_watcher_rx = Some(fs_watcher::spawn(workdir.clone()));
         let (saved_layout, saved_mode) = load_prefs();
         let mut app = Self {
             repo,
@@ -135,6 +142,7 @@ impl App {
             plugin_manager: PluginManager::new(),
             active_sidebar_panel: None,
             panel_scroll: HashMap::new(),
+            fs_watcher_rx,
             should_quit: false,
             select_mode: false,
             show_help: false,
@@ -172,11 +180,30 @@ impl App {
         }
     }
 
+    /// Rebuild the file tree from disk, applying git decorations when a repo is open.
+    /// Safe to call on any workdir — `refresh_status` handles repo/no-repo internally.
+    pub fn refresh_file_tree(&mut self) {
+        if self.repo.is_some() {
+            self.refresh_status();
+        } else {
+            self.file_tree.rebuild();
+        }
+    }
+
     pub fn load_preview(&mut self) {
         if let Some(entry) = self.file_tree.selected_entry() {
             if !entry.is_dir {
-                self.preview_content = file_tree::load_preview(&self.file_tree.root, &entry.path);
-                self.preview_scroll = 0;
+                let new_content = file_tree::load_preview(&self.file_tree.root, &entry.path);
+                // Preserve scroll when reloading the same file (fs-watcher refresh);
+                // reset only when the selected path actually changed (navigation).
+                let same_file = matches!(
+                    (self.preview_content.as_ref(), new_content.as_ref()),
+                    (Some(old), Some(new)) if old.file_path == new.file_path
+                );
+                self.preview_content = new_content;
+                if !same_file {
+                    self.preview_scroll = 0;
+                }
             }
         }
     }
@@ -508,6 +535,26 @@ impl App {
     /// Called every frame: let plugin manager process incoming messages.
     pub fn tick_plugins(&mut self) {
         self.plugin_manager.tick();
+
+        // Drain any debounced fs events from the host watcher. The watcher already
+        // coalesces bursts, so a single `()` represents one or more real changes.
+        let mut fs_dirty = false;
+        if let Some(rx) = self.fs_watcher_rx.as_ref() {
+            while rx.try_recv().is_ok() {
+                fs_dirty = true;
+            }
+        }
+        if fs_dirty {
+            self.refresh_file_tree();
+            // Host-native views cache disk/git reads; refresh them so the
+            // currently-previewed file and selected diff reflect the change.
+            self.load_preview();
+            self.load_diff();
+            // Plugins cache their own git state (refreshed inside their render
+            // handler). Forcing a re-render pulls them back in sync without a
+            // bespoke protocol message.
+            self.plugin_manager.invalidate_panels();
+        }
 
         // If the plugin refreshed its git state (after staging/unstaging), sync host file list
         if self.plugin_manager.status_refresh_needed {

@@ -332,8 +332,7 @@ fn handle_key_files(key: event::KeyEvent, app: &mut App) {
             app.load_preview();
         }
         KeyCode::Char('r') => {
-            app.file_tree.rebuild();
-            app.refresh_status(); // re-syncs git decorations
+            app.refresh_file_tree();
         }
         _ => {}
     }

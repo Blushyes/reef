@@ -22,6 +22,11 @@ jobs:
   audit:
     name: cargo-audit (RustSec CVE scan)
     runs-on: ubuntu-latest
+    # The audit action posts a check run annotation summarizing findings.
+    # That requires `checks: write` in addition to the default read perms.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2.0.0

@@ -45,7 +45,10 @@ fn set_key(key: &str, value: &str) {
 }
 
 pub fn load_tree_mode() -> bool {
-    read_all().get("tree_mode").map(|v| v == "true").unwrap_or(false)
+    read_all()
+        .get("tree_mode")
+        .map(|v| v == "true")
+        .unwrap_or(false)
 }
 
 pub fn save_tree_mode(tree_mode: bool) {

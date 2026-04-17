@@ -1232,7 +1232,10 @@ fn commit_file_row(
         Span::new(display).fg(Color::named("white")),
     ];
     if ctx.selected_file == Some(file.path.as_str()) {
-        spans = spans.into_iter().map(|s| s.bg(ctx.sel_bg.clone())).collect();
+        spans = spans
+            .into_iter()
+            .map(|s| s.bg(ctx.sel_bg.clone()))
+            .collect();
     }
     StyledLine::new(spans).on_click(
         "git.selectCommitFile",
@@ -1273,10 +1276,7 @@ fn render_commit_file_tree(
                             .fg(Color::named("cyan"))
                             .bold(),
                     ])
-                    .on_click(
-                        "git.toggleCommitDir",
-                        serde_json::json!({ "path": path }),
-                    ),
+                    .on_click("git.toggleCommitDir", serde_json::json!({ "path": path })),
                 );
                 if !is_collapsed {
                     render_commit_file_tree(children, depth + 1, ctx, out);
@@ -1716,8 +1716,8 @@ fn pair_hunk_lines(hunk: &crate::git::DiffHunk) -> Vec<SbsRow> {
                 pending_removed.push((line.old_lineno, line.content.clone()));
             }
             LineTag::Added => {
-                if let Some((old_no, old_text)) = (!pending_removed.is_empty())
-                    .then(|| pending_removed.remove(0))
+                if let Some((old_no, old_text)) =
+                    (!pending_removed.is_empty()).then(|| pending_removed.remove(0))
                 {
                     rows.push(SbsRow {
                         left_tag: LineTag::Removed,
@@ -2407,7 +2407,10 @@ mod tests {
         assert_eq!(out.len(), 2);
         let row = &out[1];
         let has_divider = row.spans.iter().any(|s| s.text == "│");
-        assert!(has_divider, "side-by-side row should contain a divider span");
+        assert!(
+            has_divider,
+            "side-by-side row should contain a divider span"
+        );
         let joined: String = row.spans.iter().map(|s| s.text.as_str()).collect();
         assert!(joined.contains("old"));
         assert!(joined.contains("new"));
@@ -2415,8 +2418,12 @@ mod tests {
 
     #[test]
     fn diff_header_line_surfaces_layout_and_mode_hints() {
-        let line =
-            super::diff_header_line("foo.rs", super::DiffLayout::SideBySide, super::DiffMode::FullFile, 80);
+        let line = super::diff_header_line(
+            "foo.rs",
+            super::DiffLayout::SideBySide,
+            super::DiffMode::FullFile,
+            80,
+        );
         let joined: String = line.spans.iter().map(|s| s.text.as_str()).collect();
         assert!(joined.starts_with("foo.rs"));
         assert!(joined.contains("[左右]"));

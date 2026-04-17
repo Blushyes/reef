@@ -132,6 +132,10 @@ struct PluginState {
     /// Path of the unstaged file pending discard confirmation. While set, the
     /// status panel shows a confirmation banner and `y`/`Esc` are intercepted.
     confirm_discard: Option<String>,
+    /// Set while a normal-push confirmation banner is shown. Mutually
+    /// exclusive with `confirm_force_push` by UI convention — only one
+    /// confirmation is ever active.
+    confirm_push: bool,
     /// Set while a force-push confirmation banner is shown. Same y/Esc
     /// interception as discard.
     confirm_force_push: bool,
@@ -176,6 +180,7 @@ impl PluginState {
             tree_mode: prefs::load_tree_mode(),
             collapsed_dirs: HashSet::new(),
             confirm_discard: None,
+            confirm_push: false,
             confirm_force_push: false,
             push_error: None,
             graph_rows: Vec::new(),
@@ -345,7 +350,7 @@ impl PluginState {
         // Selected file's diff (inline, below the file list).
         if let Some((_, diff)) = &self.commit_file_diff {
             lines.push(StyledLine::plain(""));
-            append_diff_lines(&mut lines, diff);
+            append_diff_lines(&mut lines, diff, width);
         }
 
         lines
@@ -396,26 +401,60 @@ impl PluginState {
             lines.push(StyledLine::plain(""));
         }
 
-        // ── Force-push confirmation banner ───────────────────────────────────
-        if self.confirm_force_push {
-            lines.push(StyledLine::new(vec![
-                Span::new("  ⚠ 强制推送？")
-                    .fg(Color::named("yellow"))
-                    .bold(),
-                Span::new("（会覆盖远端，使用 --force-with-lease）").fg(Color::named("yellow")),
-            ]));
+        // ── Push / force-push confirmation banner ────────────────────────────
+        // Both share the same shape (prompt + confirm/cancel + keybinding hint);
+        // only the wording and button styling differ.
+        if self.confirm_push || self.confirm_force_push {
+            let force = self.confirm_force_push;
+            let ahead = self
+                .repo
+                .as_ref()
+                .and_then(|r| r.ahead_behind())
+                .map(|(a, _)| a)
+                .unwrap_or(0);
+
+            // Prompt line
+            if force {
+                lines.push(StyledLine::new(vec![
+                    Span::new("  ⚠ 强制推送？")
+                        .fg(Color::named("yellow"))
+                        .bold(),
+                    Span::new("（会覆盖远端，使用 --force-with-lease）").fg(Color::named("yellow")),
+                ]));
+            } else {
+                let msg = if ahead > 0 {
+                    format!("  推送 {ahead} 个提交到远端？")
+                } else {
+                    "  推送到远端？".to_string()
+                };
+                lines.push(StyledLine::new(vec![
+                    Span::new(msg).fg(Color::named("white")).bold(),
+                ]));
+            }
+
+            // Buttons
+            let (confirm_label, confirm_bg, confirm_cmd) = if force {
+                (" 确认强制推送 ", "red", "git.forcePushConfirm")
+            } else {
+                (" 确认推送 ", "green", "git.pushConfirm")
+            };
+            let cancel_cmd = if force {
+                "git.forcePushCancel"
+            } else {
+                "git.pushCancel"
+            };
             lines.push(StyledLine::new(vec![
                 Span::new("  "),
-                Span::new(" 确认强制推送 ")
+                Span::new(confirm_label)
                     .fg(Color::named("black"))
-                    .bg(Color::named("red"))
+                    .bg(Color::named(confirm_bg))
                     .bold()
-                    .on_click("git.forcePushConfirm", serde_json::Value::Null),
+                    .on_click(confirm_cmd, serde_json::Value::Null),
                 Span::new("  "),
                 Span::new(" 取消 ")
                     .fg(Color::named("white"))
                     .bg(Color::named("darkGray"))
-                    .on_click("git.forcePushCancel", serde_json::Value::Null),
+                    .on_click(cancel_cmd, serde_json::Value::Null),
                 Span::new("  "),
                 Span::new("(y / Esc)").fg(Color::named("darkGray")),
             ]));
@@ -426,7 +465,11 @@ impl PluginState {
         // Showing the button while there are uncommitted changes would be
         // misleading — VSCode's git extension only shows it when there's
         // actually nothing else the user should be looking at first.
-        if self.staged.is_empty() && self.unstaged.is_empty() && !self.confirm_force_push {
+        if self.staged.is_empty()
+            && self.unstaged.is_empty()
+            && !self.confirm_push
+            && !self.confirm_force_push
+        {
             if let Some((ahead, behind)) = self.repo.as_ref().and_then(|r| r.ahead_behind()) {
                 if let Some(line) = push_indicator_line(ahead, behind) {
                     lines.push(line);
@@ -646,6 +689,10 @@ impl PluginState {
                     self.confirm_force_push = false;
                     self.run_push(true, writer);
                     true
+                } else if self.confirm_push {
+                    self.confirm_push = false;
+                    self.run_push(false, writer);
+                    true
                 } else {
                     false
                 }
@@ -657,6 +704,10 @@ impl PluginState {
                     true
                 } else if self.confirm_force_push {
                     self.confirm_force_push = false;
+                    self.request_status_render(writer);
+                    true
+                } else if self.confirm_push {
+                    self.confirm_push = false;
                     self.request_status_render(writer);
                     true
                 } else if self.push_error.is_some() {
@@ -834,12 +885,26 @@ impl PluginState {
                 self.request_status_render(writer);
                 true
             }
-            "git.push" => {
+            "git.pushPrompt" => {
+                self.confirm_push = true;
+                self.confirm_force_push = false;
+                self.push_error = None;
+                self.request_status_render(writer);
+                true
+            }
+            "git.pushConfirm" => {
+                self.confirm_push = false;
                 self.run_push(false, writer);
+                true
+            }
+            "git.pushCancel" => {
+                self.confirm_push = false;
+                self.request_status_render(writer);
                 true
             }
             "git.forcePushPrompt" => {
                 self.confirm_force_push = true;
+                self.confirm_push = false;
                 self.push_error = None;
                 self.request_status_render(writer);
                 true
@@ -1275,23 +1340,72 @@ fn render_lane_chars(row: &graph::GraphRow) -> Vec<char> {
 /// Render a DiffContent into styled lines: one header span per hunk, then
 /// per-line `+`/`-`/` ` with green/red/default coloring. Minimal version — no
 /// line numbers (plain unified patch look).
-fn append_diff_lines(out: &mut Vec<StyledLine>, diff: &DiffContent) {
-    for hunk in &diff.hunks {
-        out.push(StyledLine::new(vec![
-            Span::new(hunk.header.clone()).fg(Color::named("cyan")),
-        ]));
-        for line in &hunk.lines {
-            let (prefix, fg) = match line.tag {
-                LineTag::Added => ("+", "green"),
-                LineTag::Removed => ("-", "red"),
-                LineTag::Context => (" ", "white"),
-            };
+/// Gutter is " NNNNN  NNNNN  " (old/new line numbers) — matches the host's
+/// Git-tab diff panel so both views feel identical.
+const DIFF_GUTTER_WIDTH: usize = 15;
+
+fn append_diff_lines(out: &mut Vec<StyledLine>, diff: &DiffContent, width: u16) {
+    let added_bg = Color::rgb(0, 40, 0);
+    let removed_bg = Color::rgb(60, 0, 0);
+
+    for (i, hunk) in diff.hunks.iter().enumerate() {
+        if i > 0 {
             out.push(StyledLine::new(vec![
-                Span::new(prefix.to_string()).fg(Color::named(fg)),
-                Span::new(line.content.clone()).fg(Color::named(fg)),
+                Span::new(format!(" {:>5}  {:>5}  ⋯", "", "")).fg(Color::named("darkGray")),
             ]));
         }
+        out.push(StyledLine::new(vec![
+            Span::new(format!(" {:>5}  {:>5}  {}", "", "", hunk.header))
+                .fg(Color::named("cyan"))
+                .dim(),
+        ]));
+
+        for line in &hunk.lines {
+            let (prefix, fg, bg) = match line.tag {
+                LineTag::Added => ("+", Color::named("green"), Some(added_bg.clone())),
+                LineTag::Removed => ("-", Color::named("red"), Some(removed_bg.clone())),
+                LineTag::Context => (" ", Color::named("white"), None),
+            };
+            let old_no = fmt_diff_lineno(line.old_lineno);
+            let new_no = fmt_diff_lineno(line.new_lineno);
+
+            let max_text = (width as usize).saturating_sub(DIFF_GUTTER_WIDTH);
+            let content = truncate_to_display_width(&line.content, max_text);
+            let pad = max_text.saturating_sub(UnicodeWidthStr::width(content));
+
+            let mut gutter =
+                Span::new(format!(" {}  {} ", old_no, new_no)).fg(Color::named("darkGray"));
+            let mut marker = Span::new(format!("{} ", prefix)).fg(fg.clone());
+            let mut text = Span::new(content.to_string()).fg(fg);
+            let mut padding = Span::new(" ".repeat(pad));
+
+            if let Some(bg) = bg {
+                gutter = gutter.bg(bg.clone());
+                marker = marker.bg(bg.clone());
+                text = text.bg(bg.clone());
+                padding = padding.bg(bg);
+            }
+            out.push(StyledLine::new(vec![gutter, marker, text, padding]));
+        }
     }
+}
+
+fn fmt_diff_lineno(n: Option<u32>) -> String {
+    n.map(|v| format!("{:>5}", v))
+        .unwrap_or_else(|| "     ".to_string())
+}
+
+/// Truncate `s` to fit within `max_width` terminal columns (respects wide chars).
+fn truncate_to_display_width(s: &str, max_width: usize) -> &str {
+    let mut width = 0;
+    for (i, c) in s.char_indices() {
+        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if width + cw > max_width {
+            return &s[..i];
+        }
+        width += cw;
+    }
+    s
 }
 
 fn ref_label_span(label: &RefLabel) -> Span {
@@ -1325,7 +1439,7 @@ fn push_indicator_line(ahead: usize, behind: usize) -> Option<StyledLine> {
                 .fg(Color::named("black"))
                 .bg(Color::named("green"))
                 .bold()
-                .on_click("git.push", serde_json::Value::Null),
+                .on_click("git.pushPrompt", serde_json::Value::Null),
         ])),
         (0, b) => Some(StyledLine::new(vec![
             Span::new(format!("  ↓ 落后远端 {b} 次提交 — 请先 fetch/pull"))
@@ -1703,10 +1817,18 @@ mod tests {
             }],
         };
         let mut out = Vec::new();
-        super::append_diff_lines(&mut out, &diff);
+        super::append_diff_lines(&mut out, &diff, 80);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].spans[0].text, "@@ -1,3 +1,3 @@");
-        assert_eq!(out[0].spans[0].fg, Some(Color::named("cyan")));
+        // Hunk header now lives in a gutter-padded cyan-dim span so it aligns
+        // with the +/- rows below it.
+        let span = &out[0].spans[0];
+        assert!(
+            span.text.ends_with("@@ -1,3 +1,3 @@"),
+            "unexpected header span: {:?}",
+            span.text
+        );
+        assert_eq!(span.fg, Some(Color::named("cyan")));
+        assert_eq!(span.dim, Some(true));
     }
 
     // ── relative_time_at ─────────────────────────────────────────────────────
@@ -1785,15 +1907,59 @@ mod tests {
             }],
         };
         let mut out = Vec::new();
-        super::append_diff_lines(&mut out, &diff);
-        // 1 header + 3 content lines
+        super::append_diff_lines(&mut out, &diff, 80);
+        // 1 header + 3 content lines. Each content row is 4 spans:
+        // [gutter, "+/-/ ", content, padding].
         assert_eq!(out.len(), 4);
-        assert_eq!(out[1].spans[0].text, "+");
-        assert_eq!(out[1].spans[0].fg, Some(Color::named("green")));
-        assert_eq!(out[2].spans[0].text, "-");
-        assert_eq!(out[2].spans[0].fg, Some(Color::named("red")));
-        assert_eq!(out[3].spans[0].text, " ");
-        assert_eq!(out[3].spans[0].fg, Some(Color::named("white")));
+
+        let added = &out[1];
+        assert_eq!(added.spans.len(), 4);
+        assert_eq!(added.spans[1].text, "+ ");
+        assert_eq!(added.spans[1].fg, Some(Color::named("green")));
+        // Added rows tint the whole row dark-green (marker + text + padding).
+        assert_eq!(added.spans[1].bg, Some(Color::rgb(0, 40, 0)));
+        assert_eq!(added.spans[2].text, "add");
+        assert_eq!(added.spans[2].bg, Some(Color::rgb(0, 40, 0)));
+        // Gutter shows only the new line number for added rows.
+        assert!(added.spans[0].text.contains("1"));
+
+        let removed = &out[2];
+        assert_eq!(removed.spans[1].text, "- ");
+        assert_eq!(removed.spans[1].fg, Some(Color::named("red")));
+        assert_eq!(removed.spans[1].bg, Some(Color::rgb(60, 0, 0)));
+        assert_eq!(removed.spans[2].text, "rm");
+
+        let context = &out[3];
+        assert_eq!(context.spans[1].text, "  ");
+        assert_eq!(context.spans[1].fg, Some(Color::named("white")));
+        // Context rows have no background tint so they blend with the panel.
+        assert_eq!(context.spans[1].bg, None);
+        // Gutter shows both old and new line numbers for context rows.
+        assert!(context.spans[0].text.contains("2"));
+    }
+
+    #[test]
+    fn append_diff_lines_inserts_separator_between_hunks() {
+        use crate::git::{DiffContent, DiffHunk};
+        let diff = DiffContent {
+            file_path: "foo.rs".into(),
+            hunks: vec![
+                DiffHunk {
+                    header: "@@ -1 +1 @@".into(),
+                    lines: vec![],
+                },
+                DiffHunk {
+                    header: "@@ -10 +10 @@".into(),
+                    lines: vec![],
+                },
+            ],
+        };
+        let mut out = Vec::new();
+        super::append_diff_lines(&mut out, &diff, 80);
+        // header-1, separator, header-2
+        assert_eq!(out.len(), 3);
+        assert!(out[1].spans[0].text.contains("⋯"));
+        assert_eq!(out[1].spans[0].fg, Some(Color::named("darkGray")));
     }
 
     // ── push_indicator_line ──────────────────────────────────────────────────
@@ -1818,7 +1984,9 @@ mod tests {
             btn.text
         );
         assert_eq!(btn.bg, Some(Color::named("green")));
-        assert_eq!(btn.click_command.as_deref(), Some("git.push"));
+        // Click raises the confirmation banner rather than pushing immediately,
+        // symmetric with git.forcePushPrompt.
+        assert_eq!(btn.click_command.as_deref(), Some("git.pushPrompt"));
     }
 
     #[test]

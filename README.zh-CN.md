@@ -30,7 +30,23 @@ Reef 是一个 host 加若干插件。插件是**独立子进程**，通过 stdi
 
 完整协议见 [docs/plugin-protocol.md](./docs/plugin-protocol.md)。
 
-## 运行
+## 安装
+
+**通过 npm（推荐）：**
+
+```bash
+# 直接运行，无需安装
+npx @reef-tui/cli
+
+# 或全局安装
+npm install -g @reef-tui/cli
+reef
+```
+
+会自动选择当前平台对应的原生二进制。
+支持：macOS (arm64, x64)、Linux (arm64, x64)、Windows (x64)。
+
+**从源码构建：**
 
 ```bash
 # 必须 release 构建——内置 git 插件的清单指向 target/release/reef-git。

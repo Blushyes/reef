@@ -30,7 +30,23 @@ The name is the architecture: a reef is built up by many small independent organ
 
 See [docs/plugin-protocol.md](./docs/plugin-protocol.md) for the full protocol.
 
-## Running it
+## Install
+
+**Via npm (recommended):**
+
+```bash
+# Run without installing
+npx @reef-tui/cli
+
+# Or install globally
+npm install -g @reef-tui/cli
+reef
+```
+
+The correct native binary for your platform is selected automatically.
+Supported: macOS (arm64, x64), Linux (arm64, x64), Windows (x64).
+
+**Build from source:**
 
 ```bash
 # Release build is required — the bundled git plugin's manifest

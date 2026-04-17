@@ -1,5 +1,5 @@
-use reef_protocol::{read_message, write_message, RpcMessage};
-use std::io::{BufReader, Write};
+use reef_protocol::{RpcMessage, read_message, write_message};
+use std::io::BufReader;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -59,7 +59,11 @@ impl PluginProcess {
     }
 
     /// Send a request (with id). Returns the id assigned.
-    pub fn send_request(&mut self, method: &str, params: serde_json::Value) -> std::io::Result<u64> {
+    pub fn send_request(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> std::io::Result<u64> {
         let id = self.next_id;
         self.next_id += 1;
         let msg = RpcMessage::request(id, method, params);
@@ -68,7 +72,11 @@ impl PluginProcess {
     }
 
     /// Send a notification (no id, no response expected).
-    pub fn send_notification(&mut self, method: &str, params: serde_json::Value) -> std::io::Result<()> {
+    pub fn send_notification(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> std::io::Result<()> {
         let msg = RpcMessage::notification(method, params);
         write_message(&mut self.stdin, &msg)
     }

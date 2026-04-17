@@ -1,23 +1,16 @@
-mod app;
-mod file_tree;
-mod git;
-mod highlight;
-mod mouse;
-mod plugin;
-mod renderer;
-mod ui;
-
-use app::{App, Panel, Tab};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers,
-        MouseButton, MouseEvent, MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
+        MouseEvent, MouseEventKind,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use reef_host::app::{App, Panel, Tab};
+use reef_host::mouse;
+use reef_host::ui;
 use std::io;
 use std::panic;
 use std::time::{Duration, Instant};
@@ -54,7 +47,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Snapshot selection before processing events
-        let sel_before = app.selected_file.as_ref().map(|s| (s.path.clone(), s.is_staged));
+        let sel_before = app
+            .selected_file
+            .as_ref()
+            .map(|s| (s.path.clone(), s.is_staged));
 
         // Drain ALL pending events so rapid key repeats don't queue plugin commands
         loop {
@@ -89,13 +85,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // After draining, sync selection state
-        let sel_after = app.selected_file.as_ref().map(|s| (s.path.clone(), s.is_staged));
+        let sel_after = app
+            .selected_file
+            .as_ref()
+            .map(|s| (s.path.clone(), s.is_staged));
         if sel_after != sel_before {
             // Load diff natively in the host (no plugin round-trip)
             app.load_diff();
             // Notify plugin so the sidebar highlights the selected file
             if let Some(ref sel) = app.selected_file.clone() {
-                app.plugin_manager.queue_select_file(&sel.path, sel.is_staged);
+                app.plugin_manager
+                    .queue_select_file(&sel.path, sel.is_staged);
             }
         }
 
@@ -122,9 +122,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn handle_key(key: event::KeyEvent, app: &mut App) {
     // Global keys (work on all tabs)
     match key.code {
-        KeyCode::Char('q') => { app.should_quit = true; return; }
+        KeyCode::Char('q') => {
+            app.should_quit = true;
+            return;
+        }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.should_quit = true; return;
+            app.should_quit = true;
+            return;
         }
         KeyCode::Char(c) if matches!(c, '1'..='9') => {
             let idx = (c as u8 - b'1') as usize;
@@ -146,7 +150,10 @@ fn handle_key(key: event::KeyEvent, app: &mut App) {
             };
             return;
         }
-        KeyCode::Char('h') => { app.show_help = true; return; }
+        KeyCode::Char('h') => {
+            app.show_help = true;
+            return;
+        }
         _ => {}
     }
 
@@ -160,23 +167,39 @@ fn handle_key(key: event::KeyEvent, app: &mut App) {
 fn handle_key_graph(key: event::KeyEvent, app: &mut App) {
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => match app.active_panel {
-            Panel::Files => { app.route_key_to_plugin("k"); }
+            Panel::Files => {
+                app.route_key_to_plugin("k");
+            }
             Panel::Diff => scroll_panel(app, "git.commitDetail", -1),
         },
         KeyCode::Down | KeyCode::Char('j') => match app.active_panel {
-            Panel::Files => { app.route_key_to_plugin("j"); }
+            Panel::Files => {
+                app.route_key_to_plugin("j");
+            }
             Panel::Diff => scroll_panel(app, "git.commitDetail", 1),
         },
         KeyCode::PageUp => match app.active_panel {
-            Panel::Files => { for _ in 0..10 { app.route_key_to_plugin("k"); } }
+            Panel::Files => {
+                for _ in 0..10 {
+                    app.route_key_to_plugin("k");
+                }
+            }
             Panel::Diff => scroll_panel(app, "git.commitDetail", -20),
         },
         KeyCode::PageDown => match app.active_panel {
-            Panel::Files => { for _ in 0..10 { app.route_key_to_plugin("j"); } }
+            Panel::Files => {
+                for _ in 0..10 {
+                    app.route_key_to_plugin("j");
+                }
+            }
             Panel::Diff => scroll_panel(app, "git.commitDetail", 20),
         },
-        KeyCode::Enter => { app.route_key_to_plugin("Enter"); }
-        KeyCode::Char('r') => { app.route_key_to_plugin("r"); }
+        KeyCode::Enter => {
+            app.route_key_to_plugin("Enter");
+        }
+        KeyCode::Char('r') => {
+            app.route_key_to_plugin("r");
+        }
         _ => {}
     }
 }
@@ -185,43 +208,63 @@ fn handle_key_git(key: event::KeyEvent, app: &mut App) {
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => match app.active_panel {
             Panel::Files => app.navigate_files(-1),
-            Panel::Diff => { app.diff_scroll = app.diff_scroll.saturating_sub(1); }
+            Panel::Diff => {
+                app.diff_scroll = app.diff_scroll.saturating_sub(1);
+            }
         },
         KeyCode::Down | KeyCode::Char('j') => match app.active_panel {
             Panel::Files => app.navigate_files(1),
-            Panel::Diff => { app.diff_scroll += 1; }
+            Panel::Diff => {
+                app.diff_scroll += 1;
+            }
         },
         KeyCode::PageUp => match app.active_panel {
             Panel::Files => app.navigate_files(-10),
-            Panel::Diff => { app.diff_scroll = app.diff_scroll.saturating_sub(20); }
+            Panel::Diff => {
+                app.diff_scroll = app.diff_scroll.saturating_sub(20);
+            }
         },
         KeyCode::PageDown => match app.active_panel {
             Panel::Files => app.navigate_files(10),
-            Panel::Diff => { app.diff_scroll += 20; }
+            Panel::Diff => {
+                app.diff_scroll += 20;
+            }
         },
         KeyCode::Char('s') => {
             if !app.route_key_to_plugin("s") {
                 if let Some(ref sel) = app.selected_file.clone() {
-                    if !sel.is_staged { app.stage_file(&sel.path); }
+                    if !sel.is_staged {
+                        app.stage_file(&sel.path);
+                    }
                 }
             }
         }
         KeyCode::Char('u') => {
             if !app.route_key_to_plugin("u") {
                 if let Some(ref sel) = app.selected_file.clone() {
-                    if sel.is_staged { app.unstage_file(&sel.path); }
+                    if sel.is_staged {
+                        app.unstage_file(&sel.path);
+                    }
                 }
             }
         }
         KeyCode::Char('r') => {
             if !app.route_key_to_plugin("r") {
                 app.refresh_status();
-                if app.selected_file.is_some() { app.load_diff(); }
+                if app.selected_file.is_some() {
+                    app.load_diff();
+                }
             }
         }
-        KeyCode::Char('t') => { app.route_key_to_plugin("t"); }
-        KeyCode::Char('m') => { app.toggle_diff_layout(); }
-        KeyCode::Char('f') => { app.toggle_diff_mode(); }
+        KeyCode::Char('t') => {
+            app.route_key_to_plugin("t");
+        }
+        KeyCode::Char('m') => {
+            app.toggle_diff_layout();
+        }
+        KeyCode::Char('f') => {
+            app.toggle_diff_mode();
+        }
         _ => {}
     }
 }
@@ -233,28 +276,36 @@ fn handle_key_files(key: event::KeyEvent, app: &mut App) {
                 app.file_tree.navigate(-1);
                 app.load_preview();
             }
-            Panel::Diff => { app.preview_scroll = app.preview_scroll.saturating_sub(1); }
+            Panel::Diff => {
+                app.preview_scroll = app.preview_scroll.saturating_sub(1);
+            }
         },
         KeyCode::Down | KeyCode::Char('j') => match app.active_panel {
             Panel::Files => {
                 app.file_tree.navigate(1);
                 app.load_preview();
             }
-            Panel::Diff => { app.preview_scroll += 1; }
+            Panel::Diff => {
+                app.preview_scroll += 1;
+            }
         },
         KeyCode::PageUp => match app.active_panel {
             Panel::Files => {
                 app.file_tree.navigate(-10);
                 app.load_preview();
             }
-            Panel::Diff => { app.preview_scroll = app.preview_scroll.saturating_sub(20); }
+            Panel::Diff => {
+                app.preview_scroll = app.preview_scroll.saturating_sub(20);
+            }
         },
         KeyCode::PageDown => match app.active_panel {
             Panel::Files => {
                 app.file_tree.navigate(10);
                 app.load_preview();
             }
-            Panel::Diff => { app.preview_scroll += 20; }
+            Panel::Diff => {
+                app.preview_scroll += 20;
+            }
         },
         KeyCode::Enter => {
             let idx = app.file_tree.selected;
@@ -315,7 +366,11 @@ fn handle_mouse<B: ratatui::backend::Backend>(
             }
 
             // Reset tracking on every genuine second click so triple-clicks don't chain.
-            app.last_click = if is_double { None } else { Some((now, mouse.column, mouse.row)) };
+            app.last_click = if is_double {
+                None
+            } else {
+                Some((now, mouse.column, mouse.row))
+            };
         }
         MouseEventKind::Up(MouseButton::Left) => {
             app.dragging_split = false;
@@ -324,7 +379,7 @@ fn handle_mouse<B: ratatui::backend::Backend>(
             if app.dragging_split {
                 let total_width = terminal.size().map(|s| s.width).unwrap_or(80);
                 if total_width > 0 {
-                    let percent = (mouse.column as u16 * 100 / total_width).clamp(10, 80);
+                    let percent = (mouse.column * 100 / total_width).clamp(10, 80);
                     app.split_percent = percent;
                 }
             }
@@ -335,16 +390,25 @@ fn handle_mouse<B: ratatui::backend::Backend>(
             let is_left = mouse.column < split_x;
             match app.active_tab {
                 Tab::Git => {
-                    if is_left { scroll_sidebar_plugin(app, -3); }
-                    else { app.diff_scroll = app.diff_scroll.saturating_sub(3); }
+                    if is_left {
+                        scroll_sidebar_plugin(app, -3);
+                    } else {
+                        app.diff_scroll = app.diff_scroll.saturating_sub(3);
+                    }
                 }
                 Tab::Files => {
-                    if is_left { app.tree_scroll = app.tree_scroll.saturating_sub(3); }
-                    else { app.preview_scroll = app.preview_scroll.saturating_sub(3); }
+                    if is_left {
+                        app.tree_scroll = app.tree_scroll.saturating_sub(3);
+                    } else {
+                        app.preview_scroll = app.preview_scroll.saturating_sub(3);
+                    }
                 }
                 Tab::Graph => {
-                    if is_left { scroll_panel(app, "git.graph", -3); }
-                    else { scroll_panel(app, "git.commitDetail", -3); }
+                    if is_left {
+                        scroll_panel(app, "git.graph", -3);
+                    } else {
+                        scroll_panel(app, "git.commitDetail", -3);
+                    }
                 }
             }
         }
@@ -354,16 +418,25 @@ fn handle_mouse<B: ratatui::backend::Backend>(
             let is_left = mouse.column < split_x;
             match app.active_tab {
                 Tab::Git => {
-                    if is_left { scroll_sidebar_plugin(app, 3); }
-                    else { app.diff_scroll += 3; }
+                    if is_left {
+                        scroll_sidebar_plugin(app, 3);
+                    } else {
+                        app.diff_scroll += 3;
+                    }
                 }
                 Tab::Files => {
-                    if is_left { app.tree_scroll += 3; }
-                    else { app.preview_scroll += 3; }
+                    if is_left {
+                        app.tree_scroll += 3;
+                    } else {
+                        app.preview_scroll += 3;
+                    }
                 }
                 Tab::Graph => {
-                    if is_left { scroll_panel(app, "git.graph", 3); }
-                    else { scroll_panel(app, "git.commitDetail", 3); }
+                    if is_left {
+                        scroll_panel(app, "git.graph", 3);
+                    } else {
+                        scroll_panel(app, "git.commitDetail", 3);
+                    }
                 }
             }
         }
@@ -378,7 +451,9 @@ fn handle_mouse<B: ratatui::backend::Backend>(
 /// Apply a scroll delta to the sidebar's currently-active plugin panel.
 /// Delta is in lines; positive scrolls down, negative scrolls up.
 fn scroll_sidebar_plugin(app: &mut App, delta: i32) {
-    let Some(panel_id) = app.active_sidebar_panel.clone() else { return };
+    let Some(panel_id) = app.active_sidebar_panel.clone() else {
+        return;
+    };
     let entry = app.panel_scroll.entry(panel_id).or_insert(0);
     *entry = if delta < 0 {
         entry.saturating_sub(delta.unsigned_abs() as usize)

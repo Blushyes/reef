@@ -87,7 +87,14 @@ fn walk(
                 let is_collapsed = collapsed.contains(&key);
                 out.push(dir_row(name, path, is_staged, depth, is_collapsed));
                 if !is_collapsed {
-                    walk(children, depth + 1, is_staged, collapsed, out, file_renderer);
+                    walk(
+                        children,
+                        depth + 1,
+                        is_staged,
+                        collapsed,
+                        out,
+                        file_renderer,
+                    );
                 }
             }
             Node::File(entry) => {
@@ -101,7 +108,13 @@ pub fn collapsed_key(is_staged: bool, path: &str) -> String {
     format!("{}:{}", if is_staged { "s" } else { "u" }, path)
 }
 
-fn dir_row(name: &str, path: &str, is_staged: bool, depth: usize, is_collapsed: bool) -> StyledLine {
+fn dir_row(
+    name: &str,
+    path: &str,
+    is_staged: bool,
+    depth: usize,
+    is_collapsed: bool,
+) -> StyledLine {
     let indent = "  ".repeat(depth);
     let arrow = if is_collapsed { "›" } else { "⌄" };
     StyledLine::new(vec![
@@ -124,7 +137,10 @@ mod tests {
     use reef_protocol::StyledLine;
 
     fn entry(path: &str) -> FileEntry {
-        FileEntry { path: path.to_string(), status: FileStatus::Modified }
+        FileEntry {
+            path: path.to_string(),
+            status: FileStatus::Modified,
+        }
     }
 
     // ── build() ──────────────────────────────────────────────────────────────
@@ -146,8 +162,18 @@ mod tests {
     fn build_nested_dirs() {
         let tree = build(&[entry("a/b/c.rs")]);
         assert_eq!(tree.len(), 1);
-        let Node::Dir { children: b_map, .. } = tree.get("a").unwrap() else { panic!("expected Dir") };
-        let Node::Dir { children: c_map, .. } = b_map.get("b").unwrap() else { panic!("expected Dir") };
+        let Node::Dir {
+            children: b_map, ..
+        } = tree.get("a").unwrap()
+        else {
+            panic!("expected Dir")
+        };
+        let Node::Dir {
+            children: c_map, ..
+        } = b_map.get("b").unwrap()
+        else {
+            panic!("expected Dir")
+        };
         assert!(matches!(c_map.get("c.rs"), Some(Node::File(_))));
     }
 
@@ -155,7 +181,9 @@ mod tests {
     fn build_multiple_files_same_dir() {
         let tree = build(&[entry("a/x.rs"), entry("a/y.rs")]);
         assert_eq!(tree.len(), 1);
-        let Node::Dir { children, .. } = tree.get("a").unwrap() else { panic!() };
+        let Node::Dir { children, .. } = tree.get("a").unwrap() else {
+            panic!()
+        };
         assert_eq!(children.len(), 2);
         assert!(matches!(children.get("x.rs"), Some(Node::File(_))));
         assert!(matches!(children.get("y.rs"), Some(Node::File(_))));
@@ -192,7 +220,9 @@ mod tests {
         let tree = build(&[entry("a.rs"), entry("b.rs"), entry("c.rs")]);
         let mut out = Vec::new();
         let mut count = 0usize;
-        flatten(&tree, false, &HashSet::new(), &mut out, &mut |_, _, _| { count += 1; });
+        flatten(&tree, false, &HashSet::new(), &mut out, &mut |_, _, _| {
+            count += 1;
+        });
         assert_eq!(count, 3);
     }
 
@@ -213,7 +243,9 @@ mod tests {
         collapsed.insert(collapsed_key(false, "src"));
         let mut out: Vec<StyledLine> = Vec::new();
         let mut count = 0usize;
-        flatten(&tree, false, &collapsed, &mut out, &mut |_, _, _| { count += 1; });
+        flatten(&tree, false, &collapsed, &mut out, &mut |_, _, _| {
+            count += 1;
+        });
         assert_eq!(count, 0, "children of collapsed dir should be skipped");
         assert_eq!(out.len(), 1, "dir row itself should still appear");
     }

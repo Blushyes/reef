@@ -256,11 +256,7 @@ impl GitRepo {
         })
     }
 
-    fn parse_git2_diff(
-        &self,
-        diff: &git2::Diff,
-        path: &str,
-    ) -> Option<DiffContent> {
+    fn parse_git2_diff(&self, diff: &git2::Diff, path: &str) -> Option<DiffContent> {
         let mut hunks = Vec::new();
 
         diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
@@ -282,8 +278,7 @@ impl GitRepo {
                         '-' => LineTag::Removed,
                         _ => LineTag::Context,
                     };
-                    let content =
-                        String::from_utf8_lossy(line.content()).to_string();
+                    let content = String::from_utf8_lossy(line.content()).to_string();
                     // Trim trailing newline
                     let content = content.trim_end_matches('\n').to_string();
 
@@ -301,9 +296,7 @@ impl GitRepo {
                 }
                 'H' => {
                     // Hunk header
-                    let header = String::from_utf8_lossy(line.content())
-                        .trim()
-                        .to_string();
+                    let header = String::from_utf8_lossy(line.content()).trim().to_string();
                     hunks.push(DiffHunk {
                         header,
                         lines: Vec::new(),
@@ -348,10 +341,8 @@ impl GitRepo {
         match head {
             Ok(head_ref) => {
                 let head_commit = head_ref.peel_to_commit()?;
-                self.repo.reset_default(
-                    Some(head_commit.as_object()),
-                    [path],
-                )?;
+                self.repo
+                    .reset_default(Some(head_commit.as_object()), [path])?;
             }
             Err(_) => {
                 // No HEAD (initial commit) — remove from index

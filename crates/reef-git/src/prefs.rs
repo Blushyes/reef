@@ -8,8 +8,12 @@ fn prefs_path() -> Option<PathBuf> {
 }
 
 pub fn load_tree_mode() -> bool {
-    let Some(path) = prefs_path() else { return false };
-    let Ok(content) = std::fs::read_to_string(&path) else { return false };
+    let Some(path) = prefs_path() else {
+        return false;
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return false;
+    };
     for line in content.lines() {
         if let Some(val) = line.strip_prefix("tree_mode=") {
             return val.trim() == "true";

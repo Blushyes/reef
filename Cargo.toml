@@ -9,3 +9,19 @@ resolver = "2"
 [workspace.dependencies]
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
+
+# ─── Lint policy ───────────────────────────────────────────────────────────
+# Style-only clippy lints are relaxed to avoid mechanical churn in existing
+# code. Lints that catch actual bugs or code smells stay at their default
+# warn/deny level. Each crate opts in via `[lints] workspace = true`.
+[workspace.lints.clippy]
+collapsible_if              = "allow"
+collapsible_match           = "allow"
+doc_overindented_list_items = "allow"
+explicit_counter_loop       = "allow"
+let_unit_value              = "allow"
+manual_checked_ops          = "allow"
+needless_range_loop         = "allow"
+new_without_default         = "allow"
+single_match                = "allow"
+while_let_loop              = "allow"

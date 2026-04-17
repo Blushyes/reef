@@ -1,41 +1,14 @@
-mod git;
-mod graph;
-mod prefs;
-mod tree;
-mod watcher;
-
-use git::{CommitDetail, DiffContent, FileStatus, GitRepo, LineTag, RefLabel};
+use reef_git::git::{CommitDetail, DiffContent, FileStatus, GitRepo, LineTag, RefLabel};
+use reef_git::writer::Writer;
+use reef_git::{git, graph, prefs, tree, watcher};
 
 use reef_protocol::{
-    read_message, write_message, Color, InitializeResult, RenderResult, RpcMessage,
-    Span, StyledLine,
+    Color, InitializeResult, RenderResult, RpcMessage, Span, StyledLine, read_message,
 };
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::io::{self, BufReader, Stdout};
-use std::sync::{Arc, Mutex};
+use std::io::{self, BufReader};
 use unicode_width::UnicodeWidthStr;
-
-/// Thread-safe stdout wrapper. Holds a mutex so the fs-watcher thread and the
-/// main loop can both emit JSON-RPC messages without interleaving frames.
-#[derive(Clone)]
-pub struct Writer {
-    inner: Arc<Mutex<Stdout>>,
-}
-
-impl Writer {
-    pub fn new(stdout: Stdout) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(stdout)),
-        }
-    }
-
-    pub fn send(&self, msg: &RpcMessage) {
-        if let Ok(mut w) = self.inner.lock() {
-            let _ = write_message(&mut *w, msg);
-        }
-    }
-}
 
 fn main() {
     let stdin = io::stdin();
@@ -108,7 +81,8 @@ fn main() {
                     }
                 };
                 let total = lines.len();
-                let visible: Vec<_> = lines.into_iter()
+                let visible: Vec<_> = lines
+                    .into_iter()
                     .skip(scroll as usize)
                     .take(height as usize)
                     .collect();
@@ -241,7 +215,9 @@ impl PluginState {
             self.graph_selected_idx = rows.len().saturating_sub(1);
         }
         // Sync selected_commit to the row at the current index.
-        self.selected_commit = rows.get(self.graph_selected_idx).map(|r| r.commit.oid.clone());
+        self.selected_commit = rows
+            .get(self.graph_selected_idx)
+            .map(|r| r.commit.oid.clone());
 
         self.graph_rows = rows;
         self.ref_map = refs;
@@ -285,7 +261,9 @@ impl PluginState {
 
         lines.push(StyledLine::new(vec![
             Span::new("commit ").fg(Color::named("darkGray")),
-            Span::new(info.oid.clone()).fg(Color::named("yellow")).bold(),
+            Span::new(info.oid.clone())
+                .fg(Color::named("yellow"))
+                .bold(),
         ]));
         lines.push(StyledLine::new(vec![
             Span::new("Author: ").fg(Color::named("darkGray")),
@@ -349,12 +327,10 @@ impl PluginState {
             if is_selected {
                 spans = spans.into_iter().map(|s| s.bg(sel_bg.clone())).collect();
             }
-            lines.push(
-                StyledLine::new(spans).on_click(
-                    "git.selectCommitFile",
-                    serde_json::json!({ "oid": info.oid, "path": file.path }),
-                ),
-            );
+            lines.push(StyledLine::new(spans).on_click(
+                "git.selectCommitFile",
+                serde_json::json!({ "oid": info.oid, "path": file.path }),
+            ));
         }
 
         // Selected file's diff (inline, below the file list).
@@ -423,12 +399,14 @@ impl PluginState {
         }
 
         // View mode toggle
-        let mode_label = if self.tree_mode { "视图: 树形" } else { "视图: 列表" };
+        let mode_label = if self.tree_mode {
+            "视图: 树形"
+        } else {
+            "视图: 列表"
+        };
         lines.push(
-            StyledLine::new(vec![
-                Span::new(mode_label).fg(Color::named("darkGray")),
-            ])
-            .on_click("git.toggleTree", serde_json::Value::Null),
+            StyledLine::new(vec![Span::new(mode_label).fg(Color::named("darkGray"))])
+                .on_click("git.toggleTree", serde_json::Value::Null),
         );
         lines.push(StyledLine::plain(""));
 
@@ -507,7 +485,9 @@ impl PluginState {
             tree::flatten(&t, is_staged, &self.collapsed_dirs, out, &mut renderer);
         } else {
             for file in files {
-                let is_selected = self.selected.as_ref()
+                let is_selected = self
+                    .selected
+                    .as_ref()
                     .map(|s| s.path == file.path && s.is_staged == is_staged)
                     .unwrap_or(false);
                 out.push(file_row(
@@ -540,7 +520,7 @@ impl PluginState {
 
         match key {
             "s" => {
-                if let Some(ref sel) = self.selected.as_ref().filter(|s| !s.is_staged) {
+                if let Some(sel) = self.selected.as_ref().filter(|s| !s.is_staged) {
                     let path = sel.path.clone();
                     if let Some(ref repo) = self.repo {
                         let _ = repo.stage_file(&path);
@@ -552,7 +532,7 @@ impl PluginState {
                 true
             }
             "u" => {
-                if let Some(ref sel) = self.selected.as_ref().filter(|s| s.is_staged) {
+                if let Some(sel) = self.selected.as_ref().filter(|s| s.is_staged) {
                     let path = sel.path.clone();
                     if let Some(ref repo) = self.repo {
                         let _ = repo.unstage_file(&path);
@@ -585,7 +565,12 @@ impl PluginState {
                 if let Some(path) = self.confirm_discard.take() {
                     if let Some(ref repo) = self.repo {
                         let _ = repo.restore_file(&path);
-                        if self.selected.as_ref().map(|s| s.path == path).unwrap_or(false) {
+                        if self
+                            .selected
+                            .as_ref()
+                            .map(|s| s.path == path)
+                            .unwrap_or(false)
+                        {
                             self.selected = None;
                         }
                         self.refresh();
@@ -623,13 +608,26 @@ impl PluginState {
     }
 
     fn handle_command(&mut self, params: Option<&serde_json::Value>, writer: &Writer) -> bool {
-        let id = params.and_then(|p| p.get("id")).and_then(|v| v.as_str()).unwrap_or("");
-        let args = params.and_then(|p| p.get("args")).cloned().unwrap_or_default();
+        let id = params
+            .and_then(|p| p.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let args = params
+            .and_then(|p| p.get("args"))
+            .cloned()
+            .unwrap_or_default();
 
         match id {
             "git.selectFile" => {
-                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let is_staged = args.get("staged").and_then(|v| v.as_bool()).unwrap_or(false);
+                let path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let is_staged = args
+                    .get("staged")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 self.selected = Some(SelectedFile { path, is_staged });
                 self.confirm_discard = None;
                 self.request_status_render(writer);
@@ -653,7 +651,10 @@ impl PluginState {
             }
             "git.toggleDir" => {
                 let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                let is_staged = args.get("staged").and_then(|v| v.as_bool()).unwrap_or(false);
+                let is_staged = args
+                    .get("staged")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 if !path.is_empty() {
                     let key = tree::collapsed_key(is_staged, path);
                     if self.collapsed_dirs.contains(&key) {
@@ -666,13 +667,23 @@ impl PluginState {
                 true
             }
             "git.stage" => {
-                let path = args.get("path").and_then(|v| v.as_str()).map(|s| s.to_string())
-                    .or_else(|| self.selected.as_ref().filter(|s| !s.is_staged).map(|s| s.path.clone()));
+                let path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        self.selected
+                            .as_ref()
+                            .filter(|s| !s.is_staged)
+                            .map(|s| s.path.clone())
+                    });
                 if let Some(path) = path {
                     if let Some(ref repo) = self.repo {
                         let _ = repo.stage_file(&path);
                         if let Some(ref mut sel) = self.selected {
-                            if sel.path == path { sel.is_staged = true; }
+                            if sel.path == path {
+                                sel.is_staged = true;
+                            }
                         }
                         self.refresh();
                         self.notify_status_changed(writer);
@@ -682,13 +693,23 @@ impl PluginState {
                 true
             }
             "git.unstage" => {
-                let path = args.get("path").and_then(|v| v.as_str()).map(|s| s.to_string())
-                    .or_else(|| self.selected.as_ref().filter(|s| s.is_staged).map(|s| s.path.clone()));
+                let path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        self.selected
+                            .as_ref()
+                            .filter(|s| s.is_staged)
+                            .map(|s| s.path.clone())
+                    });
                 if let Some(path) = path {
                     if let Some(ref repo) = self.repo {
                         let _ = repo.unstage_file(&path);
                         if let Some(ref mut sel) = self.selected {
-                            if sel.path == path { sel.is_staged = false; }
+                            if sel.path == path {
+                                sel.is_staged = false;
+                            }
                         }
                         self.refresh();
                         self.notify_status_changed(writer);
@@ -698,9 +719,16 @@ impl PluginState {
                 true
             }
             "git.discardPrompt" => {
-                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if !path.is_empty() {
-                    self.selected = Some(SelectedFile { path: path.clone(), is_staged: false });
+                    self.selected = Some(SelectedFile {
+                        path: path.clone(),
+                        is_staged: false,
+                    });
                     self.confirm_discard = Some(path);
                     self.request_status_render(writer);
                 }
@@ -710,7 +738,12 @@ impl PluginState {
                 if let Some(path) = self.confirm_discard.take() {
                     if let Some(ref repo) = self.repo {
                         let _ = repo.restore_file(&path);
-                        if self.selected.as_ref().map(|s| s.path == path).unwrap_or(false) {
+                        if self
+                            .selected
+                            .as_ref()
+                            .map(|s| s.path == path)
+                            .unwrap_or(false)
+                        {
                             self.selected = None;
                         }
                         self.refresh();
@@ -727,8 +760,7 @@ impl PluginState {
             }
             "git.stageAll" => {
                 if let Some(ref repo) = self.repo {
-                    let paths: Vec<String> =
-                        self.unstaged.iter().map(|f| f.path.clone()).collect();
+                    let paths: Vec<String> = self.unstaged.iter().map(|f| f.path.clone()).collect();
                     for p in &paths {
                         let _ = repo.stage_file(p);
                     }
@@ -745,8 +777,7 @@ impl PluginState {
             }
             "git.unstageAll" => {
                 if let Some(ref repo) = self.repo {
-                    let paths: Vec<String> =
-                        self.staged.iter().map(|f| f.path.clone()).collect();
+                    let paths: Vec<String> = self.staged.iter().map(|f| f.path.clone()).collect();
                     for p in &paths {
                         let _ = repo.unstage_file(p);
                     }
@@ -761,8 +792,14 @@ impl PluginState {
                 }
                 true
             }
-            "git.graph.next" => { self.move_graph_selection(1, writer); true }
-            "git.graph.prev" => { self.move_graph_selection(-1, writer); true }
+            "git.graph.next" => {
+                self.move_graph_selection(1, writer);
+                true
+            }
+            "git.graph.prev" => {
+                self.move_graph_selection(-1, writer);
+                true
+            }
             "git.selectCommit" => {
                 let oid = args.get("oid").and_then(|v| v.as_str()).unwrap_or("");
                 if !oid.is_empty() {
@@ -857,10 +894,7 @@ impl PluginState {
             return;
         }
         self.graph_selected_idx = next;
-        self.selected_commit = self
-            .graph_rows
-            .get(next)
-            .map(|r| r.commit.oid.clone());
+        self.selected_commit = self.graph_rows.get(next).map(|r| r.commit.oid.clone());
         self.load_commit_detail();
         self.request_graph_render(writer);
         self.request_commit_detail_render(writer);
@@ -879,21 +913,36 @@ fn file_row(
     indent: &str,
 ) -> StyledLine {
     let status_color = match status {
-        FileStatus::Modified  => Color::named("yellow"),
-        FileStatus::Added     => Color::named("green"),
-        FileStatus::Deleted   => Color::named("red"),
-        FileStatus::Renamed   => Color::named("cyan"),
+        FileStatus::Modified => Color::named("yellow"),
+        FileStatus::Added => Color::named("green"),
+        FileStatus::Deleted => Color::named("red"),
+        FileStatus::Renamed => Color::named("cyan"),
         FileStatus::Untracked => Color::named("green"),
     };
     let status_label = status.label();
     let button = if is_staged { "−" } else { "+" };
-    let button_color = if is_staged { Color::named("red") } else { Color::named("green") };
-    let button_cmd  = if is_staged { "git.unstage" } else { "git.stage" };
+    let button_color = if is_staged {
+        Color::named("red")
+    } else {
+        Color::named("green")
+    };
+    let button_cmd = if is_staged {
+        "git.unstage"
+    } else {
+        "git.stage"
+    };
     // Double-click anywhere on the row toggles staging (stage/unstage).
-    let dbl_cmd = if is_staged { "git.unstage" } else { "git.stage" };
+    let dbl_cmd = if is_staged {
+        "git.unstage"
+    } else {
+        "git.stage"
+    };
 
     let display_path = if display.len() > max_path {
-        format!("...{}", &display[display.len().saturating_sub(max_path.saturating_sub(3))..])
+        format!(
+            "...{}",
+            &display[display.len().saturating_sub(max_path.saturating_sub(3))..]
+        )
     } else {
         display.to_string()
     };
@@ -904,7 +953,9 @@ fn file_row(
         Span::new(indent.to_string()),
         Span::new(display_path).fg(Color::named("white")),
         Span::new(format!(" {} ", status_label)).fg(status_color),
-        Span::new(button).fg(button_color).bold()
+        Span::new(button)
+            .fg(button_color)
+            .bold()
             .on_click(button_cmd, serde_json::json!({ "path": path })),
         Span::new(" "),
     ];
@@ -924,7 +975,10 @@ fn file_row(
     }
 
     StyledLine::new(spans)
-        .on_click("git.selectFile", serde_json::json!({ "path": path, "staged": is_staged }))
+        .on_click(
+            "git.selectFile",
+            serde_json::json!({ "path": path, "staged": is_staged }),
+        )
         .on_dbl_click(dbl_cmd, serde_json::json!({ "path": path }))
 }
 
@@ -946,13 +1000,17 @@ fn section_header(
 
     // Compute right-side padding so the action button sits at the panel's edge.
     let button_text = action.as_ref().map(|(t, _, _)| format!(" {} ", t));
-    let used = prefix.width() + label.width() + count_str.width()
+    let used = prefix.width()
+        + label.width()
+        + count_str.width()
         + button_text.as_deref().map(str::width).unwrap_or(0);
     let padding = (width as usize).saturating_sub(used);
 
     let mut spans = vec![
         Span::new(prefix).fg(Color::named("white")),
-        Span::new(label.to_string()).fg(Color::named("white")).bold(),
+        Span::new(label.to_string())
+            .fg(Color::named("white"))
+            .bold(),
         Span::new(count_str).fg(count_color),
     ];
     if padding > 0 {
@@ -1012,15 +1070,11 @@ impl PluginState {
         if show_meta {
             let mut author = row.commit.author_name.clone();
             truncate_in_place(&mut author, 12);
-            spans.push(
-                Span::new(format!("{:<12}", author)).fg(Color::named("cyan")),
-            );
+            spans.push(Span::new(format!("{:<12}", author)).fg(Color::named("cyan")));
             spans.push(Span::new(" "));
 
             let rel = relative_time(row.commit.time);
-            spans.push(
-                Span::new(format!("{:>4}", rel)).fg(Color::named("darkGray")),
-            );
+            spans.push(Span::new(format!("{:>4}", rel)).fg(Color::named("darkGray")));
             spans.push(Span::new(" "));
         }
 
@@ -1038,10 +1092,7 @@ impl PluginState {
         spans.push(Span::new(subject).fg(Color::named("white")));
 
         if selected {
-            spans = spans
-                .into_iter()
-                .map(|s| s.bg(sel_bg.clone()))
-                .collect();
+            spans = spans.into_iter().map(|s| s.bg(sel_bg.clone())).collect();
         }
 
         StyledLine::new(spans).on_click("git.selectCommit", serde_json::json!({ "oid": oid }))
@@ -1061,10 +1112,18 @@ fn render_lane_chars(row: &graph::GraphRow) -> Vec<char> {
             graph::LaneCell::Pass => '│',
             graph::LaneCell::Node => '●',
             graph::LaneCell::Merge { from } => {
-                if col < *from { '├' } else { '┤' }
+                if col < *from {
+                    '├'
+                } else {
+                    '┤'
+                }
             }
             graph::LaneCell::Fork { to } => {
-                if col < *to { '╭' } else { '╮' }
+                if col < *to {
+                    '╭'
+                } else {
+                    '╮'
+                }
             }
         })
         .collect();
@@ -1175,13 +1234,22 @@ fn days_to_ymd(days: i64) -> (i64, u32, u32) {
 }
 
 /// Compute a short relative-time string ("2h", "3d", "5mo", "1y") from a
-/// unix timestamp. Seconds/minutes collapse to "now" / "Nm".
+/// unix timestamp. Seconds/minutes collapse to "now" / "Nm". Reads
+/// `SystemTime::now()` for the reference clock; see `relative_time_at` for
+/// a deterministic variant that accepts an explicit "now".
 fn relative_time(author_time: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(author_time);
-    let diff = (now - author_time).max(0);
+    relative_time_at(now, author_time)
+}
+
+/// Pure variant of `relative_time` — computes the display string from an
+/// explicit `now_secs`. Exposed as a module-private helper so tests can
+/// exercise every time-bucket branch deterministically.
+fn relative_time_at(now_secs: i64, author_time: i64) -> String {
+    let diff = (now_secs - author_time).max(0);
     if diff < 60 {
         "now".into()
     } else if diff < 3600 {
@@ -1207,9 +1275,18 @@ fn hash_ref_map(map: &HashMap<String, Vec<RefLabel>>) -> u64 {
         for label in labels {
             match label {
                 RefLabel::Head => 0u8.hash(&mut hasher),
-                RefLabel::Branch(n) => { 1u8.hash(&mut hasher); n.hash(&mut hasher); }
-                RefLabel::RemoteBranch(n) => { 2u8.hash(&mut hasher); n.hash(&mut hasher); }
-                RefLabel::Tag(n) => { 3u8.hash(&mut hasher); n.hash(&mut hasher); }
+                RefLabel::Branch(n) => {
+                    1u8.hash(&mut hasher);
+                    n.hash(&mut hasher);
+                }
+                RefLabel::RemoteBranch(n) => {
+                    2u8.hash(&mut hasher);
+                    n.hash(&mut hasher);
+                }
+                RefLabel::Tag(n) => {
+                    3u8.hash(&mut hasher);
+                    n.hash(&mut hasher);
+                }
             }
         }
     }
@@ -1219,11 +1296,11 @@ fn hash_ref_map(map: &HashMap<String, Vec<RefLabel>>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        truncate_in_place, days_to_ymd, format_timestamp,
-        lane_color_for, hash_ref_map, render_lane_chars,
+        days_to_ymd, format_timestamp, hash_ref_map, lane_color_for, relative_time_at,
+        render_lane_chars, truncate_in_place,
     };
-    use crate::graph::{GraphRow, LaneCell};
-    use crate::git::{CommitInfo, RefLabel};
+    use reef_git::git::{CommitInfo, RefLabel};
+    use reef_git::graph::{GraphRow, LaneCell};
     use reef_protocol::Color;
     use std::collections::HashMap;
 
@@ -1240,7 +1317,11 @@ mod tests {
     }
 
     fn row(cells: Vec<LaneCell>, node_col: usize) -> GraphRow {
-        GraphRow { cells, node_col, commit: blank_commit() }
+        GraphRow {
+            cells,
+            node_col,
+            commit: blank_commit(),
+        }
     }
 
     // ── truncate_in_place ────────────────────────────────────────────────────
@@ -1369,7 +1450,10 @@ mod tests {
         let mut m1: HashMap<String, Vec<RefLabel>> = HashMap::new();
         m1.insert("abc".to_string(), vec![RefLabel::Head]);
         let mut m2: HashMap<String, Vec<RefLabel>> = HashMap::new();
-        m2.insert("abc".to_string(), vec![RefLabel::Branch("main".to_string())]);
+        m2.insert(
+            "abc".to_string(),
+            vec![RefLabel::Branch("main".to_string())],
+        );
         assert_ne!(hash_ref_map(&m1), hash_ref_map(&m2));
     }
 
@@ -1454,7 +1538,7 @@ mod tests {
 
     #[test]
     fn append_diff_lines_hunk_header_is_cyan() {
-        use crate::git::{DiffContent, DiffHunk, DiffLine, LineTag as GitLineTag};
+        use crate::git::{DiffContent, DiffHunk};
         let diff = DiffContent {
             file_path: "foo.rs".into(),
             hunks: vec![DiffHunk {
@@ -1469,6 +1553,52 @@ mod tests {
         assert_eq!(out[0].spans[0].fg, Some(Color::named("cyan")));
     }
 
+    // ── relative_time_at ─────────────────────────────────────────────────────
+
+    #[test]
+    fn relative_time_at_now() {
+        // < 60s diff → "now"
+        assert_eq!(relative_time_at(100, 100), "now");
+        assert_eq!(relative_time_at(159, 100), "now"); // 59s diff
+    }
+
+    #[test]
+    fn relative_time_at_minutes() {
+        assert_eq!(relative_time_at(160, 100), "1m"); // 60s
+        assert_eq!(relative_time_at(3699, 100), "59m"); // 3599s
+    }
+
+    #[test]
+    fn relative_time_at_hours() {
+        assert_eq!(relative_time_at(3700, 100), "1h"); // 3600s
+        assert_eq!(relative_time_at(86499, 100), "23h"); // 86399s
+    }
+
+    #[test]
+    fn relative_time_at_days() {
+        assert_eq!(relative_time_at(86500, 100), "1d"); // 86400s
+        assert_eq!(relative_time_at(2592000 + 99, 100), "29d"); // 30d boundary
+    }
+
+    #[test]
+    fn relative_time_at_months() {
+        assert_eq!(relative_time_at(2592000 + 100, 100), "1mo"); // 30d
+        // 340 days / 30 = 11.33 → "11mo" (still < 365d year threshold)
+        assert_eq!(relative_time_at(86_400 * 340 + 100, 100), "11mo");
+    }
+
+    #[test]
+    fn relative_time_at_years() {
+        assert_eq!(relative_time_at(86_400 * 365 + 100, 100), "1y");
+        assert_eq!(relative_time_at(86_400 * 365 * 5 + 100, 100), "5y");
+    }
+
+    #[test]
+    fn relative_time_at_future_clamps_to_now() {
+        // author_time in the future → diff negative → clamped to 0 → "now"
+        assert_eq!(relative_time_at(100, 500), "now");
+    }
+
     #[test]
     fn append_diff_lines_colors_by_tag() {
         use crate::git::{DiffContent, DiffHunk, DiffLine, LineTag as GitLineTag};
@@ -1477,9 +1607,24 @@ mod tests {
             hunks: vec![DiffHunk {
                 header: "@@ @@".into(),
                 lines: vec![
-                    DiffLine { tag: GitLineTag::Added,   content: "add".into(), old_lineno: None, new_lineno: Some(1) },
-                    DiffLine { tag: GitLineTag::Removed, content: "rm".into(),  old_lineno: Some(1), new_lineno: None },
-                    DiffLine { tag: GitLineTag::Context, content: "ctx".into(), old_lineno: Some(2), new_lineno: Some(2) },
+                    DiffLine {
+                        tag: GitLineTag::Added,
+                        content: "add".into(),
+                        old_lineno: None,
+                        new_lineno: Some(1),
+                    },
+                    DiffLine {
+                        tag: GitLineTag::Removed,
+                        content: "rm".into(),
+                        old_lineno: Some(1),
+                        new_lineno: None,
+                    },
+                    DiffLine {
+                        tag: GitLineTag::Context,
+                        content: "ctx".into(),
+                        old_lineno: Some(2),
+                        new_lineno: Some(2),
+                    },
                 ],
             }],
         };

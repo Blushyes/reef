@@ -4,7 +4,10 @@ use serde_json;
 
 #[derive(Debug, Clone)]
 pub enum ClickAction {
-    SelectFile { path: String, staged: bool },
+    SelectFile {
+        path: String,
+        staged: bool,
+    },
     StageFile(String),
     UnstageFile(String),
     ToggleStaged,
@@ -105,7 +108,10 @@ mod tests {
         r.register_row(0, 0, 10, ClickAction::ToggleStaged);
         r.register_row(0, 0, 10, ClickAction::ToggleUnstaged);
         // Later registration should win on overlap
-        assert!(matches!(r.hit_test(5, 0), Some(ClickAction::ToggleUnstaged)));
+        assert!(matches!(
+            r.hit_test(5, 0),
+            Some(ClickAction::ToggleUnstaged)
+        ));
     }
 
     #[test]

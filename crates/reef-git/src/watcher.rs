@@ -6,7 +6,7 @@ use std::time::Duration;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use reef_protocol::RpcMessage;
 
-use crate::Writer;
+use crate::writer::Writer;
 
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
@@ -62,12 +62,7 @@ fn run(workdir: PathBuf, gitdir: PathBuf, writer: Writer) {
     }
 }
 
-fn is_relevant(
-    ev: &Event,
-    gitdir: &Path,
-    workdir: &Path,
-    repo: Option<&git2::Repository>,
-) -> bool {
+fn is_relevant(ev: &Event, gitdir: &Path, workdir: &Path, repo: Option<&git2::Repository>) -> bool {
     for path in &ev.paths {
         if let Ok(rel) = path.strip_prefix(gitdir) {
             if is_relevant_gitdir_path(rel) {

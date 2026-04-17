@@ -1,18 +1,28 @@
 use crate::app::App;
 use crate::git::FileStatus;
 use crate::mouse::ClickAction;
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding};
-use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 /// A logical row in the file panel (before scroll is applied).
 enum PanelRow {
-    StagedHeader { collapsed: bool, count: usize },
-    UnstagedHeader { collapsed: bool, count: usize },
-    File { path: String, status: FileStatus, staged: bool },
+    StagedHeader {
+        collapsed: bool,
+        count: usize,
+    },
+    UnstagedHeader {
+        collapsed: bool,
+        count: usize,
+    },
+    File {
+        path: String,
+        status: FileStatus,
+        staged: bool,
+    },
     Spacer,
     Empty,
 }
@@ -87,15 +97,19 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
                     Span::styled(format!("{} ", arrow), Style::default().fg(Color::White)),
                     Span::styled(
                         "暂存的更改",
-                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(
-                        format!("  {}", count),
-                        Style::default().fg(Color::Green),
-                    ),
+                    Span::styled(format!("  {}", count), Style::default().fg(Color::Green)),
                 ]);
                 f.render_widget(line, Rect::new(inner.x, screen_y, inner.width, 1));
-                app.hit_registry.register_row(inner.x, screen_y, inner.width, ClickAction::ToggleStaged);
+                app.hit_registry.register_row(
+                    inner.x,
+                    screen_y,
+                    inner.width,
+                    ClickAction::ToggleStaged,
+                );
             }
             PanelRow::UnstagedHeader { collapsed, count } => {
                 let arrow = if *collapsed { "›" } else { "⌄" };
@@ -103,17 +117,25 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
                     Span::styled(format!("{} ", arrow), Style::default().fg(Color::White)),
                     Span::styled(
                         "更改",
-                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(
-                        format!("  {}", count),
-                        Style::default().fg(Color::Blue),
-                    ),
+                    Span::styled(format!("  {}", count), Style::default().fg(Color::Blue)),
                 ]);
                 f.render_widget(line, Rect::new(inner.x, screen_y, inner.width, 1));
-                app.hit_registry.register_row(inner.x, screen_y, inner.width, ClickAction::ToggleUnstaged);
+                app.hit_registry.register_row(
+                    inner.x,
+                    screen_y,
+                    inner.width,
+                    ClickAction::ToggleUnstaged,
+                );
             }
-            PanelRow::File { path, status, staged } => {
+            PanelRow::File {
+                path,
+                status,
+                staged,
+            } => {
                 render_file_row(f, app, inner, screen_y, path, *status, *staged);
             }
             PanelRow::Spacer => {
@@ -185,11 +207,17 @@ fn render_file_row(
     let line = Line::from(vec![
         Span::styled("  ", Style::default().bg(bg)),
         Span::styled(padded_path, Style::default().fg(Color::White).bg(bg)),
-        Span::styled(format!(" {}", status_label), Style::default().fg(status_color).bg(bg)),
+        Span::styled(
+            format!(" {}", status_label),
+            Style::default().fg(status_color).bg(bg),
+        ),
         Span::styled(" ", Style::default().bg(bg)),
         Span::styled(
             button_label,
-            Style::default().fg(button_color).bg(bg).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(button_color)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" ", Style::default().bg(bg)),
     ]);
@@ -201,7 +229,10 @@ fn render_file_row(
         area.x,
         y,
         area.width.saturating_sub(3),
-        ClickAction::SelectFile { path: path.to_string(), staged: is_staged },
+        ClickAction::SelectFile {
+            path: path.to_string(),
+            staged: is_staged,
+        },
     );
 
     // Last 3 cols → stage / unstage button

@@ -168,7 +168,10 @@ mod tests {
 
         // M: node col 0, fork to col 1
         assert_eq!(rows[0].node_col, 0);
-        assert_eq!(rows[0].cells, vec![LaneCell::Node, LaneCell::Fork { to: 0 }]);
+        assert_eq!(
+            rows[0].cells,
+            vec![LaneCell::Node, LaneCell::Fork { to: 0 }]
+        );
 
         // L: node col 0, R still passing on col 1
         assert_eq!(rows[1].node_col, 0);
@@ -241,10 +244,15 @@ mod tests {
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].node_col, 0);
         assert_eq!(rows[0].cells.len(), 3);
-        let fork_count = rows[0].cells.iter()
+        let fork_count = rows[0]
+            .cells
+            .iter()
             .filter(|&&c| matches!(c, LaneCell::Fork { .. }))
             .count();
-        assert_eq!(fork_count, 2, "two extra parents should produce two Fork cells");
+        assert_eq!(
+            fork_count, 2,
+            "two extra parents should produce two Fork cells"
+        );
     }
 
     #[test]
@@ -256,7 +264,9 @@ mod tests {
         // a and b on different lanes
         assert_ne!(rows[0].node_col, rows[1].node_col);
         // c merges both
-        let merge_count = rows[2].cells.iter()
+        let merge_count = rows[2]
+            .cells
+            .iter()
             .filter(|&&c| matches!(c, LaneCell::Merge { .. }))
             .count();
         assert_eq!(merge_count, 1);

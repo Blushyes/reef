@@ -73,11 +73,7 @@ pub fn highlight_file(path: &str, lines: &[String]) -> Option<Vec<Vec<StyledToke
 }
 
 fn convert_style(s: syntect::highlighting::Style) -> Style {
-    let mut style = Style::default().fg(Color::Rgb(
-        s.foreground.r,
-        s.foreground.g,
-        s.foreground.b,
-    ));
+    let mut style = Style::default().fg(Color::Rgb(s.foreground.r, s.foreground.g, s.foreground.b));
     if s.font_style.contains(FontStyle::BOLD) {
         style = style.add_modifier(Modifier::BOLD);
     }
@@ -100,17 +96,20 @@ mod tests {
         let out = highlight_file("foo.rs", &lines).expect("rust must highlight");
         println!("tokens: {:#?}", out);
         assert_eq!(out.len(), 1);
-        assert!(out[0].len() > 1, "expected multiple tokens, got {:?}", out[0]);
+        assert!(
+            out[0].len() > 1,
+            "expected multiple tokens, got {:?}",
+            out[0]
+        );
     }
 
     #[test]
     fn highlight_extensions_exist() {
         let exts = [
-            "rs", "py", "js", "ts", "tsx", "jsx", "go", "md", "json", "jsonc",
-            "yml", "yaml", "toml", "sh", "bash", "zsh", "html", "css", "scss",
-            "c", "cpp", "h", "hpp", "java", "kt", "swift", "rb", "php", "lua",
-            "vue", "svelte", "dart", "zig", "nix", "hcl", "tf", "proto",
-            "sql", "xml", "ini", "cjs", "mjs", "mts",
+            "rs", "py", "js", "ts", "tsx", "jsx", "go", "md", "json", "jsonc", "yml", "yaml",
+            "toml", "sh", "bash", "zsh", "html", "css", "scss", "c", "cpp", "h", "hpp", "java",
+            "kt", "swift", "rb", "php", "lua", "vue", "svelte", "dart", "zig", "nix", "hcl", "tf",
+            "proto", "sql", "xml", "ini", "cjs", "mjs", "mts",
         ];
         let mut missing = vec![];
         for ext in exts {
@@ -124,7 +123,13 @@ mod tests {
 
     #[test]
     fn highlight_by_filename() {
-        for name in ["Makefile", "Dockerfile", "Gemfile", "Rakefile", "CMakeLists.txt"] {
+        for name in [
+            "Makefile",
+            "Dockerfile",
+            "Gemfile",
+            "Rakefile",
+            "CMakeLists.txt",
+        ] {
             let result = highlight_file(name, &["x = y".to_string()]);
             assert!(result.is_some(), "{} should resolve a syntax", name);
         }
@@ -143,7 +148,10 @@ mod tests {
     fn highlight_empty_lines_returns_empty_vec() {
         let result = highlight_file("foo.rs", &[]);
         // A known syntax with zero lines should return Some([])
-        assert!(matches!(result, Some(ref v) if v.is_empty()), "empty input → Some([])");
+        assert!(
+            matches!(result, Some(ref v) if v.is_empty()),
+            "empty input → Some([])"
+        );
     }
 
     #[test]
@@ -169,7 +177,9 @@ mod tests {
     #[test]
     fn highlight_toml_file_recognized() {
         let lines = vec!["[package]".to_string(), "name = \"reef\"".to_string()];
-        assert!(highlight_file("Cargo.toml", &lines).is_some(), "toml should be recognized");
+        assert!(
+            highlight_file("Cargo.toml", &lines).is_some(),
+            "toml should be recognized"
+        );
     }
 }
-

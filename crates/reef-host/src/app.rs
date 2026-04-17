@@ -102,7 +102,8 @@ pub struct SelectedFile {
 impl App {
     pub fn new() -> Self {
         let repo = GitRepo::open().ok();
-        let workdir = repo.as_ref()
+        let workdir = repo
+            .as_ref()
             .and_then(|r| r.workdir_path())
             .unwrap_or_else(|| PathBuf::from("."));
         let file_tree = FileTree::new(&workdir);
@@ -144,12 +145,15 @@ impl App {
     }
 
     pub fn refresh_status(&mut self) {
-        let Some(ref repo) = self.repo else { return; };
+        let Some(ref repo) = self.repo else {
+            return;
+        };
         let (staged, unstaged) = repo.get_status();
         self.staged_files = staged;
         self.unstaged_files = unstaged;
 
-        self.file_tree.refresh_git_statuses(&self.staged_files, &self.unstaged_files);
+        self.file_tree
+            .refresh_git_statuses(&self.staged_files, &self.unstaged_files);
 
         // Reconcile selection: check both lists so is_staged stays correct
         // even if the plugin staged/unstaged via a key event that the host
@@ -219,7 +223,11 @@ impl App {
     }
 
     pub fn stage_file(&mut self, path: &str) {
-        let ok = self.repo.as_ref().map(|r| r.stage_file(path).is_ok()).unwrap_or(false);
+        let ok = self
+            .repo
+            .as_ref()
+            .map(|r| r.stage_file(path).is_ok())
+            .unwrap_or(false);
         if ok {
             // If we were viewing this file, update selection
             if let Some(ref mut sel) = self.selected_file {
@@ -233,7 +241,11 @@ impl App {
     }
 
     pub fn unstage_file(&mut self, path: &str) {
-        let ok = self.repo.as_ref().map(|r| r.unstage_file(path).is_ok()).unwrap_or(false);
+        let ok = self
+            .repo
+            .as_ref()
+            .map(|r| r.unstage_file(path).is_ok())
+            .unwrap_or(false);
         if ok {
             if let Some(ref mut sel) = self.selected_file {
                 if sel.path == path && sel.is_staged {
@@ -322,10 +334,15 @@ impl App {
                 // Keep host state in sync for known selection commands
                 if command == "git.selectFile" {
                     if let (Some(path), Some(staged)) = (
-                        args.get("path").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        args.get("path")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
                         args.get("staged").and_then(|v| v.as_bool()),
                     ) {
-                        self.selected_file = Some(SelectedFile { path, is_staged: staged });
+                        self.selected_file = Some(SelectedFile {
+                            path,
+                            is_staged: staged,
+                        });
                         self.diff_scroll = 0;
                         self.load_diff();
                     }
@@ -415,7 +432,10 @@ impl App {
         let (path, staged) = items[new_idx].clone();
         // Only update host selection state; caller is responsible for syncing to plugin
         // so rapid key repeats can be coalesced into a single command.
-        self.selected_file = Some(SelectedFile { path, is_staged: staged });
+        self.selected_file = Some(SelectedFile {
+            path,
+            is_staged: staged,
+        });
         self.diff_scroll = 0;
     }
 
@@ -442,7 +462,10 @@ impl App {
     pub fn load_plugins(&mut self) {
         // 1. Built-in plugins shipped alongside the binary
         if let Ok(exe) = std::env::current_exe() {
-            let builtin = exe.parent().unwrap_or(std::path::Path::new(".")).join("plugins");
+            let builtin = exe
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join("plugins");
             self.plugin_manager.load_from_dir(&builtin);
         }
 
@@ -452,8 +475,10 @@ impl App {
             let dev_paths = [
                 // workspace root / plugins/
                 PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .parent().unwrap_or(std::path::Path::new("."))
-                    .parent().unwrap_or(std::path::Path::new("."))
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
                     .join("plugins"),
             ];
             for path in &dev_paths {
@@ -465,7 +490,10 @@ impl App {
 
         // 3. User plugins in ~/.config/reef/plugins/
         if let Ok(home) = std::env::var("HOME") {
-            let user = PathBuf::from(home).join(".config").join("reef").join("plugins");
+            let user = PathBuf::from(home)
+                .join(".config")
+                .join("reef")
+                .join("plugins");
             self.plugin_manager.load_from_dir(&user);
         }
 
@@ -490,18 +518,23 @@ impl App {
         }
 
         // Handle plugin→host requests
-        let requests: Vec<_> = self.plugin_manager.pending_host_requests.drain(..).collect();
+        let requests: Vec<_> = self
+            .plugin_manager
+            .pending_host_requests
+            .drain(..)
+            .collect();
         for req in requests {
             match req.method.as_str() {
                 "reef/openFile" => {
-                    if let Ok(p) = serde_json::from_value::<reef_protocol::OpenFileParams>(req.params.clone()) {
+                    if let Ok(p) =
+                        serde_json::from_value::<reef_protocol::OpenFileParams>(req.params.clone())
+                    {
                         // TODO: open file in editor panel
                         eprintln!("[reef] openFile: {}", p.path);
                     }
-                    let _ = self.plugin_manager.respond_to_plugin(
-                        &req,
-                        serde_json::json!({ "success": true }),
-                    );
+                    let _ = self
+                        .plugin_manager
+                        .respond_to_plugin(&req, serde_json::json!({ "success": true }));
                 }
                 _ => {}
             }

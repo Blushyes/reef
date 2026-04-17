@@ -6,13 +6,31 @@ use std::io::{self, BufRead, Write};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum Color {
-    Named(String),           // "red", "green", "white", …
-    Rgb([u8; 3]),            // [30, 30, 40]
+    Named(String), // "red", "green", "white", …
+    Rgb([u8; 3]),  // [30, 30, 40]
 }
 
 impl Color {
-    pub fn named(s: &str) -> Self { Self::Named(s.to_string()) }
-    pub fn rgb(r: u8, g: u8, b: u8) -> Self { Self::Rgb([r, g, b]) }
+    /// Construct a named color. The host maps known names (`"red"`, `"cyan"`,
+    /// …) to its terminal palette; unknown names fall back to the default.
+    ///
+    /// ```
+    /// use reef_protocol::Color;
+    /// assert_eq!(Color::named("red"), Color::Named("red".into()));
+    /// ```
+    pub fn named(s: &str) -> Self {
+        Self::Named(s.to_string())
+    }
+
+    /// Construct an RGB color.
+    ///
+    /// ```
+    /// use reef_protocol::Color;
+    /// assert_eq!(Color::rgb(10, 20, 30), Color::Rgb([10, 20, 30]));
+    /// ```
+    pub fn rgb(r: u8, g: u8, b: u8) -> Self {
+        Self::Rgb([r, g, b])
+    }
 }
 
 // ─── StyledLine / Span ───────────────────────────────────────────────────────
@@ -43,18 +61,67 @@ pub struct Span {
 }
 
 impl Span {
+    /// Create an unstyled span with the given text.
+    ///
+    /// ```
+    /// use reef_protocol::Span;
+    /// let s = Span::new("hello");
+    /// assert_eq!(s.text, "hello");
+    /// assert!(s.fg.is_none());
+    /// ```
     pub fn new(text: impl Into<String>) -> Self {
-        Self { text: text.into(), ..Default::default() }
+        Self {
+            text: text.into(),
+            ..Default::default()
+        }
     }
-    pub fn fg(mut self, c: Color) -> Self { self.fg = Some(c); self }
-    pub fn bg(mut self, c: Color) -> Self { self.bg = Some(c); self }
-    pub fn bold(mut self) -> Self { self.bold = Some(true); self }
-    pub fn dim(mut self) -> Self { self.dim = Some(true); self }
+
+    /// Set the foreground color. Builder-style; returns `self`.
+    ///
+    /// ```
+    /// use reef_protocol::{Color, Span};
+    /// let s = Span::new("x").fg(Color::named("red")).bold();
+    /// assert_eq!(s.fg, Some(Color::named("red")));
+    /// assert_eq!(s.bold, Some(true));
+    /// ```
+    pub fn fg(mut self, c: Color) -> Self {
+        self.fg = Some(c);
+        self
+    }
+
+    /// Set the background color.
+    pub fn bg(mut self, c: Color) -> Self {
+        self.bg = Some(c);
+        self
+    }
+
+    /// Mark this span as bold.
+    pub fn bold(mut self) -> Self {
+        self.bold = Some(true);
+        self
+    }
+
+    /// Mark this span as dim.
+    pub fn dim(mut self) -> Self {
+        self.dim = Some(true);
+        self
+    }
+
+    /// Attach a click handler. The host fires `command` with `args` as params
+    /// when the user clicks any cell inside this span's region.
+    ///
+    /// ```
+    /// use reef_protocol::Span;
+    /// let s = Span::new("[ok]").on_click("git.stage", serde_json::json!({"path": "a.rs"}));
+    /// assert_eq!(s.click_command, Some("git.stage".into()));
+    /// ```
     pub fn on_click(mut self, command: impl Into<String>, args: serde_json::Value) -> Self {
         self.click_command = Some(command.into());
         self.click_args = Some(args);
         self
     }
+
+    /// Attach a double-click handler.
     pub fn on_dbl_click(mut self, command: impl Into<String>, args: serde_json::Value) -> Self {
         self.dbl_click_command = Some(command.into());
         self.dbl_click_args = Some(args);
@@ -78,17 +145,43 @@ pub struct StyledLine {
 }
 
 impl StyledLine {
+    /// Compose a line from multiple spans.
+    ///
+    /// ```
+    /// use reef_protocol::{Span, StyledLine, Color};
+    /// let line = StyledLine::new(vec![
+    ///     Span::new("prefix "),
+    ///     Span::new("WARN").fg(Color::named("yellow")).bold(),
+    /// ]);
+    /// assert_eq!(line.spans.len(), 2);
+    /// ```
     pub fn new(spans: Vec<Span>) -> Self {
-        Self { spans, ..Default::default() }
+        Self {
+            spans,
+            ..Default::default()
+        }
     }
+
+    /// Convenience: a line containing a single unstyled span.
+    ///
+    /// ```
+    /// use reef_protocol::StyledLine;
+    /// let line = StyledLine::plain("hello world");
+    /// assert_eq!(line.spans.len(), 1);
+    /// assert_eq!(line.spans[0].text, "hello world");
+    /// ```
     pub fn plain(text: impl Into<String>) -> Self {
         Self::new(vec![Span::new(text)])
     }
+
+    /// Attach a line-level click handler.
     pub fn on_click(mut self, command: impl Into<String>, args: serde_json::Value) -> Self {
         self.click_command = Some(command.into());
         self.click_args = Some(args);
         self
     }
+
+    /// Attach a line-level double-click handler.
     pub fn on_dbl_click(mut self, command: impl Into<String>, args: serde_json::Value) -> Self {
         self.dbl_click_command = Some(command.into());
         self.dbl_click_args = Some(args);
@@ -129,7 +222,9 @@ pub struct KeybindingDecl {
     pub description: Option<String>,
 }
 
-fn default_when() -> String { "always".to_string() }
+fn default_when() -> String {
+    "always".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandDecl {
@@ -183,6 +278,15 @@ pub struct RpcError {
 }
 
 impl RpcMessage {
+    /// Build a JSON-RPC 2.0 request (expects a response).
+    ///
+    /// ```
+    /// use reef_protocol::RpcMessage;
+    /// let req = RpcMessage::request(42, "reef/render", serde_json::json!({"panel_id": "git.status"}));
+    /// assert_eq!(req.id, Some(42));
+    /// assert_eq!(req.method, "reef/render");
+    /// assert!(!req.is_response());
+    /// ```
     pub fn request(id: u64, method: &str, params: serde_json::Value) -> Self {
         Self {
             jsonrpc: "2.0".into(),
@@ -194,6 +298,13 @@ impl RpcMessage {
         }
     }
 
+    /// Build a JSON-RPC 2.0 notification (no id, no response expected).
+    ///
+    /// ```
+    /// use reef_protocol::RpcMessage;
+    /// let n = RpcMessage::notification("reef/statusChanged", serde_json::json!({}));
+    /// assert!(n.id.is_none());
+    /// ```
     pub fn notification(method: &str, params: serde_json::Value) -> Self {
         Self {
             jsonrpc: "2.0".into(),
@@ -205,6 +316,14 @@ impl RpcMessage {
         }
     }
 
+    /// Build a successful response to a request with matching `id`.
+    ///
+    /// ```
+    /// use reef_protocol::RpcMessage;
+    /// let r = RpcMessage::response(1, serde_json::json!({"ok": true}));
+    /// assert!(r.is_response());
+    /// assert_eq!(r.id, Some(1));
+    /// ```
     pub fn response(id: u64, result: serde_json::Value) -> Self {
         Self {
             jsonrpc: "2.0".into(),
@@ -267,8 +386,16 @@ pub struct EventResult {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum InputEvent {
-    Key { key: String, modifiers: Vec<String> },
-    Mouse { kind: String, button: Option<String>, column: u16, row: u16 },
+    Key {
+        key: String,
+        modifiers: Vec<String>,
+    },
+    Mouse {
+        kind: String,
+        button: Option<String>,
+        column: u16,
+        row: u16,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -302,8 +429,7 @@ pub struct NotifyParams {
 
 /// Write one JSON-RPC message with Content-Length header.
 pub fn write_message(writer: &mut impl Write, msg: &RpcMessage) -> io::Result<()> {
-    let body = serde_json::to_string(msg)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let body = serde_json::to_string(msg).map_err(io::Error::other)?;
     write!(writer, "Content-Length: {}\r\n\r\n{}", body.len(), body)?;
     writer.flush()
 }
@@ -316,7 +442,10 @@ pub fn read_message(reader: &mut impl BufRead) -> io::Result<RpcMessage> {
         let mut line = String::new();
         let n = reader.read_line(&mut line)?;
         if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "plugin closed"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "plugin closed",
+            ));
         }
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
@@ -327,15 +456,13 @@ pub fn read_message(reader: &mut impl BufRead) -> io::Result<RpcMessage> {
         }
     }
 
-    let len = content_length.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length")
-    })?;
+    let len = content_length
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length"))?;
 
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf)?;
 
-    serde_json::from_slice(&buf)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 #[cfg(test)]
@@ -500,7 +627,8 @@ mod tests {
 
     #[test]
     fn write_then_read_roundtrip() {
-        let original = RpcMessage::request(42, "reef/render", serde_json::json!({"panel_id": "test"}));
+        let original =
+            RpcMessage::request(42, "reef/render", serde_json::json!({"panel_id": "test"}));
         let mut buf = Vec::new();
         write_message(&mut buf, &original).unwrap();
         let mut cursor = Cursor::new(buf);
@@ -516,7 +644,10 @@ mod tests {
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.starts_with("Content-Length: "), "expected Content-Length header");
+        assert!(
+            s.starts_with("Content-Length: "),
+            "expected Content-Length header"
+        );
         assert!(s.contains("\r\n\r\n"), "expected CRLF separator");
     }
 
@@ -537,7 +668,10 @@ mod tests {
 
     #[test]
     fn rpc_error_fields() {
-        let err = RpcError { code: -32600, message: "Invalid Request".to_string() };
+        let err = RpcError {
+            code: -32600,
+            message: "Invalid Request".to_string(),
+        };
         let json = serde_json::to_string(&err).unwrap();
         assert!(json.contains("-32600"));
         assert!(json.contains("Invalid Request"));
@@ -561,6 +695,9 @@ mod tests {
         assert_eq!(serde_json::to_value(PanelSlot::Sidebar).unwrap(), "sidebar");
         assert_eq!(serde_json::to_value(PanelSlot::Editor).unwrap(), "editor");
         assert_eq!(serde_json::to_value(PanelSlot::Overlay).unwrap(), "overlay");
-        assert_eq!(serde_json::to_value(PanelSlot::Statusbar).unwrap(), "statusbar");
+        assert_eq!(
+            serde_json::to_value(PanelSlot::Statusbar).unwrap(),
+            "statusbar"
+        );
     }
 }

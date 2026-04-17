@@ -1,8 +1,7 @@
 use super::process::PluginProcess;
 use reef_protocol::{
-    CommandParams, CommandResult, EventParams, EventResult, InitializeParams,
-    OpenFileParams, NotifyParams, PanelDecl, PanelSlot, PluginManifest,
-    RenderParams, RenderResult, RpcMessage,
+    CommandParams, EventParams, InitializeParams, NotifyParams, PanelDecl, PanelSlot,
+    PluginManifest, RenderParams, RenderResult, RpcMessage,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -34,7 +33,7 @@ pub struct HelpEntry {
 
 pub struct PluginManager {
     processes: HashMap<String, PluginProcess>,
-    pub panels: Vec<ManagedPanel>,   // ordered: sidebar panels in registration order
+    pub panels: Vec<ManagedPanel>, // ordered: sidebar panels in registration order
     /// Events raised by plugins for the host to act on this frame.
     pub pending_host_requests: Vec<PendingRequest>,
     pub notifications: Vec<NotifyParams>,
@@ -59,7 +58,9 @@ impl PluginManager {
     /// Discover and load all plugins from a directory.
     /// Each subdirectory with a reef.json is considered a plugin.
     pub fn load_from_dir(&mut self, dir: &Path) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
         for entry in entries.flatten() {
             let manifest_path = entry.path().join("reef.json");
             if manifest_path.exists() {
@@ -84,7 +85,8 @@ impl PluginManager {
         // Send initialize
         let params = serde_json::to_value(InitializeParams {
             reef_version: env!("CARGO_PKG_VERSION").to_string(),
-        }).unwrap();
+        })
+        .unwrap();
         proc.send_request("reef/initialize", params)?;
 
         // Register panels declared in manifest
@@ -121,20 +123,23 @@ impl PluginManager {
 
         let names: Vec<String> = self.processes.keys().cloned().collect();
         for name in names {
-            let Some(proc) = self.processes.get_mut(&name) else { continue };
+            let Some(proc) = self.processes.get_mut(&name) else {
+                continue;
+            };
             let messages = proc.drain_messages();
             for msg in messages {
                 self.handle_message(&name.clone(), msg);
             }
         }
-
     }
 
     fn handle_message(&mut self, plugin_name: &str, msg: RpcMessage) {
         if msg.is_response() {
             if let Some(result_val) = &msg.result {
                 // Try to deserialize as RenderResult
-                if let Ok(render_result) = serde_json::from_value::<RenderResult>(result_val.clone()) {
+                if let Ok(render_result) =
+                    serde_json::from_value::<RenderResult>(result_val.clone())
+                {
                     for panel in &mut self.panels {
                         if panel.plugin_name == plugin_name
                             && panel.decl.id == render_result.panel_id
@@ -194,8 +199,17 @@ impl PluginManager {
     }
 
     /// Request a render from the plugin owning `panel_id`.
-    pub fn request_render(&mut self, panel_id: &str, width: u16, height: u16, focused: bool, scroll: u32) {
-        let plugin_name = self.panels.iter()
+    pub fn request_render(
+        &mut self,
+        panel_id: &str,
+        width: u16,
+        height: u16,
+        focused: bool,
+        scroll: u32,
+    ) {
+        let plugin_name = self
+            .panels
+            .iter()
             .find(|p| p.decl.id == panel_id)
             .map(|p| p.plugin_name.clone());
 
@@ -207,7 +221,8 @@ impl PluginManager {
                     height,
                     focused,
                     scroll,
-                }).unwrap();
+                })
+                .unwrap();
                 // Clear needs_render BEFORE sending so we don't flood the plugin
                 // with duplicate render requests while waiting for the response.
                 for panel in &mut self.panels {
@@ -224,13 +239,10 @@ impl PluginManager {
 
     /// Forward a key event to the plugin owning `panel_id`.
     /// Returns true if the plugin consumed it.
-    pub fn send_key_event(
-        &mut self,
-        panel_id: &str,
-        key: &str,
-        modifiers: Vec<String>,
-    ) -> bool {
-        let plugin_name = self.panels.iter()
+    pub fn send_key_event(&mut self, panel_id: &str, key: &str, modifiers: Vec<String>) -> bool {
+        let plugin_name = self
+            .panels
+            .iter()
             .find(|p| p.decl.id == panel_id)
             .map(|p| p.plugin_name.clone());
 
@@ -242,7 +254,8 @@ impl PluginManager {
                         key: key.to_string(),
                         modifiers,
                     },
-                }).unwrap();
+                })
+                .unwrap();
                 let _ = proc.send_request("reef/event", params);
                 // Optimistic: assume consumed; plugin can correct on next tick
                 return true;
@@ -269,7 +282,8 @@ impl PluginManager {
                 let params = serde_json::to_value(CommandParams {
                     id: command_id.to_string(),
                     args,
-                }).unwrap();
+                })
+                .unwrap();
                 let _ = proc.send_request("reef/command", params);
             }
         }
@@ -284,7 +298,8 @@ impl PluginManager {
 
     /// Sidebar panels in order.
     pub fn sidebar_panels(&self) -> Vec<&ManagedPanel> {
-        self.panels.iter()
+        self.panels
+            .iter()
             .filter(|p| p.decl.slot == PanelSlot::Sidebar)
             .collect()
     }
@@ -320,7 +335,12 @@ mod tests {
 
     fn sidebar_panel(id: &str, plugin: &str) -> ManagedPanel {
         ManagedPanel {
-            decl: PanelDecl { id: id.into(), title: id.into(), slot: PanelSlot::Sidebar, icon: None },
+            decl: PanelDecl {
+                id: id.into(),
+                title: id.into(),
+                slot: PanelSlot::Sidebar,
+                icon: None,
+            },
             plugin_name: plugin.into(),
             last_render: None,
             needs_render: false,
@@ -330,7 +350,12 @@ mod tests {
 
     fn editor_panel(id: &str, plugin: &str) -> ManagedPanel {
         ManagedPanel {
-            decl: PanelDecl { id: id.into(), title: id.into(), slot: PanelSlot::Editor, icon: None },
+            decl: PanelDecl {
+                id: id.into(),
+                title: id.into(),
+                slot: PanelSlot::Editor,
+                icon: None,
+            },
             plugin_name: plugin.into(),
             last_render: None,
             needs_render: false,
@@ -388,7 +413,10 @@ mod tests {
     fn resolve_exe_relative_joined_with_dir() {
         let dir = Path::new("/plugins/myplugin");
         let result = resolve_exe("./plugin", dir);
-        assert!(result.contains("myplugin"), "should be joined with plugin_dir");
+        assert!(
+            result.contains("myplugin"),
+            "should be joined with plugin_dir"
+        );
         assert!(result.contains("plugin"));
     }
 
@@ -396,7 +424,10 @@ mod tests {
     fn resolve_exe_parent_relative() {
         let dir = Path::new("/plugins/myplugin");
         let result = resolve_exe("../bin/plugin", dir);
-        assert!(result.contains("plugins"), "parent-relative path joined with dir");
+        assert!(
+            result.contains("plugins"),
+            "parent-relative path joined with dir"
+        );
     }
 
     #[test]
@@ -442,7 +473,10 @@ mod tests {
         };
         // Message arrives from "other" plugin, not "git"
         m.handle_message("other", msg);
-        assert!(!m.panels[0].needs_render, "wrong plugin should not mark panel");
+        assert!(
+            !m.panels[0].needs_render,
+            "wrong plugin should not mark panel"
+        );
     }
 
     #[test]

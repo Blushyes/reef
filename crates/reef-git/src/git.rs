@@ -285,11 +285,7 @@ impl GitRepo {
         })
     }
 
-    fn parse_git2_diff(
-        &self,
-        diff: &git2::Diff,
-        path: &str,
-    ) -> Option<DiffContent> {
+    fn parse_git2_diff(&self, diff: &git2::Diff, path: &str) -> Option<DiffContent> {
         let mut hunks = Vec::new();
 
         diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
@@ -311,8 +307,7 @@ impl GitRepo {
                         '-' => LineTag::Removed,
                         _ => LineTag::Context,
                     };
-                    let content =
-                        String::from_utf8_lossy(line.content()).to_string();
+                    let content = String::from_utf8_lossy(line.content()).to_string();
                     // Trim trailing newline
                     let content = content.trim_end_matches('\n').to_string();
 
@@ -330,9 +325,7 @@ impl GitRepo {
                 }
                 'H' => {
                     // Hunk header
-                    let header = String::from_utf8_lossy(line.content())
-                        .trim()
-                        .to_string();
+                    let header = String::from_utf8_lossy(line.content()).trim().to_string();
                     hunks.push(DiffHunk {
                         header,
                         lines: Vec::new(),
@@ -377,10 +370,8 @@ impl GitRepo {
         match head {
             Ok(head_ref) => {
                 let head_commit = head_ref.peel_to_commit()?;
-                self.repo.reset_default(
-                    Some(head_commit.as_object()),
-                    [path],
-                )?;
+                self.repo
+                    .reset_default(Some(head_commit.as_object()), [path])?;
             }
             Err(_) => {
                 // No HEAD (initial commit) — remove from index
@@ -414,7 +405,8 @@ impl GitRepo {
             let head_tree = self.repo.head()?.peel_to_commit()?.tree()?;
             let mut opts = git2::build::CheckoutBuilder::new();
             opts.force().update_index(false).path(path);
-            self.repo.checkout_tree(head_tree.as_object(), Some(&mut opts))
+            self.repo
+                .checkout_tree(head_tree.as_object(), Some(&mut opts))
         } else {
             std::fs::remove_file(workdir.join(path))
                 .map_err(|e| git2::Error::from_str(&e.to_string()))
@@ -435,7 +427,9 @@ impl GitRepo {
     /// Walk up to `limit` commits reachable from all branches/tags/HEAD, in
     /// topological + time order (child before parent, newest first).
     pub fn list_commits(&self, limit: usize) -> Vec<CommitInfo> {
-        let Ok(mut walk) = self.repo.revwalk() else { return Vec::new() };
+        let Ok(mut walk) = self.repo.revwalk() else {
+            return Vec::new();
+        };
         let _ = walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME);
 
         // Seed from local branches, remote branches, tags (peeled), and HEAD.
@@ -447,7 +441,9 @@ impl GitRepo {
 
         let mut out = Vec::with_capacity(limit.min(256));
         for oid in walk.flatten().take(limit) {
-            let Ok(commit) = self.repo.find_commit(oid) else { continue };
+            let Ok(commit) = self.repo.find_commit(oid) else {
+                continue;
+            };
             out.push(commit_to_info(&commit));
         }
         out
@@ -540,7 +536,9 @@ impl GitRepo {
     /// Compute the list of files changed by this commit (vs first parent, or
     /// vs empty tree for the initial commit).
     fn commit_files(&self, commit: &git2::Commit) -> Vec<FileEntry> {
-        let Ok(new_tree) = commit.tree() else { return Vec::new() };
+        let Ok(new_tree) = commit.tree() else {
+            return Vec::new();
+        };
         let parent_tree = commit.parents().next().and_then(|p| p.tree().ok());
 
         let diff = match self
@@ -591,10 +589,7 @@ fn commit_to_info(commit: &git2::Commit) -> CommitInfo {
     let author_name = author.name().unwrap_or("").to_string();
     let author_email = author.email().unwrap_or("").to_string();
     let time = author.when().seconds();
-    let subject = commit
-        .summary()
-        .unwrap_or("")
-        .to_string();
+    let subject = commit.summary().unwrap_or("").to_string();
     CommitInfo {
         oid,
         short_oid,

@@ -1,15 +1,14 @@
 use crate::app::{App, DiffLayout};
 use crate::git::{DiffContent, DiffHunk, LineTag};
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthStr;
 use ratatui::widgets::{Block, Padding};
-use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default()
-        .padding(Padding::new(1, 1, 0, 0));
+    let block = Block::default().padding(Padding::new(1, 1, 0, 0));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -89,7 +88,12 @@ fn render_unified_line(f: &mut Frame, area: Rect, y: u16, dl: &UnifiedLine) {
             ));
             f.render_widget(line, Rect::new(area.x, y, area.width, 1));
         }
-        UnifiedLine::Content { tag, old_lineno, new_lineno, text } => {
+        UnifiedLine::Content {
+            tag,
+            old_lineno,
+            new_lineno,
+            text,
+        } => {
             let (prefix, fg, bg) = line_style(*tag);
             let old_num = fmt_lineno(*old_lineno);
             let new_num = fmt_lineno(*new_lineno);
@@ -100,10 +104,16 @@ fn render_unified_line(f: &mut Frame, area: Rect, y: u16, dl: &UnifiedLine) {
             let pad = max_text.saturating_sub(UnicodeWidthStr::width(display_text));
 
             let line = Line::from(vec![
-                Span::styled(format!(" {}  {} ", old_num, new_num), Style::default().fg(Color::DarkGray).bg(bg)),
+                Span::styled(
+                    format!(" {}  {} ", old_num, new_num),
+                    Style::default().fg(Color::DarkGray).bg(bg),
+                ),
                 Span::styled(format!("{} ", prefix), Style::default().fg(fg).bg(bg)),
                 Span::styled(display_text.to_string(), Style::default().fg(fg).bg(bg)),
-                Span::styled(" ".repeat(pad.min(area.width as usize)), Style::default().bg(bg)),
+                Span::styled(
+                    " ".repeat(pad.min(area.width as usize)),
+                    Style::default().bg(bg),
+                ),
             ]);
             f.render_widget(line, Rect::new(area.x, y, area.width, 1));
         }
@@ -239,7 +249,11 @@ fn render_side_by_side(f: &mut Frame, app: &App, area: Rect, diff: &DiffContent)
         match dl {
             SbsDisplayLine::Separator => {
                 let line = Line::from(Span::styled(
-                    format!(" {:>5}  ⋯{}", "", " ".repeat(area.width.saturating_sub(10) as usize)),
+                    format!(
+                        " {:>5}  ⋯{}",
+                        "",
+                        " ".repeat(area.width.saturating_sub(10) as usize)
+                    ),
                     Style::default().fg(Color::DarkGray),
                 ));
                 f.render_widget(line, Rect::new(area.x, y, area.width, 1));
@@ -271,8 +285,14 @@ fn render_sbs_row(f: &mut Frame, area: Rect, y: u16, row: &SbsRow, half_w: u16, 
     let left_pad = left_content_w.saturating_sub(UnicodeWidthStr::width(left_text));
 
     let left_line = Line::from(vec![
-        Span::styled(format!(" {} ", left_no), Style::default().fg(Color::DarkGray).bg(left_bg)),
-        Span::styled(left_text.to_string(), Style::default().fg(left_fg).bg(left_bg)),
+        Span::styled(
+            format!(" {} ", left_no),
+            Style::default().fg(Color::DarkGray).bg(left_bg),
+        ),
+        Span::styled(
+            left_text.to_string(),
+            Style::default().fg(left_fg).bg(left_bg),
+        ),
         Span::styled(" ".repeat(left_pad), Style::default().bg(left_bg)),
     ]);
     f.render_widget(left_line, Rect::new(area.x, y, half_w, 1));
@@ -290,8 +310,14 @@ fn render_sbs_row(f: &mut Frame, area: Rect, y: u16, row: &SbsRow, half_w: u16, 
     let right_pad = right_content_w.saturating_sub(UnicodeWidthStr::width(right_text));
 
     let right_line = Line::from(vec![
-        Span::styled(format!(" {} ", right_no), Style::default().fg(Color::DarkGray).bg(right_bg)),
-        Span::styled(right_text.to_string(), Style::default().fg(right_fg).bg(right_bg)),
+        Span::styled(
+            format!(" {} ", right_no),
+            Style::default().fg(Color::DarkGray).bg(right_bg),
+        ),
+        Span::styled(
+            right_text.to_string(),
+            Style::default().fg(right_fg).bg(right_bg),
+        ),
         Span::styled(" ".repeat(right_pad), Style::default().bg(right_bg)),
     ]);
     f.render_widget(right_line, Rect::new(div_x + 1, y, right_w, 1));
@@ -299,7 +325,14 @@ fn render_sbs_row(f: &mut Frame, area: Rect, y: u16, row: &SbsRow, half_w: u16, 
 
 // ─── Shared helpers ──────────────────────────────────────────────────────────
 
-fn render_file_header(f: &mut Frame, app: &App, area: Rect, diff: &DiffContent, y: &mut u16, max_y: u16) {
+fn render_file_header(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    diff: &DiffContent,
+    y: &mut u16,
+    max_y: u16,
+) {
     if *y >= max_y {
         return;
     }
@@ -319,7 +352,12 @@ fn render_file_header(f: &mut Frame, app: &App, area: Rect, diff: &DiffContent, 
     let path_display = truncate_to_width(&diff.file_path, path_max);
 
     let header = Line::from(vec![
-        Span::styled(path_display.to_string(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            path_display.to_string(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(tag_str, Style::default().fg(Color::DarkGray)),
     ]);
     f.render_widget(header, Rect::new(area.x, *y, area.width, 1));
@@ -368,20 +406,43 @@ mod tests {
     use super::*;
     use crate::git::{DiffHunk, DiffLine, LineTag};
 
-    fn make_line(tag: LineTag, content: &str, old_no: Option<u32>, new_no: Option<u32>) -> DiffLine {
-        DiffLine { tag, content: content.to_string(), old_lineno: old_no, new_lineno: new_no }
+    fn make_line(
+        tag: LineTag,
+        content: &str,
+        old_no: Option<u32>,
+        new_no: Option<u32>,
+    ) -> DiffLine {
+        DiffLine {
+            tag,
+            content: content.to_string(),
+            old_lineno: old_no,
+            new_lineno: new_no,
+        }
     }
 
     fn make_hunk(header: &str, lines: Vec<DiffLine>) -> DiffHunk {
-        DiffHunk { header: header.to_string(), lines }
+        DiffHunk {
+            header: header.to_string(),
+            lines,
+        }
     }
 
     fn count_rows(v: &[SbsDisplayLine]) -> usize {
-        v.iter().filter(|l| matches!(l, SbsDisplayLine::Row(_))).count()
+        v.iter()
+            .filter(|l| matches!(l, SbsDisplayLine::Row(_)))
+            .count()
     }
 
     fn get_rows(v: &[SbsDisplayLine]) -> Vec<&SbsRow> {
-        v.iter().filter_map(|l| if let SbsDisplayLine::Row(r) = l { Some(r) } else { None }).collect()
+        v.iter()
+            .filter_map(|l| {
+                if let SbsDisplayLine::Row(r) = l {
+                    Some(r)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     // ── line_style ───────────────────────────────────────────────────────────
@@ -463,9 +524,10 @@ mod tests {
 
     #[test]
     fn build_sbs_lines_context_appears_on_both_sides() {
-        let hunk = make_hunk("@@ @@", vec![
-            make_line(LineTag::Context, "same", Some(1), Some(1)),
-        ]);
+        let hunk = make_hunk(
+            "@@ @@",
+            vec![make_line(LineTag::Context, "same", Some(1), Some(1))],
+        );
         let lines = build_sbs_lines(&hunk);
         let rows = get_rows(&lines);
         assert_eq!(rows.len(), 1);
@@ -477,9 +539,10 @@ mod tests {
 
     #[test]
     fn build_sbs_lines_add_only_has_empty_left() {
-        let hunk = make_hunk("@@ @@", vec![
-            make_line(LineTag::Added, "new line", None, Some(1)),
-        ]);
+        let hunk = make_hunk(
+            "@@ @@",
+            vec![make_line(LineTag::Added, "new line", None, Some(1))],
+        );
         let lines = build_sbs_lines(&hunk);
         let rows = get_rows(&lines);
         assert_eq!(rows.len(), 1);
@@ -491,9 +554,10 @@ mod tests {
 
     #[test]
     fn build_sbs_lines_remove_only_has_empty_right() {
-        let hunk = make_hunk("@@ @@", vec![
-            make_line(LineTag::Removed, "old line", Some(1), None),
-        ]);
+        let hunk = make_hunk(
+            "@@ @@",
+            vec![make_line(LineTag::Removed, "old line", Some(1), None)],
+        );
         let lines = build_sbs_lines(&hunk);
         let rows = get_rows(&lines);
         assert_eq!(rows.len(), 1);
@@ -505,10 +569,13 @@ mod tests {
 
     #[test]
     fn build_sbs_lines_remove_then_add_are_paired() {
-        let hunk = make_hunk("@@ @@", vec![
-            make_line(LineTag::Removed, "old", Some(1), None),
-            make_line(LineTag::Added, "new", None, Some(1)),
-        ]);
+        let hunk = make_hunk(
+            "@@ @@",
+            vec![
+                make_line(LineTag::Removed, "old", Some(1), None),
+                make_line(LineTag::Added, "new", None, Some(1)),
+            ],
+        );
         let lines = build_sbs_lines(&hunk);
         let rows = get_rows(&lines);
         assert_eq!(rows.len(), 1);
@@ -518,10 +585,13 @@ mod tests {
 
     #[test]
     fn build_sbs_lines_multiple_context_rows() {
-        let hunk = make_hunk("@@ @@", vec![
-            make_line(LineTag::Context, "line1", Some(1), Some(1)),
-            make_line(LineTag::Context, "line2", Some(2), Some(2)),
-        ]);
+        let hunk = make_hunk(
+            "@@ @@",
+            vec![
+                make_line(LineTag::Context, "line1", Some(1), Some(1)),
+                make_line(LineTag::Context, "line2", Some(2), Some(2)),
+            ],
+        );
         assert_eq!(count_rows(&build_sbs_lines(&hunk)), 2);
     }
 }

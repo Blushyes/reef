@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 /// A visible entry in the flattened file tree.
 #[derive(Debug, Clone)]
 pub struct TreeEntry {
-    pub path: PathBuf,   // relative to workdir
-    pub name: String,    // display name (filename only)
+    pub path: PathBuf, // relative to workdir
+    pub name: String,  // display name (filename only)
     pub depth: usize,
     pub is_dir: bool,
     pub is_expanded: bool,
@@ -74,16 +74,17 @@ impl FileTree {
         }
 
         // Sort: directories first, then files, alphabetically
-        children.sort_by(|a, b| {
-            match (a.2, b.2) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
-            }
+        children.sort_by(|a, b| match (a.2, b.2) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
         });
 
         for (name, full_path, is_dir) in children {
-            let rel = full_path.strip_prefix(&self.root).unwrap_or(&full_path).to_path_buf();
+            let rel = full_path
+                .strip_prefix(&self.root)
+                .unwrap_or(&full_path)
+                .to_path_buf();
             let rel_str = rel.to_string_lossy().to_string();
             let is_expanded = is_dir && self.expanded.contains(&rel);
             let git_status = self.git_statuses.get(&rel_str).copied();
@@ -140,7 +141,10 @@ impl FileTree {
     ) {
         self.git_statuses.clear();
         for f in staged {
-            self.git_statuses.insert(f.path.clone(), f.status.label().chars().next().unwrap_or(' '));
+            self.git_statuses.insert(
+                f.path.clone(),
+                f.status.label().chars().next().unwrap_or(' '),
+            );
         }
         for f in unstaged {
             let ch = f.status.label().chars().next().unwrap_or(' ');
@@ -152,7 +156,9 @@ impl FileTree {
             let p = Path::new(&path);
             for ancestor in p.ancestors().skip(1) {
                 let a = ancestor.to_string_lossy().to_string();
-                if a.is_empty() { break; }
+                if a.is_empty() {
+                    break;
+                }
                 self.git_statuses.entry(a).or_insert('●');
             }
         }
@@ -214,7 +220,10 @@ mod tests {
     use crate::git::{FileEntry, FileStatus};
 
     fn make_entry(path: &str, status: FileStatus) -> FileEntry {
-        FileEntry { path: path.to_string(), status }
+        FileEntry {
+            path: path.to_string(),
+            status,
+        }
     }
 
     fn make_tree_with_entries(entries: Vec<TreeEntry>) -> FileTree {
@@ -242,7 +251,8 @@ mod tests {
 
     #[test]
     fn navigate_forward() {
-        let mut tree = make_tree_with_entries(vec![dummy_entry("a"), dummy_entry("b"), dummy_entry("c")]);
+        let mut tree =
+            make_tree_with_entries(vec![dummy_entry("a"), dummy_entry("b"), dummy_entry("c")]);
         tree.navigate(1);
         assert_eq!(tree.selected, 1);
     }
@@ -256,7 +266,8 @@ mod tests {
 
     #[test]
     fn navigate_clamps_at_end() {
-        let mut tree = make_tree_with_entries(vec![dummy_entry("a"), dummy_entry("b"), dummy_entry("c")]);
+        let mut tree =
+            make_tree_with_entries(vec![dummy_entry("a"), dummy_entry("b"), dummy_entry("c")]);
         tree.navigate(9999);
         assert_eq!(tree.selected, 2);
     }
@@ -312,7 +323,10 @@ mod tests {
         let staged = vec![make_entry("src/main.rs", FileStatus::Added)];
         tree.refresh_git_statuses(&staged, &[]);
         // Parent directory "src" should have been given the propagated marker
-        assert!(tree.git_statuses.contains_key("src"), "parent dir should appear in git_statuses");
+        assert!(
+            tree.git_statuses.contains_key("src"),
+            "parent dir should appear in git_statuses"
+        );
     }
 
     #[test]

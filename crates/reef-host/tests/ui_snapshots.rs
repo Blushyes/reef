@@ -10,6 +10,7 @@ use ratatui::buffer::Buffer;
 use reef_host::app::App;
 use reef_host::ui;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use test_support::{commit_file, tempdir_repo, write_file};
 
 static CWD_LOCK: Mutex<()> = Mutex::new(());
@@ -48,11 +49,33 @@ fn buffer_to_text(buf: &Buffer) -> String {
     lines.join("\n")
 }
 
+/// Drive the main loop's tick→render pipeline until the output stops
+/// changing for three consecutive frames (or timeout). Necessary because
+/// `App::new()` spawns plugin subprocesses asynchronously — rendering once
+/// captures an incomplete frame whose content depends on OS scheduling.
 fn render_app(app: &mut App, width: u16, height: u16) -> String {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|f| ui::render(f, app)).unwrap();
-    buffer_to_text(terminal.backend().buffer())
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last = String::new();
+    let mut stable_frames = 0;
+    while Instant::now() < deadline {
+        app.tick_plugins();
+        terminal.draw(|f| ui::render(f, app)).unwrap();
+        let text = buffer_to_text(terminal.backend().buffer());
+        if text == last {
+            stable_frames += 1;
+            if stable_frames >= 3 {
+                return text;
+            }
+        } else {
+            stable_frames = 0;
+            last = text;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    last
 }
 
 /// Apply filters to mask nondeterministic tokens (tempdir name, path segments).

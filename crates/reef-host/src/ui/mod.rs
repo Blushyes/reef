@@ -6,12 +6,12 @@ pub mod plugin_panel;
 
 use crate::app::{App, Tab};
 use crate::mouse::ClickAction;
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Text;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
-use ratatui::text::Text;
-use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 pub fn render(f: &mut Frame, app: &mut App) {
@@ -33,14 +33,13 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     // Body: left + right
     let left_width = (main_layout[2].width as u32 * app.split_percent as u32 / 100) as u16;
-    let left_width = left_width.max(10).min(main_layout[2].width.saturating_sub(20));
+    let left_width = left_width
+        .max(10)
+        .min(main_layout[2].width.saturating_sub(20));
 
     let body_layout = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(left_width),
-            Constraint::Min(20),
-        ])
+        .constraints([Constraint::Length(left_width), Constraint::Min(20)])
         .split(main_layout[2]);
 
     // Drag zone on the split border
@@ -85,7 +84,9 @@ fn render_no_repo(f: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from(Span::styled(
             "Not a git repository",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
@@ -121,11 +122,15 @@ fn render_sidebar_panel(f: &mut Frame, app: &mut App, area: Rect, panel_id: &str
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let padded = Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(1), inner.height);
+    let padded = Rect::new(
+        inner.x + 1,
+        inner.y,
+        inner.width.saturating_sub(1),
+        inner.height,
+    );
     let focused = matches!(app.active_panel, crate::app::Panel::Files);
     plugin_panel::render(f, app, padded, panel_id, focused);
 }
-
 
 /// Right editor for Tab::Git — always renders the host-native diff panel. We
 /// deliberately don't scan for editor-slot plugin panels here, because
@@ -137,7 +142,12 @@ fn render_editor(f: &mut Frame, app: &mut App, area: Rect) {
 /// Render a specific plugin-contributed editor panel, with 1-col left padding.
 fn render_editor_panel(f: &mut Frame, app: &mut App, area: Rect, panel_id: &str) {
     let focused = matches!(app.active_panel, crate::app::Panel::Diff);
-    let inner = Rect::new(area.x + 1, area.y, area.width.saturating_sub(1), area.height);
+    let inner = Rect::new(
+        area.x + 1,
+        area.y,
+        area.width.saturating_sub(1),
+        area.height,
+    );
     plugin_panel::render(f, app, inner, panel_id, focused);
 }
 
@@ -152,7 +162,10 @@ fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
         let label = tab.label();
         let is_active = app.active_tab == *tab;
         let style = if is_active {
-            Style::default().fg(Color::White).bg(Color::Rgb(60, 60, 80)).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(60, 60, 80))
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray).bg(bg)
         };
@@ -162,13 +175,17 @@ fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
         // required to keep click zones aligned with the rendered text.
         let w = UnicodeWidthStr::width(label) as u16;
 
-        app.hit_registry.register_row(x, area.y, w, ClickAction::SwitchTab(*tab));
+        app.hit_registry
+            .register_row(x, area.y, w, ClickAction::SwitchTab(*tab));
         x += w;
         spans.push(span);
 
         // Separator between tabs
         if i < tabs.len() - 1 {
-            spans.push(Span::styled("│", Style::default().fg(Color::DarkGray).bg(bg)));
+            spans.push(Span::styled(
+                "│",
+                Style::default().fg(Color::DarkGray).bg(bg),
+            ));
             x += 1;
         }
     }
@@ -178,14 +195,25 @@ fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let keys_hint = " 1:Files 2:Git 3:Graph";
     let pad = remaining.saturating_sub(UnicodeWidthStr::width(keys_hint));
     spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bg)));
-    spans.push(Span::styled(keys_hint, Style::default().fg(Color::DarkGray).bg(bg)));
+    spans.push(Span::styled(
+        keys_hint,
+        Style::default().fg(Color::DarkGray).bg(bg),
+    ));
 
     f.render_widget(Line::from(spans), area);
 }
 
 fn render_title_bar(f: &mut Frame, app: &App, area: Rect) {
-    let repo_name = app.repo.as_ref().map(|r| r.workdir_name()).unwrap_or_else(|| "—".to_string());
-    let branch = app.repo.as_ref().map(|r| r.branch_name()).unwrap_or_default();
+    let repo_name = app
+        .repo
+        .as_ref()
+        .map(|r| r.workdir_name())
+        .unwrap_or_else(|| "—".to_string());
+    let branch = app
+        .repo
+        .as_ref()
+        .map(|r| r.branch_name())
+        .unwrap_or_default();
 
     let title = Line::from(vec![
         Span::styled(
@@ -204,7 +232,11 @@ fn render_title_bar(f: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            if branch.is_empty() { String::new() } else { format!("  ⎇ {}", branch) },
+            if branch.is_empty() {
+                String::new()
+            } else {
+                format!("  ⎇ {}", branch)
+            },
             Style::default().fg(Color::Cyan).bg(Color::Rgb(30, 30, 40)),
         ),
         Span::styled(
@@ -231,7 +263,9 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled(
                 "  拖拽鼠标选择文字，按 v 退出选择模式",
-                Style::default().fg(Color::Yellow).bg(Color::Rgb(30, 30, 40)),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .bg(Color::Rgb(30, 30, 40)),
             ),
         ]);
         f.render_widget(hint, area);
@@ -239,26 +273,37 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // Collect plugin notifications as inline status
-    let notif = app.plugin_manager.notifications.last()
+    let notif = app
+        .plugin_manager
+        .notifications
+        .last()
         .map(|n| format!("  {} ", n.message))
         .unwrap_or_default();
-    let notif_color = app.plugin_manager.notifications.last()
+    let notif_color = app
+        .plugin_manager
+        .notifications
+        .last()
         .map(|n| match n.level.as_str() {
             "error" => Color::Red,
-            "warn"  => Color::Yellow,
-            _       => Color::Cyan,
+            "warn" => Color::Yellow,
+            _ => Color::Cyan,
         })
         .unwrap_or(Color::Cyan);
 
     let status = Line::from(vec![
-        Span::styled(notif, Style::default().fg(notif_color).bg(Color::Rgb(30, 30, 40))),
+        Span::styled(
+            notif,
+            Style::default().fg(notif_color).bg(Color::Rgb(30, 30, 40)),
+        ),
         Span::styled(
             " ".repeat(area.width.saturating_sub(60) as usize),
             Style::default().bg(Color::Rgb(30, 30, 40)),
         ),
         Span::styled(
             " q:退出 Tab:切换 s:暂存 u:取消 r:刷新 h:帮助 ",
-            Style::default().fg(Color::DarkGray).bg(Color::Rgb(30, 30, 40)),
+            Style::default()
+                .fg(Color::DarkGray)
+                .bg(Color::Rgb(30, 30, 40)),
         ),
     ]);
     f.render_widget(status, area);
@@ -266,25 +311,29 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_help(f: &mut Frame, screen: Rect, plugin_entries: &[crate::plugin::manager::HelpEntry]) {
     let core_entries: &[(&str, &str)] = &[
-        ("q / Ctrl+C",   "退出"),
-        ("Tab",          "切换顶部标签页（Files ↔ Git）"),
-        ("Shift+Tab",    "切换焦点面板（侧边栏 ↔ 编辑区）"),
-        ("1 … 9",        "跳转到第 N 个标签页"),
-        ("↑ / k",        "向上导航 / 向上滚动"),
-        ("↓ / j",        "向下导航 / 向下滚动"),
-        ("PageUp",       "快速向上翻页"),
-        ("PageDown",     "快速向下翻页"),
-        ("m",            "切换 Diff 布局（上下 ↔ 左右）"),
-        ("f",            "切换 Diff 模式（局部 ↔ 全量）"),
-        ("v",            "文字选择模式"),
-        ("h",            "显示 / 关闭此帮助"),
-        ("任意键",        "关闭帮助"),
+        ("q / Ctrl+C", "退出"),
+        ("Tab", "切换顶部标签页（Files ↔ Git）"),
+        ("Shift+Tab", "切换焦点面板（侧边栏 ↔ 编辑区）"),
+        ("1 … 9", "跳转到第 N 个标签页"),
+        ("↑ / k", "向上导航 / 向上滚动"),
+        ("↓ / j", "向下导航 / 向下滚动"),
+        ("PageUp", "快速向上翻页"),
+        ("PageDown", "快速向下翻页"),
+        ("m", "切换 Diff 布局（上下 ↔ 左右）"),
+        ("f", "切换 Diff 模式（局部 ↔ 全量）"),
+        ("v", "文字选择模式"),
+        ("h", "显示 / 关闭此帮助"),
+        ("任意键", "关闭帮助"),
     ];
 
     let has_plugin = !plugin_entries.is_empty();
     // core rows + optional divider + optional header + plugin rows
     let total_rows = core_entries.len()
-        + if has_plugin { 1 + 1 + plugin_entries.len() } else { 0 };
+        + if has_plugin {
+            1 + 1 + plugin_entries.len()
+        } else {
+            0
+        };
 
     let popup_w = 62u16;
     let popup_h = total_rows as u16 + 4;
@@ -299,7 +348,9 @@ fn render_help(f: &mut Frame, screen: Rect, plugin_entries: &[crate::plugin::man
         .border_style(Style::default().fg(Color::Blue))
         .title(Span::styled(
             " 快捷键帮助 ",
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ))
         .padding(Padding::new(1, 1, 0, 0));
 
@@ -310,11 +361,15 @@ fn render_help(f: &mut Frame, screen: Rect, plugin_entries: &[crate::plugin::man
     let mut row_y = inner.y;
 
     for (key, desc) in core_entries {
-        if row_y >= inner.y + inner.height { break; }
+        if row_y >= inner.y + inner.height {
+            break;
+        }
         let line = Line::from(vec![
             Span::styled(
                 format!("{:<width$}", key, width = key_col),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(*desc, Style::default().fg(Color::White)),
         ]);
@@ -328,18 +383,24 @@ fn render_help(f: &mut Frame, screen: Rect, plugin_entries: &[crate::plugin::man
             f.render_widget(
                 Line::from(Span::styled(
                     "插件快捷键",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Rect::new(inner.x, row_y, inner.width, 1),
             );
             row_y += 1;
         }
         for entry in plugin_entries {
-            if row_y >= inner.y + inner.height { break; }
+            if row_y >= inner.y + inner.height {
+                break;
+            }
             let line = Line::from(vec![
                 Span::styled(
                     format!("{:<width$}", entry.key, width = key_col),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(&*entry.description, Style::default().fg(Color::White)),
                 Span::styled(

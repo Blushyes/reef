@@ -1,10 +1,10 @@
 use crate::app::App;
 use crate::file_tree::PreviewContent;
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding};
-use ratatui::Frame;
 
 pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default().padding(Padding::new(1, 1, 0, 0));
@@ -29,7 +29,9 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_empty(f: &mut Frame, area: Rect) {
-    if area.height < 1 { return; }
+    if area.height < 1 {
+        return;
+    }
     let msg = Line::from(Span::styled(
         "选择一个文件预览内容",
         Style::default().fg(Color::DarkGray),
@@ -40,10 +42,14 @@ fn render_empty(f: &mut Frame, area: Rect) {
 }
 
 fn render_binary(f: &mut Frame, area: Rect, path: &str) {
-    if area.height < 2 { return; }
+    if area.height < 2 {
+        return;
+    }
     let header = Line::from(Span::styled(
         path,
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
     ));
     f.render_widget(header, Rect::new(area.x, area.y, area.width, 1));
 
@@ -64,7 +70,9 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewCon
     if y < max_y {
         let header = Line::from(Span::styled(
             preview.file_path.as_str(),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ));
         f.render_widget(header, Rect::new(area.x, y, area.width, 1));
         y += 1;
@@ -89,7 +97,9 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewCon
 
     for (i, line) in preview.lines.iter().skip(app.preview_scroll).enumerate() {
         let cy = y + i as u16;
-        if cy >= max_y { break; }
+        if cy >= max_y {
+            break;
+        }
         let real_idx = app.preview_scroll + i;
         let lineno = real_idx + 1;
 
@@ -130,7 +140,9 @@ fn truncate_spans<'a>(tokens: &'a [(Style, String)], max_width: usize) -> Vec<Sp
     let mut out = Vec::with_capacity(tokens.len());
     let mut width = 0usize;
     for (style, text) in tokens {
-        if width >= max_width { break; }
+        if width >= max_width {
+            break;
+        }
         let remaining = max_width - width;
         let mut tok_w = 0usize;
         let mut cut: Option<usize> = None;

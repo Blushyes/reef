@@ -1,15 +1,18 @@
 use crate::app::App;
 use crate::mouse::ClickAction;
 use crate::renderer::to_ratatui_line;
-use ratatui::layout::Rect;
 use ratatui::Frame;
+use ratatui::layout::Rect;
 use unicode_width::UnicodeWidthStr;
 
 /// Render a plugin panel identified by `panel_id` into `area`.
 pub fn render(f: &mut Frame, app: &mut App, area: Rect, panel_id: &str, focused: bool) {
     // Determine current scroll and clamp it using total_lines from the last render.
     let raw_scroll = app.panel_scroll.get(panel_id).copied().unwrap_or(0);
-    let total_lines = app.plugin_manager.panels.iter()
+    let total_lines = app
+        .plugin_manager
+        .panels
+        .iter()
         .find(|p| p.decl.id == panel_id)
         .and_then(|p| p.last_render.as_ref())
         .map(|r| r.total_lines)
@@ -19,17 +22,24 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, panel_id: &str, focused:
     let scroll = clamped as u32;
 
     // Request render if content is stale OR the scroll offset changed.
-    let needs = app.plugin_manager.panels.iter()
+    let needs = app
+        .plugin_manager
+        .panels
+        .iter()
         .find(|p| p.decl.id == panel_id)
         .map(|p| p.needs_render || p.last_render_scroll != scroll)
         .unwrap_or(false);
 
     if needs {
-        app.plugin_manager.request_render(panel_id, area.width, area.height, focused, scroll);
+        app.plugin_manager
+            .request_render(panel_id, area.width, area.height, focused, scroll);
     }
 
     // Grab cached lines — plugin already applied the scroll offset, render directly.
-    let lines: Vec<_> = app.plugin_manager.panels.iter()
+    let lines: Vec<_> = app
+        .plugin_manager
+        .panels
+        .iter()
         .find(|p| p.decl.id == panel_id)
         .and_then(|p| p.last_render.as_ref())
         .map(|r| r.lines.clone())
@@ -43,7 +53,10 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, panel_id: &str, focused:
         }
 
         let hover = app.hover_row == Some(y)
-            && app.hover_col.map(|c| c >= area.x && c < area.x + area.width).unwrap_or(false);
+            && app
+                .hover_col
+                .map(|c| c >= area.x && c < area.x + area.width)
+                .unwrap_or(false);
         let line = to_ratatui_line(styled_line, hover);
         f.render_widget(line, Rect::new(area.x, y, area.width, 1));
 
@@ -56,11 +69,17 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, panel_id: &str, focused:
             if span_w > 0 {
                 let (cmd, cmd_args) = match &span.click_command {
                     Some(c) => (Some(c.clone()), span.click_args.clone()),
-                    None => (styled_line.click_command.clone(), styled_line.click_args.clone()),
+                    None => (
+                        styled_line.click_command.clone(),
+                        styled_line.click_args.clone(),
+                    ),
                 };
                 let (dbl, dbl_args) = match &span.dbl_click_command {
                     Some(c) => (Some(c.clone()), span.dbl_click_args.clone()),
-                    None => (styled_line.dbl_click_command.clone(), styled_line.dbl_click_args.clone()),
+                    None => (
+                        styled_line.dbl_click_command.clone(),
+                        styled_line.dbl_click_args.clone(),
+                    ),
                 };
 
                 if cmd.is_some() || dbl.is_some() {

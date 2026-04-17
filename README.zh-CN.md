@@ -5,7 +5,8 @@
 
 **AI 写代码，你审代码；Reef 只做后一半。**
 
-[English](./README.md) · [简体中文](./README.zh-CN.md)
+<a href="./README.md"><img alt="English" src="https://img.shields.io/badge/lang-EN-blue?style=flat-square"></a>
+<a href="./README.zh-CN.md"><img alt="简体中文" src="https://img.shields.io/badge/lang-%E4%B8%AD%E6%96%87-red?style=flat-square"></a>
 
 ---
 

@@ -3,3 +3,16 @@ node_modules
 .claude
 npm/**/bin/reef
 npm/**/bin/reef.exe
+
+# fuzz artifacts
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+
+# cargo-mutants output
+mutants.out
+mutants.json
+
+# insta pending snapshots (accepted ones are tracked)
+*.snap.new
+.DS_Store

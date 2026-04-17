@@ -1,0 +1,20 @@
+coverage:
+  status:
+    project:
+      default:
+        target: 60%
+        threshold: 1%
+    patch:
+      default:
+        target: 70%
+
+comment:
+  layout: "reach, diff, files"
+  behavior: default
+  require_changes: false
+
+ignore:
+  - "**/tests/**"
+  - "**/benches/**"
+  - "fuzz/**"
+  - "crates/test-support/**"

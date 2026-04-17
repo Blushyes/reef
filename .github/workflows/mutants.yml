@@ -1,0 +1,35 @@
+name: Mutation Testing
+
+on:
+  schedule:
+    # Every Monday 02:00 UTC
+    - cron: '0 2 * * 1'
+  workflow_dispatch:
+
+jobs:
+  mutants:
+    name: cargo-mutants
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+      - name: Run mutation tests
+        run: |
+          cargo mutants --workspace --no-shuffle --timeout 60 \
+            --exclude 'crates/reef-host/src/bin/*' \
+            --exclude 'crates/test-support/*' \
+            --json-output > mutants.json || true
+      - name: Upload mutants report
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-report
+          path: |
+            mutants.json
+            mutants.out/
+          retention-days: 30

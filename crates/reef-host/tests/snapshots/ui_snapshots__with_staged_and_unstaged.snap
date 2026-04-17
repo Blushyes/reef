@@ -4,11 +4,11 @@ expression: output
 ---
  reef  [TMPDIR]  ⎇ master
  📁  Files │ ⎇ Git │ ⑂ Graph                                1:Files 2:Git 3:Graph
- 视 图 : 树 形             │
+ ⌄ 更 改   2             │
+   new.txt       U +   │
+   tracked.txt   M +   │
                        │
- ⌄ 更 改   2    暂 存 全 部  │
-   new.txt U + ↺       │
-   tracked.txt M + ↺   │
+                       │
                        │
                        │
                        │

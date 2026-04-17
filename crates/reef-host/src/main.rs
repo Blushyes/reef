@@ -41,21 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     // App init
-    let mut app = match App::new() {
-        Ok(app) => app,
-        Err(e) => {
-            // Restore terminal before printing error
-            disable_raw_mode()?;
-            execute!(
-                io::stdout(),
-                LeaveAlternateScreen,
-                DisableMouseCapture
-            )?;
-            eprintln!("错误: 无法打开 Git 仓库: {}", e);
-            eprintln!("请在 Git 仓库目录中运行 reef");
-            std::process::exit(1);
-        }
-    };
+    let mut app = App::new();
 
     // Main loop
     loop {

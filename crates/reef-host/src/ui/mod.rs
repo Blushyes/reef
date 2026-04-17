@@ -9,7 +9,8 @@ use crate::mouse::ClickAction;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Padding};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
+use ratatui::text::Text;
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
@@ -51,8 +52,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     match app.active_tab {
         Tab::Git => {
-            render_sidebar(f, app, body_layout[0]);
-            render_editor(f, app, body_layout[1]);
+            if app.repo.is_none() {
+                render_no_repo(f, body_layout[0]);
+            } else {
+                render_sidebar(f, app, body_layout[0]);
+                render_editor(f, app, body_layout[1]);
+            }
         }
         Tab::Files => {
             file_tree_panel::render(f, app, body_layout[0]);
@@ -67,8 +72,30 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_status_bar(f, app, main_layout[3]);
 
     if app.show_help {
-        render_help(f, size);
+        render_help(f, size, &app.plugin_manager.help_entries);
     }
+}
+
+/// Full-width message shown in the Git tab when not inside a git repository.
+fn render_no_repo(f: &mut Frame, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let msg = Paragraph::new(Text::from(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Not a git repository",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Run `git init` to initialise one, or open reef inside a git repo.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]))
+    .alignment(ratatui::layout::Alignment::Center)
+    .block(block);
+    f.render_widget(msg, area);
 }
 
 /// Left sidebar: shows the active plugin panel, falling back to the legacy file panel.
@@ -157,8 +184,8 @@ fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_title_bar(f: &mut Frame, app: &App, area: Rect) {
-    let repo_name = app.repo.workdir_name();
-    let branch = app.repo.branch_name();
+    let repo_name = app.repo.as_ref().map(|r| r.workdir_name()).unwrap_or_else(|| "—".to_string());
+    let branch = app.repo.as_ref().map(|r| r.branch_name()).unwrap_or_default();
 
     let title = Line::from(vec![
         Span::styled(
@@ -177,7 +204,7 @@ fn render_title_bar(f: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("  ⎇ {}", branch),
+            if branch.is_empty() { String::new() } else { format!("  ⎇ {}", branch) },
             Style::default().fg(Color::Cyan).bg(Color::Rgb(30, 30, 40)),
         ),
         Span::styled(
@@ -237,8 +264,8 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(status, area);
 }
 
-fn render_help(f: &mut Frame, screen: Rect) {
-    let entries: &[(&str, &str)] = &[
+fn render_help(f: &mut Frame, screen: Rect, plugin_entries: &[crate::plugin::manager::HelpEntry]) {
+    let core_entries: &[(&str, &str)] = &[
         ("q / Ctrl+C",   "退出"),
         ("Tab",          "切换顶部标签页（Files ↔ Git）"),
         ("Shift+Tab",    "切换焦点面板（侧边栏 ↔ 编辑区）"),
@@ -247,10 +274,6 @@ fn render_help(f: &mut Frame, screen: Rect) {
         ("↓ / j",        "向下导航 / 向下滚动"),
         ("PageUp",       "快速向上翻页"),
         ("PageDown",     "快速向下翻页"),
-        ("s",            "暂存当前选中文件"),
-        ("u",            "取消暂存当前选中文件"),
-        ("r",            "刷新状态"),
-        ("t",            "切换 Git 文件列表视图（列表 ↔ 树形）"),
         ("m",            "切换 Diff 布局（上下 ↔ 左右）"),
         ("f",            "切换 Diff 模式（局部 ↔ 全量）"),
         ("v",            "文字选择模式"),
@@ -258,8 +281,13 @@ fn render_help(f: &mut Frame, screen: Rect) {
         ("任意键",        "关闭帮助"),
     ];
 
-    let popup_w = 58u16;
-    let popup_h = entries.len() as u16 + 4;
+    let has_plugin = !plugin_entries.is_empty();
+    // core rows + optional divider + optional header + plugin rows
+    let total_rows = core_entries.len()
+        + if has_plugin { 1 + 1 + plugin_entries.len() } else { 0 };
+
+    let popup_w = 62u16;
+    let popup_h = total_rows as u16 + 4;
     let x = screen.x + screen.width.saturating_sub(popup_w) / 2;
     let y = screen.y + screen.height.saturating_sub(popup_h) / 2;
     let area = Rect::new(x, y, popup_w.min(screen.width), popup_h.min(screen.height));
@@ -278,19 +306,49 @@ fn render_help(f: &mut Frame, screen: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    let key_col = 15usize;
     let mut row_y = inner.y;
-    for (key, desc) in entries {
-        if row_y >= inner.y + inner.height {
-            break;
-        }
+
+    for (key, desc) in core_entries {
+        if row_y >= inner.y + inner.height { break; }
         let line = Line::from(vec![
             Span::styled(
-                format!("{:<15}", key),
+                format!("{:<width$}", key, width = key_col),
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ),
             Span::styled(*desc, Style::default().fg(Color::White)),
         ]);
         f.render_widget(line, Rect::new(inner.x, row_y, inner.width, 1));
         row_y += 1;
+    }
+
+    if has_plugin {
+        row_y += 1; // blank divider
+        if row_y < inner.y + inner.height {
+            f.render_widget(
+                Line::from(Span::styled(
+                    "插件快捷键",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )),
+                Rect::new(inner.x, row_y, inner.width, 1),
+            );
+            row_y += 1;
+        }
+        for entry in plugin_entries {
+            if row_y >= inner.y + inner.height { break; }
+            let line = Line::from(vec![
+                Span::styled(
+                    format!("{:<width$}", entry.key, width = key_col),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(&*entry.description, Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("  [{}]", entry.plugin_name),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]);
+            f.render_widget(line, Rect::new(inner.x, row_y, inner.width, 1));
+            row_y += 1;
+        }
     }
 }

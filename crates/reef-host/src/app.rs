@@ -45,7 +45,7 @@ pub enum DiffMode {
 }
 
 pub struct App {
-    pub repo: GitRepo,
+    pub repo: Option<GitRepo>,
 
     // Tab
     pub active_tab: Tab,
@@ -100,9 +100,11 @@ pub struct SelectedFile {
 }
 
 impl App {
-    pub fn new() -> Result<Self, git2::Error> {
-        let repo = GitRepo::open()?;
-        let workdir = repo.workdir_path().unwrap_or_else(|| PathBuf::from("."));
+    pub fn new() -> Self {
+        let repo = GitRepo::open().ok();
+        let workdir = repo.as_ref()
+            .and_then(|r| r.workdir_path())
+            .unwrap_or_else(|| PathBuf::from("."));
         let file_tree = FileTree::new(&workdir);
         let (saved_layout, saved_mode) = load_prefs();
         let mut app = Self {
@@ -138,11 +140,12 @@ impl App {
         };
         app.refresh_status();
         app.load_plugins();
-        Ok(app)
+        app
     }
 
     pub fn refresh_status(&mut self) {
-        let (staged, unstaged) = self.repo.get_status();
+        let Some(ref repo) = self.repo else { return; };
+        let (staged, unstaged) = repo.get_status();
         self.staged_files = staged;
         self.unstaged_files = unstaged;
 
@@ -184,13 +187,16 @@ impl App {
     }
 
     pub fn load_diff(&mut self) {
-        if let Some(ref sel) = self.selected_file {
+        let diff = if let (Some(repo), Some(sel)) = (&self.repo, &self.selected_file) {
             let context = match self.diff_mode {
                 DiffMode::FullFile => 9999,
                 DiffMode::Compact => 3,
             };
-            self.diff_content = self.repo.get_diff(&sel.path, sel.is_staged, context);
-        }
+            repo.get_diff(&sel.path, sel.is_staged, context)
+        } else {
+            None
+        };
+        self.diff_content = diff;
     }
 
     pub fn toggle_diff_layout(&mut self) {
@@ -213,7 +219,8 @@ impl App {
     }
 
     pub fn stage_file(&mut self, path: &str) {
-        if self.repo.stage_file(path).is_ok() {
+        let ok = self.repo.as_ref().map(|r| r.stage_file(path).is_ok()).unwrap_or(false);
+        if ok {
             // If we were viewing this file, update selection
             if let Some(ref mut sel) = self.selected_file {
                 if sel.path == path && !sel.is_staged {
@@ -226,7 +233,8 @@ impl App {
     }
 
     pub fn unstage_file(&mut self, path: &str) {
-        if self.repo.unstage_file(path).is_ok() {
+        let ok = self.repo.as_ref().map(|r| r.unstage_file(path).is_ok()).unwrap_or(false);
+        if ok {
             if let Some(ref mut sel) = self.selected_file {
                 if sel.path == path && sel.is_staged {
                     sel.is_staged = false;
@@ -240,7 +248,9 @@ impl App {
     pub fn stage_all(&mut self) {
         let paths: Vec<String> = self.unstaged_files.iter().map(|f| f.path.clone()).collect();
         for p in &paths {
-            let _ = self.repo.stage_file(p);
+            if let Some(ref repo) = self.repo {
+                let _ = repo.stage_file(p);
+            }
         }
         if let Some(ref mut sel) = self.selected_file {
             if paths.iter().any(|p| p == &sel.path) {
@@ -257,7 +267,9 @@ impl App {
     pub fn unstage_all(&mut self) {
         let paths: Vec<String> = self.staged_files.iter().map(|f| f.path.clone()).collect();
         for p in &paths {
-            let _ = self.repo.unstage_file(p);
+            if let Some(ref repo) = self.repo {
+                let _ = repo.unstage_file(p);
+            }
         }
         if let Some(ref mut sel) = self.selected_file {
             if paths.iter().any(|p| p == &sel.path) {

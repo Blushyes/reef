@@ -132,6 +132,13 @@ struct PluginState {
     /// Path of the unstaged file pending discard confirmation. While set, the
     /// status panel shows a confirmation banner and `y`/`Esc` are intercepted.
     confirm_discard: Option<String>,
+    /// Set while a force-push confirmation banner is shown. Same y/Esc
+    /// interception as discard.
+    confirm_force_push: bool,
+    /// Last push failure to surface in the status panel. Cleared by a
+    /// successful push or an explicit dismiss. Kept as a plain string — we
+    /// don't need structured error info, just what git told the user.
+    push_error: Option<String>,
 
     // ── Graph panel state ──
     graph_rows: Vec<graph::GraphRow>,
@@ -169,6 +176,8 @@ impl PluginState {
             tree_mode: prefs::load_tree_mode(),
             collapsed_dirs: HashSet::new(),
             confirm_discard: None,
+            confirm_force_push: false,
+            push_error: None,
             graph_rows: Vec::new(),
             ref_map: HashMap::new(),
             graph_cache_key: None,
@@ -370,6 +379,61 @@ impl PluginState {
         let mut lines: Vec<StyledLine> = Vec::new();
         // Slightly narrower budget to accommodate the extra ↺ discard button on unstaged rows.
         let max_path = (width as usize).saturating_sub(10);
+
+        // ── Push error banner (dismissable) ──────────────────────────────────
+        if let Some(ref err) = self.push_error {
+            let mut msg = err.clone();
+            // Keep to single-line; users can run `git push` manually for full output.
+            truncate_in_place(&mut msg, max_path);
+            lines.push(
+                StyledLine::new(vec![
+                    Span::new("  ✖ 推送失败: ").fg(Color::named("red")).bold(),
+                    Span::new(msg).fg(Color::named("white")),
+                    Span::new("  [关闭]").fg(Color::named("darkGray")),
+                ])
+                .on_click("git.dismissPushError", serde_json::Value::Null),
+            );
+            lines.push(StyledLine::plain(""));
+        }
+
+        // ── Force-push confirmation banner ───────────────────────────────────
+        if self.confirm_force_push {
+            lines.push(StyledLine::new(vec![
+                Span::new("  ⚠ 强制推送？")
+                    .fg(Color::named("yellow"))
+                    .bold(),
+                Span::new("（会覆盖远端，使用 --force-with-lease）").fg(Color::named("yellow")),
+            ]));
+            lines.push(StyledLine::new(vec![
+                Span::new("  "),
+                Span::new(" 确认强制推送 ")
+                    .fg(Color::named("black"))
+                    .bg(Color::named("red"))
+                    .bold()
+                    .on_click("git.forcePushConfirm", serde_json::Value::Null),
+                Span::new("  "),
+                Span::new(" 取消 ")
+                    .fg(Color::named("white"))
+                    .bg(Color::named("darkGray"))
+                    .on_click("git.forcePushCancel", serde_json::Value::Null),
+                Span::new("  "),
+                Span::new("(y / Esc)").fg(Color::named("darkGray")),
+            ]));
+            lines.push(StyledLine::plain(""));
+        }
+
+        // ── Push indicator (only when working tree is clean) ─────────────────
+        // Showing the button while there are uncommitted changes would be
+        // misleading — VSCode's git extension only shows it when there's
+        // actually nothing else the user should be looking at first.
+        if self.staged.is_empty() && self.unstaged.is_empty() && !self.confirm_force_push {
+            if let Some((ahead, behind)) = self.repo.as_ref().and_then(|r| r.ahead_behind()) {
+                if let Some(line) = push_indicator_line(ahead, behind) {
+                    lines.push(line);
+                    lines.push(StyledLine::plain(""));
+                }
+            }
+        }
 
         // ── Confirmation banner ──────────────────────────────────────────────
         if let Some(ref path) = self.confirm_discard {
@@ -578,6 +642,10 @@ impl PluginState {
                         self.request_status_render(writer);
                     }
                     true
+                } else if self.confirm_force_push {
+                    self.confirm_force_push = false;
+                    self.run_push(true, writer);
+                    true
                 } else {
                     false
                 }
@@ -585,6 +653,14 @@ impl PluginState {
             "n" | "Escape" => {
                 if self.confirm_discard.is_some() {
                     self.confirm_discard = None;
+                    self.request_status_render(writer);
+                    true
+                } else if self.confirm_force_push {
+                    self.confirm_force_push = false;
+                    self.request_status_render(writer);
+                    true
+                } else if self.push_error.is_some() {
+                    self.push_error = None;
                     self.request_status_render(writer);
                     true
                 } else {
@@ -758,6 +834,31 @@ impl PluginState {
                 self.request_status_render(writer);
                 true
             }
+            "git.push" => {
+                self.run_push(false, writer);
+                true
+            }
+            "git.forcePushPrompt" => {
+                self.confirm_force_push = true;
+                self.push_error = None;
+                self.request_status_render(writer);
+                true
+            }
+            "git.forcePushConfirm" => {
+                self.confirm_force_push = false;
+                self.run_push(true, writer);
+                true
+            }
+            "git.forcePushCancel" => {
+                self.confirm_force_push = false;
+                self.request_status_render(writer);
+                true
+            }
+            "git.dismissPushError" => {
+                self.push_error = None;
+                self.request_status_render(writer);
+                true
+            }
             "git.stageAll" => {
                 if let Some(ref repo) = self.repo {
                     let paths: Vec<String> = self.unstaged.iter().map(|f| f.path.clone()).collect();
@@ -867,6 +968,26 @@ impl PluginState {
             "reef/statusChanged",
             serde_json::json!({}),
         ));
+    }
+
+    /// Invoke `git push` (or `git push --force-with-lease` when `force`),
+    /// store any error for display, and trigger a status re-render. Blocks
+    /// the plugin's event loop for the duration of the push — acceptable
+    /// because there's no meaningful work we could do concurrently anyway.
+    fn run_push(&mut self, force: bool, writer: &Writer) {
+        if let Some(ref repo) = self.repo {
+            match repo.push(force) {
+                Ok(()) => self.push_error = None,
+                Err(e) => self.push_error = Some(e),
+            }
+            // Push updates remote-tracking refs on success, so the graph
+            // cache needs to see the new state.
+            self.graph_cache_key = None;
+            self.refresh();
+            self.notify_status_changed(writer);
+            self.request_status_render(writer);
+            self.request_graph_render(writer);
+        }
     }
 
     fn handle_graph_key(&mut self, key: &str, writer: &Writer) -> bool {
@@ -1186,6 +1307,41 @@ fn ref_label_span(label: &RefLabel) -> Span {
         .bold()
 }
 
+/// Produce the status-panel push indicator for the given ahead/behind counts.
+/// Returns `None` when local and remote are in sync (nothing to show).
+///
+/// Three visual states:
+/// - `ahead > 0, behind == 0` → green "↑ 推送 (N)" button → `git.push`
+/// - `ahead == 0, behind > 0` → read-only "落后 N 次提交" hint (no pull action
+///   yet; pushing would fail so we don't offer a button)
+/// - `ahead > 0, behind > 0`  → orange "⚠ 已分叉 ↑A ↓B — 强制推送" →
+///   `git.forcePushPrompt`, which raises a confirmation banner
+fn push_indicator_line(ahead: usize, behind: usize) -> Option<StyledLine> {
+    match (ahead, behind) {
+        (0, 0) => None,
+        (a, 0) => Some(StyledLine::new(vec![
+            Span::new("  "),
+            Span::new(format!(" ↑ 推送 ({a}) "))
+                .fg(Color::named("black"))
+                .bg(Color::named("green"))
+                .bold()
+                .on_click("git.push", serde_json::Value::Null),
+        ])),
+        (0, b) => Some(StyledLine::new(vec![
+            Span::new(format!("  ↓ 落后远端 {b} 次提交 — 请先 fetch/pull"))
+                .fg(Color::named("yellow")),
+        ])),
+        (a, b) => Some(StyledLine::new(vec![
+            Span::new("  "),
+            Span::new(format!(" ⚠ 已分叉 ↑{a} ↓{b} — 强制推送 "))
+                .fg(Color::named("black"))
+                .bg(Color::named("yellow"))
+                .bold()
+                .on_click("git.forcePushPrompt", serde_json::Value::Null),
+        ])),
+    }
+}
+
 /// Truncate a string (in-place) to at most `max` Unicode chars, appending `…`.
 fn truncate_in_place(s: &mut String, max: usize) {
     if max == 0 {
@@ -1296,8 +1452,8 @@ fn hash_ref_map(map: &HashMap<String, Vec<RefLabel>>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        days_to_ymd, format_timestamp, hash_ref_map, lane_color_for, relative_time_at,
-        render_lane_chars, truncate_in_place,
+        days_to_ymd, format_timestamp, hash_ref_map, lane_color_for, push_indicator_line,
+        relative_time_at, render_lane_chars, truncate_in_place,
     };
     use reef_git::git::{CommitInfo, RefLabel};
     use reef_git::graph::{GraphRow, LaneCell};
@@ -1638,5 +1794,55 @@ mod tests {
         assert_eq!(out[2].spans[0].fg, Some(Color::named("red")));
         assert_eq!(out[3].spans[0].text, " ");
         assert_eq!(out[3].spans[0].fg, Some(Color::named("white")));
+    }
+
+    // ── push_indicator_line ──────────────────────────────────────────────────
+
+    #[test]
+    fn push_indicator_in_sync_returns_none() {
+        assert!(push_indicator_line(0, 0).is_none());
+    }
+
+    #[test]
+    fn push_indicator_ahead_is_green_push_button() {
+        let line = push_indicator_line(3, 0).expect("ahead → button");
+        // Find the clickable span (has text content with ↑).
+        let btn = line
+            .spans
+            .iter()
+            .find(|s| s.text.contains("↑"))
+            .expect("↑ span present");
+        assert!(
+            btn.text.contains("3"),
+            "ahead count in label: {:?}",
+            btn.text
+        );
+        assert_eq!(btn.bg, Some(Color::named("green")));
+        assert_eq!(btn.click_command.as_deref(), Some("git.push"));
+    }
+
+    #[test]
+    fn push_indicator_behind_is_readonly_yellow_hint() {
+        let line = push_indicator_line(0, 2).expect("behind → hint");
+        // No clickable span — this is read-only info; pulling is out of scope.
+        let has_click = line.spans.iter().any(|s| s.click_command.is_some());
+        assert!(!has_click, "behind-only should have no click handler");
+        let text: String = line.spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(text.contains("落后"));
+        assert!(text.contains("2"));
+    }
+
+    #[test]
+    fn push_indicator_diverged_triggers_force_push_prompt() {
+        let line = push_indicator_line(1, 1).expect("diverged → force button");
+        let btn = line
+            .spans
+            .iter()
+            .find(|s| s.text.contains("分叉"))
+            .expect("分叉 span present");
+        assert_eq!(btn.bg, Some(Color::named("yellow")));
+        assert_eq!(btn.click_command.as_deref(), Some("git.forcePushPrompt"));
+        assert!(btn.text.contains("↑1"));
+        assert!(btn.text.contains("↓1"));
     }
 }

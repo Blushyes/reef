@@ -38,7 +38,7 @@ fn open_in(path: &std::path::Path) -> (CwdGuard, GitRepo) {
 
 #[test]
 fn open_succeeds_on_real_repo() {
-    let _lock = CWD_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, _raw) = tempdir_repo();
     let (_g, repo) = open_in(tmp.path());
     assert!(repo.workdir().is_some());
@@ -46,7 +46,7 @@ fn open_succeeds_on_real_repo() {
 
 #[test]
 fn branch_name_reports_initial_branch() {
-    let _lock = CWD_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
     // Before any commit, HEAD points to an unborn branch — be tolerant.
     commit_file(&raw, "a.txt", "hello", "init");
@@ -61,7 +61,7 @@ fn branch_name_reports_initial_branch() {
 
 #[test]
 fn workdir_name_extracts_dirname() {
-    let _lock = CWD_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, _raw) = tempdir_repo();
     let (_g, repo) = open_in(tmp.path());
     let name = repo.workdir_name();
@@ -70,7 +70,7 @@ fn workdir_name_extracts_dirname() {
 
 #[test]
 fn get_status_detects_untracked_file() {
-    let _lock = CWD_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
     commit_file(&raw, "tracked.txt", "content", "init");
     write_file(&raw, "new.txt", "new content");
@@ -85,7 +85,7 @@ fn get_status_detects_untracked_file() {
 
 #[test]
 fn get_status_detects_modified_file() {
-    let _lock = CWD_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
     commit_file(&raw, "a.txt", "v1", "init");
     write_file(&raw, "a.txt", "v2"); // modify
@@ -99,7 +99,7 @@ fn get_status_detects_modified_file() {
 
 #[test]
 fn stage_file_moves_from_unstaged_to_staged() {
-    let _lock = CWD_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
     commit_file(&raw, "a.txt", "v1", "init");
     write_file(&raw, "a.txt", "v2");
@@ -113,7 +113,7 @@ fn stage_file_moves_from_unstaged_to_staged() {
 
 #[test]
 fn stage_then_unstage_roundtrip() {
-    let _lock = CWD_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
     commit_file(&raw, "a.txt", "v1", "init");
     write_file(&raw, "a.txt", "v2");
@@ -128,7 +128,7 @@ fn stage_then_unstage_roundtrip() {
 
 #[test]
 fn restore_file_reverts_workdir_to_head() {
-    let _lock = CWD_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
     commit_file(&raw, "a.txt", "v1", "init");
     write_file(&raw, "a.txt", "v2");
@@ -144,7 +144,7 @@ fn restore_file_reverts_workdir_to_head() {
 
 #[test]
 fn get_diff_unstaged_shows_additions() {
-    let _lock = CWD_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
     commit_file(&raw, "a.txt", "line1\n", "init");
     write_file(&raw, "a.txt", "line1\nline2\n");
@@ -164,7 +164,7 @@ fn get_diff_unstaged_shows_additions() {
 
 #[test]
 fn get_diff_staged_compares_index_to_head() {
-    let _lock = CWD_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
     commit_file(&raw, "a.txt", "v1\n", "init");
     write_file(&raw, "a.txt", "v2\n");
@@ -187,7 +187,7 @@ fn get_diff_staged_compares_index_to_head() {
 
 #[test]
 fn head_oid_matches_latest_commit() {
-    let _lock = CWD_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
     let oid = commit_file(&raw, "a.txt", "v1", "init");
 
@@ -197,7 +197,7 @@ fn head_oid_matches_latest_commit() {
 
 #[test]
 fn list_commits_returns_topological_order() {
-    let _lock = CWD_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
     commit_file(&raw, "a.txt", "v1", "first");
     commit_file(&raw, "a.txt", "v2", "second");
@@ -212,7 +212,7 @@ fn list_commits_returns_topological_order() {
 
 #[test]
 fn list_refs_contains_head() {
-    let _lock = CWD_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
     let oid = commit_file(&raw, "a.txt", "v1", "init");
 
@@ -224,7 +224,7 @@ fn list_refs_contains_head() {
 
 #[test]
 fn get_commit_returns_metadata_and_files() {
-    let _lock = CWD_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
     let oid = commit_file(&raw, "a.txt", "v1", "first");
 
@@ -240,7 +240,7 @@ fn get_commit_returns_metadata_and_files() {
 
 #[test]
 fn get_commit_file_diff_shows_additions() {
-    let _lock = CWD_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
     commit_file(&raw, "a.txt", "v1\n", "first");
     let oid = commit_file(&raw, "a.txt", "v1\nv2\n", "second");
@@ -255,4 +255,122 @@ fn get_commit_file_diff_shows_additions() {
         .flat_map(|h| h.lines.iter())
         .any(|l| l.tag == LineTag::Added && l.content.contains("v2"));
     assert!(added);
+}
+
+// ── Remote sync state (ahead_behind / push) ─────────────────────────────────
+
+/// Seeds a local repo, registers a fake `origin` remote (bogus URL — we never
+/// actually talk to it), manually creates `refs/remotes/origin/<branch>` at
+/// the current HEAD, and binds the local branch's upstream to it. This
+/// simulates "just-fetched" state without needing a real remote on disk,
+/// sidestepping Git's file:// protocol restrictions.
+fn setup_repo_with_fake_upstream() -> (tempfile::TempDir, git2::Repository) {
+    let (tmp, raw) = tempdir_repo();
+    raw.remote("origin", "file:///nonexistent/bogus")
+        .expect("add fake remote");
+    let oid = commit_file(&raw, "a.txt", "v1", "init");
+
+    let branch_name = raw
+        .head()
+        .unwrap()
+        .shorthand()
+        .unwrap_or("master")
+        .to_string();
+    raw.reference(
+        &format!("refs/remotes/origin/{}", branch_name),
+        oid,
+        false,
+        "fake upstream",
+    )
+    .expect("create remote-tracking ref");
+
+    {
+        // Branch already exists from the commit_file above — just bind its
+        // upstream. Re-creating with `branch(force=true)` fails because HEAD
+        // is checked out on it.
+        let mut branch = raw
+            .find_branch(&branch_name, git2::BranchType::Local)
+            .expect("find local branch");
+        branch
+            .set_upstream(Some(&format!("origin/{}", branch_name)))
+            .expect("bind upstream");
+    }
+    let _ = oid; // silence unused when the branch code path above was refactored
+
+    (tmp, raw)
+}
+
+#[test]
+fn ahead_behind_no_upstream_returns_none() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "a.txt", "v1", "init");
+    let (_g, repo) = open_in(tmp.path());
+    assert!(repo.ahead_behind().is_none(), "no upstream configured");
+}
+
+#[test]
+fn ahead_behind_zero_when_in_sync() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, _raw) = setup_repo_with_fake_upstream();
+    let (_g, repo) = open_in(tmp.path());
+    assert_eq!(repo.ahead_behind(), Some((0, 0)));
+}
+
+#[test]
+fn ahead_behind_detects_local_ahead() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, raw) = setup_repo_with_fake_upstream();
+    // Two commits past upstream.
+    commit_file(&raw, "b.txt", "v2", "second");
+    commit_file(&raw, "c.txt", "v3", "third");
+
+    let (_g, repo) = open_in(tmp.path());
+    assert_eq!(repo.ahead_behind(), Some((2, 0)));
+}
+
+#[test]
+fn ahead_behind_detects_divergence() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, raw) = setup_repo_with_fake_upstream();
+    let initial_oid = raw.head().unwrap().target().unwrap();
+    let initial = raw.find_commit(initial_oid).unwrap();
+    let sig = git2::Signature::now("Tester", "tester@example.com").unwrap();
+    let tree = initial.tree().unwrap();
+
+    // Advance origin/<branch> by one commit we don't have locally.
+    let branch_name = raw
+        .head()
+        .unwrap()
+        .shorthand()
+        .unwrap_or("master")
+        .to_string();
+    raw.commit(
+        Some(&format!("refs/remotes/origin/{}", branch_name)),
+        &sig,
+        &sig,
+        "remote-only commit",
+        &tree,
+        &[&initial],
+    )
+    .expect("commit on remote-tracking ref");
+
+    // Then advance local by a different commit on top of the shared base.
+    commit_file(&raw, "local.txt", "local", "local-only commit");
+
+    let (_g, repo) = open_in(tmp.path());
+    assert_eq!(repo.ahead_behind(), Some((1, 1)));
+}
+
+#[test]
+fn push_without_upstream_returns_error_message() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "a.txt", "v1", "init");
+    let (_g, repo) = open_in(tmp.path());
+    // No remote → git push can't find one → exits non-zero with stderr.
+    let err = repo
+        .push(false)
+        .expect_err("push must fail without a remote");
+    assert!(!err.is_empty(), "error message should be non-empty");
 }

@@ -413,6 +413,59 @@ impl GitRepo {
         }
     }
 
+    // ── remote sync state / push ───────────────────────────────────────────
+
+    /// Returns `(ahead, behind)` commit counts of the current branch vs. its
+    /// upstream. Returns `None` when HEAD is detached, the branch has no
+    /// upstream configured, or any lookup fails. Does NOT perform a network
+    /// fetch — the `behind` count reflects the last-fetched state of the
+    /// upstream ref.
+    pub fn ahead_behind(&self) -> Option<(usize, usize)> {
+        let head = self.repo.head().ok()?;
+        let head_oid = head.target()?;
+        let shorthand = head.shorthand()?;
+        let branch = self
+            .repo
+            .find_branch(shorthand, git2::BranchType::Local)
+            .ok()?;
+        let upstream = branch.upstream().ok()?;
+        let upstream_oid = upstream.get().target()?;
+        self.repo.graph_ahead_behind(head_oid, upstream_oid).ok()
+    }
+
+    /// Push the current branch to its upstream. When `force` is true, uses
+    /// `--force-with-lease` (safer than `--force`: rejects the push if the
+    /// remote advanced since our last fetch, preventing accidental overwrites
+    /// of work pushed by collaborators we didn't know about).
+    ///
+    /// Shells out to the `git` binary because libgit2's push requires
+    /// credential handling (SSH agent, keychain, credential helpers) that
+    /// would otherwise need reimplementing. `git push` respects the user's
+    /// existing git config and works identically to running it manually.
+    pub fn push(&self, force: bool) -> Result<(), String> {
+        let workdir = self
+            .repo
+            .workdir()
+            .ok_or_else(|| "no workdir (bare repo?)".to_string())?;
+        let mut cmd = std::process::Command::new("git");
+        cmd.current_dir(workdir).arg("push");
+        if force {
+            cmd.arg("--force-with-lease");
+        }
+        let output = cmd
+            .output()
+            .map_err(|e| format!("failed to run git: {e}"))?;
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(if err.is_empty() {
+                "push failed".to_string()
+            } else {
+                err
+            });
+        }
+        Ok(())
+    }
+
     // ── commit history / refs ──────────────────────────────────────────────
 
     pub fn head_oid(&self) -> Option<String> {

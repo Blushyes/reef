@@ -37,7 +37,12 @@
       { "id": "git.graph.prev",    "title": "上一个 commit" },
       { "id": "git.selectCommit",  "title": "选中 commit" },
       { "id": "git.selectCommitFile", "title": "查看 commit 内文件 diff" },
-      { "id": "git.graph.refresh", "title": "刷新 commit 图" }
+      { "id": "git.graph.refresh", "title": "刷新 commit 图" },
+      { "id": "git.push",             "title": "推送当前分支" },
+      { "id": "git.forcePushPrompt",  "title": "准备强制推送（弹确认）" },
+      { "id": "git.forcePushConfirm", "title": "确认强制推送（--force-with-lease）" },
+      { "id": "git.forcePushCancel",  "title": "取消强制推送" },
+      { "id": "git.dismissPushError", "title": "关闭推送失败提示" }
     ]
   }
 }

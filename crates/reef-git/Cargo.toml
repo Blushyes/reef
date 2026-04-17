@@ -22,6 +22,7 @@ unicode-width = "0.2.2"
 tempfile     = "3"
 proptest     = "1"
 criterion    = { version = "0.5", features = ["html_reports"] }
+git2         = { version = "0.20.4", default-features = false }
 test-support = { path = "../test-support" }
 
 [[bench]]

@@ -124,6 +124,9 @@ pub struct KeybindingDecl {
     pub command: String,
     #[serde(default = "default_when")]
     pub when: String,
+    /// If set, this keybinding appears in the help panel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 fn default_when() -> String { "always".to_string() }

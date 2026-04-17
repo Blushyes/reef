@@ -26,6 +26,12 @@ pub struct PendingRequest {
     pub params: serde_json::Value,
 }
 
+pub struct HelpEntry {
+    pub key: String,
+    pub description: String,
+    pub plugin_name: String,
+}
+
 pub struct PluginManager {
     processes: HashMap<String, PluginProcess>,
     pub panels: Vec<ManagedPanel>,   // ordered: sidebar panels in registration order
@@ -34,7 +40,8 @@ pub struct PluginManager {
     pub notifications: Vec<NotifyParams>,
     /// Set when a plugin signals git status has changed (staging/unstaging/refresh).
     pub status_refresh_needed: bool,
-
+    /// Help entries contributed by plugins via keybinding descriptions in their manifest.
+    pub help_entries: Vec<HelpEntry>,
 }
 
 impl PluginManager {
@@ -45,6 +52,7 @@ impl PluginManager {
             pending_host_requests: Vec::new(),
             notifications: Vec::new(),
             status_refresh_needed: false,
+            help_entries: Vec::new(),
         }
     }
 
@@ -88,6 +96,17 @@ impl PluginManager {
                 needs_render: true,
                 last_render_scroll: u32::MAX,
             });
+        }
+
+        // Collect keybindings that have a description into the help registry
+        for kb in &manifest.contributes.keybindings {
+            if let Some(desc) = &kb.description {
+                self.help_entries.push(HelpEntry {
+                    key: kb.key.clone(),
+                    description: desc.clone(),
+                    plugin_name: manifest.name.clone(),
+                });
+            }
         }
 
         self.processes.insert(manifest.name.clone(), proc);

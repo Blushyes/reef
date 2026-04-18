@@ -1,7 +1,7 @@
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
-        MouseEvent, MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -56,6 +56,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             match event::read()? {
                 Event::Key(key) => {
+                    // Crossterm emits Press + Release (and Repeat on hold) for every
+                    // physical keystroke on Windows Terminal, in terminals that enable
+                    // the kitty keyboard protocol, and on some macOS configurations.
+                    // Without this filter each keypress runs handle_key twice, so j/k
+                    // navigate 2 rows instead of 1 (and 3+ when held).
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+
                     // v toggles select mode regardless of active panel
                     if key.code == KeyCode::Char('v') && key.modifiers.is_empty() {
                         app.select_mode = !app.select_mode;

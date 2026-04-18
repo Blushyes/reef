@@ -8,8 +8,5 @@ publish = false
 workspace = true
 
 [dependencies]
-reef-protocol = { path = "../reef-protocol" }
-reef-git      = { path = "../reef-git" }
 git2          = { version = "0.20.4", default-features = false }
 tempfile      = "3"
-serde_json    = { workspace = true }

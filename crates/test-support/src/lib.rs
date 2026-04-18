@@ -3,22 +3,58 @@
 //! All items here are `pub` and consumed via `[dev-dependencies]`.
 
 use git2::{Repository, Signature};
-use reef_git::git::CommitInfo;
-use reef_protocol::{Span, StyledLine};
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 
-/// Build a `CommitInfo` with sensible defaults; override fields as needed.
-pub fn make_commit_info(oid: &str, parents: &[&str]) -> CommitInfo {
-    CommitInfo {
-        oid: oid.into(),
-        short_oid: oid.chars().take(7).collect(),
-        parents: parents.iter().map(|s| (*s).to_string()).collect(),
-        author_name: "Tester".into(),
-        author_email: "tester@example.com".into(),
-        time: 0,
-        subject: format!("commit {}", oid),
+/// Redirect `$HOME` to a path for the lifetime of the guard, then restore
+/// whatever value was there before (or remove it if HOME was unset).
+///
+/// `std::env::set_var` is process-global, so callers MUST serialise HOME
+/// mutations through a `static Mutex<()>` in their test file. This helper
+/// is the "do the unsafe set/restore correctly" part; the lock is yours.
+///
+/// Typical use:
+/// ```no_run
+/// use std::sync::Mutex;
+/// use test_support::{tempdir_repo, HomeGuard};
+/// static HOME_LOCK: Mutex<()> = Mutex::new(());
+///
+/// # fn body() {
+/// let _lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+/// let (tmp, _repo) = tempdir_repo();
+/// let _home = HomeGuard::enter(tmp.path());
+/// // ... test body — any `std::env::var("HOME")` reads the tempdir
+/// # }
+/// ```
+pub struct HomeGuard {
+    original: Option<OsString>,
+}
+
+impl HomeGuard {
+    pub fn enter(path: &Path) -> Self {
+        let original = std::env::var_os("HOME");
+        // SAFETY: caller must hold a process-wide HOME_LOCK for the
+        // duration of this guard's lifetime. See the type-level doc.
+        unsafe {
+            std::env::set_var("HOME", path);
+        }
+        Self { original }
+    }
+}
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        // SAFETY: same as `enter`; the lock the caller holds spans the
+        // guard's whole lifetime, including this Drop.
+        unsafe {
+            if let Some(v) = self.original.take() {
+                std::env::set_var("HOME", v);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
     }
 }
 
@@ -75,25 +111,4 @@ pub fn write_file(repo: &Repository, path: &str, content: &str) {
         fs::create_dir_all(parent).unwrap();
     }
     fs::write(&full, content).unwrap();
-}
-
-/// Concatenate all span texts in a `StyledLine`.
-pub fn extract_text(line: &StyledLine) -> String {
-    line.spans.iter().map(|s| s.text.as_str()).collect()
-}
-
-/// Assert that any span's text contains `needle`.
-pub fn assert_span_contains(line: &StyledLine, needle: &str) {
-    let ok = line.spans.iter().any(|s| s.text.contains(needle));
-    assert!(
-        ok,
-        "no span contained {:?}; got spans: {:?}",
-        needle,
-        line.spans.iter().map(|s| &s.text).collect::<Vec<_>>()
-    );
-}
-
-/// Find the first span whose text contains `needle`.
-pub fn find_span<'a>(line: &'a StyledLine, needle: &str) -> Option<&'a Span> {
-    line.spans.iter().find(|s| s.text.contains(needle))
 }

@@ -1,9 +1,10 @@
 use crate::file_tree::{self, FileTree, PreviewContent};
 use crate::fs_watcher;
-use crate::git::{DiffContent, FileEntry, GitRepo};
+use crate::git::graph::GraphRow;
+use crate::git::{CommitDetail, DiffContent, FileEntry, GitRepo, RefLabel};
 use crate::mouse::{ClickAction, HitTestRegistry};
-use crate::plugin::manager::PluginManager;
-use std::collections::HashMap;
+use crate::toast::Toast;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -46,6 +47,66 @@ pub enum DiffMode {
     FullFile, // 显示整个文件
 }
 
+/// State for the inline Git status sidebar.
+#[derive(Debug, Default)]
+pub struct GitStatusState {
+    pub tree_mode: bool,
+    pub collapsed_dirs: HashSet<String>,
+    pub confirm_discard: Option<String>,
+    pub confirm_push: bool,
+    pub confirm_force_push: bool,
+    /// Last `git push` failure surfaced as an in-panel banner. Cleared by a
+    /// successful push or explicit dismiss. Kept in addition to `App.toasts`
+    /// because the banner stays visible across re-renders whereas toasts are
+    /// ephemeral.
+    pub push_error: Option<String>,
+    pub scroll: usize,
+}
+
+/// State for the inline commit graph sidebar.
+#[derive(Debug, Default)]
+pub struct GitGraphState {
+    pub rows: Vec<GraphRow>,
+    pub ref_map: HashMap<String, Vec<RefLabel>>,
+    /// `(head_oid, refs_hash)` — revwalk is skipped when these are unchanged,
+    /// so workdir edits don't trigger a full re-walk on large repos.
+    pub cache_key: Option<(String, u64)>,
+    pub selected_idx: usize,
+    pub selected_commit: Option<String>,
+    pub scroll: usize,
+}
+
+/// State for the inline commit-detail editor panel (Tab::Graph right side).
+#[derive(Debug)]
+pub struct CommitDetailState {
+    pub detail: Option<CommitDetail>,
+    pub file_diff: Option<(String, DiffContent)>,
+    /// Intentionally independent of `App.diff_layout` — the Git tab and the
+    /// Graph tab track their diff layout separately (see plan pitfall #1).
+    pub diff_layout: DiffLayout,
+    pub diff_mode: DiffMode,
+    pub files_tree_mode: bool,
+    pub files_collapsed: HashSet<String>,
+    /// Vertical scroll for the entire panel (header + files + diff). One
+    /// offset covers the whole view — the commit detail is rendered as a
+    /// single list rather than split scroll regions.
+    pub scroll: usize,
+}
+
+impl Default for CommitDetailState {
+    fn default() -> Self {
+        Self {
+            detail: None,
+            file_diff: None,
+            diff_layout: DiffLayout::Unified,
+            diff_mode: DiffMode::Compact,
+            files_tree_mode: false,
+            files_collapsed: HashSet::new(),
+            scroll: 0,
+        }
+    }
+}
+
 pub struct App {
     pub repo: Option<GitRepo>,
 
@@ -84,12 +145,20 @@ pub struct App {
     /// (timestamp, column, row) of the last mouse-down — used to detect double-clicks.
     pub last_click: Option<(Instant, u16, u16)>,
 
-    // Plugin system
-    pub plugin_manager: PluginManager,
-    pub active_sidebar_panel: Option<String>,
-    /// Per-plugin-panel scroll offsets, keyed by panel_id. Host-native panels
-    /// (file_tree, file_preview, legacy diff/file) keep their own scalars.
-    pub panel_scroll: HashMap<String, usize>,
+    // ── Inline git state ──
+    pub git_status: GitStatusState,
+    pub git_graph: GitGraphState,
+    pub commit_detail: CommitDetailState,
+    /// Cross-panel toast queue, surfaced in the status bar. Used for push
+    /// success/failure and any future in-app notifications.
+    pub toasts: Vec<Toast>,
+
+    /// `true` while a background `git push` is in flight. Blocks additional
+    /// pushes and lets the status panel render a "推送中…" indicator.
+    pub push_in_flight: bool,
+    /// Receives `(force, result)` from the push worker thread. Drained in
+    /// `App::tick`; once the result is consumed we drop the channel.
+    pub push_rx: Option<mpsc::Receiver<(bool, Result<(), String>)>>,
 
     /// Host-owned fs watcher channel. `None` when the watcher couldn't start —
     /// the sender inside the thread was dropped so `try_recv` returns `Disconnected`.
@@ -109,6 +178,15 @@ pub struct SelectedFile {
 
 impl App {
     pub fn new() -> Self {
+        // Fold pre-1.0 unprefixed keys (`layout=`, `mode=`) and the retired
+        // `~/.config/reef/git.prefs` into the current prefixed namespace
+        // BEFORE any `prefs::get` runs. Order matters: `load_prefs` below
+        // reads `diff.layout` / `diff.mode`, and the `GitStatusState` /
+        // `CommitDetailState` initializers read `status.*` / `commit.*` —
+        // all of those keys only exist after the migrator has run on a
+        // legacy install.
+        crate::prefs::migrate_legacy_prefs();
+
         let repo = GitRepo::open().ok();
         let workdir = repo
             .as_ref()
@@ -143,16 +221,32 @@ impl App {
             hover_row: None,
             hover_col: None,
             last_click: None,
-            plugin_manager: PluginManager::new(),
-            active_sidebar_panel: None,
-            panel_scroll: HashMap::new(),
+            git_status: GitStatusState {
+                tree_mode: crate::prefs::get_bool("status.tree_mode"),
+                ..GitStatusState::default()
+            },
+            git_graph: GitGraphState::default(),
+            commit_detail: CommitDetailState {
+                diff_layout: match crate::prefs::get("commit.diff_layout").as_deref() {
+                    Some("side_by_side") => DiffLayout::SideBySide,
+                    _ => DiffLayout::Unified,
+                },
+                diff_mode: match crate::prefs::get("commit.diff_mode").as_deref() {
+                    Some("full_file") => DiffMode::FullFile,
+                    _ => DiffMode::Compact,
+                },
+                files_tree_mode: crate::prefs::get_bool("commit.files_tree_mode"),
+                ..CommitDetailState::default()
+            },
+            toasts: Vec::new(),
+            push_in_flight: false,
+            push_rx: None,
             fs_watcher_rx,
             should_quit: false,
             select_mode: false,
             show_help: false,
         };
         app.refresh_status();
-        app.load_plugins();
         app
     }
 
@@ -168,8 +262,8 @@ impl App {
             .refresh_git_statuses(&self.staged_files, &self.unstaged_files);
 
         // Reconcile selection: check both lists so is_staged stays correct
-        // even if the plugin staged/unstaged via a key event that the host
-        // didn't directly observe.
+        // if the file has just moved between sections (e.g. an fs-watcher
+        // refresh after an external `git add`).
         if let Some(ref mut sel) = self.selected_file {
             let in_staged = self.staged_files.iter().any(|f| f.path == sel.path);
             let in_unstaged = self.unstaged_files.iter().any(|f| f.path == sel.path);
@@ -306,9 +400,6 @@ impl App {
         }
         self.refresh_status();
         self.load_diff();
-        // fs watcher will re-invalidate plugin panels shortly, but invalidate
-        // now so the sidebar updates without waiting on the debounce.
-        self.plugin_manager.invalidate_panels();
     }
 
     pub fn unstage_all(&mut self) {
@@ -325,7 +416,194 @@ impl App {
         }
         self.refresh_status();
         self.load_diff();
-        self.plugin_manager.invalidate_panels();
+    }
+
+    /// Restore the currently-confirmed unstaged file to its HEAD state.
+    /// Clears the confirmation banner and selection if the discarded file
+    /// was selected, then refreshes status + diff.
+    pub fn confirm_discard(&mut self) {
+        let Some(path) = self.git_status.confirm_discard.take() else {
+            return;
+        };
+        if let Some(ref repo) = self.repo {
+            let _ = repo.restore_file(&path);
+        }
+        if self
+            .selected_file
+            .as_ref()
+            .map(|s| s.path == path)
+            .unwrap_or(false)
+        {
+            self.selected_file = None;
+            self.diff_content = None;
+        }
+        self.refresh_status();
+        self.load_diff();
+    }
+
+    /// Rebuild the commit graph iff HEAD or any ref moved since the last build.
+    /// Working-tree fs events do NOT invalidate the cache — see plan pitfall #2.
+    pub fn refresh_graph(&mut self) {
+        const GRAPH_COMMIT_LIMIT: usize = 500;
+        let Some(ref repo) = self.repo else {
+            self.git_graph.rows.clear();
+            self.git_graph.ref_map.clear();
+            self.git_graph.cache_key = None;
+            return;
+        };
+
+        let head = repo.head_oid().unwrap_or_default();
+        let refs = repo.list_refs();
+        let refs_hash = hash_ref_map(&refs);
+        let key = (head, refs_hash);
+
+        if self.git_graph.cache_key.as_ref() == Some(&key) {
+            return;
+        }
+
+        let commits = repo.list_commits(GRAPH_COMMIT_LIMIT);
+        let rows = crate::git::graph::build_graph(&commits);
+
+        // Clamp selection if the graph got shorter (e.g. reset --hard).
+        if self.git_graph.selected_idx >= rows.len() {
+            self.git_graph.selected_idx = rows.len().saturating_sub(1);
+        }
+        self.git_graph.selected_commit = rows
+            .get(self.git_graph.selected_idx)
+            .map(|r| r.commit.oid.clone());
+
+        self.git_graph.rows = rows;
+        self.git_graph.ref_map = refs;
+        self.git_graph.cache_key = Some(key);
+
+        self.load_commit_detail();
+    }
+
+    /// (Re)load commit detail for the currently-selected commit. Clears detail
+    /// and any previously-selected file diff whenever the target changes.
+    pub fn load_commit_detail(&mut self) {
+        self.commit_detail.detail = match (&self.repo, &self.git_graph.selected_commit) {
+            (Some(repo), Some(oid)) => repo.get_commit(oid),
+            _ => None,
+        };
+        self.commit_detail.file_diff = None;
+    }
+
+    /// Load the inline diff for a file inside the currently-selected commit.
+    pub fn load_commit_file_diff(&mut self, path: &str) {
+        let context = match self.commit_detail.diff_mode {
+            DiffMode::Compact => 3,
+            DiffMode::FullFile => 9999,
+        };
+        self.commit_detail.file_diff = match (&self.repo, &self.git_graph.selected_commit) {
+            (Some(repo), Some(oid)) => repo
+                .get_commit_file_diff(oid, path, context)
+                .map(|d| (path.to_string(), d)),
+            _ => None,
+        };
+    }
+
+    /// Reload the currently-selected commit-file diff — used after toggling
+    /// `commit.diff_mode`, which changes the context-lines argument.
+    pub fn reload_commit_file_diff(&mut self) {
+        let path = self
+            .commit_detail
+            .file_diff
+            .as_ref()
+            .map(|(p, _)| p.clone());
+        if let Some(path) = path {
+            self.load_commit_file_diff(&path);
+        }
+    }
+
+    /// Move the graph selection by `delta` rows (clamped). Updates
+    /// selected_commit and reloads commit detail.
+    pub fn move_graph_selection(&mut self, delta: i32) {
+        if self.git_graph.rows.is_empty() {
+            return;
+        }
+        let last = self.git_graph.rows.len() - 1;
+        let current = self.git_graph.selected_idx as i32;
+        let next = (current + delta).clamp(0, last as i32) as usize;
+        if next == self.git_graph.selected_idx {
+            return;
+        }
+        self.git_graph.selected_idx = next;
+        self.git_graph.selected_commit =
+            self.git_graph.rows.get(next).map(|r| r.commit.oid.clone());
+        // Reset commit-detail scroll so the new commit starts at the top.
+        self.commit_detail.scroll = 0;
+        self.load_commit_detail();
+    }
+
+    /// Kick off a `git push` in the background. Returns immediately; the
+    /// result is collected in `App::tick` when the worker thread posts it
+    /// back through `push_rx`. If a push is already in flight the new
+    /// request is dropped — we don't want two pushes racing on the same
+    /// refs. UI surfaces the in-flight state via `self.push_in_flight`.
+    pub fn run_push(&mut self, force: bool) {
+        if self.push_in_flight {
+            return;
+        }
+        let Some(workdir) = self.repo.as_ref().and_then(|r| r.workdir_path()) else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        self.push_rx = Some(rx);
+        self.push_in_flight = true;
+        std::thread::spawn(move || {
+            let result = crate::git::push_at(&workdir, force);
+            // Recv side may have been dropped by the time we finish (e.g.
+            // user quit mid-push); ignore the send error.
+            let _ = tx.send((force, result));
+        });
+    }
+
+    /// Called from `tick()`. If the push worker has posted a result, fold
+    /// it into App state (toast + push_error banner + graph-cache bust +
+    /// status refresh) and drop the channel. If the worker dropped its
+    /// sender without posting (panic, etc.), release the in-flight flag
+    /// and surface an error toast so the user can try again.
+    fn drain_push_result(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let Some(rx) = self.push_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((force, result)) => {
+                self.push_in_flight = false;
+                self.push_rx = None;
+                match result {
+                    Ok(()) => {
+                        self.git_status.push_error = None;
+                        self.toasts.push(Toast::info(if force {
+                            "强制推送成功"
+                        } else {
+                            "推送成功"
+                        }));
+                    }
+                    Err(e) => {
+                        self.git_status.push_error = Some(e.clone());
+                        self.toasts.push(Toast::error(format!("推送失败: {e}")));
+                    }
+                }
+                // Push advances remote-tracking refs — invalidate the graph
+                // cache so Tab::Graph rebuilds on its next render.
+                self.git_graph.cache_key = None;
+                self.refresh_status();
+            }
+            Err(TryRecvError::Empty) => {
+                // Worker still running. Check again next tick.
+            }
+            Err(TryRecvError::Disconnected) => {
+                // Worker dropped the sender without sending — the only way
+                // this happens is a panic inside the thread (push_at
+                // itself always sends). Recover so the user can retry.
+                self.push_in_flight = false;
+                self.push_rx = None;
+                self.toasts.push(Toast::error("推送线程异常退出，请重试"));
+            }
+        }
     }
 
     pub fn handle_action(&mut self, action: ClickAction) {
@@ -361,55 +639,16 @@ impl App {
             ClickAction::StartDragSplit => {
                 self.dragging_split = true;
             }
-            ClickAction::PluginCommand { command, args, .. } => {
-                // Reset commit-detail scroll so a new commit starts at the top.
-                if command == "git.selectCommit" {
-                    self.panel_scroll.insert("git.commitDetail".into(), 0);
+            ClickAction::GitCommand { command, args, .. } => {
+                // Try each panel's dispatcher in turn. Unknown commands are
+                // silently dropped — no external handler to fall through to.
+                if crate::ui::git_status_panel::handle_command(self, &command, &args) {
+                    return;
                 }
-                // Keep host state in sync for known selection commands
-                if command == "git.selectFile" {
-                    if let (Some(path), Some(staged)) = (
-                        args.get("path")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
-                        args.get("staged").and_then(|v| v.as_bool()),
-                    ) {
-                        self.selected_file = Some(SelectedFile {
-                            path,
-                            is_staged: staged,
-                        });
-                        self.diff_scroll = 0;
-                        self.diff_h_scroll = 0;
-                        self.load_diff();
-                    }
+                if crate::ui::git_graph_panel::handle_command(self, &command, &args) {
+                    return;
                 }
-                // Sync collapsed state so navigate_files skips collapsed sections correctly
-                if command == "git.toggleStaged" {
-                    self.staged_collapsed = !self.staged_collapsed;
-                }
-                if command == "git.toggleUnstaged" {
-                    self.unstaged_collapsed = !self.unstaged_collapsed;
-                }
-                // Stage/unstage: host executes directly so its state is
-                // immediately consistent; also forward to plugin so its
-                // sidebar refreshes.
-                if command == "git.stage" {
-                    if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-                        self.stage_file(path);
-                    }
-                    self.plugin_manager.execute_command(&command, args);
-                } else if command == "git.unstage" {
-                    if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-                        self.unstage_file(path);
-                    }
-                    self.plugin_manager.execute_command(&command, args);
-                } else if command == "git.stageAll" {
-                    self.stage_all();
-                } else if command == "git.unstageAll" {
-                    self.unstage_all();
-                } else {
-                    self.plugin_manager.execute_command(&command, args);
-                }
+                let _ = crate::ui::commit_detail_panel::handle_command(self, &command, &args);
             }
         }
     }
@@ -466,8 +705,8 @@ impl App {
         };
 
         let (path, staged) = items[new_idx].clone();
-        // Only update host selection state; caller is responsible for syncing to plugin
-        // so rapid key repeats can be coalesced into a single command.
+        // Defer `load_diff()` to main.rs after the event-drain loop so rapid
+        // key repeats coalesce into a single diff load.
         self.selected_file = Some(SelectedFile {
             path,
             is_staged: staged,
@@ -476,78 +715,12 @@ impl App {
         self.diff_h_scroll = 0;
     }
 
-    /// Returns the plugin panel_id for the currently focused panel, if any.
-    pub fn focused_plugin_panel(&self) -> Option<String> {
-        match (self.active_tab, self.active_panel) {
-            (Tab::Graph, Panel::Files) => Some("git.graph".into()),
-            (Tab::Graph, Panel::Diff) => Some("git.commitDetail".into()),
-            (_, Panel::Files) => self.active_sidebar_panel.clone(),
-            (_, Panel::Diff) => None, // diff is host-native, no plugin panel
-        }
-    }
-
-    /// Route a key event to the plugin that owns the currently focused panel.
-    /// Returns true if the event was forwarded to a plugin.
-    pub fn route_key_to_plugin(&mut self, key: &str) -> bool {
-        let Some(panel_id) = self.focused_plugin_panel() else {
-            return false;
-        };
-        self.plugin_manager.send_key_event(&panel_id, key, vec![])
-    }
-
-    /// Discover and start plugins from known locations.
-    pub fn load_plugins(&mut self) {
-        // 1. Built-in plugins shipped alongside the binary
-        if let Ok(exe) = std::env::current_exe() {
-            let builtin = exe
-                .parent()
-                .unwrap_or(std::path::Path::new("."))
-                .join("plugins");
-            self.plugin_manager.load_from_dir(&builtin);
-        }
-
-        // 2. Dev mode: look for plugins/ next to the workspace root
-        //    (covers `cargo run` from the project directory)
-        if self.plugin_manager.panels.is_empty() {
-            let dev_paths = [
-                // workspace root / plugins/
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .parent()
-                    .unwrap_or(std::path::Path::new("."))
-                    .parent()
-                    .unwrap_or(std::path::Path::new("."))
-                    .join("plugins"),
-            ];
-            for path in &dev_paths {
-                if path.exists() {
-                    self.plugin_manager.load_from_dir(path);
-                }
-            }
-        }
-
-        // 3. User plugins in ~/.config/reef/plugins/
-        if let Ok(home) = std::env::var("HOME") {
-            let user = PathBuf::from(home)
-                .join(".config")
-                .join("reef")
-                .join("plugins");
-            self.plugin_manager.load_from_dir(&user);
-        }
-
-        // Set default active sidebar panel to first sidebar panel
-        if self.active_sidebar_panel.is_none() {
-            if let Some(p) = self.plugin_manager.sidebar_panels().first() {
-                self.active_sidebar_panel = Some(p.decl.id.clone());
-            }
-        }
-    }
-
-    /// Called every frame: let plugin manager process incoming messages.
-    pub fn tick_plugins(&mut self) {
-        self.plugin_manager.tick();
-
-        // Drain any debounced fs events from the host watcher. The watcher already
-        // coalesces bursts, so a single `()` represents one or more real changes.
+    /// Called every frame: drain fs-watcher events and the push worker's
+    /// result channel, refreshing caches on any change. Does NOT invalidate
+    /// `git_graph.cache_key` on fs events — working-tree edits don't move
+    /// HEAD or refs, so the commit graph stays valid (see plan pitfall #2).
+    /// Push completion handles its own cache_key bust separately.
+    pub fn tick(&mut self) {
         let mut fs_dirty = false;
         if let Some(rx) = self.fs_watcher_rx.as_ref() {
             while rx.try_recv().is_ok() {
@@ -556,97 +729,75 @@ impl App {
         }
         if fs_dirty {
             self.refresh_file_tree();
-            // Host-native views cache disk/git reads; refresh them so the
-            // currently-previewed file and selected diff reflect the change.
             self.load_preview();
             self.load_diff();
-            // Plugins cache their own git state (refreshed inside their render
-            // handler). Forcing a re-render pulls them back in sync without a
-            // bespoke protocol message.
-            self.plugin_manager.invalidate_panels();
         }
 
-        // If the plugin refreshed its git state (after staging/unstaging), sync host file list
-        if self.plugin_manager.status_refresh_needed {
-            // statusChanged only fires on stage/unstage (not file selection),
-            // so a synchronous refresh here is acceptable — it's user-initiated.
-            self.refresh_status();
-            self.load_diff();
-        }
-
-        // Handle plugin→host requests
-        let requests: Vec<_> = self
-            .plugin_manager
-            .pending_host_requests
-            .drain(..)
-            .collect();
-        for req in requests {
-            match req.method.as_str() {
-                "reef/openFile" => {
-                    if let Ok(p) =
-                        serde_json::from_value::<reef_protocol::OpenFileParams>(req.params.clone())
-                    {
-                        // TODO: open file in editor panel
-                        eprintln!("[reef] openFile: {}", p.path);
-                    }
-                    let _ = self
-                        .plugin_manager
-                        .respond_to_plugin(&req, serde_json::json!({ "success": true }));
-                }
-                _ => {}
-            }
-        }
+        self.drain_push_result();
     }
 }
 
 // ─── Prefs persistence ────────────────────────────────────────────────────────
 
-fn prefs_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let dir = PathBuf::from(home).join(".config").join("reef");
-    std::fs::create_dir_all(&dir).ok()?;
-    Some(dir.join("prefs"))
-}
-
+/// Load the Git tab's diff layout + mode from the unified prefs file.
+/// Keys are `diff.layout` and `diff.mode`; missing keys fall back to
+/// defaults. `migrate_legacy_prefs` runs first in `App::new` so any old
+/// unprefixed `layout=` / `mode=` entries have been renamed by the time
+/// we get here.
 fn load_prefs() -> (DiffLayout, DiffMode) {
-    let default = (DiffLayout::Unified, DiffMode::Compact);
-    let path = match prefs_path() {
-        Some(p) => p,
-        None => return default,
+    let layout = match crate::prefs::get("diff.layout").as_deref() {
+        Some("side_by_side") => DiffLayout::SideBySide,
+        _ => DiffLayout::Unified,
     };
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return default,
+    let mode = match crate::prefs::get("diff.mode").as_deref() {
+        Some("full_file") => DiffMode::FullFile,
+        _ => DiffMode::Compact,
     };
-    let mut layout = DiffLayout::Unified;
-    let mut mode = DiffMode::Compact;
-    for line in content.lines() {
-        if let Some(val) = line.strip_prefix("layout=") {
-            layout = match val.trim() {
-                "side_by_side" => DiffLayout::SideBySide,
-                _ => DiffLayout::Unified,
-            };
-        } else if let Some(val) = line.strip_prefix("mode=") {
-            mode = match val.trim() {
-                "full_file" => DiffMode::FullFile,
-                _ => DiffMode::Compact,
-            };
-        }
-    }
     (layout, mode)
 }
 
+/// Stable hash of the ref map — used as part of the graph cache key.
+fn hash_ref_map(map: &HashMap<String, Vec<RefLabel>>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut entries: Vec<(&String, &Vec<RefLabel>)> = map.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (oid, labels) in entries {
+        oid.hash(&mut hasher);
+        for label in labels {
+            match label {
+                RefLabel::Head => 0u8.hash(&mut hasher),
+                RefLabel::Branch(s) => {
+                    1u8.hash(&mut hasher);
+                    s.hash(&mut hasher);
+                }
+                RefLabel::RemoteBranch(s) => {
+                    2u8.hash(&mut hasher);
+                    s.hash(&mut hasher);
+                }
+                RefLabel::Tag(s) => {
+                    3u8.hash(&mut hasher);
+                    s.hash(&mut hasher);
+                }
+            }
+        }
+    }
+    hasher.finish()
+}
+
 fn save_prefs(layout: DiffLayout, mode: DiffMode) {
-    if let Some(path) = prefs_path() {
-        let layout_str = match layout {
+    crate::prefs::set(
+        "diff.layout",
+        match layout {
             DiffLayout::Unified => "unified",
             DiffLayout::SideBySide => "side_by_side",
-        };
-        let mode_str = match mode {
+        },
+    );
+    crate::prefs::set(
+        "diff.mode",
+        match mode {
             DiffMode::Compact => "compact",
             DiffMode::FullFile => "full_file",
-        };
-        let content = format!("layout={}\nmode={}\n", layout_str, mode_str);
-        let _ = std::fs::write(path, content);
-    }
+        },
+    );
 }

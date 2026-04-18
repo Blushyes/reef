@@ -1,13 +1,13 @@
 # Property test recipe
 
-For asserting invariants that hold over a wide input space. Uses `proptest` (already a dev-dependency in `reef-git` and `reef-protocol`). Live under `crates/<crate>/tests/<name>_properties.rs`.
+For asserting invariants that hold over a wide input space. Uses `proptest` (already a dev-dependency in `reef-host`). Live under `crates/reef-host/tests/<name>_properties.rs`.
 
 ## When to use proptest vs. unit tests
 
 Use proptest when:
 - The property is a **universal quantifier**: "for all valid inputs, X holds"
 - Example: "every row in `build_graph(commits)` has `cells[node_col] == Node`"
-- Example: "`read_message(write_message(m))` equals `m` for any valid `m`"
+- Example: "`tree::build(files)` contains exactly as many `File` leaves as the input slice has entries"
 
 Use unit tests when:
 - The property is "for this specific input, X is exactly Y"
@@ -85,7 +85,7 @@ Key moves:
 2. Map the shape to valid structures
 3. Rely on `%` to keep parent indices in range (instead of filtering, which slows generation)
 
-See `crates/reef-git/tests/graph_properties.rs` for the complete version.
+See `crates/reef-host/tests/git_graph_properties.rs` for the complete version.
 
 ## Useful property patterns
 
@@ -108,7 +108,7 @@ proptest! {
 }
 ```
 
-Use for any deserializer / parser that consumes untrusted input. `write_message` / `read_message` has one of these.
+Use for any deserializer / parser that consumes untrusted input. The `build_graph` fuzz target in `fuzz/fuzz_targets/build_graph.rs` uses the same never-panic pattern outside proptest.
 
 ### Structural invariants
 

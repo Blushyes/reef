@@ -1805,20 +1805,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "reef-git"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "git2",
- "proptest",
- "reef-protocol",
- "serde_json",
- "tempfile",
- "test-support",
- "unicode-width",
-]
-
-[[package]]
 name = "reef-host"
 version = "0.1.0"
 dependencies = [
@@ -1828,9 +1814,8 @@ dependencies = [
  "ignore",
  "insta",
  "notify",
+ "proptest",
  "ratatui",
- "reef-protocol",
- "serde",
  "serde_json",
  "similar 3.1.0",
  "syntect",
@@ -1838,15 +1823,6 @@ dependencies = [
  "test-support",
  "two-face",
  "unicode-width",
-]
-
-[[package]]
-name = "reef-protocol"
-version = "0.1.0"
-dependencies = [
- "proptest",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -2243,9 +2219,6 @@ name = "test-support"
 version = "0.1.0"
 dependencies = [
  "git2",
- "reef-git",
- "reef-protocol",
- "serde_json",
  "tempfile",
 ]
 

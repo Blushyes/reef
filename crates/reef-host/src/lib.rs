@@ -8,6 +8,6 @@ pub mod fs_watcher;
 pub mod git;
 pub mod highlight;
 pub mod mouse;
-pub mod plugin;
-pub mod renderer;
+pub mod prefs;
+pub mod toast;
 pub mod ui;

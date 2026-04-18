@@ -1,6 +1,6 @@
 # `test-support` fixture reference
 
-All shared test helpers live in `crates/test-support/src/lib.rs`. Every crate has `test-support = { path = "../test-support" }` as a dev-dependency, so `use test_support::...` works from any `tests/*.rs` or `benches/*.rs`.
+All shared test helpers live in `crates/test-support/src/lib.rs`. Every consumer has `test-support = { path = "../test-support" }` as a dev-dependency, so `use test_support::...` works from any `tests/*.rs` or `benches/*.rs`.
 
 Don't reach into `git2` directly from tests or copy these helpers around — extend the crate when you need something new. One canonical source means every test gets the same fix when we find a better way.
 
@@ -18,7 +18,7 @@ let (tmp, raw) = tempdir_repo();
 // raw is the git2::Repository handle
 ```
 
-Keep the `TempDir` binding alive for the whole test. Don't pass `tmp.path()` into code that escapes the test's scope (threads, subprocesses) without confirming they'll finish before `tmp` drops.
+Keep the `TempDir` binding alive for the whole test. Don't pass `tmp.path()` into code that escapes the test's scope (threads, watchers) without confirming they'll finish before `tmp` drops.
 
 ### `commit_file(repo, path, content, subject) -> git2::Oid`
 
@@ -33,6 +33,7 @@ Use for setting up known baseline state before the test exercises the code path 
 ### `write_file(repo, path, content)`
 
 Writes without staging. Use to create:
+
 - **Untracked files** — file exists in workdir but not in index (triggers `FileStatus::Untracked`)
 - **Modified unstaged files** — after a previous `commit_file`, overwrite with different content (triggers `FileStatus::Modified` on the unstaged side)
 
@@ -42,62 +43,50 @@ write_file(&raw, "a.txt", "v2");                 // now unstaged-modified
 write_file(&raw, "new.txt", "untracked");        // untracked
 ```
 
-## Styled-line inspection
+## Asserting on ratatui panel output
 
-UI tests and plugin tests often need to assert that some piece of text or styling appeared in a `StyledLine`. Don't do `line.spans[3].text == "expected"` — span indices shift whenever the layout changes and every test breaks.
+There are no span-level helpers here for ratatui output. When a test needs to assert that specific text appears in a rendered panel, use the snapshot recipe (`references/recipes/snapshot.md`) to render to a `TestBackend` and assert against the buffer as a string. Ratatui's `Line` / `Span` types aren't meant to be introspected in tests — span boundaries shift as layouts evolve and every index-based assertion becomes a trap.
 
-### `extract_text(&styled_line) -> String`
-
-Concatenates all span texts into one string. Good for substring assertions without caring about span boundaries.
-
-```rust
-let text = extract_text(&line);
-assert!(text.contains("modified"));
-```
-
-### `assert_span_contains(&styled_line, needle)`
-
-Asserts some span's text contains `needle`. Panics with a helpful message showing all span texts if not found.
-
-```rust
-assert_span_contains(&line, "HEAD");
-```
-
-### `find_span(&styled_line, needle) -> Option<&Span>`
-
-Returns the first span whose text contains `needle`, so you can inspect its styling:
-
-```rust
-let head_span = find_span(&line, " HEAD ").expect("HEAD label present");
-assert_eq!(head_span.bg, Some(Color::named("cyan")));
-assert_eq!(head_span.bold, Some(true));
-```
+For the inline panels' pure logic (e.g. `tree::build` in `crates/reef-host/src/git/tree.rs`), assert on the returned data structure directly — don't route through rendering.
 
 ## Commit graph fixtures
 
-### `make_commit_info(oid, parents) -> CommitInfo`
-
-Builds a `reef_git::git::CommitInfo` with sensible defaults (author "Tester", time 0, subject derived from oid). Used for testing `build_graph` and other pure graph algorithms without needing a real repo.
+If you need a `CommitInfo` for graph algorithm tests, build one by hand — it's six fields, half trivial:
 
 ```rust
-let commits = vec![
-    make_commit_info("c0", &["c1"]),
-    make_commit_info("c1", &["c2"]),
-    make_commit_info("c2", &[]),
-];
-let rows = build_graph(&commits);
+use reef_host::git::CommitInfo;
+
+fn fake_commit(oid: &str, parents: &[&str]) -> CommitInfo {
+    CommitInfo {
+        oid: oid.into(),
+        short_oid: oid.chars().take(7).collect(),
+        parents: parents.iter().map(|s| (*s).into()).collect(),
+        author_name: String::new(),
+        author_email: String::new(),
+        time: 0,
+        subject: String::new(),
+    }
+}
 ```
+
+Existing examples:
+
+- `crates/reef-host/src/git/graph.rs` — unit tests inside the module itself
+- `crates/reef-host/tests/git_graph_properties.rs` — the proptest version, which generates topologically-ordered commit vectors from a random shape
+- `crates/reef-host/benches/graph.rs` — the bench version with a deterministic fork/merge pattern
 
 Topological order (child before parent) is the caller's responsibility — `build_graph` assumes it.
 
 ## Extending `test-support`
 
 Add a helper when:
+
 - Three or more test files would duplicate the same setup
 - A non-obvious configuration (like `user.email` for commits on CI) needs to be centralized so it can't be forgotten
 - A helper hides a gotcha (macOS canonicalization, env var scoping, etc.) that should never have to be rediscovered
 
 Don't add a helper when:
+
 - Only one test needs it — put it in the test file
 - It's trivial (one line) and the test reads more clearly inline
 

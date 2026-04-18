@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Main loop
     loop {
-        app.tick_plugins();
+        app.tick();
         terminal.draw(|f| ui::render(f, &mut app))?;
 
         // Block until at least one event arrives (or 16ms timeout for ~60fps)
@@ -52,7 +52,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_ref()
             .map(|s| (s.path.clone(), s.is_staged));
 
-        // Drain ALL pending events so rapid key repeats don't queue plugin commands
+        // Drain ALL pending events so rapid key repeats coalesce — only one
+        // render + diff-load runs per frame, regardless of how many events fired.
         loop {
             match event::read()? {
                 Event::Key(key) => {
@@ -99,22 +100,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_ref()
             .map(|s| (s.path.clone(), s.is_staged));
         if sel_after != sel_before {
-            // Load diff natively in the host (no plugin round-trip)
             app.load_diff();
-            // Notify plugin so the sidebar highlights the selected file
-            if let Some(ref sel) = app.selected_file.clone() {
-                app.plugin_manager
-                    .queue_select_file(&sel.path, sel.is_staged);
-            }
         }
 
         if app.should_quit {
             break;
         }
     }
-
-    // Shutdown plugins
-    app.plugin_manager.shutdown();
 
     // Restore terminal
     disable_raw_mode()?;
@@ -174,55 +166,50 @@ fn handle_key(key: event::KeyEvent, app: &mut App) {
 }
 
 fn handle_key_graph(key: event::KeyEvent, app: &mut App) {
+    use reef_host::ui::{commit_detail_panel, git_graph_panel};
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => match app.active_panel {
             Panel::Files => {
-                app.route_key_to_plugin("k");
+                git_graph_panel::handle_key(app, "k");
             }
-            Panel::Diff => scroll_panel(app, "git.commitDetail", -1),
+            Panel::Diff => commit_detail_panel::scroll(app, -1),
         },
         KeyCode::Down | KeyCode::Char('j') => match app.active_panel {
             Panel::Files => {
-                app.route_key_to_plugin("j");
+                git_graph_panel::handle_key(app, "j");
             }
-            Panel::Diff => scroll_panel(app, "git.commitDetail", 1),
+            Panel::Diff => commit_detail_panel::scroll(app, 1),
         },
         KeyCode::PageUp => match app.active_panel {
             Panel::Files => {
                 for _ in 0..10 {
-                    app.route_key_to_plugin("k");
+                    git_graph_panel::handle_key(app, "k");
                 }
             }
-            Panel::Diff => scroll_panel(app, "git.commitDetail", -20),
+            Panel::Diff => commit_detail_panel::scroll(app, -20),
         },
         KeyCode::PageDown => match app.active_panel {
             Panel::Files => {
                 for _ in 0..10 {
-                    app.route_key_to_plugin("j");
+                    git_graph_panel::handle_key(app, "j");
                 }
             }
-            Panel::Diff => scroll_panel(app, "git.commitDetail", 20),
+            Panel::Diff => commit_detail_panel::scroll(app, 20),
         },
-        KeyCode::Enter => {
-            app.route_key_to_plugin("Enter");
-        }
         KeyCode::Char('r') => {
-            app.route_key_to_plugin("r");
+            // `r` on the graph sidebar = force a graph cache refresh
+            app.git_graph.cache_key = None;
+            app.refresh_graph();
         }
-        // m/f/t always target the commit-detail panel regardless of focus —
-        // they configure the inline diff / changed-files view, which is only
-        // meaningful there. t toggles the Changed-files tree/flat layout.
+        // m/f/t target the commit-detail panel regardless of focus.
         KeyCode::Char('m') => {
-            app.plugin_manager
-                .send_key_event("git.commitDetail", "m", vec![]);
+            commit_detail_panel::handle_key(app, "m");
         }
         KeyCode::Char('f') => {
-            app.plugin_manager
-                .send_key_event("git.commitDetail", "f", vec![]);
+            commit_detail_panel::handle_key(app, "f");
         }
         KeyCode::Char('t') => {
-            app.plugin_manager
-                .send_key_event("git.commitDetail", "t", vec![]);
+            commit_detail_panel::handle_key(app, "t");
         }
         _ => {}
     }
@@ -277,33 +264,28 @@ fn handle_key_git(key: event::KeyEvent, app: &mut App) {
             app.diff_h_scroll = usize::MAX; // render 自动钳到实际最大值
         }
         KeyCode::Char('s') => {
-            if !app.route_key_to_plugin("s") {
-                if let Some(ref sel) = app.selected_file.clone() {
-                    if !sel.is_staged {
-                        app.stage_file(&sel.path);
-                    }
-                }
-            }
+            reef_host::ui::git_status_panel::handle_key(app, "s");
         }
         KeyCode::Char('u') => {
-            if !app.route_key_to_plugin("u") {
-                if let Some(ref sel) = app.selected_file.clone() {
-                    if sel.is_staged {
-                        app.unstage_file(&sel.path);
-                    }
-                }
-            }
+            reef_host::ui::git_status_panel::handle_key(app, "u");
+        }
+        KeyCode::Char('d') => {
+            reef_host::ui::git_status_panel::handle_key(app, "d");
+        }
+        KeyCode::Char('y') => {
+            reef_host::ui::git_status_panel::handle_key(app, "y");
+        }
+        KeyCode::Char('n') => {
+            reef_host::ui::git_status_panel::handle_key(app, "n");
+        }
+        KeyCode::Esc => {
+            reef_host::ui::git_status_panel::handle_key(app, "Escape");
         }
         KeyCode::Char('r') => {
-            if !app.route_key_to_plugin("r") {
-                app.refresh_status();
-                if app.selected_file.is_some() {
-                    app.load_diff();
-                }
-            }
+            reef_host::ui::git_status_panel::handle_key(app, "r");
         }
         KeyCode::Char('t') => {
-            app.route_key_to_plugin("t");
+            reef_host::ui::git_status_panel::handle_key(app, "t");
         }
         KeyCode::Char('m') => {
             app.toggle_diff_layout();
@@ -411,13 +393,13 @@ fn handle_mouse<B: ratatui::backend::Backend>(
                 // On double-click: if the region carries a dbl action, swap to it
                 // and run through handle_action so host-side side effects fire.
                 let effective = if is_double {
-                    if let crate::mouse::ClickAction::PluginCommand {
+                    if let crate::mouse::ClickAction::GitCommand {
                         dbl_command: Some(ref cmd),
                         ref dbl_args,
                         ..
                     } = action
                     {
-                        crate::mouse::ClickAction::PluginCommand {
+                        crate::mouse::ClickAction::GitCommand {
                             command: cmd.clone(),
                             args: dbl_args.clone().unwrap_or(serde_json::Value::Null),
                             dbl_command: None,
@@ -463,7 +445,7 @@ fn handle_mouse<B: ratatui::backend::Backend>(
             match app.active_tab {
                 Tab::Git => {
                     if is_left {
-                        scroll_sidebar_plugin(app, -3);
+                        reef_host::ui::git_status_panel::scroll(app, -3);
                     } else {
                         app.diff_scroll = app.diff_scroll.saturating_sub(3);
                     }
@@ -477,9 +459,9 @@ fn handle_mouse<B: ratatui::backend::Backend>(
                 }
                 Tab::Graph => {
                     if is_left {
-                        scroll_panel(app, "git.graph", -3);
+                        reef_host::ui::git_graph_panel::scroll(app, -3);
                     } else {
-                        scroll_panel(app, "git.commitDetail", -3);
+                        reef_host::ui::commit_detail_panel::scroll(app, -3);
                     }
                 }
             }
@@ -495,7 +477,7 @@ fn handle_mouse<B: ratatui::backend::Backend>(
             match app.active_tab {
                 Tab::Git => {
                     if is_left {
-                        scroll_sidebar_plugin(app, 3);
+                        reef_host::ui::git_status_panel::scroll(app, 3);
                     } else {
                         app.diff_scroll += 3;
                     }
@@ -509,9 +491,9 @@ fn handle_mouse<B: ratatui::backend::Backend>(
                 }
                 Tab::Graph => {
                     if is_left {
-                        scroll_panel(app, "git.graph", 3);
+                        reef_host::ui::git_graph_panel::scroll(app, 3);
                     } else {
-                        scroll_panel(app, "git.commitDetail", 3);
+                        reef_host::ui::commit_detail_panel::scroll(app, 3);
                     }
                 }
             }
@@ -532,34 +514,11 @@ fn handle_mouse<B: ratatui::backend::Backend>(
     }
 }
 
-/// Apply a scroll delta to the sidebar's currently-active plugin panel.
-/// Delta is in lines; positive scrolls down, negative scrolls up.
-fn scroll_sidebar_plugin(app: &mut App, delta: i32) {
-    let Some(panel_id) = app.active_sidebar_panel.clone() else {
-        return;
-    };
-    let entry = app.panel_scroll.entry(panel_id).or_insert(0);
-    *entry = if delta < 0 {
-        entry.saturating_sub(delta.unsigned_abs() as usize)
-    } else {
-        entry.saturating_add(delta as usize)
-    };
-}
-
-/// Apply a scroll delta to a specific plugin panel by id.
-fn scroll_panel(app: &mut App, panel_id: &str, delta: i32) {
-    let entry = app.panel_scroll.entry(panel_id.to_string()).or_insert(0);
-    *entry = if delta < 0 {
-        entry.saturating_sub(delta.unsigned_abs() as usize)
-    } else {
-        entry.saturating_add(delta as usize)
-    };
-}
-
 /// Apply a horizontal-scroll delta (in display columns) to the preview / diff
-/// panel under the cursor. Events landing on the left sidebar or on the Graph
-/// tab's plugin-owned panel are ignored — the Graph panel needs a protocol
-/// extension for horizontal scroll which we haven't done yet.
+/// panel under the cursor. Events landing on the left sidebar are ignored.
+/// Graph tab doesn't support horizontal scroll yet — the commit-detail rows
+/// already truncate to the panel width; if long-line viewing becomes a real
+/// need, wire up `CommitDetailState.diff_h_scroll` here.
 fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: i32) {
     let split_x = total_width * app.split_percent / 100;
     let is_left = column < split_x;

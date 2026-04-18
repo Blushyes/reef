@@ -1,20 +1,18 @@
 //! Full-terminal snapshot tests via `ratatui::TestBackend`.
 //!
-//! Strategy: drop into a controlled tempdir with a real git repo, construct
-//! `App::new()`, immediately detach its plugin manager (plugins are external
-//! subprocesses whose output varies by cached binary version and scheduling —
-//! not useful for host-UI snapshots), then render and snapshot. What we're
-//! asserting on is the HOST shell: tab bar, borders, status line — not the
-//! plugin's panel content.
+//! Strategy: drop into a controlled tempdir with a real git repo, redirect
+//! `$HOME` to the same tempdir so `App::new()`'s prefs read starts from a
+//! blank slate (otherwise the developer's saved tree-mode / diff-layout
+//! bleeds into the snapshot), then render and assert against a committed
+//! `.snap` file.
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use reef_host::app::App;
-use reef_host::plugin::manager::PluginManager;
 use reef_host::ui;
 use std::sync::Mutex;
-use test_support::{commit_file, tempdir_repo, write_file};
+use test_support::{HomeGuard, commit_file, tempdir_repo, write_file};
 
 static CWD_LOCK: Mutex<()> = Mutex::new(());
 
@@ -35,6 +33,10 @@ impl Drop for CwdGuard {
         let _ = std::env::set_current_dir(&self.original);
     }
 }
+
+// `HomeGuard` — redirect $HOME for the snapshot — lives in `test-support`.
+// The local `CWD_LOCK` doubles as the HOME_LOCK here because every test in
+// this file swaps both in lockstep and nothing else touches HOME concurrently.
 
 fn buffer_to_text(buf: &Buffer) -> String {
     let w = buf.area().width as usize;
@@ -59,15 +61,6 @@ fn render_app(app: &mut App, width: u16, height: u16) -> String {
     buffer_to_text(terminal.backend().buffer())
 }
 
-/// Replace App's auto-loaded plugin_manager with an empty one. Any plugin
-/// subprocesses spawned by `App::new()` get their stdin/stdout pipes dropped
-/// and exit on EOF; their output never reaches the terminal buffer so the
-/// snapshot becomes deterministic regardless of cached plugin binaries.
-fn detach_plugins(app: &mut App) {
-    app.plugin_manager = PluginManager::new();
-    app.active_sidebar_panel = None;
-}
-
 /// Apply filters to mask nondeterministic tokens (tempdir name, path segments).
 fn with_filters<F: FnOnce()>(body: F) {
     let mut settings = insta::Settings::clone_current();
@@ -81,10 +74,10 @@ fn with_filters<F: FnOnce()>(body: F) {
 fn snapshot_empty_repo() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, _raw) = tempdir_repo();
+    let _h = HomeGuard::enter(tmp.path());
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new();
-    detach_plugins(&mut app);
     let output = render_app(&mut app, 80, 20);
     with_filters(|| insta::assert_snapshot!("empty_repo", output));
 }
@@ -96,10 +89,10 @@ fn snapshot_with_staged_and_unstaged() {
     commit_file(&raw, "tracked.txt", "v1\n", "init");
     write_file(&raw, "tracked.txt", "v2\n"); // unstaged modification
     write_file(&raw, "new.txt", "new\n"); // untracked
+    let _h = HomeGuard::enter(tmp.path());
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new();
-    detach_plugins(&mut app);
     // Switch to Git tab to show staged/unstaged sections
     app.active_tab = reef_host::app::Tab::Git;
     app.refresh_status();

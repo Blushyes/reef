@@ -15,9 +15,9 @@ pub enum ClickAction {
     StartDragSplit,
     SwitchTab(Tab),
     TreeClick(usize),
-    /// Invoke a plugin command (from a StyledLine click_command).
+    /// Invoke an inline Git panel command (`git.stage`, `git.selectCommit`, …).
     /// `dbl_command`/`dbl_args`, if present, are fired on double-click instead.
-    PluginCommand {
+    GitCommand {
         command: String,
         args: serde_json::Value,
         dbl_command: Option<String>,

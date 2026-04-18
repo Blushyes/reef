@@ -1,6 +1,6 @@
 # Integration test recipe
 
-For tests that use real `git2::Repository`, real filesystem, or spawn real subprocesses. Live under `crates/<crate>/tests/<name>_integration.rs`.
+For tests that use real `git2::Repository` or real filesystem. Live under `crates/reef-host/tests/<name>_integration.rs`.
 
 ## Basic skeleton
 
@@ -46,77 +46,41 @@ fn scenario_expected_outcome() {
 
 The `CwdGuard` and `CWD_LOCK` pattern is identical across files (`git_repo_integration.rs`, `ui_snapshots.rs`, `app_error_paths.rs`). Copy it; it hasn't needed to diverge.
 
-## Spawning a subprocess
-
-When the test exercises subprocess I/O (plugin protocol, CLI tools):
-
-1. Declare the binary in the relevant crate's `Cargo.toml`:
-   ```toml
-   [[bin]]
-   name = "echo-plugin"
-   path = "src/bin/echo_plugin.rs"
-   ```
-
-2. Locate it at test runtime via the env var Cargo sets:
-   ```rust
-   const ECHO_PLUGIN: &str = env!("CARGO_BIN_EXE_echo-plugin");
-   ```
-
-3. Poll for completion with a bounded timeout — never block unbounded on a subprocess that might have died silently:
-
-```rust
-fn wait_for_message(proc: &PluginProcess, timeout: Duration)
-    -> Vec<reef_protocol::RpcMessage>
-{
-    let start = Instant::now();
-    loop {
-        let msgs = proc.drain_messages();
-        if !msgs.is_empty() || start.elapsed() > timeout {
-            return msgs;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-```
-
-4. Test binaries live in the same crate as the tests that use them. Keep them minimal — just enough protocol behavior to exercise the host code path you care about.
-
-See `crates/reef-host/src/bin/echo_plugin.rs` + `crates/reef-host/tests/plugin_handshake.rs` for a worked example.
-
 ## HOME isolation pattern
 
-For tests that call into `prefs.rs` or anything that reads `std::env::var("HOME")`:
+For tests that call `App::new()` or anything else that reads `std::env::var("HOME")` — specifically `crates/reef-host/src/prefs.rs`:
 
 ```rust
-static HOME_LOCK: Mutex<()> = Mutex::new(());
+static HOME_LOCK: Mutex<()> = Mutex::new(());   // or reuse CWD_LOCK if paired
 
 struct HomeGuard {
-    _tmp: TempDir,
-    original: Option<String>,
+    original: Option<std::ffi::OsString>,
 }
 
 impl HomeGuard {
-    fn new() -> Self {
-        let tmp = TempDir::new().unwrap();
-        let original = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", tmp.path()); }
-        Self { _tmp: tmp, original }
+    fn enter(path: &std::path::Path) -> Self {
+        let original = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", path); }
+        Self { original }
     }
 }
 
 impl Drop for HomeGuard {
     fn drop(&mut self) {
         unsafe {
-            match &self.original {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
+            if let Some(v) = self.original.take() {
+                std::env::set_var("HOME", v);
+            } else {
+                std::env::remove_var("HOME");
             }
         }
     }
 }
 ```
 
-`unsafe` is required because `set_var` is not threadsafe. The `HOME_LOCK` is the contract that makes our usage safe — never call `set_var` without holding the lock.
+`unsafe` is required because `set_var` is not threadsafe. The lock is the contract that makes our usage safe — never call `set_var` without holding one.
+
+`ui_snapshots.rs` pairs `HomeGuard` with `CwdGuard` under a single `CWD_LOCK`, because every HOME swap in that file is paired with a cwd swap and nothing else touches HOME concurrently.
 
 ## Coverage goal
 
@@ -126,4 +90,4 @@ When a method has multiple meaningful outcomes (e.g., `get_status` distinguishes
 
 ## When to prefer unit over integration
 
-If you can write the same assertion with no filesystem, no git2, no subprocess — do that. A unit test inside the source file is an order of magnitude faster and less flaky. Promote to integration only when you're genuinely testing the boundary with external state.
+If you can write the same assertion with no filesystem, no git2 — do that. A unit test inside the source file is an order of magnitude faster and less flaky. Promote to integration only when you're genuinely testing the boundary with external state.

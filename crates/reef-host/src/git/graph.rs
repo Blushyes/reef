@@ -1,4 +1,4 @@
-use crate::git::CommitInfo;
+use super::CommitInfo;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaneCell {

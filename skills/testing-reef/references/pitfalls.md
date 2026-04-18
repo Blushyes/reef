@@ -2,25 +2,15 @@
 
 Every entry here represents time paid. Read before writing a test that touches the relevant area.
 
-## Plugin subprocess races in UI snapshots
+## `App::new()` reads the developer's real `~/.config/reef/prefs`
 
-**Symptom**: Snapshot test passes locally, fails on CI (or vice versa). The diff shows a whole panel's worth of content appearing/disappearing.
+**Symptom**: Snapshot test passes for the author but fails for someone else (or on CI). The diff shows the Git sidebar's view-mode toggle flipping between "视图: 列表" and "视图: 树形", or the commit-file view switching tree/flat, with no obvious source.
 
-**Root cause**: `App::new()` calls `plugin_manager.load_plugins()`, which spawns `reef-git` as a subprocess. The plugin answers the first render request asynchronously. Whether your `terminal.draw(...)` call captures the plugin's output depends on:
+**Root cause**: `App::new()` runs `load_bool_pref("status.tree_mode", ...)` and the equivalents for `commit.diff_layout`, `commit.diff_mode`, `commit.files_tree_mode`. Without test-level isolation, these reads hit the tester's real home directory — which has been used as a real Reef user and has non-default prefs persisted.
 
-1. **Does the plugin binary exist?** The plugin manifest points at `target/release/reef-git`. On a dev machine that's been `cargo build --release`'d, it exists. On CI running `cargo test` (which only builds debug binaries), it doesn't — plugin spawn fails silently, panel is empty.
-2. **How fast does the plugin respond?** Even when the binary exists, `terminal.draw()` right after `App::new()` may capture a frame before the plugin's first render arrives.
+**Fix**: Redirect `$HOME` to the test's tempdir before calling `App::new()`, serialised behind a lock that also covers cwd mutation (see SKILL.md critical pattern #1 for the `HomeGuard` template). `prefs::migrate_legacy_prefs()` is a no-op when the tempdir has no prefs file, so it won't create a spurious `.config/reef/prefs` that shows up as an untracked file in the snapshot's `git status`.
 
-**Fix**: Detach the plugin manager before snapshotting:
-
-```rust
-app.plugin_manager = PluginManager::new();
-app.active_sidebar_panel = None;
-```
-
-Snapshot only host-native rendering. Test plugin behavior separately in `plugin_handshake.rs` / `plugin_manager_lifecycle.rs` where you deterministically spawn the test-only `echo-plugin` binary.
-
-**Don't fix by**: Polling until the plugin responds — works today, breaks when the build changes. The binary's availability is outside the test's control.
+**Don't fix by**: Sprinkling `prefs::set(...)` at the top of each test to force known values. You'd have to know every key `App::new()` reads, and the list will grow.
 
 ## macOS tempdir symlink vs. `notify` canonicalization
 
@@ -28,12 +18,12 @@ Snapshot only host-native rendering. Test plugin behavior separately in `plugin_
 
 **Root cause**: On macOS, `TempDir` returns `/var/folders/<...>` which is a symlink to `/private/var/folders/<...>`. The `notify` crate (via FSEvents) delivers events with the **canonical** path (`/private/var/...`). The watcher's `is_relevant()` does `path.starts_with(workdir)`; if `workdir` is the non-canonical `/var/...` form, the match fails and every event is discarded.
 
-**Fix**: Canonicalize before passing to `watcher::spawn`:
+**Fix**: Canonicalize before passing to `fs_watcher::spawn`:
 
 ```rust
 let workdir = std::fs::canonicalize(tmp.path()).unwrap_or(tmp.path().to_path_buf());
 let gitdir = std::fs::canonicalize(workdir.join(".git")).unwrap_or(workdir.join(".git"));
-watcher::spawn(workdir, gitdir, writer);
+fs_watcher::spawn(workdir);
 ```
 
 **Generalizes to**: Any code that compares paths received from the OS (fs events, resolved exe paths) against a path you constructed. If you constructed via `TempDir` on macOS, canonicalize it first.
@@ -58,9 +48,19 @@ fn my_test() {
 }
 ```
 
-Keep `CWD_LOCK` and `HOME_LOCK` separate. Two tests that mutate different env vars don't need to serialize.
+In practice you often need both cwd and HOME locked together (e.g. `ui_snapshots.rs`). A single `CWD_LOCK` covers both, since the HOME swap in that file is always paired with a cwd swap and nothing else touches HOME concurrently. Don't over-share locks across files that don't need to serialise.
 
 **Don't fix by**: Running tests with `--test-threads=1`. That serializes everything, including tests that don't need it, and hides the bug rather than expressing the real dependency.
+
+## Graph cache not invalidated → stale DAG on ref moves
+
+**Symptom**: Tab::Graph shows the commit DAG from five minutes ago. New commits don't appear; HEAD doesn't move.
+
+**Root cause**: `App::refresh_graph()` keys on `(head_oid, refs_hash)` and skips the `revwalk` when unchanged. This is deliberately aggressive — we don't want working-tree edits (which can fire fs-watcher events every keystroke) to trigger a 500-commit revwalk on large repos. But any code path that moves HEAD or refs must clear `app.git_graph.cache_key = None` explicitly.
+
+**Fix**: In any new code path that can change HEAD or refs (commit, checkout, reset, push, fetch, rebase), add `self.git_graph.cache_key = None;` next to the mutation. Existing examples: `App::run_push` clears it on push success/failure.
+
+**Don't fix by**: Invalidating cache_key in `App::tick()` or on every fs-watcher event. That reintroduces the 500-commit revwalk per keystroke.
 
 ## Cargo.lock drift in commits
 
@@ -68,7 +68,7 @@ Keep `CWD_LOCK` and `HOME_LOCK` separate. Two tests that mutate different env va
 
 **Root cause**: Dev-dependencies (especially `criterion`, `proptest`, `insta`) pull in large dep trees. When someone adds a dev-dep and forgets to commit the resulting `Cargo.lock` change, the next person's build resolves a different lockfile.
 
-**Fix**: Always commit `Cargo.lock` changes alongside `Cargo.toml` changes. `cargo.lock` is NOT in `.gitignore` for this workspace (it's a binary crate workspace, locking is the correct choice).
+**Fix**: Always commit `Cargo.lock` changes alongside `Cargo.toml` changes. `Cargo.lock` is NOT in `.gitignore` for this workspace (it's a binary crate workspace, locking is the correct choice).
 
 **Check before pushing**: `git status Cargo.lock` — if it's modified, stage and include in the relevant commit.
 
@@ -89,16 +89,3 @@ Keep `CWD_LOCK` and `HOME_LOCK` separate. Two tests that mutate different env va
 **Fix**: Run `cargo clippy --workspace --all-targets -- -D warnings` locally before pushing. This is step 3 of the pre-commit checklist in SKILL.md.
 
 **If the lint is style-only and project-wide**: Add it to `[workspace.lints.clippy] <lint> = "allow"` in root `Cargo.toml`. If it catches real issues, fix the code.
-
-## Tests spawning subprocesses without waiting for them
-
-**Symptom**: Tests pass, but occasionally zombie processes accumulate. Or: test times out waiting for a plugin that never responds.
-
-**Root cause**: `PluginProcess` holds a `Child` in a field but doesn't actively kill it on drop. The spawned process reads stdin; when the test drops the PluginProcess, stdin is closed, and the subprocess exits on EOF — but this relies on the subprocess checking for EOF, not blocking elsewhere.
-
-**Fix**:
-1. Always give a bounded timeout when polling `drain_messages`
-2. For tests that call `mgr.shutdown()`, rely on `reef/shutdown` notification to terminate plugins cleanly
-3. If a test spawns a subprocess directly, call `.kill()` or send shutdown explicitly at test end — don't rely on drop
-
-The `echo-plugin` binary exits on EOF specifically to survive this scenario. New test-only subprocess binaries should do the same.

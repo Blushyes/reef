@@ -1,34 +1,40 @@
 ---
 name: testing-reef
-description: Conventions and gotchas for writing tests in the reef Rust workspace — unit, integration, property, snapshot, benchmark, and fuzz. Use whenever adding or modifying a test in reef-host, reef-git, reef-protocol, or test-support, or when the user asks "add a test for X", "how should I test Y", "why is this test flaky", "where does this test go", or anything about test fixtures, snapshots, proptest, or CI test failures. Also use when touching clock/time code (requires splitting `*_at(now, t)` helpers), the plugin manager (UI snapshots must detach it), or any code that mutates `cwd`/`HOME` (needs process-wide lock). Covers file-placement rules, the `test-support` fixture crate, insta filters, proptest strategy construction, and the specific pitfalls we've paid for in production — plugin subprocess races, macOS tempdir symlinks, env-var sharing across parallel tests.
+description: Conventions and gotchas for writing tests in the reef Rust workspace — unit, integration, property, snapshot, benchmark, and fuzz. Use whenever adding or modifying a test in reef-host or test-support, or when the user asks "add a test for X", "how should I test Y", "why is this test flaky", "where does this test go", or anything about test fixtures, snapshots, proptest, or CI test failures. Also use when touching clock/time code (requires splitting `*_at(now, t)` helpers), or any code that mutates `cwd`/`HOME` (needs process-wide lock). Covers file-placement rules, the `test-support` fixture crate, insta filters, proptest strategy construction, and the specific pitfalls we've paid for in production — macOS tempdir symlinks, env-var sharing across parallel tests, and the HOME-redirect pattern for prefs-reading code.
 ---
 
 # Testing in the reef workspace
 
 A project-specific test playbook. Follow this when adding **any** test. The goal is that tests are deterministic across Linux/macOS CI and every dev's laptop, and that no test becomes that one flaky thing everyone reruns.
 
+## Workspace layout (post-deplugin)
+
+Reef is a single-process binary — there is no plugin subsystem. Two crates live in the workspace:
+
+- **`crates/reef-host`** — the binary and all its logic (app state, UI panels, git operations). Tests live in `crates/reef-host/tests/`. Benches in `crates/reef-host/benches/`.
+- **`crates/test-support`** — shared fixtures (`tempdir_repo`, `commit_file`, `write_file`).
+- **`fuzz/`** — fuzz targets. Separate package, not in the workspace; run via `cargo +nightly fuzz run <target>`.
+
 ## Quick decision table
 
 | Scenario | Test type | Where it goes |
 |----------|-----------|---------------|
 | Pure function, no I/O | Unit test | `#[cfg(test)] mod tests` inline at bottom of the source file |
-| Uses `git2::Repository`, real fs, real subprocess | Integration test | `crates/<crate>/tests/<name>_integration.rs` |
-| Algorithmic invariant over random inputs | Property test | `crates/<crate>/tests/<name>_properties.rs` (uses `proptest`) |
+| Uses `git2::Repository`, real fs | Integration test | `crates/reef-host/tests/<name>_integration.rs` |
+| Algorithmic invariant over random inputs | Property test | `crates/reef-host/tests/<name>_properties.rs` (uses `proptest`) |
 | Full UI rendered to terminal buffer | Snapshot | `crates/reef-host/tests/<name>_snapshots.rs` (uses `insta` + `ratatui::TestBackend`) |
-| Hot-path performance | Benchmark | `crates/<crate>/benches/<name>.rs` (uses `criterion`) |
+| Hot-path performance | Benchmark | `crates/reef-host/benches/<name>.rs` (uses `criterion`) |
 | Parser / deserializer robustness | Fuzz target | `fuzz/fuzz_targets/<name>.rs` |
 
 If you're unsure, default to unit test first; promote to integration only when real I/O is required for the test to be meaningful.
 
 ## Fixtures: always go through `test-support`
 
-The `crates/test-support` crate exists so tests don't reinvent repo setup or span inspection. **Never write `git2::Repository::init` or manual `std::env::set_var` in a test file.** Use these helpers:
+The `crates/test-support` crate exists so tests don't reinvent repo setup. **Never write `git2::Repository::init` or manual `std::env::set_var` in a test file.** Use these helpers:
 
 - `tempdir_repo()` — returns `(TempDir, git2::Repository)` with `user.name`/`user.email` pre-set (critical for CI where global git config is absent)
 - `commit_file(&repo, path, content, subject)` — stages + commits in one call, returns the `Oid`
 - `write_file(&repo, path, content)` — writes without staging (for untracked / modified paths)
-- `extract_text(&styled_line)`, `assert_span_contains(&styled_line, needle)`, `find_span(&styled_line, needle)` — span assertions that survive styling changes
-- `make_commit_info(oid, parents)` — fake `CommitInfo` for graph algorithm tests
 
 Full reference: **`references/fixtures.md`**.
 
@@ -36,24 +42,40 @@ If something's missing from `test-support`, add it there rather than duplicating
 
 ## Critical patterns
 
-### 1. UI snapshot tests MUST detach the plugin manager
+### 1. UI snapshot tests must redirect `$HOME` to a tempdir
 
-`App::new()` auto-spawns plugin subprocesses. Their output depends on whether `target/release/reef-git` happens to exist locally, on OS scheduling, and on how fast the subprocess responds. This has already burned us twice (snapshot green locally, red on CI; then green on CI, red locally). **Never snapshot a frame that includes plugin-rendered panels.**
+`App::new()` reads `~/.config/reef/prefs` (and, once, the legacy `~/.config/reef/git.prefs`) to seed view-mode toggles. If the test runs with the developer's real `HOME`, the saved `status.tree_mode = true` on their machine bleeds into the snapshot and CI disagrees. Wrap each snapshot test with a `HomeGuard` that points `HOME` at the test's tempdir before calling `App::new()`.
 
 ```rust
-use reef_host::plugin::manager::PluginManager;
-
-fn detach_plugins(app: &mut App) {
-    app.plugin_manager = PluginManager::new();   // drops existing subprocesses
-    app.active_sidebar_panel = None;
+struct HomeGuard { original: Option<std::ffi::OsString> }
+impl HomeGuard {
+    fn enter(path: &std::path::Path) -> Self {
+        let original = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", path); }
+        Self { original }
+    }
+}
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(v) = self.original.take() {
+                std::env::set_var("HOME", v);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+    }
 }
 
+let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());  // serialises HOME swaps too
+let (tmp, _raw) = tempdir_repo();
+let _home = HomeGuard::enter(tmp.path());
+let _cwd  = CwdGuard::enter(tmp.path());
 let mut app = App::new();
-detach_plugins(&mut app);                         // <-- do this before rendering
-// ... then render + snapshot
+// ... render + snapshot
 ```
 
-Plugin-specific integration testing lives in `plugin_handshake.rs` and `plugin_manager_lifecycle.rs` where a real `echo-plugin` subprocess is spawned with a known protocol — use those as the template for plugin tests.
+The `CWD_LOCK` does double duty: it also guards the HOME mutation, so we don't need a second lock. `App::new()` runs `prefs::migrate_legacy_prefs()`; the migrator is a no-op (no fs write) when the tempdir has no prefs file, so the tempdir isn't polluted with a spurious `.config/reef/prefs`.
 
 Full snapshot recipe: **`references/recipes/snapshot.md`**.
 
@@ -70,18 +92,19 @@ pub fn relative_time(t: i64) -> String {                   // thin SystemTime wr
     relative_time_at(now, t)
 }
 
-fn relative_time_at(now: i64, t: i64) -> String {          // pure, testable
+pub fn relative_time_at(now: i64, t: i64) -> String {      // pure, testable
     // ... all the logic here
 }
 ```
 
-Then test every branch of `relative_time_at` with fixed `now` values. The wrapper stays untested (it's three lines of plumbing). This is how `reef-git/src/main.rs` does it — match that pattern.
+Then test every branch of `relative_time_at` with fixed `now` values. The wrapper stays untested (it's three lines of plumbing). This is how `crates/reef-host/src/ui/git_graph_panel.rs` does it — match that pattern.
 
 ### 3. Tests that mutate process-global state must share a lock
 
 Two sources of process-global state in reef tests:
-- **cwd** (`std::env::set_current_dir`) — integration tests that call `GitRepo::open()` or `App::new()` need to be in a real git directory
-- **HOME** (`std::env::set_var("HOME", ...)`) — `prefs_roundtrip.rs` redirects HOME to a tempdir
+
+- **cwd** (`std::env::set_current_dir`) — integration tests that call `GitRepo::open()` or `App::new()` need to be in a real git directory.
+- **HOME** (`std::env::set_var("HOME", ...)`) — snapshot tests redirect HOME so `App::new()`'s prefs read doesn't leak the developer's machine state.
 
 Cargo runs tests in parallel threads by default. Without a lock, test A changes cwd, test B reads it mid-operation, both fail unpredictably. Always use this pattern:
 
@@ -98,9 +121,9 @@ fn my_test() {
 }
 ```
 
-Keep the lock **per state type**, not one global lock. `CWD_LOCK` and `HOME_LOCK` are independent; sharing a lock serializes more than needed.
+In practice `ui_snapshots.rs` uses a single `CWD_LOCK` for both cwd and HOME because every HOME swap in this codebase is paired with a cwd swap. If you add a test that touches only HOME, a separate `HOME_LOCK` is fine; don't over-share.
 
-See existing examples: `reef-host/tests/ui_snapshots.rs`, `reef-git/tests/prefs_roundtrip.rs`, `reef-git/tests/git_repo_integration.rs`.
+See existing examples: `crates/reef-host/tests/ui_snapshots.rs`, `crates/reef-host/tests/git_repo_integration.rs`.
 
 ### 4. Canonicalize tempdir paths on macOS before handing them to watchers
 
@@ -140,22 +163,10 @@ Full recipe: **`references/recipes/snapshot.md`**.
 `proptest` is for "this property holds over a wide input space", not "this specific input produces this specific output" (that's a unit test). Good properties look like:
 
 - "Every row in `build_graph(commits)` has `cells[node_col] == LaneCell::Node`"
-- "`write_message` then `read_message` returns an equivalent message for any valid message"
-- "`read_message` never panics on any byte input"
+- "`parser(any_bytes)` never panics"
+- "The length of `build_graph`'s output equals the length of the input"
 
 Generating structured inputs (like topologically-ordered commit sequences) is the bulk of the work. See **`references/recipes/property.md`** for the strategy patterns we use.
-
-## Writing integration tests that spawn binaries
-
-When a test needs a real subprocess (plugin handshake, CLI invocation), declare the binary in Cargo.toml and use `env!("CARGO_BIN_EXE_<name>")` to locate it at runtime:
-
-```rust
-const ECHO_PLUGIN: &str = env!("CARGO_BIN_EXE_echo-plugin");
-```
-
-This resolves to the debug binary during `cargo test`. See `reef-host/tests/plugin_handshake.rs` for the full pattern, including polling `drain_messages` with a bounded timeout.
-
-Full recipe: **`references/recipes/integration.md`**.
 
 ## Naming convention
 
@@ -173,13 +184,12 @@ The workspace's `[workspace.lints.clippy]` policy allows style-only lints (`coll
 
 ## Before committing a test
 
-1. `cargo test -p <crate>` passes
+1. `cargo test -p reef-host` passes
 2. Run the same test twice to check for flakiness
 3. `cargo clippy --workspace --all-targets -- -D warnings` clean
 4. `cargo fmt --all -- --check` clean
 5. If the test uses `insta::assert_snapshot!`, the `.snap` file is staged (NOT `.snap.new`)
 6. If the test mutates process-global state, verify a lock is held before the mutation
-7. If the test spawns a subprocess, verify cleanup works on panic (usually handled by `Drop` impls but check)
 
 ## Reference files
 
@@ -187,6 +197,6 @@ Read these when the relevant topic comes up — don't try to memorize everything
 
 - **`references/fixtures.md`** — Full `test-support` API reference with examples
 - **`references/pitfalls.md`** — Every non-obvious failure mode we've hit, with root cause and fix
-- **`references/recipes/integration.md`** — Template for new integration tests (real git repo, env isolation, subprocess spawn)
-- **`references/recipes/snapshot.md`** — Template for new UI snapshots (plugin detachment, insta filters, stability check)
+- **`references/recipes/integration.md`** — Template for new integration tests (real git repo, env isolation)
+- **`references/recipes/snapshot.md`** — Template for new UI snapshots (HOME redirect, insta filters, stability check)
 - **`references/recipes/property.md`** — proptest strategy patterns for reef's data types

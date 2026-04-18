@@ -1,18 +1,17 @@
 //! Persistent preferences stored in `~/.config/reef/prefs` as a flat
-//! `key=value` file, plus a one-shot migrator that folds the legacy unprefixed
-//! keys (from the pre-inline host and the retired `git.prefs` file) into the
-//! new prefixed namespace.
+//! `key=value` file, plus `migrate_legacy_prefs` — a one-shot, idempotent
+//! migrator called from `App::new` that folds pre-1.0 unprefixed keys
+//! (`layout=`, `mode=`) and the retired `~/.config/reef/git.prefs` file
+//! into the current prefixed namespace.
 //!
-//! Key convention after migration:
+//! Key convention:
 //!   - `diff.layout` / `diff.mode`             — Git tab right-side diff
 //!   - `commit.diff_layout` / `commit.diff_mode` — Graph tab commit-file diff
 //!   - `status.tree_mode`                       — Git tab left-side list/tree
 //!   - `commit.files_tree_mode`                 — Graph tab commit files list/tree
 //!
-//! The migrator is intentionally not called by `App::new()` yet; it will be
-//! wired up once the inline panels are the source of truth (M4/M5), otherwise
-//! the still-running git plugin would rewrite `git.prefs` right after we
-//! deleted it.
+//! Writers must go through `set()` (not raw `std::fs::write`) so that
+//! updating one key doesn't erase all the others.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -66,6 +65,12 @@ fn write_all(map: &BTreeMap<String, String>) {
 
 pub fn get(key: &str) -> Option<String> {
     read_all().get(key).cloned()
+}
+
+/// Read a bool pref: `true` iff the stored value is the literal string
+/// `"true"`. Any other value (including missing) yields `false`.
+pub fn get_bool(key: &str) -> bool {
+    get(key).map(|v| v == "true").unwrap_or(false)
 }
 
 pub fn set(key: &str, value: &str) {

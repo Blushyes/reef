@@ -52,7 +52,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_ref()
             .map(|s| (s.path.clone(), s.is_staged));
 
-        // Drain ALL pending events so rapid key repeats don't queue plugin commands
+        // Drain ALL pending events so rapid key repeats coalesce — only one
+        // render + diff-load runs per frame, regardless of how many events fired.
         loop {
             match event::read()? {
                 Event::Key(key) => {
@@ -514,9 +515,10 @@ fn handle_mouse<B: ratatui::backend::Backend>(
 }
 
 /// Apply a horizontal-scroll delta (in display columns) to the preview / diff
-/// panel under the cursor. Events landing on the left sidebar or on the Graph
-/// tab's plugin-owned panel are ignored — the Graph panel needs a protocol
-/// extension for horizontal scroll which we haven't done yet.
+/// panel under the cursor. Events landing on the left sidebar are ignored.
+/// Graph tab doesn't support horizontal scroll yet — the commit-detail rows
+/// already truncate to the panel width; if long-line viewing becomes a real
+/// need, wire up `CommitDetailState.diff_h_scroll` here.
 fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: i32) {
     let split_x = total_width * app.split_percent / 100;
     let is_left = column < split_x;

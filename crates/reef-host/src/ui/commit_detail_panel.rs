@@ -1,6 +1,5 @@
 //! Graph tab's right editor — commit metadata + Changed-files list (tree or
-//! flat) + inline diff for the currently-selected file. Replaces the
-//! plugin-owned `git.commitDetail` panel.
+//! flat) + inline diff for the currently-selected file.
 
 use crate::app::{App, DiffLayout, DiffMode};
 use crate::git::tree::{self as gtree, Node};

@@ -1,5 +1,4 @@
-//! Git tab's left sidebar — the inline replacement for the `git.status`
-//! plugin panel.
+//! Git tab's left sidebar.
 //!
 //! All state lives on `App` (staged_files/unstaged_files/selected_file/
 //! diff_layout/diff_mode and the dedicated `App.git_status`). This module
@@ -168,8 +167,7 @@ pub fn handle_key(app: &mut App, key: &str) -> bool {
     }
 }
 
-/// Return true when the command was handled by the status panel. Plugin
-/// forwarding is no longer needed — host is the source of truth.
+/// Return true when the command was handled by the status panel.
 pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
     match id {
         "git.selectFile" => {

@@ -1,11 +1,10 @@
 //! Full-terminal snapshot tests via `ratatui::TestBackend`.
 //!
-//! Strategy: drop into a controlled tempdir with a real git repo, construct
-//! `App::new()`, immediately detach its plugin manager (plugins are external
-//! subprocesses whose output varies by cached binary version and scheduling —
-//! not useful for host-UI snapshots), then render and snapshot. What we're
-//! asserting on is the HOST shell: tab bar, borders, status line — not the
-//! plugin's panel content.
+//! Strategy: drop into a controlled tempdir with a real git repo, redirect
+//! `$HOME` to the same tempdir so `App::new()`'s prefs read starts from a
+//! blank slate (otherwise the developer's saved tree-mode / diff-layout
+//! bleeds into the snapshot), then render and assert against a committed
+//! `.snap` file.
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -89,11 +88,6 @@ fn render_app(app: &mut App, width: u16, height: u16) -> String {
     buffer_to_text(terminal.backend().buffer())
 }
 
-/// No-op retained for call-site continuity — kept separately named so a
-/// future reintroduction of any external process hook has one obvious place
-/// to detach from in tests.
-fn detach_plugins(_app: &mut App) {}
-
 /// Apply filters to mask nondeterministic tokens (tempdir name, path segments).
 fn with_filters<F: FnOnce()>(body: F) {
     let mut settings = insta::Settings::clone_current();
@@ -111,7 +105,6 @@ fn snapshot_empty_repo() {
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new();
-    detach_plugins(&mut app);
     let output = render_app(&mut app, 80, 20);
     with_filters(|| insta::assert_snapshot!("empty_repo", output));
 }
@@ -127,7 +120,6 @@ fn snapshot_with_staged_and_unstaged() {
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new();
-    detach_plugins(&mut app);
     // Switch to Git tab to show staged/unstaged sections
     app.active_tab = reef_host::app::Tab::Git;
     app.refresh_status();

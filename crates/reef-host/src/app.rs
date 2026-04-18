@@ -87,8 +87,9 @@ pub struct CommitDetailState {
     pub diff_mode: DiffMode,
     pub files_tree_mode: bool,
     pub files_collapsed: HashSet<String>,
-    /// Vertical scroll for the entire panel (header + files + diff), matching
-    /// the plugin-era behaviour of one scroll offset for the whole view.
+    /// Vertical scroll for the entire panel (header + files + diff). One
+    /// offset covers the whole view — the commit detail is rendered as a
+    /// single list rather than split scroll regions.
     pub scroll: usize,
 }
 
@@ -205,22 +206,20 @@ impl App {
             hover_col: None,
             last_click: None,
             git_status: GitStatusState {
-                tree_mode: load_bool_pref("status.tree_mode", "tree_mode"),
+                tree_mode: crate::prefs::get_bool("status.tree_mode"),
                 ..GitStatusState::default()
             },
             git_graph: GitGraphState::default(),
             commit_detail: CommitDetailState {
-                diff_layout: match load_str_pref("commit.diff_layout", "commit_diff_layout")
-                    .as_deref()
-                {
+                diff_layout: match crate::prefs::get("commit.diff_layout").as_deref() {
                     Some("side_by_side") => DiffLayout::SideBySide,
                     _ => DiffLayout::Unified,
                 },
-                diff_mode: match load_str_pref("commit.diff_mode", "commit_diff_mode").as_deref() {
+                diff_mode: match crate::prefs::get("commit.diff_mode").as_deref() {
                     Some("full_file") => DiffMode::FullFile,
                     _ => DiffMode::Compact,
                 },
-                files_tree_mode: load_bool_pref("commit.files_tree_mode", "commit_files_tree_mode"),
+                files_tree_mode: crate::prefs::get_bool("commit.files_tree_mode"),
                 ..CommitDetailState::default()
             },
             toasts: Vec::new(),
@@ -248,8 +247,8 @@ impl App {
             .refresh_git_statuses(&self.staged_files, &self.unstaged_files);
 
         // Reconcile selection: check both lists so is_staged stays correct
-        // even if the plugin staged/unstaged via a key event that the host
-        // didn't directly observe.
+        // if the file has just moved between sections (e.g. an fs-watcher
+        // refresh after an external `git add`).
         if let Some(ref mut sel) = self.selected_file {
             let in_staged = self.staged_files.iter().any(|f| f.path == sel.path);
             let in_unstaged = self.unstaged_files.iter().any(|f| f.path == sel.path);
@@ -386,8 +385,6 @@ impl App {
         }
         self.refresh_status();
         self.load_diff();
-        // fs watcher will re-invalidate plugin panels shortly, but invalidate
-        // now so the sidebar updates without waiting on the debounce.
     }
 
     pub fn unstage_all(&mut self) {
@@ -585,8 +582,8 @@ impl App {
                 self.dragging_split = true;
             }
             ClickAction::GitCommand { command, args, .. } => {
-                // All git.* commands are handled inline now. Try each panel's
-                // dispatcher in turn; nothing falls through to the plugin.
+                // Try each panel's dispatcher in turn. Unknown commands are
+                // silently dropped — no external handler to fall through to.
                 if crate::ui::git_status_panel::handle_command(self, &command, &args) {
                     return;
                 }
@@ -650,8 +647,8 @@ impl App {
         };
 
         let (path, staged) = items[new_idx].clone();
-        // Only update host selection state; caller is responsible for syncing to plugin
-        // so rapid key repeats can be coalesced into a single command.
+        // Defer `load_diff()` to main.rs after the event-drain loop so rapid
+        // key repeats coalesce into a single diff load.
         self.selected_file = Some(SelectedFile {
             path,
             is_staged: staged,
@@ -680,68 +677,21 @@ impl App {
 
 // ─── Prefs persistence ────────────────────────────────────────────────────────
 
-fn prefs_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let dir = PathBuf::from(home).join(".config").join("reef");
-    std::fs::create_dir_all(&dir).ok()?;
-    Some(dir.join("prefs"))
-}
-
+/// Load the Git tab's diff layout + mode from the unified prefs file.
+/// Keys are `diff.layout` and `diff.mode`; missing keys fall back to
+/// defaults. `migrate_legacy_prefs` runs first in `App::new` so any old
+/// unprefixed `layout=` / `mode=` entries have been renamed by the time
+/// we get here.
 fn load_prefs() -> (DiffLayout, DiffMode) {
-    let default = (DiffLayout::Unified, DiffMode::Compact);
-    let path = match prefs_path() {
-        Some(p) => p,
-        None => return default,
+    let layout = match crate::prefs::get("diff.layout").as_deref() {
+        Some("side_by_side") => DiffLayout::SideBySide,
+        _ => DiffLayout::Unified,
     };
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return default,
+    let mode = match crate::prefs::get("diff.mode").as_deref() {
+        Some("full_file") => DiffMode::FullFile,
+        _ => DiffMode::Compact,
     };
-    let mut layout = DiffLayout::Unified;
-    let mut mode = DiffMode::Compact;
-    for line in content.lines() {
-        if let Some(val) = line.strip_prefix("layout=") {
-            layout = match val.trim() {
-                "side_by_side" => DiffLayout::SideBySide,
-                _ => DiffLayout::Unified,
-            };
-        } else if let Some(val) = line.strip_prefix("mode=") {
-            mode = match val.trim() {
-                "full_file" => DiffMode::FullFile,
-                _ => DiffMode::Compact,
-            };
-        }
-    }
     (layout, mode)
-}
-
-/// Look up a prefixed key from the unified prefs file, falling back to the
-/// legacy unprefixed `git.prefs` file (which the plugin still writes). The
-/// fallback path disappears once the plugin is gone in M4/M5.
-fn load_str_pref(new_key: &str, legacy_git_key: &str) -> Option<String> {
-    if let Some(v) = crate::prefs::get(new_key) {
-        return Some(v);
-    }
-    let home = std::env::var("HOME").ok()?;
-    let path = PathBuf::from(home)
-        .join(".config")
-        .join("reef")
-        .join("git.prefs");
-    let content = std::fs::read_to_string(&path).ok()?;
-    for line in content.lines() {
-        if let Some((k, v)) = line.split_once('=') {
-            if k.trim() == legacy_git_key {
-                return Some(v.trim().to_string());
-            }
-        }
-    }
-    None
-}
-
-fn load_bool_pref(new_key: &str, legacy_git_key: &str) -> bool {
-    load_str_pref(new_key, legacy_git_key)
-        .map(|v| v == "true")
-        .unwrap_or(false)
 }
 
 /// Stable hash of the ref map — used as part of the graph cache key.
@@ -774,16 +724,18 @@ fn hash_ref_map(map: &HashMap<String, Vec<RefLabel>>) -> u64 {
 }
 
 fn save_prefs(layout: DiffLayout, mode: DiffMode) {
-    if let Some(path) = prefs_path() {
-        let layout_str = match layout {
+    crate::prefs::set(
+        "diff.layout",
+        match layout {
             DiffLayout::Unified => "unified",
             DiffLayout::SideBySide => "side_by_side",
-        };
-        let mode_str = match mode {
+        },
+    );
+    crate::prefs::set(
+        "diff.mode",
+        match mode {
             DiffMode::Compact => "compact",
             DiffMode::FullFile => "full_file",
-        };
-        let content = format!("layout={}\nmode={}\n", layout_str, mode_str);
-        let _ = std::fs::write(path, content);
-    }
+        },
+    );
 }

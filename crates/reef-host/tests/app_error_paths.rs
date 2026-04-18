@@ -1,5 +1,6 @@
 //! `App::new()` error-path tests: verify graceful degradation when the
-//! environment is missing pieces (no git repo, no plugin dir).
+//! environment is missing pieces — most importantly when the cwd is not
+//! inside a git repo, so `GitRepo::open()` returns `None`.
 
 use reef_host::app::App;
 use std::sync::Mutex;

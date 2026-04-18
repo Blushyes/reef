@@ -1,5 +1,5 @@
 //! Graph tab's left sidebar — DAG of commits with lane rendering and
-//! ref-label chips. Replaces the plugin-owned `git.graph` panel.
+//! ref-label chips.
 
 use crate::app::App;
 use crate::git::RefLabel;

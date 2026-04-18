@@ -227,7 +227,9 @@ impl GitRepo {
     }
 
     fn get_staged_diff(&self, path: &str, context_lines: u32) -> Option<DiffContent> {
-        // Force-reload index — the plugin process may have written a new index.
+        // Force-reload index so we see writes from a concurrent external
+        // `git add`, and so our own index.write() from stage_file is picked
+        // up without needing to reopen the repo.
         if let Ok(mut idx) = self.repo.index() {
             let _ = idx.read(true);
         }
@@ -246,7 +248,9 @@ impl GitRepo {
     }
 
     fn get_unstaged_diff(&self, path: &str, context_lines: u32) -> Option<DiffContent> {
-        // Force-reload index — the plugin process may have written a new index.
+        // Force-reload index so we see writes from a concurrent external
+        // `git add`, and so our own index.write() from stage_file is picked
+        // up without needing to reopen the repo.
         if let Ok(mut idx) = self.repo.index() {
             let _ = idx.read(true);
         }

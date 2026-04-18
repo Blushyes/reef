@@ -6,5 +6,6 @@ pub mod app;
 pub mod file_tree;
 pub mod fs_watcher;
 pub mod git;
+pub mod input;
 pub mod prefs;
 pub mod ui;

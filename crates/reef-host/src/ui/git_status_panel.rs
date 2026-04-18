@@ -21,6 +21,15 @@ use unicode_width::UnicodeWidthStr;
 // ─── Public entry points ──────────────────────────────────────────────────────
 
 pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
+    // Pull fresh git state on every render so an external `git add`,
+    // `git commit`, `git reset`, etc. (which change `.git/index` or
+    // `.git/HEAD` — both filtered out by the fs-watcher) still reflect in
+    // the sidebar without the user having to press `r`. Matches the
+    // plugin-era behaviour where the plugin refreshed on every render
+    // request. `repo.statuses` is cheap enough on typical repos; we only
+    // do it while the Git tab is being drawn.
+    app.refresh_status();
+
     let rows = build_rows(app, area.width);
     let total = rows.len();
 
@@ -281,6 +290,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.pushPrompt" => {
+            if app.push_in_flight {
+                return true;
+            }
             app.git_status.confirm_push = true;
             app.git_status.confirm_force_push = false;
             app.git_status.push_error = None;
@@ -296,6 +308,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.forcePushPrompt" => {
+            if app.push_in_flight {
+                return true;
+            }
             app.git_status.confirm_force_push = true;
             app.git_status.confirm_push = false;
             app.git_status.push_error = None;

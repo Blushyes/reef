@@ -561,35 +561,49 @@ impl App {
 
     /// Called from `tick()`. If the push worker has posted a result, fold
     /// it into App state (toast + push_error banner + graph-cache bust +
-    /// status refresh) and drop the channel.
+    /// status refresh) and drop the channel. If the worker dropped its
+    /// sender without posting (panic, etc.), release the in-flight flag
+    /// and surface an error toast so the user can try again.
     fn drain_push_result(&mut self) {
+        use std::sync::mpsc::TryRecvError;
         let Some(rx) = self.push_rx.as_ref() else {
             return;
         };
-        let (force, result) = match rx.try_recv() {
-            Ok(r) => r,
-            Err(_) => return,
-        };
-        self.push_in_flight = false;
-        self.push_rx = None;
-        match result {
-            Ok(()) => {
-                self.git_status.push_error = None;
-                self.toasts.push(Toast::info(if force {
-                    "强制推送成功"
-                } else {
-                    "推送成功"
-                }));
+        match rx.try_recv() {
+            Ok((force, result)) => {
+                self.push_in_flight = false;
+                self.push_rx = None;
+                match result {
+                    Ok(()) => {
+                        self.git_status.push_error = None;
+                        self.toasts.push(Toast::info(if force {
+                            "强制推送成功"
+                        } else {
+                            "推送成功"
+                        }));
+                    }
+                    Err(e) => {
+                        self.git_status.push_error = Some(e.clone());
+                        self.toasts.push(Toast::error(format!("推送失败: {e}")));
+                    }
+                }
+                // Push advances remote-tracking refs — invalidate the graph
+                // cache so Tab::Graph rebuilds on its next render.
+                self.git_graph.cache_key = None;
+                self.refresh_status();
             }
-            Err(e) => {
-                self.git_status.push_error = Some(e.clone());
-                self.toasts.push(Toast::error(format!("推送失败: {e}")));
+            Err(TryRecvError::Empty) => {
+                // Worker still running. Check again next tick.
+            }
+            Err(TryRecvError::Disconnected) => {
+                // Worker dropped the sender without sending — the only way
+                // this happens is a panic inside the thread (push_at
+                // itself always sends). Recover so the user can retry.
+                self.push_in_flight = false;
+                self.push_rx = None;
+                self.toasts.push(Toast::error("推送线程异常退出，请重试"));
             }
         }
-        // Push advances remote-tracking refs — invalidate the graph cache
-        // so Tab::Graph rebuilds on its next render.
-        self.git_graph.cache_key = None;
-        self.refresh_status();
     }
 
     pub fn handle_action(&mut self, action: ClickAction) {

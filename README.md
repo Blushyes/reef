@@ -3,7 +3,7 @@
 > **AI 时代的最小开发者终端**
 > **The minimal dev terminal for the AI coding era**
 
-**AI writes the code. You review it. Reef does only the second half.**
+**Once AI writes your code, 90% of an IDE becomes dead weight. Reef is the other 10%.**
 
 <a href="./README.md"><img alt="English" src="https://img.shields.io/badge/lang-EN-blue?style=flat-square"></a>
 <a href="./README.zh-CN.md"><img alt="简体中文" src="https://img.shields.io/badge/lang-%E4%B8%AD%E6%96%87-red?style=flat-square"></a>

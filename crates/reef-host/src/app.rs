@@ -153,6 +153,13 @@ pub struct App {
     /// success/failure and any future in-app notifications.
     pub toasts: Vec<Toast>,
 
+    /// `true` while a background `git push` is in flight. Blocks additional
+    /// pushes and lets the status panel render a "推送中…" indicator.
+    pub push_in_flight: bool,
+    /// Receives `(force, result)` from the push worker thread. Drained in
+    /// `App::tick`; once the result is consumed we drop the channel.
+    pub push_rx: Option<mpsc::Receiver<(bool, Result<(), String>)>>,
+
     /// Host-owned fs watcher channel. `None` when the watcher couldn't start —
     /// the sender inside the thread was dropped so `try_recv` returns `Disconnected`.
     pub fs_watcher_rx: Option<mpsc::Receiver<()>>,
@@ -232,6 +239,8 @@ impl App {
                 ..CommitDetailState::default()
             },
             toasts: Vec::new(),
+            push_in_flight: false,
+            push_rx: None,
             fs_watcher_rx,
             should_quit: false,
             select_mode: false,
@@ -527,14 +536,44 @@ impl App {
         self.load_commit_detail();
     }
 
-    /// Invoke `git push` (or `--force-with-lease` when `force`), store any
-    /// error for display as both a panel banner and a cross-panel toast, and
-    /// invalidate the graph cache so Tab::Graph picks up the new remote refs
-    /// on the next render.
+    /// Kick off a `git push` in the background. Returns immediately; the
+    /// result is collected in `App::tick` when the worker thread posts it
+    /// back through `push_rx`. If a push is already in flight the new
+    /// request is dropped — we don't want two pushes racing on the same
+    /// refs. UI surfaces the in-flight state via `self.push_in_flight`.
     pub fn run_push(&mut self, force: bool) {
-        let result = self.repo.as_ref().map(|r| r.push(force));
+        if self.push_in_flight {
+            return;
+        }
+        let Some(workdir) = self.repo.as_ref().and_then(|r| r.workdir_path()) else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        self.push_rx = Some(rx);
+        self.push_in_flight = true;
+        std::thread::spawn(move || {
+            let result = crate::git::push_at(&workdir, force);
+            // Recv side may have been dropped by the time we finish (e.g.
+            // user quit mid-push); ignore the send error.
+            let _ = tx.send((force, result));
+        });
+    }
+
+    /// Called from `tick()`. If the push worker has posted a result, fold
+    /// it into App state (toast + push_error banner + graph-cache bust +
+    /// status refresh) and drop the channel.
+    fn drain_push_result(&mut self) {
+        let Some(rx) = self.push_rx.as_ref() else {
+            return;
+        };
+        let (force, result) = match rx.try_recv() {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        self.push_in_flight = false;
+        self.push_rx = None;
         match result {
-            Some(Ok(())) => {
+            Ok(()) => {
                 self.git_status.push_error = None;
                 self.toasts.push(Toast::info(if force {
                     "强制推送成功"
@@ -542,11 +581,10 @@ impl App {
                     "推送成功"
                 }));
             }
-            Some(Err(e)) => {
+            Err(e) => {
                 self.git_status.push_error = Some(e.clone());
                 self.toasts.push(Toast::error(format!("推送失败: {e}")));
             }
-            None => {}
         }
         // Push advances remote-tracking refs — invalidate the graph cache
         // so Tab::Graph rebuilds on its next render.
@@ -663,9 +701,11 @@ impl App {
         self.diff_h_scroll = 0;
     }
 
-    /// Called every frame: drain fs-watcher events and refresh caches. Does
-    /// NOT invalidate `git_graph.cache_key` — working-tree edits don't move
+    /// Called every frame: drain fs-watcher events and the push worker's
+    /// result channel, refreshing caches on any change. Does NOT invalidate
+    /// `git_graph.cache_key` on fs events — working-tree edits don't move
     /// HEAD or refs, so the commit graph stays valid (see plan pitfall #2).
+    /// Push completion handles its own cache_key bust separately.
     pub fn tick(&mut self) {
         let mut fs_dirty = false;
         if let Some(rx) = self.fs_watcher_rx.as_ref() {
@@ -678,6 +718,8 @@ impl App {
             self.load_preview();
             self.load_diff();
         }
+
+        self.drain_push_result();
     }
 }
 

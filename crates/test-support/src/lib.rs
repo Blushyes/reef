@@ -3,9 +3,60 @@
 //! All items here are `pub` and consumed via `[dev-dependencies]`.
 
 use git2::{Repository, Signature};
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
+
+/// Redirect `$HOME` to a path for the lifetime of the guard, then restore
+/// whatever value was there before (or remove it if HOME was unset).
+///
+/// `std::env::set_var` is process-global, so callers MUST serialise HOME
+/// mutations through a `static Mutex<()>` in their test file. This helper
+/// is the "do the unsafe set/restore correctly" part; the lock is yours.
+///
+/// Typical use:
+/// ```no_run
+/// use std::sync::Mutex;
+/// use test_support::{tempdir_repo, HomeGuard};
+/// static HOME_LOCK: Mutex<()> = Mutex::new(());
+///
+/// # fn body() {
+/// let _lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+/// let (tmp, _repo) = tempdir_repo();
+/// let _home = HomeGuard::enter(tmp.path());
+/// // ... test body — any `std::env::var("HOME")` reads the tempdir
+/// # }
+/// ```
+pub struct HomeGuard {
+    original: Option<OsString>,
+}
+
+impl HomeGuard {
+    pub fn enter(path: &Path) -> Self {
+        let original = std::env::var_os("HOME");
+        // SAFETY: caller must hold a process-wide HOME_LOCK for the
+        // duration of this guard's lifetime. See the type-level doc.
+        unsafe {
+            std::env::set_var("HOME", path);
+        }
+        Self { original }
+    }
+}
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        // SAFETY: same as `enter`; the lock the caller holds spans the
+        // guard's whole lifetime, including this Drop.
+        unsafe {
+            if let Some(v) = self.original.take() {
+                std::env::set_var("HOME", v);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+    }
+}
 
 /// Initialize a real git repository in a temp directory. Sets the required
 /// `user.name` and `user.email` config so commits don't depend on the caller's

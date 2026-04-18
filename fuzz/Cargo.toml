@@ -19,6 +19,7 @@ test = false
 doc = false
 bench = false
 
-# This crate is excluded from the workspace via workspace's default-members.
-# Run fuzz targets with `cargo +nightly fuzz run <target>` from this directory.
+# Empty `[workspace]` makes this crate its own workspace, excluding it from
+# the root workspace at `../Cargo.toml`. Run fuzz targets with
+# `cargo +nightly fuzz run <target>` from this directory.
 [workspace]

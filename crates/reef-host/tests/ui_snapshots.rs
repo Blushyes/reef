@@ -12,7 +12,7 @@ use ratatui::buffer::Buffer;
 use reef_host::app::App;
 use reef_host::ui;
 use std::sync::Mutex;
-use test_support::{commit_file, tempdir_repo, write_file};
+use test_support::{HomeGuard, commit_file, tempdir_repo, write_file};
 
 static CWD_LOCK: Mutex<()> = Mutex::new(());
 
@@ -34,36 +34,9 @@ impl Drop for CwdGuard {
     }
 }
 
-/// Temporarily redirect `$HOME` to the given path so `~/.config/reef/prefs`
-/// lookups during `App::new()` don't read the developer's real config.
-/// The caller already holds `CWD_LOCK`, which also serialises HOME swaps.
-struct HomeGuard {
-    original: Option<std::ffi::OsString>,
-}
-
-impl HomeGuard {
-    fn enter(path: &std::path::Path) -> Self {
-        let original = std::env::var_os("HOME");
-        // SAFETY: tests serialise HOME mutation via CWD_LOCK.
-        unsafe {
-            std::env::set_var("HOME", path);
-        }
-        Self { original }
-    }
-}
-
-impl Drop for HomeGuard {
-    fn drop(&mut self) {
-        // SAFETY: tests serialise HOME mutation via CWD_LOCK.
-        unsafe {
-            if let Some(v) = self.original.take() {
-                std::env::set_var("HOME", v);
-            } else {
-                std::env::remove_var("HOME");
-            }
-        }
-    }
-}
+// `HomeGuard` — redirect $HOME for the snapshot — lives in `test-support`.
+// The local `CWD_LOCK` doubles as the HOME_LOCK here because every test in
+// this file swaps both in lockstep and nothing else touches HOME concurrently.
 
 fn buffer_to_text(buf: &Buffer) -> String {
     let w = buf.area().width as usize;

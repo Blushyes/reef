@@ -4,6 +4,7 @@ pub mod file_preview_panel;
 pub mod file_tree_panel;
 pub mod git_graph_panel;
 pub mod git_status_panel;
+pub mod hover;
 pub mod text;
 
 use crate::app::{App, Tab};

@@ -34,10 +34,11 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
     let visible = rows.iter().skip(scroll).take(area.height as usize);
     for (i, row) in visible.enumerate() {
         let y = area.y + i as u16;
+        let hover = crate::ui::hover::is_hover(app, area, y);
         let spans: Vec<Span<'static>> = row
             .spans
             .iter()
-            .map(|s| Span::styled(s.text.clone(), s.style))
+            .map(|s| Span::styled(s.text.clone(), crate::ui::hover::apply(s.style, hover)))
             .collect();
         f.render_widget(Line::from(spans), Rect::new(area.x, y, area.width, 1));
 
@@ -397,6 +398,18 @@ fn build_rows(app: &App, width: u16) -> Vec<Row> {
     // Slightly narrower budget to accommodate the ↺ discard button on unstaged rows.
     let max_path = (width as usize).saturating_sub(10);
 
+    // Push-in-flight banner — shown while the worker thread is running.
+    // Non-interactive: user just waits for tick() to drain the result.
+    if app.push_in_flight {
+        rows.push(Row::new(vec![RowSpan::styled(
+            "  ⋯ 推送中…",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        rows.push(Row::blank());
+    }
+
     // Push error banner
     if let Some(ref err) = status.push_error {
         let mut msg = err.clone();
@@ -484,11 +497,13 @@ fn build_rows(app: &App, width: u16) -> Vec<Row> {
         rows.push(Row::blank());
     }
 
-    // Push indicator (only when tree is clean and no banner already shown)
+    // Push indicator (only when tree is clean, no confirmation banner is
+    // already shown, and no push is currently in flight).
     if app.staged_files.is_empty()
         && app.unstaged_files.is_empty()
         && !status.confirm_push
         && !status.confirm_force_push
+        && !app.push_in_flight
     {
         if let Some((ahead, behind)) = app.repo.as_ref().and_then(|r| r.ahead_behind()) {
             if let Some(row) = push_indicator_row(ahead, behind) {

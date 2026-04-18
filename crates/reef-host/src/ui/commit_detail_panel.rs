@@ -35,10 +35,11 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
         .enumerate()
     {
         let y = area.y + i as u16;
+        let hover = crate::ui::hover::is_hover(app, area, y);
         let spans: Vec<Span<'static>> = row
             .spans
             .iter()
-            .map(|s| Span::styled(s.text.clone(), s.style))
+            .map(|s| Span::styled(s.text.clone(), crate::ui::hover::apply(s.style, hover)))
             .collect();
         f.render_widget(Line::from(spans), Rect::new(area.x, y, area.width, 1));
 

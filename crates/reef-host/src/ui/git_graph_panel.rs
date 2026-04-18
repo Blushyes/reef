@@ -49,6 +49,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
     for (i, row) in rows.iter().skip(scroll).take(height).enumerate() {
         let idx = scroll + i;
         let y = area.y + i as u16;
+        let hover = crate::ui::hover::is_hover(app, area, y);
         let (line, click_x_w) = build_row_line(
             row,
             idx == app.git_graph.selected_idx,
@@ -56,6 +57,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
             max_subject,
             head_oid.as_deref(),
             &app.git_graph.ref_map,
+            hover,
         );
         f.render_widget(line, Rect::new(area.x, y, area.width, 1));
 
@@ -130,6 +132,7 @@ pub fn scroll(app: &mut App, delta: i32) {
 
 // ─── Row builder ──────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn build_row_line(
     row: &GraphRow,
     selected: bool,
@@ -137,6 +140,7 @@ fn build_row_line(
     max_subject: usize,
     head_oid: Option<&str>,
     ref_map: &std::collections::HashMap<String, Vec<RefLabel>>,
+    hover: bool,
 ) -> (Line<'static>, u16) {
     let oid = row.commit.oid.clone();
     let sel_bg = Color::Rgb(40, 60, 100);
@@ -196,6 +200,16 @@ fn build_row_line(
         spans = spans
             .into_iter()
             .map(|s| Span::styled(s.content.into_owned(), s.style.bg(sel_bg)))
+            .collect();
+    } else if hover {
+        // Apply hover wash only when not selected — the brighter sel_bg
+        // should stay visible when the cursor is on the selected row.
+        spans = spans
+            .into_iter()
+            .map(|s| {
+                let style = crate::ui::hover::apply(s.style, true);
+                Span::styled(s.content.into_owned(), style)
+            })
             .collect();
     }
 

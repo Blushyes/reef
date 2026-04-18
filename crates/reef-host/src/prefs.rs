@@ -126,56 +126,34 @@ pub fn migrate_legacy_prefs() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, MutexGuard};
     use tempfile::TempDir;
+    use test_support::HomeGuard;
 
     // `set_var("HOME", ...)` is process-global; serialise to avoid races
     // with any other test that touches HOME in this crate.
     static HOME_LOCK: Mutex<()> = Mutex::new(());
 
-    struct HomeGuard {
-        _tmp: TempDir,
-        original: Option<std::ffi::OsString>,
-    }
-
-    impl HomeGuard {
-        fn new() -> Self {
-            let tmp = TempDir::new().unwrap();
-            let original = std::env::var_os("HOME");
-            unsafe {
-                std::env::set_var("HOME", tmp.path());
-            }
-            Self {
-                _tmp: tmp,
-                original,
-            }
-        }
-    }
-
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(v) = self.original.take() {
-                    std::env::set_var("HOME", v);
-                } else {
-                    std::env::remove_var("HOME");
-                }
-            }
-        }
+    /// Grab HOME_LOCK, make a fresh tempdir, point `$HOME` at it, and return
+    /// the three guards to hold for the whole test. Drop order restores HOME
+    /// before the tempdir is removed.
+    fn isolated_home() -> (MutexGuard<'static, ()>, HomeGuard, TempDir) {
+        let lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let home = HomeGuard::enter(tmp.path());
+        (lock, home, tmp)
     }
 
     #[test]
     fn get_missing_key_returns_none() {
-        let _lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _h = HomeGuard::new();
+        let (_lock, _home, _tmp) = isolated_home();
         assert_eq!(get("nothing"), None);
         assert!(!get_bool("nothing"));
     }
 
     #[test]
     fn set_then_get_roundtrip() {
-        let _lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _h = HomeGuard::new();
+        let (_lock, _home, _tmp) = isolated_home();
         set("diff.layout", "side_by_side");
         assert_eq!(get("diff.layout").as_deref(), Some("side_by_side"));
     }
@@ -185,8 +163,7 @@ mod tests {
         // Regression: an earlier `save_prefs` rewrote the file with only
         // `layout=` / `mode=`, wiping `status.tree_mode` and friends every
         // time the user pressed `m` on the Git tab.
-        let _lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _h = HomeGuard::new();
+        let (_lock, _home, _tmp) = isolated_home();
         set("status.tree_mode", "true");
         set("commit.diff_layout", "side_by_side");
         set("diff.layout", "unified"); // the "pressing m" moment
@@ -197,8 +174,7 @@ mod tests {
 
     #[test]
     fn get_bool_reads_true_false_and_default() {
-        let _lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _h = HomeGuard::new();
+        let (_lock, _home, _tmp) = isolated_home();
         set("a", "true");
         set("b", "false");
         assert!(get_bool("a"));
@@ -211,18 +187,16 @@ mod tests {
         // First launch for a brand-new user: no prefs file, no git.prefs.
         // Migrator must NOT create an empty prefs file (otherwise the
         // tempdir snapshot tests show a spurious untracked file).
-        let _lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let h = HomeGuard::new();
+        let (_lock, _home, tmp) = isolated_home();
         migrate_legacy_prefs();
-        let path = h._tmp.path().join(".config").join("reef").join("prefs");
+        let path = tmp.path().join(".config").join("reef").join("prefs");
         assert!(!path.exists(), "migrator created a spurious prefs file");
     }
 
     #[test]
     fn migrate_renames_unprefixed_layout_mode() {
-        let _lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let h = HomeGuard::new();
-        let dir = h._tmp.path().join(".config").join("reef");
+        let (_lock, _home, tmp) = isolated_home();
+        let dir = tmp.path().join(".config").join("reef");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("prefs"), "layout=side_by_side\nmode=full_file\n").unwrap();
 
@@ -239,9 +213,8 @@ mod tests {
         // End-to-end: a pre-deplugin install has both files. One boot of
         // App::new() (which calls migrate_legacy_prefs at the top) must
         // leave every inline panel reading the user's real saved state.
-        let _lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let h = HomeGuard::new();
-        let dir = h._tmp.path().join(".config").join("reef");
+        let (_lock, _home, tmp) = isolated_home();
+        let dir = tmp.path().join(".config").join("reef");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("prefs"), "layout=side_by_side\nmode=full_file\n").unwrap();
         std::fs::write(
@@ -271,10 +244,9 @@ mod tests {
     fn migrate_is_idempotent() {
         // Second boot and every boot after: nothing to migrate, no fs write,
         // no change in prefs contents.
-        let _lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let h = HomeGuard::new();
+        let (_lock, _home, tmp) = isolated_home();
         set("diff.layout", "side_by_side");
-        let path = h._tmp.path().join(".config").join("reef").join("prefs");
+        let path = tmp.path().join(".config").join("reef").join("prefs");
         let first = std::fs::read(&path).unwrap();
 
         migrate_legacy_prefs();
@@ -289,9 +261,8 @@ mod tests {
         // If the user somehow has both `layout=x` (legacy) AND
         // `diff.layout=y` (already-migrated) in the same file, the
         // already-migrated value wins — we never downgrade.
-        let _lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let h = HomeGuard::new();
-        let dir = h._tmp.path().join(".config").join("reef");
+        let (_lock, _home, tmp) = isolated_home();
+        let dir = tmp.path().join(".config").join("reef");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("prefs"),

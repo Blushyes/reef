@@ -1816,7 +1816,6 @@ dependencies = [
  "notify",
  "proptest",
  "ratatui",
- "serde",
  "serde_json",
  "similar 3.1.0",
  "syntect",

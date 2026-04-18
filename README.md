@@ -50,7 +50,7 @@ cd your-git-repo
 /path/to/reef/target/release/reef
 ```
 
-Reef exits immediately if the current directory isn't inside a git repo.
+Reef works anywhere, but the Git and Graph tabs only light up inside a git repo. Outside one, they show a "Not a git repository" placeholder and the Files tab still browses the current directory.
 
 ## Keybindings
 

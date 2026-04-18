@@ -171,6 +171,15 @@ pub struct SelectedFile {
 
 impl App {
     pub fn new() -> Self {
+        // Fold pre-1.0 unprefixed keys (`layout=`, `mode=`) and the retired
+        // `~/.config/reef/git.prefs` into the current prefixed namespace
+        // BEFORE any `prefs::get` runs. Order matters: `load_prefs` below
+        // reads `diff.layout` / `diff.mode`, and the `GitStatusState` /
+        // `CommitDetailState` initializers read `status.*` / `commit.*` —
+        // all of those keys only exist after the migrator has run on a
+        // legacy install.
+        crate::prefs::migrate_legacy_prefs();
+
         let repo = GitRepo::open().ok();
         let workdir = repo
             .as_ref()
@@ -228,9 +237,6 @@ impl App {
             select_mode: false,
             show_help: false,
         };
-        // Migrate legacy prefs (unprefixed host keys + old git.prefs file)
-        // into the prefixed namespace. Safe to run on every boot.
-        crate::prefs::migrate_legacy_prefs();
         app.refresh_status();
         app
     }

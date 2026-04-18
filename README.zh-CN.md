@@ -50,7 +50,7 @@ cd your-git-repo
 /path/to/reef/target/release/reef
 ```
 
-当前目录不在 git 仓库里，Reef 会直接退出。
+Reef 在任何目录都能启动。不在 git 仓库里时，Git 和 Graph 标签显示 "Not a git repository" 占位，Files 标签仍然可以浏览当前目录。
 
 ## 快捷键
 

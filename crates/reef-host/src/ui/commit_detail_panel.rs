@@ -54,7 +54,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
                     x,
                     y,
                     w,
-                    ClickAction::PluginCommand {
+                    ClickAction::GitCommand {
                         command: cmd,
                         args: args.unwrap_or(Value::Null),
                         dbl_command: None,

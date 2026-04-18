@@ -50,17 +50,15 @@ fn app_new_refresh_status_is_noop_without_repo() {
 }
 
 #[test]
-fn app_new_plugin_manager_is_functional() {
-    // `App::new()` probes several well-known paths for plugins. Whether or
-    // not any get loaded (depends on repo layout), the manager API should
-    // remain safe to call without panics.
+fn app_tick_without_fs_watcher_is_safe() {
+    // `App::new()` starts an fs_watcher thread per workdir; tick() drains
+    // its channel and refreshes caches. Outside a git repo the watcher may
+    // still spin up for the tempdir — tick must stay a no-op regardless.
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = TempDir::new().unwrap();
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new();
-    app.plugin_manager.tick();
-    app.plugin_manager.invalidate_panels();
-    // sidebar_panels returns a borrowed slice — just ensure it doesn't panic.
-    let _ = app.plugin_manager.sidebar_panels();
+    app.tick();
+    app.tick();
 }

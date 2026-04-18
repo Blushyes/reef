@@ -66,7 +66,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
                     x,
                     y,
                     w,
-                    ClickAction::PluginCommand {
+                    ClickAction::GitCommand {
                         command: cmd.unwrap_or_default(),
                         args: args.unwrap_or(Value::Null),
                         dbl_command: dbl,
@@ -86,7 +86,6 @@ pub fn handle_key(app: &mut App, key: &str) -> bool {
             if let Some(ref sel) = app.selected_file.clone() {
                 if !sel.is_staged {
                     app.stage_file(&sel.path);
-                    app.plugin_manager.invalidate_panels();
                 }
             }
             true
@@ -95,7 +94,6 @@ pub fn handle_key(app: &mut App, key: &str) -> bool {
             if let Some(ref sel) = app.selected_file.clone() {
                 if sel.is_staged {
                     app.unstage_file(&sel.path);
-                    app.plugin_manager.invalidate_panels();
                 }
             }
             true
@@ -152,7 +150,6 @@ pub fn handle_key(app: &mut App, key: &str) -> bool {
         "r" => {
             app.refresh_status();
             app.load_diff();
-            app.plugin_manager.invalidate_panels();
             true
         }
         "t" => {
@@ -230,7 +227,6 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
                 });
             if let Some(path) = path {
                 app.stage_file(&path);
-                app.plugin_manager.invalidate_panels();
             }
             true
         }
@@ -247,7 +243,6 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
                 });
             if let Some(path) = path {
                 app.unstage_file(&path);
-                app.plugin_manager.invalidate_panels();
             }
             true
         }
@@ -322,7 +317,6 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
         "git.refresh" => {
             app.refresh_status();
             app.load_diff();
-            app.plugin_manager.invalidate_panels();
             true
         }
         _ => false,

@@ -75,20 +75,22 @@ pub fn set(key: &str, value: &str) {
 
 /// Fold unprefixed legacy keys into the new prefixed namespace and delete the
 /// old `git.prefs` file. Safe to call repeatedly — already-migrated keys are
-/// left alone and never overwrite explicit values.
-#[allow(dead_code)]
+/// left alone and never overwrite explicit values. Writes only when state
+/// actually changed, so a first boot in a clean HOME doesn't touch the fs.
 pub fn migrate_legacy_prefs() {
-    let mut map = read_all();
+    let original = read_all();
+    let mut map = original.clone();
+    let mut changed = false;
 
-    // Step 1: fold unprefixed host keys (`layout=`, `mode=`) into `diff.*`.
     if let Some(v) = map.remove("layout") {
         map.entry("diff.layout".into()).or_insert(v);
+        changed = true;
     }
     if let Some(v) = map.remove("mode") {
         map.entry("diff.mode".into()).or_insert(v);
+        changed = true;
     }
 
-    // Step 2: fold `~/.config/reef/git.prefs` in, then delete it.
     if let Some(legacy) = legacy_git_prefs_path() {
         if let Ok(content) = std::fs::read_to_string(&legacy) {
             for line in content.lines() {
@@ -106,8 +108,11 @@ pub fn migrate_legacy_prefs() {
                 }
             }
             let _ = std::fs::remove_file(&legacy);
+            changed = true;
         }
     }
 
-    write_all(&map);
+    if changed {
+        write_all(&map);
+    }
 }

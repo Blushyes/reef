@@ -1829,7 +1829,6 @@ dependencies = [
  "insta",
  "notify",
  "ratatui",
- "reef-protocol",
  "serde",
  "serde_json",
  "similar 3.1.0",

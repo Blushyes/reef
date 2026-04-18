@@ -11,12 +11,7 @@ workspace = true
 name = "reef"
 path = "src/main.rs"
 
-[[bin]]
-name = "echo-plugin"
-path = "src/bin/echo_plugin.rs"
-
 [dependencies]
-reef-protocol = { path = "../reef-protocol" }
 crossterm     = "0.29.0"
 git2          = { version = "0.20.4", default-features = false }
 ratatui       = "0.30.0"

@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Main loop
     loop {
-        app.tick_plugins();
+        app.tick();
         terminal.draw(|f| ui::render(f, &mut app))?;
 
         // Block until at least one event arrives (or 16ms timeout for ~60fps)
@@ -99,22 +99,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_ref()
             .map(|s| (s.path.clone(), s.is_staged));
         if sel_after != sel_before {
-            // Load diff natively in the host (no plugin round-trip)
             app.load_diff();
-            // Notify plugin so the sidebar highlights the selected file
-            if let Some(ref sel) = app.selected_file.clone() {
-                app.plugin_manager
-                    .queue_select_file(&sel.path, sel.is_staged);
-            }
         }
 
         if app.should_quit {
             break;
         }
     }
-
-    // Shutdown plugins
-    app.plugin_manager.shutdown();
 
     // Restore terminal
     disable_raw_mode()?;
@@ -401,13 +392,13 @@ fn handle_mouse<B: ratatui::backend::Backend>(
                 // On double-click: if the region carries a dbl action, swap to it
                 // and run through handle_action so host-side side effects fire.
                 let effective = if is_double {
-                    if let crate::mouse::ClickAction::PluginCommand {
+                    if let crate::mouse::ClickAction::GitCommand {
                         dbl_command: Some(ref cmd),
                         ref dbl_args,
                         ..
                     } = action
                     {
-                        crate::mouse::ClickAction::PluginCommand {
+                        crate::mouse::ClickAction::GitCommand {
                             command: cmd.clone(),
                             args: dbl_args.clone().unwrap_or(serde_json::Value::Null),
                             dbl_command: None,

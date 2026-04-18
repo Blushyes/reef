@@ -3,7 +3,6 @@ use crate::fs_watcher;
 use crate::git::graph::GraphRow;
 use crate::git::{CommitDetail, DiffContent, FileEntry, GitRepo, RefLabel};
 use crate::mouse::{ClickAction, HitTestRegistry};
-use crate::plugin::manager::PluginManager;
 use crate::toast::Toast;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -146,21 +145,12 @@ pub struct App {
     /// (timestamp, column, row) of the last mouse-down — used to detect double-clicks.
     pub last_click: Option<(Instant, u16, u16)>,
 
-    // Plugin system
-    pub plugin_manager: PluginManager,
-    pub active_sidebar_panel: Option<String>,
-    /// Per-plugin-panel scroll offsets, keyed by panel_id. Host-native panels
-    /// (file_tree, file_preview, legacy diff/file) keep their own scalars.
-    pub panel_scroll: HashMap<String, usize>,
-
-    /// Inline git state — populated in M1 but not yet consumed by rendering.
-    /// Plugin still drives behaviour until M2/M3 flip the switch.
+    // ── Inline git state ──
     pub git_status: GitStatusState,
     pub git_graph: GitGraphState,
     pub commit_detail: CommitDetailState,
-    /// Cross-panel toast queue. Takes over what `PluginManager::notifications`
-    /// used to do so that (e.g.) push failures remain visible when the user
-    /// switches tabs.
+    /// Cross-panel toast queue, surfaced in the status bar. Used for push
+    /// success/failure and any future in-app notifications.
     pub toasts: Vec<Toast>,
 
     /// Host-owned fs watcher channel. `None` when the watcher couldn't start —
@@ -215,9 +205,6 @@ impl App {
             hover_row: None,
             hover_col: None,
             last_click: None,
-            plugin_manager: PluginManager::new(),
-            active_sidebar_panel: None,
-            panel_scroll: HashMap::new(),
             git_status: GitStatusState {
                 tree_mode: load_bool_pref("status.tree_mode", "tree_mode"),
                 ..GitStatusState::default()
@@ -243,8 +230,10 @@ impl App {
             select_mode: false,
             show_help: false,
         };
+        // Migrate legacy prefs (unprefixed host keys + old git.prefs file)
+        // into the prefixed namespace. Safe to run on every boot.
+        crate::prefs::migrate_legacy_prefs();
         app.refresh_status();
-        app.load_plugins();
         app
     }
 
@@ -400,7 +389,6 @@ impl App {
         self.load_diff();
         // fs watcher will re-invalidate plugin panels shortly, but invalidate
         // now so the sidebar updates without waiting on the debounce.
-        self.plugin_manager.invalidate_panels();
     }
 
     pub fn unstage_all(&mut self) {
@@ -417,7 +405,6 @@ impl App {
         }
         self.refresh_status();
         self.load_diff();
-        self.plugin_manager.invalidate_panels();
     }
 
     /// Restore the currently-confirmed unstaged file to its HEAD state.
@@ -441,7 +428,6 @@ impl App {
         }
         self.refresh_status();
         self.load_diff();
-        self.plugin_manager.invalidate_panels();
     }
 
     /// Rebuild the commit graph iff HEAD or any ref moved since the last build.
@@ -563,7 +549,6 @@ impl App {
         // so Tab::Graph rebuilds on its next render.
         self.git_graph.cache_key = None;
         self.refresh_status();
-        self.plugin_manager.invalidate_panels();
     }
 
     pub fn handle_action(&mut self, action: ClickAction) {
@@ -599,7 +584,7 @@ impl App {
             ClickAction::StartDragSplit => {
                 self.dragging_split = true;
             }
-            ClickAction::PluginCommand { command, args, .. } => {
+            ClickAction::GitCommand { command, args, .. } => {
                 // All git.* commands are handled inline now. Try each panel's
                 // dispatcher in turn; nothing falls through to the plugin.
                 if crate::ui::git_status_panel::handle_command(self, &command, &args) {
@@ -675,78 +660,10 @@ impl App {
         self.diff_h_scroll = 0;
     }
 
-    /// Returns the plugin panel_id for the currently focused panel, if any.
-    pub fn focused_plugin_panel(&self) -> Option<String> {
-        match (self.active_tab, self.active_panel) {
-            (Tab::Graph, Panel::Files) => Some("git.graph".into()),
-            (Tab::Graph, Panel::Diff) => Some("git.commitDetail".into()),
-            (_, Panel::Files) => self.active_sidebar_panel.clone(),
-            (_, Panel::Diff) => None, // diff is host-native, no plugin panel
-        }
-    }
-
-    /// Route a key event to the plugin that owns the currently focused panel.
-    /// Returns true if the event was forwarded to a plugin.
-    pub fn route_key_to_plugin(&mut self, key: &str) -> bool {
-        let Some(panel_id) = self.focused_plugin_panel() else {
-            return false;
-        };
-        self.plugin_manager.send_key_event(&panel_id, key, vec![])
-    }
-
-    /// Discover and start plugins from known locations.
-    pub fn load_plugins(&mut self) {
-        // 1. Built-in plugins shipped alongside the binary
-        if let Ok(exe) = std::env::current_exe() {
-            let builtin = exe
-                .parent()
-                .unwrap_or(std::path::Path::new("."))
-                .join("plugins");
-            self.plugin_manager.load_from_dir(&builtin);
-        }
-
-        // 2. Dev mode: look for plugins/ next to the workspace root
-        //    (covers `cargo run` from the project directory)
-        if self.plugin_manager.panels.is_empty() {
-            let dev_paths = [
-                // workspace root / plugins/
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .parent()
-                    .unwrap_or(std::path::Path::new("."))
-                    .parent()
-                    .unwrap_or(std::path::Path::new("."))
-                    .join("plugins"),
-            ];
-            for path in &dev_paths {
-                if path.exists() {
-                    self.plugin_manager.load_from_dir(path);
-                }
-            }
-        }
-
-        // 3. User plugins in ~/.config/reef/plugins/
-        if let Ok(home) = std::env::var("HOME") {
-            let user = PathBuf::from(home)
-                .join(".config")
-                .join("reef")
-                .join("plugins");
-            self.plugin_manager.load_from_dir(&user);
-        }
-
-        // Set default active sidebar panel to first sidebar panel
-        if self.active_sidebar_panel.is_none() {
-            if let Some(p) = self.plugin_manager.sidebar_panels().first() {
-                self.active_sidebar_panel = Some(p.decl.id.clone());
-            }
-        }
-    }
-
-    /// Called every frame: let plugin manager process incoming messages.
-    pub fn tick_plugins(&mut self) {
-        self.plugin_manager.tick();
-
-        // Drain any debounced fs events from the host watcher. The watcher already
-        // coalesces bursts, so a single `()` represents one or more real changes.
+    /// Called every frame: drain fs-watcher events and refresh caches. Does
+    /// NOT invalidate `git_graph.cache_key` — working-tree edits don't move
+    /// HEAD or refs, so the commit graph stays valid (see plan pitfall #2).
+    pub fn tick(&mut self) {
         let mut fs_dirty = false;
         if let Some(rx) = self.fs_watcher_rx.as_ref() {
             while rx.try_recv().is_ok() {
@@ -755,45 +672,8 @@ impl App {
         }
         if fs_dirty {
             self.refresh_file_tree();
-            // Host-native views cache disk/git reads; refresh them so the
-            // currently-previewed file and selected diff reflect the change.
             self.load_preview();
             self.load_diff();
-            // Plugins cache their own git state (refreshed inside their render
-            // handler). Forcing a re-render pulls them back in sync without a
-            // bespoke protocol message.
-            self.plugin_manager.invalidate_panels();
-        }
-
-        // If the plugin refreshed its git state (after staging/unstaging), sync host file list
-        if self.plugin_manager.status_refresh_needed {
-            // statusChanged only fires on stage/unstage (not file selection),
-            // so a synchronous refresh here is acceptable — it's user-initiated.
-            self.refresh_status();
-            self.load_diff();
-        }
-
-        // Handle plugin→host requests
-        let requests: Vec<_> = self
-            .plugin_manager
-            .pending_host_requests
-            .drain(..)
-            .collect();
-        for req in requests {
-            match req.method.as_str() {
-                "reef/openFile" => {
-                    if let Ok(p) =
-                        serde_json::from_value::<reef_protocol::OpenFileParams>(req.params.clone())
-                    {
-                        // TODO: open file in editor panel
-                        eprintln!("[reef] openFile: {}", p.path);
-                    }
-                    let _ = self
-                        .plugin_manager
-                        .respond_to_plugin(&req, serde_json::json!({ "success": true }));
-                }
-                _ => {}
-            }
         }
     }
 }

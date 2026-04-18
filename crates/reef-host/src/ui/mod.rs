@@ -1,15 +1,14 @@
 pub mod commit_detail_panel;
 pub mod diff_panel;
-pub mod file_panel;
 pub mod file_preview_panel;
 pub mod file_tree_panel;
 pub mod git_graph_panel;
 pub mod git_status_panel;
-pub mod plugin_panel;
 pub mod text;
 
 use crate::app::{App, Tab};
 use crate::mouse::ClickAction;
+use crate::toast::ToastLevel;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -58,8 +57,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
             if app.repo.is_none() {
                 render_no_repo(f, body_layout[0]);
             } else {
-                render_sidebar(f, app, body_layout[0]);
-                render_editor(f, app, body_layout[1]);
+                render_git_sidebar(f, app, body_layout[0]);
+                render_git_editor(f, app, body_layout[1]);
             }
         }
         Tab::Files => {
@@ -75,7 +74,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_status_bar(f, app, main_layout[3]);
 
     if app.show_help {
-        render_help(f, size, &app.plugin_manager.help_entries);
+        render_help(f, size);
     }
 }
 
@@ -103,9 +102,8 @@ fn render_no_repo(f: &mut Frame, area: Rect) {
     f.render_widget(msg, area);
 }
 
-/// Git tab's left sidebar. Uses the inline host-native status panel; the
-/// plugin's `git.status` is no longer queried.
-fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
+/// Git tab's left sidebar — inline host-native status panel.
+fn render_git_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::RIGHT)
         .border_style(Style::default().fg(Color::DarkGray));
@@ -120,6 +118,11 @@ fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
     );
     let focused = matches!(app.active_panel, crate::app::Panel::Files);
     git_status_panel::render(f, app, padded, focused);
+}
+
+/// Git tab's right editor — host-native diff panel.
+fn render_git_editor(f: &mut Frame, app: &mut App, area: Rect) {
+    diff_panel::render(f, app, area);
 }
 
 /// Graph tab's left sidebar — inline commit-graph panel.
@@ -150,46 +153,6 @@ fn render_graph_editor(f: &mut Frame, app: &mut App, area: Rect) {
     );
     let focused = matches!(app.active_panel, crate::app::Panel::Diff);
     commit_detail_panel::render(f, app, inner, focused);
-}
-
-/// Render a specific plugin-contributed sidebar panel into `area`, wrapping it
-/// in the shared right-border + 1-col padding chrome.
-#[allow(dead_code)]
-fn render_sidebar_panel(f: &mut Frame, app: &mut App, area: Rect, panel_id: &str) {
-    let block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(Color::DarkGray));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let padded = Rect::new(
-        inner.x + 1,
-        inner.y,
-        inner.width.saturating_sub(1),
-        inner.height,
-    );
-    let focused = matches!(app.active_panel, crate::app::Panel::Files);
-    plugin_panel::render(f, app, padded, panel_id, focused);
-}
-
-/// Right editor for Tab::Git — always renders the host-native diff panel. We
-/// deliberately don't scan for editor-slot plugin panels here, because
-/// `git.commitDetail` (also an editor-slot panel) is Tab::Graph's.
-fn render_editor(f: &mut Frame, app: &mut App, area: Rect) {
-    diff_panel::render(f, app, area);
-}
-
-/// Render a specific plugin-contributed editor panel, with 1-col left padding.
-#[allow(dead_code)]
-fn render_editor_panel(f: &mut Frame, app: &mut App, area: Rect, panel_id: &str) {
-    let focused = matches!(app.active_panel, crate::app::Panel::Diff);
-    let inner = Rect::new(
-        area.x + 1,
-        area.y,
-        area.width.saturating_sub(1),
-        area.height,
-    );
-    plugin_panel::render(f, app, inner, panel_id, focused);
 }
 
 fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
@@ -313,23 +276,18 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // Collect plugin notifications as inline status
-    let notif = app
-        .plugin_manager
-        .notifications
-        .last()
-        .map(|n| format!("  {} ", n.message))
-        .unwrap_or_default();
-    let notif_color = app
-        .plugin_manager
-        .notifications
-        .last()
-        .map(|n| match n.level.as_str() {
-            "error" => Color::Red,
-            "warn" => Color::Yellow,
-            _ => Color::Cyan,
-        })
-        .unwrap_or(Color::Cyan);
+    // Show the most recent toast (push success/failure etc.) inline.
+    let (notif, notif_color) = match app.toasts.last() {
+        Some(t) => (
+            format!("  {} ", t.message),
+            match t.level {
+                ToastLevel::Error => Color::Red,
+                ToastLevel::Warn => Color::Yellow,
+                ToastLevel::Info => Color::Cyan,
+            },
+        ),
+        None => (String::new(), Color::Cyan),
+    };
 
     let status = Line::from(vec![
         Span::styled(
@@ -350,10 +308,10 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(status, area);
 }
 
-fn render_help(f: &mut Frame, screen: Rect, plugin_entries: &[crate::plugin::manager::HelpEntry]) {
+fn render_help(f: &mut Frame, screen: Rect) {
     let core_entries: &[(&str, &str)] = &[
         ("q / Ctrl+C", "退出"),
-        ("Tab", "切换顶部标签页（Files ↔ Git）"),
+        ("Tab", "切换顶部标签页（Files ↔ Git ↔ Graph）"),
         ("Shift+Tab", "切换焦点面板（侧边栏 ↔ 编辑区）"),
         ("1 … 9", "跳转到第 N 个标签页"),
         ("↑ / k", "向上导航 / 向上滚动"),
@@ -364,24 +322,19 @@ fn render_help(f: &mut Frame, screen: Rect, plugin_entries: &[crate::plugin::man
         ("Shift+← / Shift+→", "横向快速滚动（10 列）"),
         ("Home / End", "回到行首 / 跳到行尾"),
         ("Shift+滚轮 / 触控板横划", "鼠标横向滚动"),
+        ("s / u", "暂存 / 取消暂存（Git tab）"),
+        ("d → y", "还原工作树文件（Git tab）"),
         ("m", "切换 Diff 布局（上下 ↔ 左右）"),
         ("f", "切换 Diff 模式（局部 ↔ 全量）"),
+        ("t", "切换列表 / 树形视图"),
+        ("r", "刷新"),
         ("v", "文字选择模式"),
         ("h", "显示 / 关闭此帮助"),
         ("任意键", "关闭帮助"),
     ];
 
-    let has_plugin = !plugin_entries.is_empty();
-    // core rows + optional divider + optional header + plugin rows
-    let total_rows = core_entries.len()
-        + if has_plugin {
-            1 + 1 + plugin_entries.len()
-        } else {
-            0
-        };
-
     let popup_w = 72u16;
-    let popup_h = total_rows as u16 + 4;
+    let popup_h = core_entries.len() as u16 + 4;
     let x = screen.x + screen.width.saturating_sub(popup_w) / 2;
     let y = screen.y + screen.height.saturating_sub(popup_h) / 2;
     let area = Rect::new(x, y, popup_w.min(screen.width), popup_h.min(screen.height));
@@ -420,41 +373,5 @@ fn render_help(f: &mut Frame, screen: Rect, plugin_entries: &[crate::plugin::man
         ]);
         f.render_widget(line, Rect::new(inner.x, row_y, inner.width, 1));
         row_y += 1;
-    }
-
-    if has_plugin {
-        row_y += 1; // blank divider
-        if row_y < inner.y + inner.height {
-            f.render_widget(
-                Line::from(Span::styled(
-                    "插件快捷键",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Rect::new(inner.x, row_y, inner.width, 1),
-            );
-            row_y += 1;
-        }
-        for entry in plugin_entries {
-            if row_y >= inner.y + inner.height {
-                break;
-            }
-            let line = Line::from(vec![
-                Span::styled(
-                    format!("{:<width$}", entry.key, width = key_col),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(&*entry.description, Style::default().fg(Color::White)),
-                Span::styled(
-                    format!("  [{}]", entry.plugin_name),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]);
-            f.render_widget(line, Rect::new(inner.x, row_y, inner.width, 1));
-            row_y += 1;
-        }
     }
 }

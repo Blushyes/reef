@@ -11,7 +11,6 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use reef_host::app::App;
-use reef_host::plugin::manager::PluginManager;
 use reef_host::ui;
 use std::sync::Mutex;
 use test_support::{commit_file, tempdir_repo, write_file};
@@ -90,14 +89,10 @@ fn render_app(app: &mut App, width: u16, height: u16) -> String {
     buffer_to_text(terminal.backend().buffer())
 }
 
-/// Replace App's auto-loaded plugin_manager with an empty one. Any plugin
-/// subprocesses spawned by `App::new()` get their stdin/stdout pipes dropped
-/// and exit on EOF; their output never reaches the terminal buffer so the
-/// snapshot becomes deterministic regardless of cached plugin binaries.
-fn detach_plugins(app: &mut App) {
-    app.plugin_manager = PluginManager::new();
-    app.active_sidebar_panel = None;
-}
+/// No-op retained for call-site continuity — kept separately named so a
+/// future reintroduction of any external process hook has one obvious place
+/// to detach from in tests.
+fn detach_plugins(_app: &mut App) {}
 
 /// Apply filters to mask nondeterministic tokens (tempdir name, path segments).
 fn with_filters<F: FnOnce()>(body: F) {

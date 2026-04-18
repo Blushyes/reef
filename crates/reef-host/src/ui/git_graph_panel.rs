@@ -64,7 +64,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
             area.x,
             y,
             click_x_w,
-            ClickAction::PluginCommand {
+            ClickAction::GitCommand {
                 command: "git.selectCommit".into(),
                 args: serde_json::json!({ "oid": row.commit.oid }),
                 dbl_command: None,

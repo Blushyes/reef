@@ -2,6 +2,7 @@ pub mod diff_panel;
 pub mod file_panel;
 pub mod file_preview_panel;
 pub mod file_tree_panel;
+pub mod git_status_panel;
 pub mod plugin_panel;
 pub mod text;
 
@@ -100,18 +101,23 @@ fn render_no_repo(f: &mut Frame, area: Rect) {
     f.render_widget(msg, area);
 }
 
-/// Left sidebar: shows the active plugin panel, falling back to the legacy file panel.
+/// Git tab's left sidebar. Uses the inline host-native status panel; the
+/// plugin's `git.status` is no longer queried.
 fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
-    if let Some(panel_id) = app.active_sidebar_panel.clone() {
-        render_sidebar_panel(f, app, area, &panel_id);
-    } else {
-        // Fallback: legacy hard-coded panel
-        let block = Block::default()
-            .borders(Borders::RIGHT)
-            .border_style(Style::default().fg(Color::DarkGray));
-        f.render_widget(block, area);
-        file_panel::render(f, app, area);
-    }
+    let block = Block::default()
+        .borders(Borders::RIGHT)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let padded = Rect::new(
+        inner.x + 1,
+        inner.y,
+        inner.width.saturating_sub(1),
+        inner.height,
+    );
+    let focused = matches!(app.active_panel, crate::app::Panel::Files);
+    git_status_panel::render(f, app, padded, focused);
 }
 
 /// Render a specific plugin-contributed sidebar panel into `area`, wrapping it

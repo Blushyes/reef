@@ -48,16 +48,19 @@ pub enum DiffMode {
     FullFile, // 显示整个文件
 }
 
-/// State for the inline Git status sidebar. Currently unused — plugin still
-/// owns the panel; wired up in M2.
+/// State for the inline Git status sidebar.
 #[derive(Debug, Default)]
-#[allow(dead_code)]
 pub struct GitStatusState {
     pub tree_mode: bool,
     pub collapsed_dirs: HashSet<String>,
     pub confirm_discard: Option<String>,
     pub confirm_push: bool,
     pub confirm_force_push: bool,
+    /// Last `git push` failure surfaced as an in-panel banner. Cleared by a
+    /// successful push or explicit dismiss. Kept in addition to `App.toasts`
+    /// because the banner stays visible across re-renders whereas toasts are
+    /// ephemeral.
+    pub push_error: Option<String>,
     pub scroll: usize,
 }
 
@@ -218,9 +221,25 @@ impl App {
             plugin_manager: PluginManager::new(),
             active_sidebar_panel: None,
             panel_scroll: HashMap::new(),
-            git_status: GitStatusState::default(),
+            git_status: GitStatusState {
+                tree_mode: load_bool_pref("status.tree_mode", "tree_mode"),
+                ..GitStatusState::default()
+            },
             git_graph: GitGraphState::default(),
-            commit_detail: CommitDetailState::default(),
+            commit_detail: CommitDetailState {
+                diff_layout: match load_str_pref("commit.diff_layout", "commit_diff_layout")
+                    .as_deref()
+                {
+                    Some("side_by_side") => DiffLayout::SideBySide,
+                    _ => DiffLayout::Unified,
+                },
+                diff_mode: match load_str_pref("commit.diff_mode", "commit_diff_mode").as_deref() {
+                    Some("full_file") => DiffMode::FullFile,
+                    _ => DiffMode::Compact,
+                },
+                files_tree_mode: load_bool_pref("commit.files_tree_mode", "commit_files_tree_mode"),
+                ..CommitDetailState::default()
+            },
             toasts: Vec::new(),
             fs_watcher_rx,
             should_quit: false,
@@ -404,6 +423,58 @@ impl App {
         self.plugin_manager.invalidate_panels();
     }
 
+    /// Restore the currently-confirmed unstaged file to its HEAD state.
+    /// Clears the confirmation banner and selection if the discarded file
+    /// was selected, then refreshes status + diff.
+    pub fn confirm_discard(&mut self) {
+        let Some(path) = self.git_status.confirm_discard.take() else {
+            return;
+        };
+        if let Some(ref repo) = self.repo {
+            let _ = repo.restore_file(&path);
+        }
+        if self
+            .selected_file
+            .as_ref()
+            .map(|s| s.path == path)
+            .unwrap_or(false)
+        {
+            self.selected_file = None;
+            self.diff_content = None;
+        }
+        self.refresh_status();
+        self.load_diff();
+        self.plugin_manager.invalidate_panels();
+    }
+
+    /// Invoke `git push` (or `--force-with-lease` when `force`), store any
+    /// error for display as both a panel banner and a cross-panel toast, and
+    /// invalidate the graph cache so Tab::Graph picks up the new remote refs
+    /// on the next render.
+    pub fn run_push(&mut self, force: bool) {
+        let result = self.repo.as_ref().map(|r| r.push(force));
+        match result {
+            Some(Ok(())) => {
+                self.git_status.push_error = None;
+                self.toasts.push(Toast::info(if force {
+                    "强制推送成功"
+                } else {
+                    "推送成功"
+                }));
+            }
+            Some(Err(e)) => {
+                self.git_status.push_error = Some(e.clone());
+                self.toasts.push(Toast::error(format!("推送失败: {e}")));
+            }
+            None => {}
+        }
+        // Push advances remote-tracking refs — invalidate the graph cache
+        // so Tab::Graph rebuilds on its next render.
+        self.git_graph.cache_key = None;
+        self.refresh_status();
+        self.plugin_manager.invalidate_panels();
+    }
+
     pub fn handle_action(&mut self, action: ClickAction) {
         match action {
             ClickAction::SwitchTab(tab) => {
@@ -438,54 +509,21 @@ impl App {
                 self.dragging_split = true;
             }
             ClickAction::PluginCommand { command, args, .. } => {
-                // Reset commit-detail scroll so a new commit starts at the top.
+                // git.selectCommit: reset commit-detail scroll so a new commit
+                // starts at the top (plugin still owns that panel until M3).
                 if command == "git.selectCommit" {
                     self.panel_scroll.insert("git.commitDetail".into(), 0);
                 }
-                // Keep host state in sync for known selection commands
-                if command == "git.selectFile" {
-                    if let (Some(path), Some(staged)) = (
-                        args.get("path")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
-                        args.get("staged").and_then(|v| v.as_bool()),
-                    ) {
-                        self.selected_file = Some(SelectedFile {
-                            path,
-                            is_staged: staged,
-                        });
-                        self.diff_scroll = 0;
-                        self.diff_h_scroll = 0;
-                        self.load_diff();
-                    }
+
+                // First try the inline git-status panel. If it handles the
+                // command, no plugin round-trip is needed.
+                if crate::ui::git_status_panel::handle_command(self, &command, &args) {
+                    return;
                 }
-                // Sync collapsed state so navigate_files skips collapsed sections correctly
-                if command == "git.toggleStaged" {
-                    self.staged_collapsed = !self.staged_collapsed;
-                }
-                if command == "git.toggleUnstaged" {
-                    self.unstaged_collapsed = !self.unstaged_collapsed;
-                }
-                // Stage/unstage: host executes directly so its state is
-                // immediately consistent; also forward to plugin so its
-                // sidebar refreshes.
-                if command == "git.stage" {
-                    if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-                        self.stage_file(path);
-                    }
-                    self.plugin_manager.execute_command(&command, args);
-                } else if command == "git.unstage" {
-                    if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-                        self.unstage_file(path);
-                    }
-                    self.plugin_manager.execute_command(&command, args);
-                } else if command == "git.stageAll" {
-                    self.stage_all();
-                } else if command == "git.unstageAll" {
-                    self.unstage_all();
-                } else {
-                    self.plugin_manager.execute_command(&command, args);
-                }
+
+                // Otherwise forward to the plugin for commands we haven't
+                // inlined yet (graph navigation, commit-detail toggles, etc.).
+                self.plugin_manager.execute_command(&command, args);
             }
         }
     }
@@ -710,6 +748,35 @@ fn load_prefs() -> (DiffLayout, DiffMode) {
         }
     }
     (layout, mode)
+}
+
+/// Look up a prefixed key from the unified prefs file, falling back to the
+/// legacy unprefixed `git.prefs` file (which the plugin still writes). The
+/// fallback path disappears once the plugin is gone in M4/M5.
+fn load_str_pref(new_key: &str, legacy_git_key: &str) -> Option<String> {
+    if let Some(v) = crate::prefs::get(new_key) {
+        return Some(v);
+    }
+    let home = std::env::var("HOME").ok()?;
+    let path = PathBuf::from(home)
+        .join(".config")
+        .join("reef")
+        .join("git.prefs");
+    let content = std::fs::read_to_string(&path).ok()?;
+    for line in content.lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim() == legacy_git_key {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+fn load_bool_pref(new_key: &str, legacy_git_key: &str) -> bool {
+    load_str_pref(new_key, legacy_git_key)
+        .map(|v| v == "true")
+        .unwrap_or(false)
 }
 
 fn save_prefs(layout: DiffLayout, mode: DiffMode) {

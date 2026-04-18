@@ -277,33 +277,28 @@ fn handle_key_git(key: event::KeyEvent, app: &mut App) {
             app.diff_h_scroll = usize::MAX; // render 自动钳到实际最大值
         }
         KeyCode::Char('s') => {
-            if !app.route_key_to_plugin("s") {
-                if let Some(ref sel) = app.selected_file.clone() {
-                    if !sel.is_staged {
-                        app.stage_file(&sel.path);
-                    }
-                }
-            }
+            reef_host::ui::git_status_panel::handle_key(app, "s");
         }
         KeyCode::Char('u') => {
-            if !app.route_key_to_plugin("u") {
-                if let Some(ref sel) = app.selected_file.clone() {
-                    if sel.is_staged {
-                        app.unstage_file(&sel.path);
-                    }
-                }
-            }
+            reef_host::ui::git_status_panel::handle_key(app, "u");
+        }
+        KeyCode::Char('d') => {
+            reef_host::ui::git_status_panel::handle_key(app, "d");
+        }
+        KeyCode::Char('y') => {
+            reef_host::ui::git_status_panel::handle_key(app, "y");
+        }
+        KeyCode::Char('n') => {
+            reef_host::ui::git_status_panel::handle_key(app, "n");
+        }
+        KeyCode::Esc => {
+            reef_host::ui::git_status_panel::handle_key(app, "Escape");
         }
         KeyCode::Char('r') => {
-            if !app.route_key_to_plugin("r") {
-                app.refresh_status();
-                if app.selected_file.is_some() {
-                    app.load_diff();
-                }
-            }
+            reef_host::ui::git_status_panel::handle_key(app, "r");
         }
         KeyCode::Char('t') => {
-            app.route_key_to_plugin("t");
+            reef_host::ui::git_status_panel::handle_key(app, "t");
         }
         KeyCode::Char('m') => {
             app.toggle_diff_layout();
@@ -463,7 +458,7 @@ fn handle_mouse<B: ratatui::backend::Backend>(
             match app.active_tab {
                 Tab::Git => {
                     if is_left {
-                        scroll_sidebar_plugin(app, -3);
+                        reef_host::ui::git_status_panel::scroll(app, -3);
                     } else {
                         app.diff_scroll = app.diff_scroll.saturating_sub(3);
                     }
@@ -495,7 +490,7 @@ fn handle_mouse<B: ratatui::backend::Backend>(
             match app.active_tab {
                 Tab::Git => {
                     if is_left {
-                        scroll_sidebar_plugin(app, 3);
+                        reef_host::ui::git_status_panel::scroll(app, 3);
                     } else {
                         app.diff_scroll += 3;
                     }
@@ -530,20 +525,6 @@ fn handle_mouse<B: ratatui::backend::Backend>(
         }
         _ => {}
     }
-}
-
-/// Apply a scroll delta to the sidebar's currently-active plugin panel.
-/// Delta is in lines; positive scrolls down, negative scrolls up.
-fn scroll_sidebar_plugin(app: &mut App, delta: i32) {
-    let Some(panel_id) = app.active_sidebar_panel.clone() else {
-        return;
-    };
-    let entry = app.panel_scroll.entry(panel_id).or_insert(0);
-    *entry = if delta < 0 {
-        entry.saturating_sub(delta.unsigned_abs() as usize)
-    } else {
-        entry.saturating_add(delta as usize)
-    };
 }
 
 /// Apply a scroll delta to a specific plugin panel by id.

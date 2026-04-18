@@ -36,6 +36,37 @@ impl Drop for CwdGuard {
     }
 }
 
+/// Temporarily redirect `$HOME` to the given path so `~/.config/reef/prefs`
+/// lookups during `App::new()` don't read the developer's real config.
+/// The caller already holds `CWD_LOCK`, which also serialises HOME swaps.
+struct HomeGuard {
+    original: Option<std::ffi::OsString>,
+}
+
+impl HomeGuard {
+    fn enter(path: &std::path::Path) -> Self {
+        let original = std::env::var_os("HOME");
+        // SAFETY: tests serialise HOME mutation via CWD_LOCK.
+        unsafe {
+            std::env::set_var("HOME", path);
+        }
+        Self { original }
+    }
+}
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        // SAFETY: tests serialise HOME mutation via CWD_LOCK.
+        unsafe {
+            if let Some(v) = self.original.take() {
+                std::env::set_var("HOME", v);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+    }
+}
+
 fn buffer_to_text(buf: &Buffer) -> String {
     let w = buf.area().width as usize;
     let h = buf.area().height as usize;
@@ -81,6 +112,7 @@ fn with_filters<F: FnOnce()>(body: F) {
 fn snapshot_empty_repo() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, _raw) = tempdir_repo();
+    let _h = HomeGuard::enter(tmp.path());
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new();
@@ -96,6 +128,7 @@ fn snapshot_with_staged_and_unstaged() {
     commit_file(&raw, "tracked.txt", "v1\n", "init");
     write_file(&raw, "tracked.txt", "v2\n"); // unstaged modification
     write_file(&raw, "new.txt", "new\n"); // untracked
+    let _h = HomeGuard::enter(tmp.path());
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new();

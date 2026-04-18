@@ -1,6 +1,6 @@
 ---
 name: testing-reef
-description: Conventions and gotchas for writing tests in the reef Rust workspace — unit, integration, property, snapshot, benchmark, and fuzz. Use whenever adding or modifying a test in reef-host or test-support, or when the user asks "add a test for X", "how should I test Y", "why is this test flaky", "where does this test go", or anything about test fixtures, snapshots, proptest, or CI test failures. Also use when touching clock/time code (requires splitting `*_at(now, t)` helpers), or any code that mutates `cwd`/`HOME` (needs process-wide lock). Covers file-placement rules, the `test-support` fixture crate, insta filters, proptest strategy construction, and the specific pitfalls we've paid for in production — macOS tempdir symlinks, env-var sharing across parallel tests, and the HOME-redirect pattern for prefs-reading code.
+description: Conventions and gotchas for writing tests in the reef Rust workspace — unit, integration, property, snapshot, benchmark, and fuzz. Use whenever adding or modifying a test in reef or test-support, or when the user asks "add a test for X", "how should I test Y", "why is this test flaky", "where does this test go", or anything about test fixtures, snapshots, proptest, or CI test failures. Also use when touching clock/time code (requires splitting `*_at(now, t)` helpers), or any code that mutates `cwd`/`HOME` (needs process-wide lock). Covers file-placement rules, the `test-support` fixture crate, insta filters, proptest strategy construction, and the specific pitfalls we've paid for in production — macOS tempdir symlinks, env-var sharing across parallel tests, and the HOME-redirect pattern for prefs-reading code.
 ---
 
 # Testing in the reef workspace
@@ -9,10 +9,10 @@ A project-specific test playbook. Follow this when adding **any** test. The goal
 
 ## Workspace layout (post-deplugin)
 
-Reef is a single-process binary — there is no plugin subsystem. Two crates live in the workspace:
+Reef is a single-process binary — there is no plugin subsystem. The repo root IS the `reef` crate; the workspace exists only to hang the test-fixture helper off it:
 
-- **`crates/reef-host`** — the binary and all its logic (app state, UI panels, git operations). Tests live in `crates/reef-host/tests/`. Benches in `crates/reef-host/benches/`.
-- **`crates/test-support`** — shared fixtures (`tempdir_repo`, `commit_file`, `write_file`).
+- **Root (`reef` crate)** — `src/` (app state, UI panels, git operations), `tests/` (integration), `benches/` (criterion).
+- **`crates/test-support`** — shared fixtures (`tempdir_repo`, `commit_file`, `write_file`, `HomeGuard`).
 - **`fuzz/`** — fuzz targets. Separate package, not in the workspace; run via `cargo +nightly fuzz run <target>`.
 
 ## Quick decision table
@@ -20,10 +20,10 @@ Reef is a single-process binary — there is no plugin subsystem. Two crates liv
 | Scenario | Test type | Where it goes |
 |----------|-----------|---------------|
 | Pure function, no I/O | Unit test | `#[cfg(test)] mod tests` inline at bottom of the source file |
-| Uses `git2::Repository`, real fs | Integration test | `crates/reef-host/tests/<name>_integration.rs` |
-| Algorithmic invariant over random inputs | Property test | `crates/reef-host/tests/<name>_properties.rs` (uses `proptest`) |
-| Full UI rendered to terminal buffer | Snapshot | `crates/reef-host/tests/<name>_snapshots.rs` (uses `insta` + `ratatui::TestBackend`) |
-| Hot-path performance | Benchmark | `crates/reef-host/benches/<name>.rs` (uses `criterion`) |
+| Uses `git2::Repository`, real fs | Integration test | `tests/<name>_integration.rs` |
+| Algorithmic invariant over random inputs | Property test | `tests/<name>_properties.rs` (uses `proptest`) |
+| Full UI rendered to terminal buffer | Snapshot | `tests/<name>_snapshots.rs` (uses `insta` + `ratatui::TestBackend`) |
+| Hot-path performance | Benchmark | `benches/<name>.rs` (uses `criterion`) |
 | Parser / deserializer robustness | Fuzz target | `fuzz/fuzz_targets/<name>.rs` |
 
 If you're unsure, default to unit test first; promote to integration only when real I/O is required for the test to be meaningful.
@@ -97,7 +97,7 @@ pub fn relative_time_at(now: i64, t: i64) -> String {      // pure, testable
 }
 ```
 
-Then test every branch of `relative_time_at` with fixed `now` values. The wrapper stays untested (it's three lines of plumbing). This is how `crates/reef-host/src/ui/git_graph_panel.rs` does it — match that pattern.
+Then test every branch of `relative_time_at` with fixed `now` values. The wrapper stays untested (it's three lines of plumbing). This is how `src/ui/git_graph_panel.rs` does it — match that pattern.
 
 ### 3. Tests that mutate process-global state must share a lock
 
@@ -123,7 +123,7 @@ fn my_test() {
 
 In practice `ui_snapshots.rs` uses a single `CWD_LOCK` for both cwd and HOME because every HOME swap in this codebase is paired with a cwd swap. If you add a test that touches only HOME, a separate `HOME_LOCK` is fine; don't over-share.
 
-See existing examples: `crates/reef-host/tests/ui_snapshots.rs`, `crates/reef-host/tests/git_repo_integration.rs`.
+See existing examples: `tests/ui_snapshots.rs`, `tests/git_repo_integration.rs`.
 
 ### 4. Canonicalize tempdir paths on macOS before handing them to watchers
 
@@ -154,7 +154,7 @@ fn my_snapshot() {
 }
 ```
 
-The `insta` dep must be `{ features = ["filters"] }` (already configured in `reef-host/Cargo.toml`).
+The `insta` dep must be `{ features = ["filters"] }` (already configured in `reef/Cargo.toml`).
 
 Full recipe: **`references/recipes/snapshot.md`**.
 
@@ -184,7 +184,7 @@ The workspace's `[workspace.lints.clippy]` policy allows style-only lints (`coll
 
 ## Before committing a test
 
-1. `cargo test -p reef-host` passes
+1. `cargo test -p reef` passes
 2. Run the same test twice to check for flakiness
 3. `cargo clippy --workspace --all-targets -- -D warnings` clean
 4. `cargo fmt --all -- --check` clean

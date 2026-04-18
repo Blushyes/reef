@@ -1,7 +1,7 @@
 //! End-to-end tests for `GitRepo` exercising real `git2::Repository` instances
 //! in `TempDir` workdirs. Exercises the entire public API surface.
 
-use reef_host::git::{FileStatus, GitRepo, LineTag, RefLabel};
+use reef::git::{FileStatus, GitRepo, LineTag, RefLabel};
 use std::fs;
 use test_support::{commit_file, tempdir_repo, write_file};
 

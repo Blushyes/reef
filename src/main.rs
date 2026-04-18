@@ -8,9 +8,9 @@ use crossterm::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use reef_host::app::{App, Panel, Tab};
-use reef_host::mouse;
-use reef_host::ui;
+use reef::app::{App, Panel, Tab};
+use reef::mouse;
+use reef::ui;
 use std::io;
 use std::panic;
 use std::time::{Duration, Instant};
@@ -166,7 +166,7 @@ fn handle_key(key: event::KeyEvent, app: &mut App) {
 }
 
 fn handle_key_graph(key: event::KeyEvent, app: &mut App) {
-    use reef_host::ui::{commit_detail_panel, git_graph_panel};
+    use reef::ui::{commit_detail_panel, git_graph_panel};
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => match app.active_panel {
             Panel::Files => {
@@ -264,28 +264,28 @@ fn handle_key_git(key: event::KeyEvent, app: &mut App) {
             app.diff_h_scroll = usize::MAX; // render 自动钳到实际最大值
         }
         KeyCode::Char('s') => {
-            reef_host::ui::git_status_panel::handle_key(app, "s");
+            reef::ui::git_status_panel::handle_key(app, "s");
         }
         KeyCode::Char('u') => {
-            reef_host::ui::git_status_panel::handle_key(app, "u");
+            reef::ui::git_status_panel::handle_key(app, "u");
         }
         KeyCode::Char('d') => {
-            reef_host::ui::git_status_panel::handle_key(app, "d");
+            reef::ui::git_status_panel::handle_key(app, "d");
         }
         KeyCode::Char('y') => {
-            reef_host::ui::git_status_panel::handle_key(app, "y");
+            reef::ui::git_status_panel::handle_key(app, "y");
         }
         KeyCode::Char('n') => {
-            reef_host::ui::git_status_panel::handle_key(app, "n");
+            reef::ui::git_status_panel::handle_key(app, "n");
         }
         KeyCode::Esc => {
-            reef_host::ui::git_status_panel::handle_key(app, "Escape");
+            reef::ui::git_status_panel::handle_key(app, "Escape");
         }
         KeyCode::Char('r') => {
-            reef_host::ui::git_status_panel::handle_key(app, "r");
+            reef::ui::git_status_panel::handle_key(app, "r");
         }
         KeyCode::Char('t') => {
-            reef_host::ui::git_status_panel::handle_key(app, "t");
+            reef::ui::git_status_panel::handle_key(app, "t");
         }
         KeyCode::Char('m') => {
             app.toggle_diff_layout();
@@ -445,7 +445,7 @@ fn handle_mouse<B: ratatui::backend::Backend>(
             match app.active_tab {
                 Tab::Git => {
                     if is_left {
-                        reef_host::ui::git_status_panel::scroll(app, -3);
+                        reef::ui::git_status_panel::scroll(app, -3);
                     } else {
                         app.diff_scroll = app.diff_scroll.saturating_sub(3);
                     }
@@ -459,9 +459,9 @@ fn handle_mouse<B: ratatui::backend::Backend>(
                 }
                 Tab::Graph => {
                     if is_left {
-                        reef_host::ui::git_graph_panel::scroll(app, -3);
+                        reef::ui::git_graph_panel::scroll(app, -3);
                     } else {
-                        reef_host::ui::commit_detail_panel::scroll(app, -3);
+                        reef::ui::commit_detail_panel::scroll(app, -3);
                     }
                 }
             }
@@ -477,7 +477,7 @@ fn handle_mouse<B: ratatui::backend::Backend>(
             match app.active_tab {
                 Tab::Git => {
                     if is_left {
-                        reef_host::ui::git_status_panel::scroll(app, 3);
+                        reef::ui::git_status_panel::scroll(app, 3);
                     } else {
                         app.diff_scroll += 3;
                     }
@@ -491,9 +491,9 @@ fn handle_mouse<B: ratatui::backend::Backend>(
                 }
                 Tab::Graph => {
                     if is_left {
-                        reef_host::ui::git_graph_panel::scroll(app, 3);
+                        reef::ui::git_graph_panel::scroll(app, 3);
                     } else {
-                        reef_host::ui::commit_detail_panel::scroll(app, 3);
+                        reef::ui::commit_detail_panel::scroll(app, 3);
                     }
                 }
             }

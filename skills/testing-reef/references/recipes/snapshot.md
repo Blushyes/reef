@@ -10,8 +10,8 @@ For asserting on rendered terminal output. Uses `ratatui::backend::TestBackend` 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
-use reef_host::app::App;
-use reef_host::ui;
+use reef::app::App;
+use reef::ui;
 use std::sync::Mutex;
 use test_support::{commit_file, tempdir_repo, write_file};
 
@@ -94,7 +94,7 @@ fn snapshot_<scenario>() {
     let _cwd  = CwdGuard::enter(tmp.path());
 
     let mut app = App::new();
-    app.active_tab = reef_host::app::Tab::Git;       // optional: set UI state
+    app.active_tab = reef::app::Tab::Git;       // optional: set UI state
     app.refresh_status();
 
     let output = render_app(&mut app, 80, 20);
@@ -119,14 +119,14 @@ Don't use tiny buffers to "simplify" the snapshot. If the UI wraps or truncates 
 When you change the UI and the snapshot should change:
 
 ```bash
-INSTA_UPDATE=always cargo test -p reef-host --test ui_snapshots
+INSTA_UPDATE=always cargo test -p reef --test ui_snapshots
 ```
 
 This accepts the new output as the new baseline. **Always** review the diff before committing:
 
 ```bash
 cargo insta review
-# or just: git diff crates/reef-host/tests/snapshots/
+# or just: git diff tests/snapshots/
 ```
 
 Commit the updated `.snap` file. **Never** commit `.snap.new` files — those are pending snapshots that weren't accepted. The `.gitignore` already excludes them.
@@ -136,8 +136,8 @@ Commit the updated `.snap` file. **Never** commit `.snap.new` files — those ar
 After creating or updating a snapshot, run the test twice in a row without `INSTA_UPDATE`:
 
 ```bash
-cargo test -p reef-host --test ui_snapshots
-cargo test -p reef-host --test ui_snapshots
+cargo test -p reef --test ui_snapshots
+cargo test -p reef --test ui_snapshots
 ```
 
 Both must pass. If the second run fails, the snapshot has nondeterministic content — add more insta filters or fix the rendering code.

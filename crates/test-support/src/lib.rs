@@ -3,24 +3,9 @@
 //! All items here are `pub` and consumed via `[dev-dependencies]`.
 
 use git2::{Repository, Signature};
-use reef_git::git::CommitInfo;
-use reef_protocol::{Span, StyledLine};
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
-
-/// Build a `CommitInfo` with sensible defaults; override fields as needed.
-pub fn make_commit_info(oid: &str, parents: &[&str]) -> CommitInfo {
-    CommitInfo {
-        oid: oid.into(),
-        short_oid: oid.chars().take(7).collect(),
-        parents: parents.iter().map(|s| (*s).to_string()).collect(),
-        author_name: "Tester".into(),
-        author_email: "tester@example.com".into(),
-        time: 0,
-        subject: format!("commit {}", oid),
-    }
-}
 
 /// Initialize a real git repository in a temp directory. Sets the required
 /// `user.name` and `user.email` config so commits don't depend on the caller's
@@ -75,25 +60,4 @@ pub fn write_file(repo: &Repository, path: &str, content: &str) {
         fs::create_dir_all(parent).unwrap();
     }
     fs::write(&full, content).unwrap();
-}
-
-/// Concatenate all span texts in a `StyledLine`.
-pub fn extract_text(line: &StyledLine) -> String {
-    line.spans.iter().map(|s| s.text.as_str()).collect()
-}
-
-/// Assert that any span's text contains `needle`.
-pub fn assert_span_contains(line: &StyledLine, needle: &str) {
-    let ok = line.spans.iter().any(|s| s.text.contains(needle));
-    assert!(
-        ok,
-        "no span contained {:?}; got spans: {:?}",
-        needle,
-        line.spans.iter().map(|s| &s.text).collect::<Vec<_>>()
-    );
-}
-
-/// Find the first span whose text contains `needle`.
-pub fn find_span<'a>(line: &'a StyledLine, needle: &str) -> Option<&'a Span> {
-    line.spans.iter().find(|s| s.text.contains(needle))
 }

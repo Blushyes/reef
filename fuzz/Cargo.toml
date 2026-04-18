@@ -10,15 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary     = { version = "1", features = ["derive"] }
-reef-protocol = { path = "../crates/reef-protocol" }
-reef-git      = { path = "../crates/reef-git" }
-
-[[bin]]
-name = "read_message"
-path = "fuzz_targets/read_message.rs"
-test = false
-doc = false
-bench = false
+reef-host     = { path = "../crates/reef-host" }
 
 [[bin]]
 name = "build_graph"

@@ -1,8 +1,6 @@
 [workspace]
 members = [
     "crates/reef-host",
-    "crates/reef-protocol",
-    "crates/reef-git",
     "crates/test-support",
 ]
 resolver = "2"

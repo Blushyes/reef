@@ -28,8 +28,13 @@ serde_json    = { workspace = true }
 tempfile     = "3"
 insta        = { version = "1", features = ["filters"] }
 criterion    = { version = "0.5", features = ["html_reports"] }
+proptest     = "1"
 test-support = { path = "../test-support" }
 
 [[bench]]
 name = "highlight"
+harness = false
+
+[[bench]]
+name = "graph"
 harness = false

@@ -2,8 +2,8 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use reef_git::git::CommitInfo;
-use reef_git::graph::build_graph;
+use reef_host::git::CommitInfo;
+use reef_host::git::graph::build_graph;
 
 #[derive(Debug, Arbitrary)]
 struct FuzzCommit {

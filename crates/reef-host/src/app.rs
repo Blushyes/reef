@@ -78,9 +78,8 @@ pub struct GitGraphState {
     pub scroll: usize,
 }
 
-/// State for the inline commit-detail editor panel. Unused until M3.
+/// State for the inline commit-detail editor panel (Tab::Graph right side).
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct CommitDetailState {
     pub detail: Option<CommitDetail>,
     pub file_diff: Option<(String, DiffContent)>,
@@ -90,9 +89,9 @@ pub struct CommitDetailState {
     pub diff_mode: DiffMode,
     pub files_tree_mode: bool,
     pub files_collapsed: HashSet<String>,
-    pub files_scroll: usize,
-    pub diff_scroll: usize,
-    pub diff_h_scroll: usize,
+    /// Vertical scroll for the entire panel (header + files + diff), matching
+    /// the plugin-era behaviour of one scroll offset for the whole view.
+    pub scroll: usize,
 }
 
 impl Default for CommitDetailState {
@@ -104,9 +103,7 @@ impl Default for CommitDetailState {
             diff_mode: DiffMode::Compact,
             files_tree_mode: false,
             files_collapsed: HashSet::new(),
-            files_scroll: 0,
-            diff_scroll: 0,
-            diff_h_scroll: 0,
+            scroll: 0,
         }
     }
 }
@@ -447,6 +444,100 @@ impl App {
         self.plugin_manager.invalidate_panels();
     }
 
+    /// Rebuild the commit graph iff HEAD or any ref moved since the last build.
+    /// Working-tree fs events do NOT invalidate the cache — see plan pitfall #2.
+    pub fn refresh_graph(&mut self) {
+        const GRAPH_COMMIT_LIMIT: usize = 500;
+        let Some(ref repo) = self.repo else {
+            self.git_graph.rows.clear();
+            self.git_graph.ref_map.clear();
+            self.git_graph.cache_key = None;
+            return;
+        };
+
+        let head = repo.head_oid().unwrap_or_default();
+        let refs = repo.list_refs();
+        let refs_hash = hash_ref_map(&refs);
+        let key = (head, refs_hash);
+
+        if self.git_graph.cache_key.as_ref() == Some(&key) {
+            return;
+        }
+
+        let commits = repo.list_commits(GRAPH_COMMIT_LIMIT);
+        let rows = crate::git::graph::build_graph(&commits);
+
+        // Clamp selection if the graph got shorter (e.g. reset --hard).
+        if self.git_graph.selected_idx >= rows.len() {
+            self.git_graph.selected_idx = rows.len().saturating_sub(1);
+        }
+        self.git_graph.selected_commit = rows
+            .get(self.git_graph.selected_idx)
+            .map(|r| r.commit.oid.clone());
+
+        self.git_graph.rows = rows;
+        self.git_graph.ref_map = refs;
+        self.git_graph.cache_key = Some(key);
+
+        self.load_commit_detail();
+    }
+
+    /// (Re)load commit detail for the currently-selected commit. Clears detail
+    /// and any previously-selected file diff whenever the target changes.
+    pub fn load_commit_detail(&mut self) {
+        self.commit_detail.detail = match (&self.repo, &self.git_graph.selected_commit) {
+            (Some(repo), Some(oid)) => repo.get_commit(oid),
+            _ => None,
+        };
+        self.commit_detail.file_diff = None;
+    }
+
+    /// Load the inline diff for a file inside the currently-selected commit.
+    pub fn load_commit_file_diff(&mut self, path: &str) {
+        let context = match self.commit_detail.diff_mode {
+            DiffMode::Compact => 3,
+            DiffMode::FullFile => 9999,
+        };
+        self.commit_detail.file_diff = match (&self.repo, &self.git_graph.selected_commit) {
+            (Some(repo), Some(oid)) => repo
+                .get_commit_file_diff(oid, path, context)
+                .map(|d| (path.to_string(), d)),
+            _ => None,
+        };
+    }
+
+    /// Reload the currently-selected commit-file diff — used after toggling
+    /// `commit.diff_mode`, which changes the context-lines argument.
+    pub fn reload_commit_file_diff(&mut self) {
+        let path = self.commit_detail.file_diff.as_ref().map(|(p, _)| p.clone());
+        if let Some(path) = path {
+            self.load_commit_file_diff(&path);
+        }
+    }
+
+    /// Move the graph selection by `delta` rows (clamped). Updates
+    /// selected_commit and reloads commit detail.
+    pub fn move_graph_selection(&mut self, delta: i32) {
+        if self.git_graph.rows.is_empty() {
+            return;
+        }
+        let last = self.git_graph.rows.len() - 1;
+        let current = self.git_graph.selected_idx as i32;
+        let next = (current + delta).clamp(0, last as i32) as usize;
+        if next == self.git_graph.selected_idx {
+            return;
+        }
+        self.git_graph.selected_idx = next;
+        self.git_graph.selected_commit = self
+            .git_graph
+            .rows
+            .get(next)
+            .map(|r| r.commit.oid.clone());
+        // Reset commit-detail scroll so the new commit starts at the top.
+        self.commit_detail.scroll = 0;
+        self.load_commit_detail();
+    }
+
     /// Invoke `git push` (or `--force-with-lease` when `force`), store any
     /// error for display as both a panel banner and a cross-panel toast, and
     /// invalidate the graph cache so Tab::Graph picks up the new remote refs
@@ -509,21 +600,15 @@ impl App {
                 self.dragging_split = true;
             }
             ClickAction::PluginCommand { command, args, .. } => {
-                // git.selectCommit: reset commit-detail scroll so a new commit
-                // starts at the top (plugin still owns that panel until M3).
-                if command == "git.selectCommit" {
-                    self.panel_scroll.insert("git.commitDetail".into(), 0);
-                }
-
-                // First try the inline git-status panel. If it handles the
-                // command, no plugin round-trip is needed.
+                // All git.* commands are handled inline now. Try each panel's
+                // dispatcher in turn; nothing falls through to the plugin.
                 if crate::ui::git_status_panel::handle_command(self, &command, &args) {
                     return;
                 }
-
-                // Otherwise forward to the plugin for commands we haven't
-                // inlined yet (graph navigation, commit-detail toggles, etc.).
-                self.plugin_manager.execute_command(&command, args);
+                if crate::ui::git_graph_panel::handle_command(self, &command, &args) {
+                    return;
+                }
+                let _ = crate::ui::commit_detail_panel::handle_command(self, &command, &args);
             }
         }
     }
@@ -777,6 +862,35 @@ fn load_bool_pref(new_key: &str, legacy_git_key: &str) -> bool {
     load_str_pref(new_key, legacy_git_key)
         .map(|v| v == "true")
         .unwrap_or(false)
+}
+
+/// Stable hash of the ref map — used as part of the graph cache key.
+fn hash_ref_map(map: &HashMap<String, Vec<RefLabel>>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut entries: Vec<(&String, &Vec<RefLabel>)> = map.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (oid, labels) in entries {
+        oid.hash(&mut hasher);
+        for label in labels {
+            match label {
+                RefLabel::Head => 0u8.hash(&mut hasher),
+                RefLabel::Branch(s) => {
+                    1u8.hash(&mut hasher);
+                    s.hash(&mut hasher);
+                }
+                RefLabel::RemoteBranch(s) => {
+                    2u8.hash(&mut hasher);
+                    s.hash(&mut hasher);
+                }
+                RefLabel::Tag(s) => {
+                    3u8.hash(&mut hasher);
+                    s.hash(&mut hasher);
+                }
+            }
+        }
+    }
+    hasher.finish()
 }
 
 fn save_prefs(layout: DiffLayout, mode: DiffMode) {

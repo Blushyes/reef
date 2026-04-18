@@ -1,7 +1,9 @@
+pub mod commit_detail_panel;
 pub mod diff_panel;
 pub mod file_panel;
 pub mod file_preview_panel;
 pub mod file_tree_panel;
+pub mod git_graph_panel;
 pub mod git_status_panel;
 pub mod plugin_panel;
 pub mod text;
@@ -65,8 +67,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
             file_preview_panel::render(f, app, body_layout[1]);
         }
         Tab::Graph => {
-            render_sidebar_panel(f, app, body_layout[0], "git.graph");
-            render_editor_panel(f, app, body_layout[1], "git.commitDetail");
+            render_graph_sidebar(f, app, body_layout[0]);
+            render_graph_editor(f, app, body_layout[1]);
         }
     }
 
@@ -120,8 +122,39 @@ fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
     git_status_panel::render(f, app, padded, focused);
 }
 
+/// Graph tab's left sidebar — inline commit-graph panel.
+fn render_graph_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::RIGHT)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let padded = Rect::new(
+        inner.x + 1,
+        inner.y,
+        inner.width.saturating_sub(1),
+        inner.height,
+    );
+    let focused = matches!(app.active_panel, crate::app::Panel::Files);
+    git_graph_panel::render(f, app, padded, focused);
+}
+
+/// Graph tab's right editor — inline commit-detail panel.
+fn render_graph_editor(f: &mut Frame, app: &mut App, area: Rect) {
+    let inner = Rect::new(
+        area.x + 1,
+        area.y,
+        area.width.saturating_sub(1),
+        area.height,
+    );
+    let focused = matches!(app.active_panel, crate::app::Panel::Diff);
+    commit_detail_panel::render(f, app, inner, focused);
+}
+
 /// Render a specific plugin-contributed sidebar panel into `area`, wrapping it
 /// in the shared right-border + 1-col padding chrome.
+#[allow(dead_code)]
 fn render_sidebar_panel(f: &mut Frame, app: &mut App, area: Rect, panel_id: &str) {
     let block = Block::default()
         .borders(Borders::RIGHT)
@@ -147,6 +180,7 @@ fn render_editor(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// Render a specific plugin-contributed editor panel, with 1-col left padding.
+#[allow(dead_code)]
 fn render_editor_panel(f: &mut Frame, app: &mut App, area: Rect, panel_id: &str) {
     let focused = matches!(app.active_panel, crate::app::Panel::Diff);
     let inner = Rect::new(

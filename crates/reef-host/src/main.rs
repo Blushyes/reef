@@ -174,55 +174,50 @@ fn handle_key(key: event::KeyEvent, app: &mut App) {
 }
 
 fn handle_key_graph(key: event::KeyEvent, app: &mut App) {
+    use reef_host::ui::{commit_detail_panel, git_graph_panel};
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => match app.active_panel {
             Panel::Files => {
-                app.route_key_to_plugin("k");
+                git_graph_panel::handle_key(app, "k");
             }
-            Panel::Diff => scroll_panel(app, "git.commitDetail", -1),
+            Panel::Diff => commit_detail_panel::scroll(app, -1),
         },
         KeyCode::Down | KeyCode::Char('j') => match app.active_panel {
             Panel::Files => {
-                app.route_key_to_plugin("j");
+                git_graph_panel::handle_key(app, "j");
             }
-            Panel::Diff => scroll_panel(app, "git.commitDetail", 1),
+            Panel::Diff => commit_detail_panel::scroll(app, 1),
         },
         KeyCode::PageUp => match app.active_panel {
             Panel::Files => {
                 for _ in 0..10 {
-                    app.route_key_to_plugin("k");
+                    git_graph_panel::handle_key(app, "k");
                 }
             }
-            Panel::Diff => scroll_panel(app, "git.commitDetail", -20),
+            Panel::Diff => commit_detail_panel::scroll(app, -20),
         },
         KeyCode::PageDown => match app.active_panel {
             Panel::Files => {
                 for _ in 0..10 {
-                    app.route_key_to_plugin("j");
+                    git_graph_panel::handle_key(app, "j");
                 }
             }
-            Panel::Diff => scroll_panel(app, "git.commitDetail", 20),
+            Panel::Diff => commit_detail_panel::scroll(app, 20),
         },
-        KeyCode::Enter => {
-            app.route_key_to_plugin("Enter");
-        }
         KeyCode::Char('r') => {
-            app.route_key_to_plugin("r");
+            // `r` on the graph sidebar = force a graph cache refresh
+            app.git_graph.cache_key = None;
+            app.refresh_graph();
         }
-        // m/f/t always target the commit-detail panel regardless of focus —
-        // they configure the inline diff / changed-files view, which is only
-        // meaningful there. t toggles the Changed-files tree/flat layout.
+        // m/f/t target the commit-detail panel regardless of focus.
         KeyCode::Char('m') => {
-            app.plugin_manager
-                .send_key_event("git.commitDetail", "m", vec![]);
+            commit_detail_panel::handle_key(app, "m");
         }
         KeyCode::Char('f') => {
-            app.plugin_manager
-                .send_key_event("git.commitDetail", "f", vec![]);
+            commit_detail_panel::handle_key(app, "f");
         }
         KeyCode::Char('t') => {
-            app.plugin_manager
-                .send_key_event("git.commitDetail", "t", vec![]);
+            commit_detail_panel::handle_key(app, "t");
         }
         _ => {}
     }
@@ -472,9 +467,9 @@ fn handle_mouse<B: ratatui::backend::Backend>(
                 }
                 Tab::Graph => {
                     if is_left {
-                        scroll_panel(app, "git.graph", -3);
+                        reef_host::ui::git_graph_panel::scroll(app, -3);
                     } else {
-                        scroll_panel(app, "git.commitDetail", -3);
+                        reef_host::ui::commit_detail_panel::scroll(app, -3);
                     }
                 }
             }
@@ -504,9 +499,9 @@ fn handle_mouse<B: ratatui::backend::Backend>(
                 }
                 Tab::Graph => {
                     if is_left {
-                        scroll_panel(app, "git.graph", 3);
+                        reef_host::ui::git_graph_panel::scroll(app, 3);
                     } else {
-                        scroll_panel(app, "git.commitDetail", 3);
+                        reef_host::ui::commit_detail_panel::scroll(app, 3);
                     }
                 }
             }
@@ -525,16 +520,6 @@ fn handle_mouse<B: ratatui::backend::Backend>(
         }
         _ => {}
     }
-}
-
-/// Apply a scroll delta to a specific plugin panel by id.
-fn scroll_panel(app: &mut App, panel_id: &str, delta: i32) {
-    let entry = app.panel_scroll.entry(panel_id.to_string()).or_insert(0);
-    *entry = if delta < 0 {
-        entry.saturating_sub(delta.unsigned_abs() as usize)
-    } else {
-        entry.saturating_add(delta as usize)
-    };
 }
 
 /// Apply a horizontal-scroll delta (in display columns) to the preview / diff

@@ -9,7 +9,6 @@ use crossterm::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use reef::app::{App, Panel, Tab};
-use reef::mouse;
 use reef::ui;
 use std::io;
 use std::panic;
@@ -393,13 +392,13 @@ fn handle_mouse<B: ratatui::backend::Backend>(
                 // On double-click: if the region carries a dbl action, swap to it
                 // and run through handle_action so host-side side effects fire.
                 let effective = if is_double {
-                    if let crate::mouse::ClickAction::GitCommand {
+                    if let crate::ui::mouse::ClickAction::GitCommand {
                         dbl_command: Some(ref cmd),
                         ref dbl_args,
                         ..
                     } = action
                     {
-                        crate::mouse::ClickAction::GitCommand {
+                        crate::ui::mouse::ClickAction::GitCommand {
                             command: cmd.clone(),
                             args: dbl_args.clone().unwrap_or(serde_json::Value::Null),
                             dbl_command: None,

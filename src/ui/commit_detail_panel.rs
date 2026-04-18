@@ -4,8 +4,8 @@
 use crate::app::{App, DiffLayout, DiffMode};
 use crate::git::tree::{self as gtree, Node};
 use crate::git::{DiffContent, FileEntry, FileStatus, LineTag};
-use crate::mouse::ClickAction;
 use crate::ui::git_graph_panel;
+use crate::ui::mouse::ClickAction;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};

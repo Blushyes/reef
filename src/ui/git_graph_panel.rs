@@ -4,7 +4,7 @@
 use crate::app::App;
 use crate::git::RefLabel;
 use crate::git::graph::{GraphRow, LaneCell};
-use crate::mouse::ClickAction;
+use crate::ui::mouse::ClickAction;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};

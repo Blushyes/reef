@@ -29,7 +29,12 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
     }
     let scroll = app.commit_detail.scroll;
 
-    for (i, row) in rows.iter().skip(scroll).take(area.height as usize).enumerate() {
+    for (i, row) in rows
+        .iter()
+        .skip(scroll)
+        .take(area.height as usize)
+        .enumerate()
+    {
         let y = area.y + i as u16;
         let spans: Vec<Span<'static>> = row
             .spans
@@ -123,12 +128,7 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
                 return true;
             }
             if app.git_graph.selected_commit.as_deref() != Some(oid) {
-                if let Some(idx) = app
-                    .git_graph
-                    .rows
-                    .iter()
-                    .position(|r| r.commit.oid == oid)
-                {
+                if let Some(idx) = app.git_graph.rows.iter().position(|r| r.commit.oid == oid) {
                     app.git_graph.selected_idx = idx;
                 }
                 app.git_graph.selected_commit = Some(oid.to_string());
@@ -244,7 +244,9 @@ fn build_rows(app: &App, width: u16) -> Vec<Row> {
         RowSpan::styled("commit ", Style::default().fg(Color::DarkGray)),
         RowSpan::styled(
             info.oid.clone(),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ),
     ]));
     rows.push(Row::new(vec![
@@ -295,7 +297,9 @@ fn build_rows(app: &App, width: u16) -> Vec<Row> {
     rows.push(Row::new(vec![
         RowSpan::styled(
             format!("Changed files ({})", detail.files.len()),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         ),
         RowSpan::styled(
             format!("  [{}]  t 切换", view_label),
@@ -413,10 +417,7 @@ fn render_commit_file_tree(
                                 .add_modifier(Modifier::BOLD),
                         ),
                     ])
-                    .on_click(
-                        "git.toggleCommitDir",
-                        serde_json::json!({ "path": path }),
-                    ),
+                    .on_click("git.toggleCommitDir", serde_json::json!({ "path": path })),
                 );
                 if !is_collapsed {
                     render_commit_file_tree(children, depth + 1, ctx, rows);
@@ -450,7 +451,9 @@ fn diff_header_row(path: &str, layout: DiffLayout, mode: DiffMode, width: u16) -
     Row::new(vec![
         RowSpan::styled(
             path_display,
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ),
         RowSpan::styled(tag_str, Style::default().fg(Color::DarkGray)),
     ])
@@ -508,12 +511,7 @@ fn append_unified_diff(rows: &mut Vec<Row>, diff: &DiffContent, width: u16) {
                     text_style.bg(bg),
                     Style::default().bg(bg),
                 ),
-                None => (
-                    gutter_style,
-                    mark_style,
-                    text_style,
-                    Style::default(),
-                ),
+                None => (gutter_style, mark_style, text_style, Style::default()),
             };
             rows.push(Row::new(vec![
                 RowSpan::styled(format!(" {}  {} ", old_no, new_no), g),
@@ -564,7 +562,14 @@ fn render_sbs_row(row: &SbsRow, half_w: u16, right_w: u16) -> Row {
     let (left_fg, left_bg) = side_style(row.left_tag, added_bg, removed_bg);
     let (right_fg, right_bg) = side_style(row.right_tag, added_bg, removed_bg);
 
-    push_sbs_half(&mut spans, row.left_no, &row.left_text, left_fg, left_bg, half_w);
+    push_sbs_half(
+        &mut spans,
+        row.left_no,
+        &row.left_text,
+        left_fg,
+        left_bg,
+        half_w,
+    );
     spans.push(RowSpan::styled(
         "│".to_string(),
         Style::default().fg(Color::DarkGray),
@@ -602,10 +607,7 @@ fn push_sbs_half(
         ),
         None => (gutter_style, body_style, Style::default()),
     };
-    spans.push(RowSpan::styled(
-        format!(" {} ", fmt_diff_lineno(lineno)),
-        g,
-    ));
+    spans.push(RowSpan::styled(format!(" {} ", fmt_diff_lineno(lineno)), g));
     spans.push(RowSpan::styled(trimmed.to_string(), b));
     spans.push(RowSpan::styled(" ".repeat(pad), p));
 }

@@ -63,9 +63,8 @@ pub struct GitStatusState {
     pub scroll: usize,
 }
 
-/// State for the inline commit graph sidebar. Unused until M3.
+/// State for the inline commit graph sidebar.
 #[derive(Debug, Default)]
-#[allow(dead_code)]
 pub struct GitGraphState {
     pub rows: Vec<GraphRow>,
     pub ref_map: HashMap<String, Vec<RefLabel>>,
@@ -495,7 +494,11 @@ impl App {
     /// Reload the currently-selected commit-file diff — used after toggling
     /// `commit.diff_mode`, which changes the context-lines argument.
     pub fn reload_commit_file_diff(&mut self) {
-        let path = self.commit_detail.file_diff.as_ref().map(|(p, _)| p.clone());
+        let path = self
+            .commit_detail
+            .file_diff
+            .as_ref()
+            .map(|(p, _)| p.clone());
         if let Some(path) = path {
             self.load_commit_file_diff(&path);
         }
@@ -514,11 +517,8 @@ impl App {
             return;
         }
         self.git_graph.selected_idx = next;
-        self.git_graph.selected_commit = self
-            .git_graph
-            .rows
-            .get(next)
-            .map(|r| r.commit.oid.clone());
+        self.git_graph.selected_commit =
+            self.git_graph.rows.get(next).map(|r| r.commit.oid.clone());
         // Reset commit-detail scroll so the new commit starts at the top.
         self.commit_detail.scroll = 0;
         self.load_commit_detail();

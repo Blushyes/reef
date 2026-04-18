@@ -26,10 +26,14 @@ fn prefs_path() -> Option<PathBuf> {
 
 fn legacy_git_prefs_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".config").join("reef").join("git.prefs"))
+    Some(
+        PathBuf::from(home)
+            .join(".config")
+            .join("reef")
+            .join("git.prefs"),
+    )
 }
 
-#[allow(dead_code)]
 pub fn read_all() -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     let Some(path) = prefs_path() else {
@@ -46,7 +50,6 @@ pub fn read_all() -> BTreeMap<String, String> {
     map
 }
 
-#[allow(dead_code)]
 fn write_all(map: &BTreeMap<String, String>) {
     let Some(path) = prefs_path() else {
         return;
@@ -61,12 +64,10 @@ fn write_all(map: &BTreeMap<String, String>) {
     let _ = std::fs::write(path, content);
 }
 
-#[allow(dead_code)]
 pub fn get(key: &str) -> Option<String> {
     read_all().get(key).cloned()
 }
 
-#[allow(dead_code)]
 pub fn set(key: &str, value: &str) {
     let mut map = read_all();
     map.insert(key.to_string(), value.to_string());

@@ -22,7 +22,6 @@ jobs:
       - name: Run mutation tests
         run: |
           cargo mutants --workspace --no-shuffle --timeout 60 \
-            --exclude 'crates/reef-host/src/bin/*' \
             --exclude 'crates/test-support/*' \
             --json-output > mutants.json || true
       - name: Upload mutants report

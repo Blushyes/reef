@@ -16,7 +16,8 @@ fn canonical(p: &Path) -> PathBuf {
 }
 
 /// Give the notify kernel watch a moment to register before the test touches
-/// files — mirrors the 200ms used in reef-git's watcher tests.
+/// files. 200ms is empirically enough on Linux inotify and macOS FSEvents
+/// without making the suite noticeably slower.
 fn kernel_warmup() {
     thread::sleep(Duration::from_millis(200));
 }

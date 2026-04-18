@@ -1,13 +1,11 @@
 //! Cross-panel toast/notification queue.
 //!
-//! Previously the plugin layer surfaced plugin-originated `reef/notify`
-//! messages via `PluginManager::notifications`. Now that everything runs
-//! in-process, any panel can push a toast here and the top-level `ui`
-//! render reads the queue so errors (push failures, etc.) stay visible when
-//! the user switches tabs.
+//! Any panel can push a toast here and the top-level `ui::render_status_bar`
+//! shows the most recent one. Used for things that must stay visible when
+//! the user switches tabs (push success/failure being the current primary
+//! consumer).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum ToastLevel {
     Info,
     Warn,
@@ -15,13 +13,11 @@ pub enum ToastLevel {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct Toast {
     pub level: ToastLevel,
     pub message: String,
 }
 
-#[allow(dead_code)]
 impl Toast {
     pub fn info(message: impl Into<String>) -> Self {
         Self {

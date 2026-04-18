@@ -28,7 +28,6 @@ pub struct GraphRow {
 ///                       the node's lane) — drawn as a connector glyph
 ///   - Fork{to}(col)   : lane `col` was just forked off from lane `to` (the
 ///                       node) because the commit has multiple parents
-#[allow(dead_code)]
 pub fn build_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
     let mut rows = Vec::with_capacity(commits.len());
     // lanes[i] = Some(oid) means lane i is waiting for commit `oid`

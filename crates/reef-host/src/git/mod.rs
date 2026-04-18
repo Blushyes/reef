@@ -115,12 +115,10 @@ impl GitRepo {
         self.repo.workdir().map(|p| p.to_path_buf())
     }
 
-    #[allow(dead_code)]
     pub fn workdir(&self) -> Option<&Path> {
         self.repo.workdir()
     }
 
-    #[allow(dead_code)]
     pub fn gitdir(&self) -> &Path {
         self.repo.path()
     }
@@ -399,7 +397,6 @@ impl GitRepo {
     /// Restore a working-tree file to its HEAD state (like `git restore <file>`).
     /// For untracked files that have no HEAD counterpart, the file is deleted.
     /// Does not touch the index.
-    #[allow(dead_code)]
     pub fn restore_file(&self, path: &str) -> Result<(), git2::Error> {
         let workdir = self
             .repo
@@ -434,7 +431,6 @@ impl GitRepo {
     /// upstream configured, or any lookup fails. Does NOT perform a network
     /// fetch — the `behind` count reflects the last-fetched state of the
     /// upstream ref.
-    #[allow(dead_code)]
     pub fn ahead_behind(&self) -> Option<(usize, usize)> {
         let head = self.repo.head().ok()?;
         let head_oid = head.target()?;
@@ -457,7 +453,6 @@ impl GitRepo {
     /// credential handling (SSH agent, keychain, credential helpers) that
     /// would otherwise need reimplementing. `git push` respects the user's
     /// existing git config and works identically to running it manually.
-    #[allow(dead_code)]
     pub fn push(&self, force: bool) -> Result<(), String> {
         let workdir = self
             .repo
@@ -484,7 +479,6 @@ impl GitRepo {
 
     // ── commit history / refs ──────────────────────────────────────────────
 
-    #[allow(dead_code)]
     pub fn head_oid(&self) -> Option<String> {
         self.repo
             .head()
@@ -496,7 +490,6 @@ impl GitRepo {
 
     /// Walk up to `limit` commits reachable from all branches/tags/HEAD, in
     /// topological + time order (child before parent, newest first).
-    #[allow(dead_code)]
     pub fn list_commits(&self, limit: usize) -> Vec<CommitInfo> {
         let Ok(mut walk) = self.repo.revwalk() else {
             return Vec::new();
@@ -522,7 +515,6 @@ impl GitRepo {
 
     /// Map oid (hex) → list of ref labels pointing at that commit. HEAD is
     /// inserted separately using the current HEAD commit oid.
-    #[allow(dead_code)]
     pub fn list_refs(&self) -> HashMap<String, Vec<RefLabel>> {
         let mut map: HashMap<String, Vec<RefLabel>> = HashMap::new();
 
@@ -562,7 +554,6 @@ impl GitRepo {
         map
     }
 
-    #[allow(dead_code)]
     pub fn get_commit(&self, oid_str: &str) -> Option<CommitDetail> {
         let oid = git2::Oid::from_str(oid_str).ok()?;
         let commit = self.repo.find_commit(oid).ok()?;
@@ -583,7 +574,6 @@ impl GitRepo {
         })
     }
 
-    #[allow(dead_code)]
     pub fn get_commit_file_diff(
         &self,
         oid_str: &str,

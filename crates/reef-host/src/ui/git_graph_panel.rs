@@ -101,12 +101,7 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
         "git.selectCommit" => {
             let oid = args.get("oid").and_then(|v| v.as_str()).unwrap_or("");
             if !oid.is_empty() {
-                if let Some(idx) = app
-                    .git_graph
-                    .rows
-                    .iter()
-                    .position(|r| r.commit.oid == oid)
-                {
+                if let Some(idx) = app.git_graph.rows.iter().position(|r| r.commit.oid == oid) {
                     app.git_graph.selected_idx = idx;
                     app.git_graph.selected_commit = Some(oid.to_string());
                     app.commit_detail.scroll = 0;
@@ -164,7 +159,9 @@ fn build_row_line(
 
     spans.push(Span::styled(
         row.commit.short_oid.clone(),
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::DIM),
     ));
     spans.push(Span::raw(" "));
 

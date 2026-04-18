@@ -11,11 +11,13 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use reef_host::app::App;
-use reef_host::plugin::manager::PluginManager;
 use reef_host::ui;
 use std::sync::Mutex;
-use test_support::{commit_file, tempdir_repo};
+use test_support::{commit_file, tempdir_repo, write_file};
 
+// One lock covers both cwd and HOME swaps — every test in this file does
+// both and nothing else touches HOME concurrently. If you add a test that
+// only touches HOME, use a separate HOME_LOCK.
 static CWD_LOCK: Mutex<()> = Mutex::new(());
 
 struct CwdGuard { original: std::path::PathBuf }
@@ -28,6 +30,29 @@ impl CwdGuard {
 }
 impl Drop for CwdGuard {
     fn drop(&mut self) { let _ = std::env::set_current_dir(&self.original); }
+}
+
+/// Redirect `$HOME` to the given path so `App::new()` reads a blank
+/// `~/.config/reef/prefs` instead of the developer's real one.
+/// The caller must hold `CWD_LOCK` (or an equivalent HOME_LOCK).
+struct HomeGuard { original: Option<std::ffi::OsString> }
+impl HomeGuard {
+    fn enter(path: &std::path::Path) -> Self {
+        let original = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", path); }
+        Self { original }
+    }
+}
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(v) = self.original.take() {
+                std::env::set_var("HOME", v);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+    }
 }
 
 fn buffer_to_text(buf: &Buffer) -> String {
@@ -51,12 +76,6 @@ fn render_app(app: &mut App, width: u16, height: u16) -> String {
     buffer_to_text(terminal.backend().buffer())
 }
 
-/// CRITICAL: disconnect plugin subprocesses before snapshotting.
-fn detach_plugins(app: &mut App) {
-    app.plugin_manager = PluginManager::new();
-    app.active_sidebar_panel = None;
-}
-
 /// Mask nondeterministic tokens (tempdir names, absolute paths, etc.)
 /// from the snapshot so it's stable across machines and runs.
 fn with_filters<F: FnOnce()>(body: F) {
@@ -70,11 +89,11 @@ fn with_filters<F: FnOnce()>(body: F) {
 fn snapshot_<scenario>() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
-    commit_file(&raw, "a.txt", "v1", "init");       // set up repo state
-    let _g = CwdGuard::enter(tmp.path());
+    commit_file(&raw, "a.txt", "v1", "init");        // set up repo state
+    let _home = HomeGuard::enter(tmp.path());        // <-- NEVER skip this
+    let _cwd  = CwdGuard::enter(tmp.path());
 
     let mut app = App::new();
-    detach_plugins(&mut app);                        // NEVER skip this
     app.active_tab = reef_host::app::Tab::Git;       // optional: set UI state
     app.refresh_status();
 
@@ -83,11 +102,11 @@ fn snapshot_<scenario>() {
 }
 ```
 
-## Why `detach_plugins` is non-negotiable
+## Why `HomeGuard` is non-negotiable
 
-See `references/pitfalls.md` → "Plugin subprocess races in UI snapshots". Summary: plugin binary availability varies across environments, so plugin-rendered content in a snapshot is inherently non-reproducible. Snapshot only host-native output.
+See `references/pitfalls.md` → "App::new() reads the developer's real ~/.config/reef/prefs". Summary: `App::new()` calls `load_bool_pref("status.tree_mode", ...)` and similar for commit-detail toggles. Without HOME isolation, your snapshot captures the dev's saved view-mode and CI gets a different one.
 
-Test the plugin's own rendering separately using `plugin_handshake.rs` / `plugin_manager_lifecycle.rs` — there, the test binary is a known-stable `echo-plugin` whose behavior is fully controlled.
+`App::new()` also runs `prefs::migrate_legacy_prefs()`. The migrator is intentionally a no-op when there's nothing to migrate, so pointing HOME at a clean tempdir doesn't leave a spurious `.config/reef/prefs` file that would show up as untracked in `git status` and pollute the snapshot.
 
 ## Picking buffer dimensions
 

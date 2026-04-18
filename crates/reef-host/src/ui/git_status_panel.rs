@@ -156,7 +156,11 @@ pub fn handle_key(app: &mut App, key: &str) -> bool {
             app.git_status.tree_mode = !app.git_status.tree_mode;
             crate::prefs::set(
                 "status.tree_mode",
-                if app.git_status.tree_mode { "true" } else { "false" },
+                if app.git_status.tree_mode {
+                    "true"
+                } else {
+                    "false"
+                },
             );
             true
         }
@@ -178,10 +182,7 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
                 .get("staged")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            app.selected_file = Some(SelectedFile {
-                path,
-                is_staged,
-            });
+            app.selected_file = Some(SelectedFile { path, is_staged });
             app.git_status.confirm_discard = None;
             app.diff_scroll = 0;
             app.diff_h_scroll = 0;
@@ -447,7 +448,9 @@ fn build_rows(app: &App, width: u16) -> Vec<Row> {
             };
             rows.push(Row::new(vec![RowSpan::styled(
                 msg,
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             )]));
         }
 
@@ -510,7 +513,9 @@ fn build_rows(app: &App, width: u16) -> Vec<Row> {
             ),
             RowSpan::styled(
                 display,
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             ),
             RowSpan::styled("？（不可撤销）", Style::default().fg(Color::Yellow)),
         ]));
@@ -707,7 +712,9 @@ fn dir_row(name: &str, path: &str, is_staged: bool, depth: usize, is_collapsed: 
         RowSpan::styled(format!("{} ", arrow), Style::default().fg(Color::DarkGray)),
         RowSpan::styled(
             format!("{}/", name),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
     ])
     .on_click(
@@ -735,7 +742,11 @@ fn file_row(
     let status_label = status.label();
     let button = if is_staged { "−" } else { "+" };
     let button_color = if is_staged { Color::Red } else { Color::Green };
-    let button_cmd = if is_staged { "git.unstage" } else { "git.stage" };
+    let button_cmd = if is_staged {
+        "git.unstage"
+    } else {
+        "git.stage"
+    };
 
     let display_path = if display.chars().count() > max_path {
         let kept = max_path.saturating_sub(3);
@@ -750,11 +761,11 @@ fn file_row(
     let base_bg = if is_selected { Some(sel_bg) } else { None };
 
     let mut spans: Vec<RowSpan> = vec![
+        RowSpan::styled(indent.to_string(), apply_bg(Style::default(), base_bg)),
         RowSpan::styled(
-            indent.to_string(),
-            apply_bg(Style::default(), base_bg),
+            display_path,
+            apply_bg(Style::default().fg(Color::White), base_bg),
         ),
-        RowSpan::styled(display_path, apply_bg(Style::default().fg(Color::White), base_bg)),
         RowSpan::styled(
             format!(" {} ", status_label),
             apply_bg(Style::default().fg(status_color), base_bg),
@@ -783,7 +794,10 @@ fn file_row(
             )),
             dbl: None,
         });
-        spans.push(RowSpan::styled(" ".to_string(), apply_bg(Style::default(), base_bg)));
+        spans.push(RowSpan::styled(
+            " ".to_string(),
+            apply_bg(Style::default(), base_bg),
+        ));
     }
 
     Row::new(spans)
@@ -824,7 +838,9 @@ fn section_header(
         RowSpan::styled(prefix, Style::default().fg(Color::White)),
         RowSpan::styled(
             label.to_string(),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ),
         RowSpan::styled(count_str, Style::default().fg(count_color)),
     ];

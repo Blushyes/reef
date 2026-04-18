@@ -8,7 +8,6 @@
 use super::FileEntry;
 use std::collections::BTreeMap;
 
-#[allow(dead_code)]
 pub enum Node {
     Dir {
         path: String,
@@ -17,7 +16,6 @@ pub enum Node {
     File(FileEntry),
 }
 
-#[allow(dead_code)]
 pub fn build(files: &[FileEntry]) -> BTreeMap<String, Node> {
     let mut root: BTreeMap<String, Node> = BTreeMap::new();
     for file in files {
@@ -62,7 +60,6 @@ fn insert(
 /// Composite key used by the Git status sidebar to remember which directory
 /// subtrees the user has collapsed. The `is_staged` prefix lets the same
 /// `src/` dir be independently collapsed in the staged and unstaged sections.
-#[allow(dead_code)]
 pub fn collapsed_key(is_staged: bool, path: &str) -> String {
     format!("{}:{}", if is_staged { "s" } else { "u" }, path)
 }

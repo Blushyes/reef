@@ -9,5 +9,7 @@ pub mod git;
 pub mod highlight;
 pub mod mouse;
 pub mod plugin;
+pub mod prefs;
 pub mod renderer;
+pub mod toast;
 pub mod ui;

@@ -1,9 +1,11 @@
 use crate::file_tree::{self, FileTree, PreviewContent};
 use crate::fs_watcher;
-use crate::git::{DiffContent, FileEntry, GitRepo};
+use crate::git::graph::GraphRow;
+use crate::git::{CommitDetail, DiffContent, FileEntry, GitRepo, RefLabel};
 use crate::mouse::{ClickAction, HitTestRegistry};
 use crate::plugin::manager::PluginManager;
-use std::collections::HashMap;
+use crate::toast::Toast;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -44,6 +46,66 @@ pub enum DiffLayout {
 pub enum DiffMode {
     Compact,  // 只显示变更区域 ± context
     FullFile, // 显示整个文件
+}
+
+/// State for the inline Git status sidebar. Currently unused — plugin still
+/// owns the panel; wired up in M2.
+#[derive(Debug, Default)]
+#[allow(dead_code)]
+pub struct GitStatusState {
+    pub tree_mode: bool,
+    pub collapsed_dirs: HashSet<String>,
+    pub confirm_discard: Option<String>,
+    pub confirm_push: bool,
+    pub confirm_force_push: bool,
+    pub scroll: usize,
+}
+
+/// State for the inline commit graph sidebar. Unused until M3.
+#[derive(Debug, Default)]
+#[allow(dead_code)]
+pub struct GitGraphState {
+    pub rows: Vec<GraphRow>,
+    pub ref_map: HashMap<String, Vec<RefLabel>>,
+    /// `(head_oid, refs_hash)` — revwalk is skipped when these are unchanged,
+    /// so workdir edits don't trigger a full re-walk on large repos.
+    pub cache_key: Option<(String, u64)>,
+    pub selected_idx: usize,
+    pub selected_commit: Option<String>,
+    pub scroll: usize,
+}
+
+/// State for the inline commit-detail editor panel. Unused until M3.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct CommitDetailState {
+    pub detail: Option<CommitDetail>,
+    pub file_diff: Option<(String, DiffContent)>,
+    /// Intentionally independent of `App.diff_layout` — the Git tab and the
+    /// Graph tab track their diff layout separately (see plan pitfall #1).
+    pub diff_layout: DiffLayout,
+    pub diff_mode: DiffMode,
+    pub files_tree_mode: bool,
+    pub files_collapsed: HashSet<String>,
+    pub files_scroll: usize,
+    pub diff_scroll: usize,
+    pub diff_h_scroll: usize,
+}
+
+impl Default for CommitDetailState {
+    fn default() -> Self {
+        Self {
+            detail: None,
+            file_diff: None,
+            diff_layout: DiffLayout::Unified,
+            diff_mode: DiffMode::Compact,
+            files_tree_mode: false,
+            files_collapsed: HashSet::new(),
+            files_scroll: 0,
+            diff_scroll: 0,
+            diff_h_scroll: 0,
+        }
+    }
 }
 
 pub struct App {
@@ -90,6 +152,16 @@ pub struct App {
     /// Per-plugin-panel scroll offsets, keyed by panel_id. Host-native panels
     /// (file_tree, file_preview, legacy diff/file) keep their own scalars.
     pub panel_scroll: HashMap<String, usize>,
+
+    /// Inline git state — populated in M1 but not yet consumed by rendering.
+    /// Plugin still drives behaviour until M2/M3 flip the switch.
+    pub git_status: GitStatusState,
+    pub git_graph: GitGraphState,
+    pub commit_detail: CommitDetailState,
+    /// Cross-panel toast queue. Takes over what `PluginManager::notifications`
+    /// used to do so that (e.g.) push failures remain visible when the user
+    /// switches tabs.
+    pub toasts: Vec<Toast>,
 
     /// Host-owned fs watcher channel. `None` when the watcher couldn't start —
     /// the sender inside the thread was dropped so `try_recv` returns `Disconnected`.
@@ -146,6 +218,10 @@ impl App {
             plugin_manager: PluginManager::new(),
             active_sidebar_panel: None,
             panel_scroll: HashMap::new(),
+            git_status: GitStatusState::default(),
+            git_graph: GitGraphState::default(),
+            commit_detail: CommitDetailState::default(),
+            toasts: Vec::new(),
             fs_watcher_rx,
             should_quit: false,
             select_mode: false,

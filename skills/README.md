@@ -11,6 +11,7 @@ particular agent's discovery rules.
 ## Available skills
 
 - **`testing-reef/`** — Conventions, fixtures, and gotchas for writing tests in this workspace. Auto-triggers on test-related prompts.
+- **`releasing-reef/`** — How to cut a release: version bump, tag, what the `v*`-tag-triggered pipeline builds/publishes, and the GitHub Release notes format. Auto-triggers on "cut a release", "打个 tag 发布", "bump version", etc.
 
 ## Installing for your agent
 

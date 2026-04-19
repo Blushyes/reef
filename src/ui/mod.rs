@@ -7,6 +7,7 @@ pub mod git_status_panel;
 pub mod highlight;
 pub mod hover;
 pub mod mouse;
+pub mod quick_open_panel;
 pub mod text;
 pub mod theme;
 pub mod toast;
@@ -81,6 +82,13 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     if app.show_help {
         render_help(f, app, size);
+    }
+
+    // Render last so the palette overlays help if both are somehow active
+    // (shouldn't happen in practice — opening one dismisses the other via
+    // input-priority — but the ordering here is a belt-and-braces guard).
+    if app.quick_open.active {
+        quick_open_panel::render(f, app, size);
     }
 }
 
@@ -430,6 +438,7 @@ fn render_help(f: &mut Frame, app: &App, screen: Rect) {
         ("r", t(Msg::HelpRefresh)),
         ("v", t(Msg::HelpSelectMode)),
         ("h", t(Msg::HelpShowHelp)),
+        ("Space p", t(Msg::HelpQuickOpen)),
         (t(Msg::HelpKeyAnyKey), t(Msg::HelpAnyKey)),
     ];
 

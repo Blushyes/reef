@@ -72,7 +72,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // so the terminal's native text-selection works. Kept inline
                     // because it's the only input that needs to poke the terminal
                     // backend mid-loop.
-                    if key.code == KeyCode::Char('v') && key.modifiers.is_empty() {
+                    //
+                    // When the quick-open palette is active it owns every key
+                    // unconditionally — 'v' must land as a literal in the query
+                    // and 'any key' must not dismiss help/palette — so route to
+                    // handle_key first and let it delegate to quick_open.
+                    if app.quick_open.active {
+                        input::handle_key(key, &mut app);
+                    } else if key.code == KeyCode::Char('v') && key.modifiers.is_empty() {
                         app.select_mode = !app.select_mode;
                         if app.select_mode {
                             execute!(terminal.backend_mut(), DisableMouseCapture)?;

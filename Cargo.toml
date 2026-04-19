@@ -21,6 +21,7 @@ syntect       = { version = "5.2", default-features = false, features = ["defaul
 two-face      = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
 notify        = "6"
 ignore        = "0.4"
+nucleo-matcher = "0.3"
 serde_json    = { workspace = true }
 terminal-colorsaurus = "1.0.3"
 

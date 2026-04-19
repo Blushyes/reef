@@ -15,6 +15,12 @@ pub enum ClickAction {
     StartDragSplit,
     SwitchTab(Tab),
     TreeClick(usize),
+    /// Click on a row in the quick-open palette. The `usize` indexes
+    /// into `QuickOpenState.matches`. Double-click semantics (select +
+    /// accept) live in `input::handle_mouse` rather than here — the palette
+    /// owns mouse when active, so we don't round-trip through
+    /// `App::handle_action` for it.
+    QuickOpenSelect(usize),
     /// Invoke an inline Git panel command (`git.stage`, `git.selectCommit`, …).
     /// `dbl_command`/`dbl_args`, if present, are fired on double-click instead.
     GitCommand {

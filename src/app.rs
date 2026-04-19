@@ -194,6 +194,17 @@ pub struct App {
     /// In-panel vim-style search (`/`, `?`, `n`, `N`). See `crate::search`.
     pub search: crate::search::SearchState,
 
+    /// VSCode-style quick-open palette. While `active`, input is routed
+    /// exclusively to `crate::quick_open::handle_key` (see input.rs).
+    pub quick_open: crate::quick_open::QuickOpenState,
+
+    /// Timestamp of the most recent bare-Space keystroke in the global
+    /// keymap. `Some(t)` means a Space leader is primed and waiting for a
+    /// follow-up key within `input::LEADER_TIMEOUT`. The palette-side
+    /// leader has its own slot inside `QuickOpenState` — separate so they
+    /// can't interfere across mode transitions.
+    pub space_leader_at: Option<std::time::Instant>,
+
     /// Last-rendered content height (in rows) for each right-side panel.
     /// Search jumps read these to center the match in view. Written by the
     /// panel's render fn every frame; defaults to 0 until the first render.
@@ -281,6 +292,8 @@ impl App {
             pending_edit: None,
             theme,
             search: crate::search::SearchState::default(),
+            quick_open: crate::quick_open::QuickOpenState::from_prefs(),
+            space_leader_at: None,
             last_preview_view_h: 0,
             last_diff_view_h: 0,
             last_commit_detail_view_h: 0,
@@ -694,6 +707,13 @@ impl App {
                 }
                 let _ = crate::ui::commit_detail_panel::handle_command(self, &command, &args);
             }
+            // Quick-open palette clicks are dispatched inline by
+            // `quick_open::handle_mouse` (single-click select, double-click
+            // accept) rather than routed through `handle_action`, because
+            // the double-click distinction needs `last_click` timing that's
+            // only available at the input layer. This arm is unreachable
+            // under normal flow but keeps the match exhaustive.
+            ClickAction::QuickOpenSelect(_) => {}
         }
     }
 
@@ -775,6 +795,10 @@ impl App {
             self.refresh_file_tree();
             self.load_preview();
             self.load_diff();
+            // Mark the quick-open index stale so the next palette open picks up
+            // the new/deleted files. Rebuilding immediately on every fs
+            // event would be wasteful for a palette the user may not open.
+            crate::quick_open::mark_stale(&mut self.quick_open);
         }
 
         self.drain_push_result();

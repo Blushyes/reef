@@ -4,12 +4,15 @@
 use crate::app::App;
 use crate::git::RefLabel;
 use crate::git::graph::{GraphRow, LaneCell};
+use crate::search::SearchTarget;
 use crate::ui::mouse::ClickAction;
+use crate::ui::text::overlay_match_highlight;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
+use std::ops::Range;
 use unicode_width::UnicodeWidthStr;
 
 pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
@@ -51,6 +54,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
         let idx = scroll + i;
         let y = area.y + i as u16;
         let hover = crate::ui::hover::is_hover(app, area, y);
+        let (search_ranges, search_cur) = app.search.ranges_on_row(SearchTarget::CommitGraph, idx);
         let (line, click_x_w) = build_row_line(
             row,
             idx == app.git_graph.selected_idx,
@@ -60,6 +64,8 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
             &app.git_graph.ref_map,
             hover,
             &theme,
+            &search_ranges,
+            search_cur,
         );
         f.render_widget(line, Rect::new(area.x, y, area.width, 1));
 
@@ -144,6 +150,8 @@ fn build_row_line(
     ref_map: &std::collections::HashMap<String, Vec<RefLabel>>,
     hover: bool,
     theme: &crate::ui::theme::Theme,
+    search_ranges: &[Range<usize>],
+    search_current: Option<Range<usize>>,
 ) -> (Line<'static>, u16) {
     let oid = row.commit.oid.clone();
     let sel_bg = theme.selection_bg;
@@ -197,7 +205,28 @@ fn build_row_line(
 
     let mut subject = row.commit.subject.clone();
     truncate_in_place(&mut subject, max_subject);
-    spans.push(Span::styled(subject, Style::default().fg(theme.fg_primary)));
+    let subject_style = Style::default().fg(theme.fg_primary);
+    // `collect_rows(CommitGraph)` uses `row.commit.subject`; overlay ranges
+    // are byte offsets into that exact string. Truncation happens after the
+    // fact so short subjects have unchanged offsets; long ones get clipped
+    // with `…` and matches past the clip are implicitly dropped when the
+    // text shrinks (our overlay walks the shorter `subject` and naturally
+    // covers only the surviving bytes).
+    if search_ranges.is_empty() {
+        spans.push(Span::styled(subject, subject_style));
+    } else {
+        let sub_tokens = vec![(subject_style, subject)];
+        let overlaid = overlay_match_highlight(
+            sub_tokens,
+            search_ranges,
+            search_current,
+            theme.search_match,
+            theme.search_current,
+        );
+        for (style, text) in overlaid {
+            spans.push(Span::styled(text, style));
+        }
+    }
 
     if selected {
         spans = spans

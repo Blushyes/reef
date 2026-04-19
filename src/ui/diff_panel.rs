@@ -1,12 +1,14 @@
 use crate::app::{App, DiffLayout};
 use crate::git::{DiffContent, DiffHunk, LineTag};
-use crate::ui::text::{skip_n_columns, truncate_to_width};
+use crate::search::SearchTarget;
+use crate::ui::text::{clip_spans, overlay_match_highlight, skip_n_columns, truncate_to_width};
 use crate::ui::theme::Theme;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding};
+use std::ops::Range;
 use unicode_width::UnicodeWidthStr;
 
 pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
@@ -70,6 +72,8 @@ fn render_unified(f: &mut Frame, app: &mut App, area: Rect, diff: &DiffContent) 
     let gutter_width = 15usize; // " XXXXX  XXXXX  "
     let content_w = (area.width as usize).saturating_sub(gutter_width);
     let visible_rows = max_y.saturating_sub(y) as usize;
+    // Remember viewport height for search-jump centering.
+    app.last_diff_view_h = visible_rows as u16;
 
     // Clamp horizontal scroll against the widest Content line currently in view.
     let max_visible_w: usize = all_lines
@@ -87,15 +91,20 @@ fn render_unified(f: &mut Frame, app: &mut App, area: Rect, diff: &DiffContent) 
     let h = app.diff_h_scroll;
 
     let scroll = app.diff_scroll;
-    for dl in all_lines.iter().skip(scroll) {
+    for (offset, dl) in all_lines.iter().skip(scroll).enumerate() {
         if y >= max_y {
             break;
         }
-        render_unified_line(f, area, y, dl, h, &theme);
+        let row_idx = scroll + offset;
+        // `collect_rows(Diff)` in `search.rs` uses the exact same
+        // `UnifiedLine` order, so row_idx matches 1:1 with match row indices.
+        let (ranges, cur) = app.search.ranges_on_row(SearchTarget::Diff, row_idx);
+        render_unified_line(f, area, y, dl, h, &theme, &ranges, cur);
         y += 1;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_unified_line(
     f: &mut Frame,
     area: Rect,
@@ -103,6 +112,8 @@ fn render_unified_line(
     dl: &UnifiedLine,
     h_scroll: usize,
     theme: &Theme,
+    match_ranges: &[Range<usize>],
+    current_range: Option<Range<usize>>,
 ) {
     match dl {
         UnifiedLine::Separator => {
@@ -113,12 +124,30 @@ fn render_unified_line(
             f.render_widget(line, Rect::new(area.x, y, area.width, 1));
         }
         UnifiedLine::HunkHeader(header) => {
-            let line = Line::from(Span::styled(
-                format!(" {}", header),
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::DIM),
-            ));
+            // Hunk headers can match too (e.g. search `@@` or a function name
+            // that shows up in the hunk context). Apply overlay to the header
+            // text after the leading space.
+            let base_style = Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::DIM);
+            let prefix = Span::styled(" ", base_style);
+            let header_tokens = vec![(base_style, header.clone())];
+            let tokens = if match_ranges.is_empty() {
+                header_tokens
+            } else {
+                overlay_match_highlight(
+                    header_tokens,
+                    match_ranges,
+                    current_range,
+                    theme.search_match,
+                    theme.search_current,
+                )
+            };
+            let mut spans = vec![prefix];
+            for (style, text) in tokens {
+                spans.push(Span::styled(text, style));
+            }
+            let line = Line::from(spans);
             f.render_widget(line, Rect::new(area.x, y, area.width, 1));
         }
         UnifiedLine::Content {
@@ -133,22 +162,43 @@ fn render_unified_line(
 
             let gutter_width = 15usize; // " XXXXX  XXXXX  "
             let max_text = (area.width as usize).saturating_sub(gutter_width);
-            let shifted = skip_n_columns(text, h_scroll);
-            let display_text = truncate_to_width(shifted, max_text);
-            let pad = max_text.saturating_sub(UnicodeWidthStr::width(display_text));
 
-            let line = Line::from(vec![
+            // Overlay search matches before horizontal-clipping so ranges map
+            // onto unshifted text. `clip_spans` then handles h_scroll without
+            // caring that the token stream was split.
+            let body_style = Style::default().fg(fg).bg(bg);
+            let base_tokens = vec![(body_style, text.clone())];
+            let tokens = if match_ranges.is_empty() {
+                base_tokens
+            } else {
+                overlay_match_highlight(
+                    base_tokens,
+                    match_ranges,
+                    current_range,
+                    theme.search_match,
+                    theme.search_current,
+                )
+            };
+            let body_spans = clip_spans(&tokens, h_scroll, max_text);
+            let body_w: usize = body_spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            let pad = max_text.saturating_sub(body_w);
+
+            let mut spans = vec![
                 Span::styled(
                     format!(" {}  {} ", old_num, new_num),
                     Style::default().fg(theme.fg_secondary).bg(bg),
                 ),
                 Span::styled(format!("{} ", prefix), Style::default().fg(fg).bg(bg)),
-                Span::styled(display_text.to_string(), Style::default().fg(fg).bg(bg)),
-                Span::styled(
-                    " ".repeat(pad.min(area.width as usize)),
-                    Style::default().bg(bg),
-                ),
-            ]);
+            ];
+            spans.extend(body_spans);
+            spans.push(Span::styled(
+                " ".repeat(pad.min(area.width as usize)),
+                Style::default().bg(bg),
+            ));
+            let line = Line::from(spans);
             f.render_widget(line, Rect::new(area.x, y, area.width, 1));
         }
     }
@@ -281,6 +331,7 @@ fn render_side_by_side(f: &mut Frame, app: &mut App, area: Rect, diff: &DiffCont
     let left_content_w = (half_w as usize).saturating_sub(gutter);
     let right_content_w = (right_w as usize).saturating_sub(gutter);
     let visible_rows = max_y.saturating_sub(y) as usize;
+    app.last_diff_view_h = visible_rows as u16;
 
     // Clamp horizontal scroll against the widest text column in view (either side).
     let max_visible_w: usize = all_lines

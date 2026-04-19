@@ -9,6 +9,7 @@
 //! just add indirection.
 
 use crate::app::{App, Panel, Tab};
+use crate::search;
 use crate::ui;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Terminal;
@@ -20,6 +21,13 @@ pub const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
 // ─── Keyboard ────────────────────────────────────────────────────────────────
 
 pub fn handle_key(key: KeyEvent, app: &mut App) {
+    // Search mode has priority over everything else — the prompt fully owns
+    // input (character append, Backspace, Enter/Esc) while active.
+    if app.search.active {
+        search::handle_key_in_search_mode(key, app);
+        return;
+    }
+
     // Global keys (work on all tabs)
     match key.code {
         KeyCode::Char('q') => {
@@ -33,6 +41,9 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         KeyCode::Char(c) if matches!(c, '1'..='9') => {
             let idx = (c as u8 - b'1') as usize;
             if let Some(&tab) = Tab::ALL.get(idx) {
+                if app.active_tab != tab {
+                    app.search.clear();
+                }
                 app.active_tab = tab;
             }
             return;
@@ -41,6 +52,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             let tabs = Tab::ALL;
             let cur = tabs.iter().position(|&t| t == app.active_tab).unwrap_or(0);
             app.active_tab = tabs[(cur + 1) % tabs.len()];
+            app.search.clear();
             return;
         }
         KeyCode::BackTab => {
@@ -48,10 +60,27 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
                 Panel::Files => Panel::Diff,
                 Panel::Diff => Panel::Files,
             };
+            app.search.clear();
             return;
         }
         KeyCode::Char('h') => {
             app.show_help = true;
+            return;
+        }
+        KeyCode::Char('/') => {
+            search::begin(app, false);
+            return;
+        }
+        KeyCode::Char('?') => {
+            search::begin(app, true);
+            return;
+        }
+        KeyCode::Char('n') if app.search.can_step() && !has_pending_confirm(app) => {
+            search::step(app, false);
+            return;
+        }
+        KeyCode::Char('N') if app.search.can_step() && !has_pending_confirm(app) => {
+            search::step(app, true);
             return;
         }
         _ => {}
@@ -62,6 +91,14 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         Tab::Files => handle_key_files(key, app),
         Tab::Graph => handle_key_graph(key, app),
     }
+}
+
+/// `n` / `N` only bind to search navigation when no git-status confirmation
+/// banner is up — otherwise `n` keeps its "no, cancel" meaning.
+fn has_pending_confirm(app: &App) -> bool {
+    app.git_status.confirm_discard.is_some()
+        || app.git_status.confirm_push
+        || app.git_status.confirm_force_push
 }
 
 fn handle_key_graph(key: KeyEvent, app: &mut App) {

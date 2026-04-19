@@ -261,9 +261,13 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
             if let Some(entry) = app.file_tree.entries.get(idx) {
                 if entry.is_dir {
                     app.file_tree.toggle_expand(idx);
+                    app.load_preview();
+                } else {
+                    // File: hand off to the main loop, which owns the
+                    // terminal and can suspend it around `$EDITOR`.
+                    app.pending_edit = Some(app.file_tree.root.join(&entry.path));
                 }
             }
-            app.load_preview();
         }
         KeyCode::Char('r') => {
             app.refresh_file_tree();

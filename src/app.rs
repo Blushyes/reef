@@ -170,6 +170,11 @@ pub struct App {
     pub select_mode: bool,
     pub show_help: bool,
 
+    /// Set by the input layer when the user asks to edit a file. Consumed
+    /// by the main loop, which needs to own the terminal to suspend/resume
+    /// around `$EDITOR`. Absolute path.
+    pub pending_edit: Option<PathBuf>,
+
     /// Active color theme. Chosen in `main.rs` before raw-mode entry (so the
     /// OSC 11 probe doesn't leak onto the TUI) and passed into `App::new`.
     pub theme: Theme,
@@ -250,6 +255,7 @@ impl App {
             should_quit: false,
             select_mode: false,
             show_help: false,
+            pending_edit: None,
             theme,
         };
         app.refresh_status();

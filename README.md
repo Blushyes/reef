@@ -71,7 +71,7 @@ Reef works anywhere, but the Git and Graph tabs only light up inside a git repo.
 | --- | --- |
 | `↑`/`↓`, `j`/`k` | navigate |
 | `PgUp` / `PgDn` | page |
-| `Enter` | expand/collapse directory |
+| `Enter` | expand/collapse directory, or open file in `$EDITOR` |
 | `r` | rebuild tree |
 
 ### Git tab

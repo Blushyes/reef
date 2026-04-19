@@ -1,0 +1,4 @@
+interface:
+  display_name: "Developing Reef"
+  short_description: "Architecture and coding rules for Reef"
+  default_prompt: "Use $developing-reef before changing Reef architecture, tabs, rendering, background work, or app state."

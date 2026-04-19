@@ -225,16 +225,12 @@ fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_title_bar(f: &mut Frame, app: &App, area: Rect) {
     let th = app.theme;
-    let repo_name = app
-        .repo
-        .as_ref()
-        .map(|r| r.workdir_name())
-        .unwrap_or_else(|| "—".to_string());
-    let branch = app
-        .repo
-        .as_ref()
-        .map(|r| r.branch_name())
-        .unwrap_or_default();
+    let repo_name = if app.repo.is_some() {
+        app.workdir_name.as_str()
+    } else {
+        "—"
+    };
+    let branch = app.branch_name.as_str();
 
     let title = Line::from(vec![
         Span::styled(
@@ -246,7 +242,7 @@ fn render_title_bar(f: &mut Frame, app: &App, area: Rect) {
         ),
         Span::styled(" ", Style::default().bg(th.chrome_bg)),
         Span::styled(
-            &repo_name,
+            repo_name,
             Style::default()
                 .fg(th.chrome_fg)
                 .bg(th.chrome_bg)
@@ -318,7 +314,10 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                 ToastLevel::Info => Color::Cyan,
             },
         ),
-        None => (String::new(), Color::Cyan),
+        None => match app.activity_message() {
+            Some(msg) => (format!("  {} ", msg), Color::Cyan),
+            None => (String::new(), Color::Cyan),
+        },
     };
 
     let status = Line::from(vec![

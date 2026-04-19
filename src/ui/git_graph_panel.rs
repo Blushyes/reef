@@ -17,11 +17,6 @@ use std::ops::Range;
 use unicode_width::UnicodeWidthStr;
 
 pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
-    // Rebuild the graph when HEAD/refs moved. The cache lookup inside
-    // `App::refresh_graph` guards against workdir-only changes triggering a
-    // full revwalk on every keystroke.
-    app.refresh_graph();
-
     if app.git_graph.rows.is_empty() {
         let line = Line::from(Span::styled(
             t(Msg::NoCommits),
@@ -33,7 +28,11 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
 
     let show_meta = area.width >= 60;
     let max_subject = (area.width as usize).saturating_sub(if show_meta { 40 } else { 14 });
-    let head_oid = app.repo.as_ref().and_then(|r| r.head_oid());
+    let head_oid = app
+        .git_graph
+        .cache_key
+        .as_ref()
+        .map(|(head, _)| head.as_str());
 
     // Clamp scroll to a valid range. Auto-scroll into view only when the
     // selection actually moved since the last render — running this every
@@ -69,7 +68,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
             idx == app.git_graph.selected_idx,
             show_meta,
             max_subject,
-            head_oid.as_deref(),
+            head_oid,
             &app.git_graph.ref_map,
             hover,
             &theme,

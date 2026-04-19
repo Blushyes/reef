@@ -25,15 +25,6 @@ use unicode_width::UnicodeWidthStr;
 // ─── Public entry points ──────────────────────────────────────────────────────
 
 pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
-    // Pull fresh git state on every render so an external `git add`,
-    // `git commit`, `git reset`, etc. (which change `.git/index` or
-    // `.git/HEAD` — both filtered out by the fs-watcher) still reflect in
-    // the sidebar without the user having to press `r`. Matches the
-    // plugin-era behaviour where the plugin refreshed on every render
-    // request. `repo.statuses` is cheap enough on typical repos; we only
-    // do it while the Git tab is being drawn.
-    app.refresh_status();
-
     let theme = app.theme;
     let rows = build_rows(app, area.width, &theme);
     let total = rows.len();
@@ -493,12 +484,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     // Push / force-push confirmation banner
     if status.confirm_push || status.confirm_force_push {
         let force = status.confirm_force_push;
-        let ahead = app
-            .repo
-            .as_ref()
-            .and_then(|r| r.ahead_behind())
-            .map(|(a, _)| a)
-            .unwrap_or(0);
+        let ahead = app.git_status.ahead_behind.map(|(a, _)| a).unwrap_or(0);
 
         if force {
             rows.push(Row::new(vec![
@@ -566,7 +552,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
         && !status.confirm_force_push
         && !app.push_in_flight
     {
-        if let Some((ahead, behind)) = app.repo.as_ref().and_then(|r| r.ahead_behind()) {
+        if let Some((ahead, behind)) = app.git_status.ahead_behind {
             if let Some(row) = push_indicator_row(ahead, behind) {
                 rows.push(row);
                 rows.push(Row::blank());

@@ -1,14 +1,15 @@
-use crate::file_tree::{self, FileTree, PreviewContent};
+use crate::file_tree::{FileTree, PreviewContent};
 use crate::fs_watcher;
 use crate::git::graph::GraphRow;
 use crate::git::{CommitDetail, DiffContent, FileEntry, GitRepo, RefLabel};
+use crate::tasks::{AsyncState, TaskCoordinator, WorkerResult};
 use crate::ui::mouse::{ClickAction, HitTestRegistry};
 use crate::ui::theme::Theme;
 use crate::ui::toast::Toast;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -63,6 +64,7 @@ pub struct GitStatusState {
     /// ephemeral.
     pub push_error: Option<String>,
     pub scroll: usize,
+    pub ahead_behind: Option<(usize, usize)>,
 }
 
 /// State for the inline commit graph sidebar.
@@ -117,6 +119,8 @@ impl Default for CommitDetailState {
 
 pub struct App {
     pub repo: Option<GitRepo>,
+    pub workdir_name: String,
+    pub branch_name: String,
 
     // Tab
     pub active_tab: Tab,
@@ -211,6 +215,18 @@ pub struct App {
     pub last_preview_view_h: u16,
     pub last_diff_view_h: u16,
     pub last_commit_detail_view_h: u16,
+
+    // ── Background work state ──
+    pub tasks: TaskCoordinator,
+    pub file_tree_load: AsyncState,
+    pub preview_load: AsyncState,
+    pub git_status_load: AsyncState,
+    pub diff_load: AsyncState,
+    pub graph_load: AsyncState,
+    pub commit_detail_load: AsyncState,
+    pub commit_file_diff_load: AsyncState,
+    next_git_revalidate_at: Instant,
+    next_graph_revalidate_at: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,11 +251,26 @@ impl App {
             .as_ref()
             .and_then(|r| r.workdir_path())
             .unwrap_or_else(|| PathBuf::from("."));
+        let workdir_name = repo
+            .as_ref()
+            .map(|r| r.workdir_name())
+            .or_else(|| {
+                workdir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| "repo".to_string());
+        let branch_name = repo.as_ref().map(|r| r.branch_name()).unwrap_or_default();
         let file_tree = FileTree::new(&workdir);
         let fs_watcher_rx = Some(fs_watcher::spawn(workdir.clone()));
         let (saved_layout, saved_mode) = load_prefs();
+        let tasks = TaskCoordinator::new();
+        let now = Instant::now();
         let mut app = Self {
             repo,
+            workdir_name,
+            branch_name,
             active_tab: Tab::Files,
             active_panel: Panel::Files,
             staged_files: Vec::new(),
@@ -297,67 +328,64 @@ impl App {
             last_preview_view_h: 0,
             last_diff_view_h: 0,
             last_commit_detail_view_h: 0,
+            tasks,
+            file_tree_load: AsyncState::default(),
+            preview_load: AsyncState::default(),
+            git_status_load: AsyncState::default(),
+            diff_load: AsyncState::default(),
+            graph_load: AsyncState::default(),
+            commit_detail_load: AsyncState::default(),
+            commit_file_diff_load: AsyncState::default(),
+            next_git_revalidate_at: now + Duration::from_millis(800),
+            next_graph_revalidate_at: now + Duration::from_millis(1200),
         };
         app.refresh_status();
         app
     }
 
     pub fn refresh_status(&mut self) {
-        let Some(ref repo) = self.repo else {
+        if self.repo.is_none() {
             return;
         };
-        let (staged, unstaged) = repo.get_status();
-        self.staged_files = staged;
-        self.unstaged_files = unstaged;
-
-        self.file_tree
-            .refresh_git_statuses(&self.staged_files, &self.unstaged_files);
-
-        // Reconcile selection: check both lists so is_staged stays correct
-        // if the file has just moved between sections (e.g. an fs-watcher
-        // refresh after an external `git add`).
-        if let Some(ref mut sel) = self.selected_file {
-            let in_staged = self.staged_files.iter().any(|f| f.path == sel.path);
-            let in_unstaged = self.unstaged_files.iter().any(|f| f.path == sel.path);
-            if in_staged {
-                sel.is_staged = true;
-            } else if in_unstaged {
-                sel.is_staged = false;
-            } else {
-                self.selected_file = None;
-                self.diff_content = None;
-            }
-        }
+        let generation = self.git_status_load.begin();
+        self.tasks
+            .refresh_status(generation, self.file_tree.root.clone());
     }
 
     /// Rebuild the file tree from disk, applying git decorations when a repo is open.
     /// Safe to call on any workdir — `refresh_status` handles repo/no-repo internally.
     pub fn refresh_file_tree(&mut self) {
-        if self.repo.is_some() {
-            self.refresh_status();
-        } else {
-            self.file_tree.rebuild();
-        }
+        self.refresh_file_tree_with_target(self.file_tree.selected_path());
+    }
+
+    pub fn refresh_file_tree_with_target(&mut self, selected_path: Option<PathBuf>) {
+        let generation = self.file_tree_load.begin();
+        self.tasks.rebuild_tree(
+            generation,
+            self.file_tree.root.clone(),
+            self.file_tree.expanded_paths(),
+            self.file_tree.git_statuses(),
+            selected_path,
+            self.file_tree.selected,
+        );
     }
 
     pub fn load_preview(&mut self) {
         if let Some(entry) = self.file_tree.selected_entry() {
             if !entry.is_dir {
-                let new_content =
-                    file_tree::load_preview(&self.file_tree.root, &entry.path, self.theme.is_dark);
-                // Preserve scroll when reloading the same file (fs-watcher refresh);
-                // reset only when the selected path actually changed (navigation).
-                let same_file = matches!(
-                    (self.preview_content.as_ref(), new_content.as_ref()),
-                    (Some(old), Some(new)) if old.file_path == new.file_path
-                );
-                self.preview_content = new_content;
-                if !same_file {
-                    self.preview_scroll = 0;
-                    self.preview_h_scroll = 0;
-                }
+                self.load_preview_for_path(entry.path.clone());
             }
         }
+    }
+
+    pub fn load_preview_for_path(&mut self, rel_path: PathBuf) {
+        let generation = self.preview_load.begin();
+        self.tasks.load_preview(
+            generation,
+            self.file_tree.root.clone(),
+            rel_path,
+            self.theme.is_dark,
+        );
     }
 
     pub fn select_file(&mut self, path: &str, is_staged: bool) {
@@ -371,16 +399,26 @@ impl App {
     }
 
     pub fn load_diff(&mut self) {
-        let diff = if let (Some(repo), Some(sel)) = (&self.repo, &self.selected_file) {
-            let context = match self.diff_mode {
-                DiffMode::FullFile => 9999,
-                DiffMode::Compact => 3,
-            };
-            repo.get_diff(&sel.path, sel.is_staged, context)
-        } else {
-            None
+        let Some(sel) = self.selected_file.clone() else {
+            self.diff_content = None;
+            return;
         };
-        self.diff_content = diff;
+        if self.repo.is_none() {
+            self.diff_content = None;
+            return;
+        }
+        let context = match self.diff_mode {
+            DiffMode::FullFile => 9999,
+            DiffMode::Compact => 3,
+        };
+        let generation = self.diff_load.begin();
+        self.tasks.load_diff(
+            generation,
+            self.file_tree.root.clone(),
+            sel.path,
+            sel.is_staged,
+            context,
+        );
     }
 
     pub fn toggle_diff_layout(&mut self) {
@@ -498,48 +536,32 @@ impl App {
     /// Working-tree fs events do NOT invalidate the cache — see plan pitfall #2.
     pub fn refresh_graph(&mut self) {
         const GRAPH_COMMIT_LIMIT: usize = 500;
-        let Some(ref repo) = self.repo else {
+        if self.repo.is_none() {
             self.git_graph.rows.clear();
             self.git_graph.ref_map.clear();
             self.git_graph.cache_key = None;
             return;
         };
-
-        let head = repo.head_oid().unwrap_or_default();
-        let refs = repo.list_refs();
-        let refs_hash = hash_ref_map(&refs);
-        let key = (head, refs_hash);
-
-        if self.git_graph.cache_key.as_ref() == Some(&key) {
-            return;
-        }
-
-        let commits = repo.list_commits(GRAPH_COMMIT_LIMIT);
-        let rows = crate::git::graph::build_graph(&commits);
-
-        // Clamp selection if the graph got shorter (e.g. reset --hard).
-        if self.git_graph.selected_idx >= rows.len() {
-            self.git_graph.selected_idx = rows.len().saturating_sub(1);
-        }
-        self.git_graph.selected_commit = rows
-            .get(self.git_graph.selected_idx)
-            .map(|r| r.commit.oid.clone());
-
-        self.git_graph.rows = rows;
-        self.git_graph.ref_map = refs;
-        self.git_graph.cache_key = Some(key);
-
-        self.load_commit_detail();
+        let generation = self.graph_load.begin();
+        self.tasks
+            .refresh_graph(generation, self.file_tree.root.clone(), GRAPH_COMMIT_LIMIT);
     }
 
     /// (Re)load commit detail for the currently-selected commit. Clears detail
     /// and any previously-selected file diff whenever the target changes.
     pub fn load_commit_detail(&mut self) {
-        self.commit_detail.detail = match (&self.repo, &self.git_graph.selected_commit) {
-            (Some(repo), Some(oid)) => repo.get_commit(oid),
-            _ => None,
-        };
         self.commit_detail.file_diff = None;
+        let Some(oid) = self.git_graph.selected_commit.clone() else {
+            self.commit_detail.detail = None;
+            return;
+        };
+        if self.repo.is_none() {
+            self.commit_detail.detail = None;
+            return;
+        }
+        let generation = self.commit_detail_load.begin();
+        self.tasks
+            .load_commit_detail(generation, self.file_tree.root.clone(), oid);
     }
 
     /// Load the inline diff for a file inside the currently-selected commit.
@@ -548,12 +570,22 @@ impl App {
             DiffMode::Compact => 3,
             DiffMode::FullFile => 9999,
         };
-        self.commit_detail.file_diff = match (&self.repo, &self.git_graph.selected_commit) {
-            (Some(repo), Some(oid)) => repo
-                .get_commit_file_diff(oid, path, context)
-                .map(|d| (path.to_string(), d)),
-            _ => None,
+        let Some(oid) = self.git_graph.selected_commit.clone() else {
+            self.commit_detail.file_diff = None;
+            return;
         };
+        if self.repo.is_none() {
+            self.commit_detail.file_diff = None;
+            return;
+        }
+        let generation = self.commit_file_diff_load.begin();
+        self.tasks.load_commit_file_diff(
+            generation,
+            self.file_tree.root.clone(),
+            oid,
+            path.to_string(),
+            context,
+        );
     }
 
     /// Reload the currently-selected commit-file diff — used after toggling
@@ -642,10 +674,11 @@ impl App {
                             .push(Toast::error(crate::i18n::push_failed_toast(&e)));
                     }
                 }
-                // Push advances remote-tracking refs — invalidate the graph
-                // cache so Tab::Graph rebuilds on its next render.
+                // Push advances remote-tracking refs — mark git/graph data
+                // stale so the coordinator refreshes it off the render path.
                 self.git_graph.cache_key = None;
-                self.refresh_status();
+                self.git_status_load.mark_stale();
+                self.graph_load.mark_stale();
             }
             Err(TryRecvError::Empty) => {
                 // Worker still running. Check again next tick.
@@ -663,16 +696,212 @@ impl App {
         }
     }
 
+    fn drain_task_results(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        loop {
+            match self.tasks.try_recv() {
+                Ok(result) => self.apply_worker_result(result),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
+    fn apply_worker_result(&mut self, result: WorkerResult) {
+        match result {
+            WorkerResult::FileTree { generation, result } => match result {
+                Ok(payload) => {
+                    if self.file_tree_load.complete_ok(generation) {
+                        let before = self.file_tree.selected_path();
+                        self.file_tree
+                            .replace_entries(payload.entries, payload.selected_idx);
+                        self.file_tree
+                            .refresh_git_statuses(&self.staged_files, &self.unstaged_files);
+                        if before != self.file_tree.selected_path() {
+                            self.load_preview();
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.file_tree_load.complete_err(generation, error);
+                }
+            },
+            WorkerResult::Preview { generation, result } => match result {
+                Ok(content) => {
+                    if self.preview_load.complete_ok(generation) {
+                        let same_file = matches!(
+                            (self.preview_content.as_ref(), content.as_ref()),
+                            (Some(old), Some(new)) if old.file_path == new.file_path
+                        );
+                        self.preview_content = content;
+                        if !same_file {
+                            self.preview_scroll = 0;
+                            self.preview_h_scroll = 0;
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.preview_load.complete_err(generation, error);
+                }
+            },
+            WorkerResult::GitStatus { generation, result } => match result {
+                Ok(payload) => {
+                    if self.git_status_load.complete_ok(generation) {
+                        let before = self.selected_file.clone();
+                        self.staged_files = payload.staged;
+                        self.unstaged_files = payload.unstaged;
+                        self.git_status.ahead_behind = payload.ahead_behind;
+                        self.branch_name = payload.branch_name;
+
+                        self.file_tree
+                            .refresh_git_statuses(&self.staged_files, &self.unstaged_files);
+
+                        if let Some(ref mut sel) = self.selected_file {
+                            let in_staged = self.staged_files.iter().any(|f| f.path == sel.path);
+                            let in_unstaged =
+                                self.unstaged_files.iter().any(|f| f.path == sel.path);
+                            if in_staged {
+                                sel.is_staged = true;
+                            } else if in_unstaged {
+                                sel.is_staged = false;
+                            } else {
+                                self.selected_file = None;
+                                self.diff_content = None;
+                            }
+                        }
+                        if before != self.selected_file {
+                            self.load_diff();
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.git_status_load.complete_err(generation, error);
+                }
+            },
+            WorkerResult::Diff { generation, result } => match result {
+                Ok(diff) => {
+                    if self.diff_load.complete_ok(generation) {
+                        self.diff_content = diff;
+                    }
+                }
+                Err(error) => {
+                    self.diff_load.complete_err(generation, error);
+                }
+            },
+            WorkerResult::Graph { generation, result } => match result {
+                Ok(payload) => {
+                    if self.graph_load.complete_ok(generation) {
+                        let previous_commit = self.git_graph.selected_commit.clone();
+                        self.git_graph.rows = payload.rows;
+                        self.git_graph.ref_map = payload.ref_map;
+                        self.git_graph.cache_key = Some(payload.cache_key);
+
+                        if let Some(ref oid) = previous_commit {
+                            if let Some(idx) = self
+                                .git_graph
+                                .rows
+                                .iter()
+                                .position(|r| r.commit.oid == *oid)
+                            {
+                                self.git_graph.selected_idx = idx;
+                            }
+                        }
+                        if self.git_graph.selected_idx >= self.git_graph.rows.len() {
+                            self.git_graph.selected_idx =
+                                self.git_graph.rows.len().saturating_sub(1);
+                        }
+                        self.git_graph.selected_commit = self
+                            .git_graph
+                            .rows
+                            .get(self.git_graph.selected_idx)
+                            .map(|r| r.commit.oid.clone());
+
+                        if self.git_graph.selected_commit != previous_commit
+                            || self.commit_detail.detail.is_none()
+                        {
+                            self.load_commit_detail();
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.graph_load.complete_err(generation, error);
+                }
+            },
+            WorkerResult::CommitDetail { generation, result } => match result {
+                Ok(detail) => {
+                    if self.commit_detail_load.complete_ok(generation) {
+                        self.commit_detail.detail = detail;
+                    }
+                }
+                Err(error) => {
+                    self.commit_detail_load.complete_err(generation, error);
+                }
+            },
+            WorkerResult::CommitFileDiff { generation, result } => match result {
+                Ok(file_diff) => {
+                    if self.commit_file_diff_load.complete_ok(generation) {
+                        self.commit_detail.file_diff = file_diff;
+                    }
+                }
+                Err(error) => {
+                    self.commit_file_diff_load.complete_err(generation, error);
+                }
+            },
+        }
+    }
+
+    pub fn set_active_tab(&mut self, tab: Tab) {
+        if self.active_tab == tab {
+            return;
+        }
+        self.active_tab = tab;
+        match tab {
+            Tab::Git => self.git_status_load.mark_stale(),
+            Tab::Graph => self.graph_load.mark_stale(),
+            Tab::Files => {
+                if self.file_tree.entries.is_empty() {
+                    self.file_tree_load.mark_stale();
+                }
+            }
+        }
+    }
+
+    pub fn activity_message(&self) -> Option<String> {
+        fn from_state(label: &str, state: &AsyncState) -> Option<String> {
+            if state.loading {
+                Some(format!("{label} refreshing…"))
+            } else if let Some(error) = state.error.as_ref() {
+                Some(format!("{label} error: {error}"))
+            } else if state.stale {
+                Some(format!("{label} stale"))
+            } else {
+                None
+            }
+        }
+
+        match self.active_tab {
+            Tab::Files => from_state("files", &self.file_tree_load)
+                .or_else(|| from_state("preview", &self.preview_load)),
+            Tab::Git => from_state("git", &self.git_status_load)
+                .or_else(|| from_state("diff", &self.diff_load)),
+            Tab::Graph => from_state("graph", &self.graph_load)
+                .or_else(|| from_state("commit", &self.commit_detail_load))
+                .or_else(|| from_state("commit diff", &self.commit_file_diff_load)),
+        }
+    }
+
     pub fn handle_action(&mut self, action: ClickAction) {
         match action {
             ClickAction::SwitchTab(tab) => {
-                self.active_tab = tab;
+                self.set_active_tab(tab);
             }
             ClickAction::TreeClick(index) => {
                 self.file_tree.selected = index;
                 if let Some(entry) = self.file_tree.entries.get(index) {
                     if entry.is_dir {
                         self.file_tree.toggle_expand(index);
+                        let selected_path = self.file_tree.selected_path();
+                        self.refresh_file_tree_with_target(selected_path);
                     } else {
                         self.load_preview();
                     }
@@ -785,6 +1014,8 @@ impl App {
     /// HEAD or refs, so the commit graph stays valid (see plan pitfall #2).
     /// Push completion handles its own cache_key bust separately.
     pub fn tick(&mut self) {
+        self.drain_task_results();
+
         let mut fs_dirty = false;
         if let Some(rx) = self.fs_watcher_rx.as_ref() {
             while rx.try_recv().is_ok() {
@@ -792,9 +1023,10 @@ impl App {
             }
         }
         if fs_dirty {
-            self.refresh_file_tree();
-            self.load_preview();
-            self.load_diff();
+            self.file_tree_load.mark_stale();
+            self.preview_load.mark_stale();
+            self.diff_load.mark_stale();
+            self.git_status_load.mark_stale();
             // Mark the quick-open index stale so the next palette open picks up
             // the new/deleted files. Rebuilding immediately on every fs
             // event would be wasteful for a palette the user may not open.
@@ -802,6 +1034,54 @@ impl App {
         }
 
         self.drain_push_result();
+        self.kick_active_tab_work();
+        self.drain_task_results();
+    }
+
+    fn kick_active_tab_work(&mut self) {
+        let now = Instant::now();
+
+        if self.file_tree_load.should_request() {
+            self.refresh_file_tree();
+        }
+
+        match self.active_tab {
+            Tab::Files => {
+                if self.preview_load.should_request() {
+                    self.load_preview();
+                }
+            }
+            Tab::Git => {
+                let should_poll_git = self.repo.is_some() && now >= self.next_git_revalidate_at;
+                if self.git_status_load.should_request()
+                    || (should_poll_git && !self.git_status_load.loading)
+                {
+                    self.refresh_status();
+                    self.next_git_revalidate_at = now + Duration::from_secs(2);
+                }
+                if self.diff_load.should_request() {
+                    self.load_diff();
+                }
+            }
+            Tab::Graph => {
+                let should_poll_graph = self.repo.is_some() && now >= self.next_graph_revalidate_at;
+                if self.graph_load.should_request()
+                    || (self.repo.is_some()
+                        && self.git_graph.rows.is_empty()
+                        && !self.graph_load.loading)
+                    || (should_poll_graph && !self.graph_load.loading)
+                {
+                    self.refresh_graph();
+                    self.next_graph_revalidate_at = now + Duration::from_secs(5);
+                }
+                if self.commit_detail_load.should_request() {
+                    self.load_commit_detail();
+                }
+                if self.commit_file_diff_load.should_request() {
+                    self.reload_commit_file_diff();
+                }
+            }
+        }
     }
 }
 
@@ -822,35 +1102,6 @@ fn load_prefs() -> (DiffLayout, DiffMode) {
         _ => DiffMode::Compact,
     };
     (layout, mode)
-}
-
-/// Stable hash of the ref map — used as part of the graph cache key.
-fn hash_ref_map(map: &HashMap<String, Vec<RefLabel>>) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut entries: Vec<(&String, &Vec<RefLabel>)> = map.iter().collect();
-    entries.sort_by(|a, b| a.0.cmp(b.0));
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for (oid, labels) in entries {
-        oid.hash(&mut hasher);
-        for label in labels {
-            match label {
-                RefLabel::Head => 0u8.hash(&mut hasher),
-                RefLabel::Branch(s) => {
-                    1u8.hash(&mut hasher);
-                    s.hash(&mut hasher);
-                }
-                RefLabel::RemoteBranch(s) => {
-                    2u8.hash(&mut hasher);
-                    s.hash(&mut hasher);
-                }
-                RefLabel::Tag(s) => {
-                    3u8.hash(&mut hasher);
-                    s.hash(&mut hasher);
-                }
-            }
-        }
-    }
-    hasher.finish()
 }
 
 fn save_prefs(layout: DiffLayout, mode: DiffMode) {

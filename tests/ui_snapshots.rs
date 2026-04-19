@@ -13,6 +13,8 @@ use reef::app::App;
 use reef::ui;
 use reef::ui::theme::Theme;
 use std::sync::Mutex;
+use std::thread;
+use std::time::{Duration, Instant};
 use test_support::{HomeGuard, commit_file, tempdir_repo, write_file};
 
 static CWD_LOCK: Mutex<()> = Mutex::new(());
@@ -74,6 +76,18 @@ fn render_app(app: &mut App, width: u16, height: u16) -> String {
     buffer_to_text(terminal.backend().buffer())
 }
 
+fn wait_for_git_status(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        app.tick();
+        if !app.git_status_load.loading {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for background git status");
+}
+
 /// Apply filters to mask nondeterministic tokens (tempdir name, path segments).
 fn with_filters<F: FnOnce()>(body: F) {
     let mut settings = insta::Settings::clone_current();
@@ -113,8 +127,9 @@ fn snapshot_with_staged_and_unstaged() {
 
     let mut app = App::new(Theme::dark());
     // Switch to Git tab to show staged/unstaged sections
-    app.active_tab = reef::app::Tab::Git;
+    app.set_active_tab(reef::app::Tab::Git);
     app.refresh_status();
+    wait_for_git_status(&mut app);
     let output = render_app(&mut app, 80, 20);
     with_filters(|| insta::assert_snapshot!("with_staged_and_unstaged", output));
 }
@@ -137,8 +152,9 @@ fn snapshot_with_staged_and_unstaged_light_theme() {
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new(Theme::light());
-    app.active_tab = reef::app::Tab::Git;
+    app.set_active_tab(reef::app::Tab::Git);
     app.refresh_status();
+    wait_for_git_status(&mut app);
     let output = render_app(&mut app, 80, 20);
     with_filters(|| insta::assert_snapshot!("with_staged_and_unstaged_light", output));
 }

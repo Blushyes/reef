@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// A visible entry in the flattened file tree.
@@ -13,6 +13,7 @@ pub struct TreeEntry {
 }
 
 /// File preview content.
+#[derive(Debug)]
 pub struct PreviewContent {
     pub file_path: String,
     pub lines: Vec<String>,
@@ -26,7 +27,7 @@ pub struct FileTree {
     pub entries: Vec<TreeEntry>,
     pub selected: usize,
     expanded: HashSet<PathBuf>,
-    git_statuses: std::collections::HashMap<String, char>,
+    git_statuses: HashMap<String, char>,
 }
 
 impl FileTree {
@@ -36,7 +37,7 @@ impl FileTree {
             entries: Vec::new(),
             selected: 0,
             expanded: HashSet::new(),
-            git_statuses: std::collections::HashMap::new(),
+            git_statuses: HashMap::new(),
         };
         tree.rebuild();
         tree
@@ -44,62 +45,12 @@ impl FileTree {
 
     /// Regenerate the flat entries list from the filesystem.
     pub fn rebuild(&mut self) {
-        self.entries.clear();
-        self.walk_dir(&self.root.clone(), 0);
+        self.entries = build_entries(&self.root, &self.expanded, &self.git_statuses);
         // Clamp selection
         if !self.entries.is_empty() {
             self.selected = self.selected.min(self.entries.len() - 1);
         } else {
             self.selected = 0;
-        }
-    }
-
-    fn walk_dir(&mut self, dir: &Path, depth: usize) {
-        let mut children: Vec<(String, PathBuf, bool)> = Vec::new();
-
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name == ".git" {
-                continue;
-            }
-            let path = entry.path();
-            let is_dir = path.is_dir();
-            children.push((name, path, is_dir));
-        }
-
-        // Sort: directories first, then files, alphabetically
-        children.sort_by(|a, b| match (a.2, b.2) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
-        });
-
-        for (name, full_path, is_dir) in children {
-            let rel = full_path
-                .strip_prefix(&self.root)
-                .unwrap_or(&full_path)
-                .to_path_buf();
-            let rel_str = rel.to_string_lossy().to_string();
-            let is_expanded = is_dir && self.expanded.contains(&rel);
-            let git_status = self.git_statuses.get(&rel_str).copied();
-
-            self.entries.push(TreeEntry {
-                path: rel,
-                name,
-                depth,
-                is_dir,
-                is_expanded,
-                git_status,
-            });
-
-            if is_dir && is_expanded {
-                self.walk_dir(&full_path, depth + 1);
-            }
         }
     }
 
@@ -112,7 +63,6 @@ impl FileTree {
                 } else {
                     self.expanded.insert(path);
                 }
-                self.rebuild();
             }
         }
     }
@@ -132,6 +82,27 @@ impl FileTree {
         self.entries.get(self.selected)
     }
 
+    pub fn selected_path(&self) -> Option<PathBuf> {
+        self.selected_entry().map(|entry| entry.path.clone())
+    }
+
+    pub fn expanded_paths(&self) -> Vec<PathBuf> {
+        self.expanded.iter().cloned().collect()
+    }
+
+    pub fn git_statuses(&self) -> HashMap<String, char> {
+        self.git_statuses.clone()
+    }
+
+    pub fn replace_entries(&mut self, entries: Vec<TreeEntry>, selected_idx: usize) {
+        self.entries = entries;
+        if self.entries.is_empty() {
+            self.selected = 0;
+        } else {
+            self.selected = selected_idx.min(self.entries.len() - 1);
+        }
+    }
+
     /// Expand every ancestor directory of `rel` and move `selected` to the
     /// row that displays `rel` in the flattened tree. Used by the quick-open
     /// palette on accept, so the chosen file is visible and the preview
@@ -144,7 +115,6 @@ impl FileTree {
             }
             self.expanded.insert(ancestor.to_path_buf());
         }
-        self.rebuild();
         if let Some(idx) = self.entries.iter().position(|e| e.path == rel) {
             self.selected = idx;
         }
@@ -179,7 +149,79 @@ impl FileTree {
                 self.git_statuses.entry(a).or_insert('●');
             }
         }
-        self.rebuild();
+        self.apply_git_statuses_to_entries();
+    }
+
+    fn apply_git_statuses_to_entries(&mut self) {
+        for entry in &mut self.entries {
+            let rel = entry.path.to_string_lossy().to_string();
+            entry.git_status = self.git_statuses.get(&rel).copied();
+        }
+    }
+}
+
+pub fn build_entries(
+    root: &Path,
+    expanded: &HashSet<PathBuf>,
+    git_statuses: &HashMap<String, char>,
+) -> Vec<TreeEntry> {
+    let mut entries = Vec::new();
+    walk_dir(root, root, expanded, git_statuses, &mut entries, 0);
+    entries
+}
+
+fn walk_dir(
+    root: &Path,
+    dir: &Path,
+    expanded: &HashSet<PathBuf>,
+    git_statuses: &HashMap<String, char>,
+    out: &mut Vec<TreeEntry>,
+    depth: usize,
+) {
+    let mut children: Vec<(String, PathBuf, bool)> = Vec::new();
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == ".git" {
+            continue;
+        }
+        let path = entry.path();
+        let is_dir = path.is_dir();
+        children.push((name, path, is_dir));
+    }
+
+    children.sort_by(|a, b| match (a.2, b.2) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
+    });
+
+    for (name, full_path, is_dir) in children {
+        let rel = full_path
+            .strip_prefix(root)
+            .unwrap_or(&full_path)
+            .to_path_buf();
+        let rel_str = rel.to_string_lossy().to_string();
+        let is_expanded = is_dir && expanded.contains(&rel);
+        let git_status = git_statuses.get(&rel_str).copied();
+
+        out.push(TreeEntry {
+            path: rel.clone(),
+            name,
+            depth,
+            is_dir,
+            is_expanded,
+            git_status,
+        });
+
+        if is_dir && is_expanded {
+            walk_dir(root, &full_path, expanded, git_statuses, out, depth + 1);
+        }
     }
 }
 
@@ -357,5 +399,22 @@ mod tests {
         // staged sets 'A'; unstaged uses or_insert so 'A' stays
         tree.refresh_git_statuses(&staged, &unstaged);
         assert_eq!(tree.git_statuses.get("a.rs").copied(), Some('A'));
+    }
+
+    #[test]
+    fn refresh_git_statuses_updates_visible_entries_without_rebuild() {
+        let mut src = dummy_entry("src");
+        src.is_dir = true;
+        let mut file = dummy_entry("main.rs");
+        file.path = PathBuf::from("src/main.rs");
+        file.depth = 1;
+        let mut tree = make_tree_with_entries(vec![src, file]);
+
+        let staged = vec![make_entry("src/main.rs", FileStatus::Modified)];
+        tree.refresh_git_statuses(&staged, &[]);
+
+        assert_eq!(tree.entries.len(), 2);
+        assert_eq!(tree.entries[0].git_status, Some('●'));
+        assert_eq!(tree.entries[1].git_status, Some('M'));
     }
 }

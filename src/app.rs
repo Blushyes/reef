@@ -173,9 +173,19 @@ pub struct App {
     /// Active color theme. Chosen in `main.rs` before raw-mode entry (so the
     /// OSC 11 probe doesn't leak onto the TUI) and passed into `App::new`.
     pub theme: Theme,
+
+    /// In-panel vim-style search (`/`, `?`, `n`, `N`). See `crate::search`.
+    pub search: crate::search::SearchState,
+
+    /// Last-rendered content height (in rows) for each right-side panel.
+    /// Search jumps read these to center the match in view. Written by the
+    /// panel's render fn every frame; defaults to 0 until the first render.
+    pub last_preview_view_h: u16,
+    pub last_diff_view_h: u16,
+    pub last_commit_detail_view_h: u16,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedFile {
     pub path: String,
     pub is_staged: bool,
@@ -251,6 +261,10 @@ impl App {
             select_mode: false,
             show_help: false,
             theme,
+            search: crate::search::SearchState::default(),
+            last_preview_view_h: 0,
+            last_diff_view_h: 0,
+            last_commit_detail_view_h: 0,
         };
         app.refresh_status();
         app

@@ -4,8 +4,10 @@
 use crate::app::{App, DiffLayout, DiffMode};
 use crate::git::tree::{self as gtree, Node};
 use crate::git::{DiffContent, FileEntry, FileStatus, LineTag};
+use crate::search::SearchTarget;
 use crate::ui::git_graph_panel;
 use crate::ui::mouse::ClickAction;
+use crate::ui::text::overlay_match_highlight;
 use crate::ui::theme::Theme;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -21,6 +23,8 @@ const SBS_GUTTER_WIDTH: usize = 7;
 
 pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
     let theme = app.theme;
+    // Cache viewport so search-jump can center.
+    app.last_commit_detail_view_h = area.height;
     let rows = build_rows(app, area.width, &theme);
     let total = rows.len();
 
@@ -37,17 +41,45 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
         .enumerate()
     {
         let y = area.y + i as u16;
+        let row_idx = scroll + i;
         let hover = crate::ui::hover::is_hover(app, area, y);
-        let spans: Vec<Span<'static>> = row
-            .spans
-            .iter()
-            .map(|s| {
-                Span::styled(
-                    s.text.clone(),
-                    crate::ui::hover::apply(s.style, hover, app.theme.hover_bg),
-                )
-            })
-            .collect();
+        let (ranges, cur) = app
+            .search
+            .ranges_on_row(SearchTarget::CommitDetail, row_idx);
+
+        let spans: Vec<Span<'static>> = if ranges.is_empty() {
+            row.spans
+                .iter()
+                .map(|s| {
+                    Span::styled(
+                        s.text.clone(),
+                        crate::ui::hover::apply(s.style, hover, app.theme.hover_bg),
+                    )
+                })
+                .collect()
+        } else {
+            let segments: Vec<(Style, String)> = row
+                .spans
+                .iter()
+                .map(|s| (s.style, s.text.clone()))
+                .collect();
+            let overlaid = overlay_match_highlight(
+                segments,
+                &ranges,
+                cur,
+                theme.search_match,
+                theme.search_current,
+            );
+            overlaid
+                .into_iter()
+                .map(|(style, text)| {
+                    Span::styled(
+                        text,
+                        crate::ui::hover::apply(style, hover, app.theme.hover_bg),
+                    )
+                })
+                .collect()
+        };
         f.render_widget(Line::from(spans), Rect::new(area.x, y, area.width, 1));
 
         let mut x = area.x;
@@ -765,6 +797,26 @@ fn format_timestamp(secs: i64) -> String {
     let s = tod % 60;
     let (y, mo, d) = days_to_ymd(days);
     format!("{y}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02} UTC")
+}
+
+// ─── Search support ───────────────────────────────────────────────────────────
+
+/// Flattens the panel's row stream into plain text — one string per rendered
+/// row. Used by `crate::search` so match row indices line up 1:1 with
+/// `commit_detail.scroll` and with what the panel draws. Width is passed as
+/// `u16::MAX` so row construction skips display-width truncation and the
+/// searchable text mirrors the underlying data.
+pub fn searchable_rows(app: &App) -> Vec<String> {
+    let rows = build_rows(app, u16::MAX, &app.theme);
+    rows.into_iter()
+        .map(|r| {
+            r.spans
+                .into_iter()
+                .map(|s| s.text)
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .collect()
 }
 
 fn days_to_ymd(days: i64) -> (i64, u32, u32) {

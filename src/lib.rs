@@ -8,4 +8,5 @@ pub mod fs_watcher;
 pub mod git;
 pub mod input;
 pub mod prefs;
+pub mod search;
 pub mod ui;

@@ -1,5 +1,7 @@
 use crate::app::App;
+use crate::search::SearchTarget;
 use crate::ui::mouse::ClickAction;
+use crate::ui::text::overlay_match_highlight;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -83,10 +85,33 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         };
 
         let mut spans = vec![
-            Span::styled(&indent, Style::default().bg(bg)),
+            Span::styled(indent.clone(), Style::default().bg(bg)),
             Span::styled(icon, Style::default().fg(th.fg_secondary).bg(bg)),
-            Span::styled(&entry.name, name_style.bg(bg)),
         ];
+        // Overlay search highlights onto the filename span. Collect_rows for
+        // the FileTree target emits `entry.name` — byte ranges returned by
+        // `ranges_on_row` are directly applicable here.
+        let name_base_style = if is_selected || is_hovered {
+            name_style.bg(bg)
+        } else {
+            name_style
+        };
+        let (ranges, cur) = app.search.ranges_on_row(SearchTarget::FileTree, global_idx);
+        if ranges.is_empty() {
+            spans.push(Span::styled(entry.name.clone(), name_base_style));
+        } else {
+            let name_tokens = vec![(name_base_style, entry.name.clone())];
+            let overlaid = overlay_match_highlight(
+                name_tokens,
+                &ranges,
+                cur,
+                th.search_match,
+                th.search_current,
+            );
+            for (style, text) in overlaid {
+                spans.push(Span::styled(text, style));
+            }
+        }
 
         // Git status indicator
         if let Some(ch) = entry.git_status {

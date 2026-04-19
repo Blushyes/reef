@@ -36,6 +36,10 @@ pub struct Theme {
     pub selection_bg: Color,
     pub hover_bg: Color,
 
+    // Search match backgrounds (all matches vs the current one).
+    pub search_match: Color,
+    pub search_current: Color,
+
     // Diff line highlights.
     pub added_bg: Color,
     pub removed_bg: Color,
@@ -72,6 +76,8 @@ impl Theme {
             border: Color::DarkGray,
             selection_bg: Color::Rgb(40, 60, 100),
             hover_bg: Color::Rgb(40, 40, 50),
+            search_match: Color::Rgb(80, 70, 30),
+            search_current: Color::Rgb(180, 140, 40),
             added_bg: Color::Rgb(0, 40, 0),
             removed_bg: Color::Rgb(60, 0, 0),
             added_accent: Color::Green,
@@ -98,6 +104,8 @@ impl Theme {
             border: Color::Rgb(208, 215, 222),
             selection_bg: Color::Rgb(221, 244, 255),
             hover_bg: Color::Rgb(234, 238, 242),
+            search_match: Color::Rgb(255, 240, 170),
+            search_current: Color::Rgb(255, 210, 50),
             added_bg: Color::Rgb(230, 255, 237),
             removed_bg: Color::Rgb(255, 235, 233),
             added_accent: Color::Rgb(26, 127, 55),

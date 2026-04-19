@@ -9,7 +9,9 @@
 use crate::app::{App, Panel, SelectedFile};
 use crate::git::tree::{self as gtree, Node};
 use crate::git::{FileEntry, FileStatus};
+use crate::search::SearchTarget;
 use crate::ui::mouse::ClickAction;
+use crate::ui::text::overlay_match_highlight;
 use crate::ui::theme::Theme;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -46,16 +48,39 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
     for (i, row) in visible.enumerate() {
         let y = area.y + i as u16;
         let hover = crate::ui::hover::is_hover(app, area, y);
-        let spans: Vec<Span<'static>> = row
-            .spans
-            .iter()
-            .map(|s| {
-                Span::styled(
-                    s.text.clone(),
-                    crate::ui::hover::apply(s.style, hover, app.theme.hover_bg),
-                )
-            })
-            .collect();
+        let (ranges, cur) = match row.search_row_idx {
+            Some(idx) => app.search.ranges_on_row(SearchTarget::GitStatus, idx),
+            None => (Vec::new(), None),
+        };
+        let spans: Vec<Span<'static>> = if ranges.is_empty() {
+            row.spans
+                .iter()
+                .map(|s| {
+                    Span::styled(
+                        s.text.clone(),
+                        crate::ui::hover::apply(s.style, hover, app.theme.hover_bg),
+                    )
+                })
+                .collect()
+        } else {
+            // Search rows in `collect_rows(GitStatus)` are raw `file.path`
+            // strings. The rendered row has a leading indent span before the
+            // filename span, so we overlay just the filename portion with
+            // ranges in path-local coords. For tree-mode rows the filename
+            // span actually holds `basename` or a "..."-truncated string;
+            // those cases fall through to the raw-string path below and any
+            // ranges pointing past the truncation boundary are simply
+            // ignored by the overlay walker.
+            build_spans_with_path_overlay(
+                row,
+                &ranges,
+                cur,
+                hover,
+                theme.search_match,
+                theme.search_current,
+                app.theme.hover_bg,
+            )
+        };
         f.render_widget(Line::from(spans), Rect::new(area.x, y, area.width, 1));
 
         // Register click zones. Span-level clicks win over the row-level click
@@ -361,6 +386,11 @@ struct Row {
     spans: Vec<RowSpan>,
     row_click: Option<(String, Value)>,
     row_dbl: Option<(String, Value)>,
+    /// When this row is a file row, its index into the unified
+    /// staged-then-unstaged file list — lines up with `collect_rows` in
+    /// `crate::search` for `SearchTarget::GitStatus`. Lets the render loop
+    /// overlay match highlights on the filename span.
+    search_row_idx: Option<usize>,
 }
 
 impl RowSpan {
@@ -394,6 +424,7 @@ impl Row {
             spans,
             row_click: None,
             row_dbl: None,
+            search_row_idx: None,
         }
     }
 
@@ -408,6 +439,11 @@ impl Row {
 
     fn on_dbl_click(mut self, cmd: &str, args: Value) -> Self {
         self.row_dbl = Some((cmd.to_string(), args));
+        self
+    }
+
+    fn with_search_row(mut self, idx: usize) -> Self {
+        self.search_row_idx = Some(idx);
         self
     }
 }
@@ -606,7 +642,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
             theme,
         ));
         if !app.staged_collapsed {
-            render_files(&mut rows, app, &app.staged_files, true, max_path, theme);
+            render_files(&mut rows, app, &app.staged_files, true, max_path, theme, 0);
         }
         rows.push(Row::blank());
     }
@@ -628,7 +664,15 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
         theme,
     ));
     if !app.unstaged_collapsed {
-        render_files(&mut rows, app, &app.unstaged_files, false, max_path, theme);
+        render_files(
+            &mut rows,
+            app,
+            &app.unstaged_files,
+            false,
+            max_path,
+            theme,
+            app.staged_files.len(),
+        );
         if app.unstaged_files.is_empty() {
             rows.push(Row::new(vec![RowSpan::styled(
                 "  无文件",
@@ -651,6 +695,9 @@ fn selected_path_for(app: &App, is_staged: bool) -> Option<String> {
         .map(|s| s.path.clone())
 }
 
+/// `search_base` is the offset applied to each file's `search_row_idx` —
+/// staged files start at 0 and unstaged files start at `staged_files.len()`,
+/// mirroring the ordering in `crate::search::collect_rows(GitStatus)`.
 fn render_files(
     rows: &mut Vec<Row>,
     app: &App,
@@ -658,6 +705,7 @@ fn render_files(
     is_staged: bool,
     max_path: usize,
     theme: &Theme,
+    search_base: usize,
 ) {
     let status = &app.git_status;
     let sel_path = selected_path_for(app, is_staged);
@@ -672,24 +720,32 @@ fn render_files(
             &status.collapsed_dirs,
             &sel_path,
             theme,
+            files,
+            search_base,
         );
     } else {
-        for file in files {
+        for (i, file) in files.iter().enumerate() {
             let is_sel = sel_path.as_deref() == Some(file.path.as_str());
-            rows.push(file_row(
-                &file.path,
-                &file.path,
-                file.status,
-                is_staged,
-                max_path,
-                is_sel,
-                "  ",
-                theme,
-            ));
+            rows.push(
+                file_row(
+                    &file.path,
+                    &file.path,
+                    file.status,
+                    is_staged,
+                    max_path,
+                    is_sel,
+                    "  ",
+                    theme,
+                )
+                .with_search_row(search_base + i),
+            );
         }
     }
 }
 
+/// `flat_files` is the linear ordering used by `collect_rows(GitStatus)` —
+/// we look each file up here to compute its `search_row_idx` regardless of
+/// tree nesting.
 #[allow(clippy::too_many_arguments)]
 fn walk_tree(
     rows: &mut Vec<Row>,
@@ -700,6 +756,8 @@ fn walk_tree(
     collapsed: &std::collections::HashSet<String>,
     selected_path: &Option<String>,
     theme: &Theme,
+    flat_files: &[FileEntry],
+    search_base: usize,
 ) {
     let mut entries: Vec<(&String, &Node)> = tree.iter().collect();
     entries.sort_by(|a, b| {
@@ -728,6 +786,8 @@ fn walk_tree(
                         collapsed,
                         selected_path,
                         theme,
+                        flat_files,
+                        search_base,
                     );
                 }
             }
@@ -735,7 +795,7 @@ fn walk_tree(
                 let is_sel = selected_path.as_deref() == Some(entry.path.as_str());
                 let basename = entry.path.rsplit('/').next().unwrap_or(&entry.path);
                 let indent = "  ".repeat(depth);
-                rows.push(file_row(
+                let mut row = file_row(
                     &entry.path,
                     basename,
                     entry.status,
@@ -744,7 +804,11 @@ fn walk_tree(
                     is_sel,
                     &indent,
                     theme,
-                ));
+                );
+                if let Some(pos) = flat_files.iter().position(|f| f.path == entry.path) {
+                    row = row.with_search_row(search_base + pos);
+                }
+                rows.push(row);
             }
         }
     }
@@ -953,6 +1017,44 @@ fn push_indicator_row(ahead: usize, behind: usize) -> Option<Row> {
             },
         ])),
     }
+}
+
+/// Apply the search overlay to just the filename span (index 1) of a file row.
+/// Leaves indent/status/button spans untouched so their colored chrome stays
+/// intact. Ranges are in the raw `file.path` byte-offset space; when the row
+/// is showing a truncated basename (tree view or "..."-prefixed path) the
+/// overlay call still runs with those ranges — mismatched ranges produce no
+/// visible highlight rather than a miscolored span.
+fn build_spans_with_path_overlay(
+    row: &Row,
+    ranges: &[std::ops::Range<usize>],
+    current: Option<std::ops::Range<usize>>,
+    hover: bool,
+    match_bg: Color,
+    current_bg: Color,
+    hover_bg: Color,
+) -> Vec<Span<'static>> {
+    let mut out: Vec<Span<'static>> = Vec::with_capacity(row.spans.len() + 2);
+    for (i, s) in row.spans.iter().enumerate() {
+        if i == 1 {
+            // Filename span — overlay here.
+            let tokens = vec![(s.style, s.text.clone())];
+            let overlaid =
+                overlay_match_highlight(tokens, ranges, current.clone(), match_bg, current_bg);
+            for (style, text) in overlaid {
+                out.push(Span::styled(
+                    text,
+                    crate::ui::hover::apply(style, hover, hover_bg),
+                ));
+            }
+        } else {
+            out.push(Span::styled(
+                s.text.clone(),
+                crate::ui::hover::apply(s.style, hover, hover_bg),
+            ));
+        }
+    }
+    out
 }
 
 fn truncate_in_place(s: &mut String, max: usize) {

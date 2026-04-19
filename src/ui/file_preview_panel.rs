@@ -1,6 +1,7 @@
 use crate::app::App;
 use crate::file_tree::PreviewContent;
-use crate::ui::text::{clip_spans, skip_n_columns, truncate_to_width};
+use crate::search::SearchTarget;
+use crate::ui::text::{clip_spans, overlay_match_highlight};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -93,6 +94,8 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewCon
     }
 
     let content_height = (max_y - y) as usize;
+    // Cache the content viewport height so search-jump can center matches.
+    app.last_preview_view_h = content_height as u16;
     let max_scroll = preview.lines.len().saturating_sub(content_height);
     app.preview_scroll = app.preview_scroll.min(max_scroll);
 
@@ -125,15 +128,32 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewCon
             Style::default().fg(th.fg_secondary),
         );
 
+        // Unified path for both the syntect-tokenized case and the plain-text
+        // fallback: build a token vec, overlay any search matches for this row,
+        // then clip horizontally. Keeps horizontal-scroll and search highlight
+        // independent of whether syntax tokens were produced.
+        let base_tokens: Vec<(Style, String)> =
+            match preview.highlighted.as_ref().and_then(|hh| hh.get(real_idx)) {
+                Some(tokens) => tokens.clone(),
+                None => vec![(Style::default().fg(th.fg_primary), line.clone())],
+            };
+        let (ranges, cur) = app
+            .search
+            .ranges_on_row(SearchTarget::FilePreview, real_idx);
+        let tokens = if ranges.is_empty() {
+            base_tokens
+        } else {
+            overlay_match_highlight(
+                base_tokens,
+                &ranges,
+                cur,
+                th.search_match,
+                th.search_current,
+            )
+        };
+
         let mut spans = vec![gutter];
-        match preview.highlighted.as_ref().and_then(|h| h.get(real_idx)) {
-            Some(tokens) => spans.extend(clip_spans(tokens, h, content_w)),
-            None => {
-                let shifted = skip_n_columns(line, h);
-                let display = truncate_to_width(shifted, content_w);
-                spans.push(Span::styled(display, Style::default().fg(th.fg_primary)));
-            }
-        }
+        spans.extend(clip_spans(&tokens, h, content_w));
 
         let rendered = Line::from(spans);
         f.render_widget(rendered, Rect::new(area.x, cy, area.width, 1));

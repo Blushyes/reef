@@ -265,6 +265,22 @@ fn render_title_bar(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let th = app.theme;
+
+    // Search prompt has the highest priority — while active it fully owns the
+    // status row so the user can see what they're typing.
+    if app.search.active {
+        render_search_prompt(f, app, area);
+        return;
+    }
+
+    // Post-search "n/N hint" indicator: when a search session is dormant but
+    // still has matches, show a compact counter so the user remembers they
+    // can keep stepping.
+    if !app.search.active && !app.search.matches.is_empty() {
+        render_search_dormant(f, app, area);
+        return;
+    }
+
     if app.select_mode {
         let hint = Line::from(vec![
             Span::styled(
@@ -308,6 +324,90 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         ),
     ]);
     f.render_widget(status, area);
+}
+
+fn render_search_prompt(f: &mut Frame, app: &App, area: Rect) {
+    use crate::search::WrapMsg;
+    let th = app.theme;
+    let prefix = if app.search.backwards { '?' } else { '/' };
+    let query = app.search.query.as_str();
+
+    // Build the right-side counter / status text.
+    let right = match (
+        app.search.matches.len(),
+        app.search.current,
+        app.search.wrap_msg,
+        query.is_empty(),
+    ) {
+        (0, _, _, true) => String::new(),
+        (0, _, _, false) => "no match ".to_string(),
+        (n, Some(i), Some(WrapMsg::Bottom), _) => format!("{}/{}  ↻ top ", i + 1, n),
+        (n, Some(i), Some(WrapMsg::Top), _) => format!("{}/{}  ↻ bottom ", i + 1, n),
+        (n, Some(i), _, _) => format!("{}/{} ", i + 1, n),
+        _ => String::new(),
+    };
+
+    let prompt_text = format!("{}{}", prefix, query);
+    let prompt_width = UnicodeWidthStr::width(prompt_text.as_str()) as u16;
+    let right_width = UnicodeWidthStr::width(right.as_str()) as u16;
+
+    // Draw background fill for the whole row first.
+    let fill = Line::from(Span::styled(
+        " ".repeat(area.width as usize),
+        Style::default().bg(th.chrome_bg),
+    ));
+    f.render_widget(fill, area);
+
+    // Prompt on the left.
+    let prompt_style = Style::default()
+        .fg(th.fg_primary)
+        .bg(th.chrome_bg)
+        .add_modifier(Modifier::BOLD);
+    f.render_widget(
+        Line::from(Span::styled(prompt_text.clone(), prompt_style)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+
+    // Counter on the right.
+    if right_width > 0 && right_width < area.width {
+        let rx = area.x + area.width.saturating_sub(right_width);
+        let right_style = Style::default().fg(th.fg_secondary).bg(th.chrome_bg);
+        f.render_widget(
+            Line::from(Span::styled(right, right_style)),
+            Rect::new(rx, area.y, right_width, 1),
+        );
+    }
+
+    // Blinking terminal cursor at the tail of the query — lets the user see
+    // their insertion point without a static `█` glyph.
+    let cursor_x = area.x + prompt_width.min(area.width.saturating_sub(1));
+    f.set_cursor_position((cursor_x, area.y));
+}
+
+fn render_search_dormant(f: &mut Frame, app: &App, area: Rect) {
+    let th = app.theme;
+    let prefix = if app.search.backwards { '?' } else { '/' };
+    let counter = match app.search.current {
+        Some(i) => format!(
+            " {}{}  {}/{}  n/N 切换 ",
+            prefix,
+            app.search.query,
+            i + 1,
+            app.search.matches.len()
+        ),
+        None => format!(" {}{} ", prefix, app.search.query),
+    };
+    let counter_w = UnicodeWidthStr::width(counter.as_str()) as u16;
+    let fill = Line::from(Span::styled(
+        " ".repeat(area.width as usize),
+        Style::default().bg(th.chrome_bg),
+    ));
+    f.render_widget(fill, area);
+    let style = Style::default().fg(th.fg_secondary).bg(th.chrome_bg);
+    f.render_widget(
+        Line::from(Span::styled(counter, style)),
+        Rect::new(area.x, area.y, counter_w.min(area.width), 1),
+    );
 }
 
 fn render_help(f: &mut Frame, app: &App, screen: Rect) {

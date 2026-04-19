@@ -1,5 +1,6 @@
-use ratatui::style::Style;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
+use std::ops::Range;
 use unicode_width::UnicodeWidthChar;
 
 /// 从字符串头部按显示列截取，直到累计宽度超过 `max_width` 为止。返回
@@ -96,6 +97,116 @@ pub fn clip_spans<'a>(
         }
     }
     out
+}
+
+/// Overlay search-match backgrounds onto already-styled tokens. Byte ranges
+/// are absolute offsets into the concatenated text of `tokens` (that is, the
+/// plain text of the row). Follows the `hover::apply` composability pattern:
+/// when a token already carries a background (e.g. diff added/removed rows),
+/// the match is surfaced via `Modifier::REVERSED` instead of clobbering the
+/// color — keeps the diff context visible under the highlight.
+///
+/// Returns a new token vec with (potentially) more tokens because each match
+/// range that straddles a token boundary forces a split. Rows with no matches
+/// round-trip unchanged.
+pub fn overlay_match_highlight(
+    tokens: Vec<(Style, String)>,
+    ranges: &[Range<usize>],
+    current_range: Option<Range<usize>>,
+    match_bg: Color,
+    current_bg: Color,
+) -> Vec<(Style, String)> {
+    if ranges.is_empty() {
+        return tokens;
+    }
+    let mut out: Vec<(Style, String)> = Vec::with_capacity(tokens.len());
+    let mut abs = 0usize;
+    for (style, text) in tokens {
+        if text.is_empty() {
+            out.push((style, text));
+            continue;
+        }
+        let base_abs = abs;
+        let len = text.len();
+        abs += len;
+
+        // Walk char starts, flush a styled segment whenever the match-kind
+        // changes. Runs of the same kind stay as a single token.
+        let mut seg_start = 0usize;
+        let mut run_kind = kind_at(base_abs, ranges, current_range.as_ref());
+        for (i, _) in text.char_indices() {
+            if i == 0 {
+                continue;
+            }
+            let next_kind = kind_at(base_abs + i, ranges, current_range.as_ref());
+            if next_kind != run_kind {
+                out.push(styled_segment(
+                    style,
+                    &text[seg_start..i],
+                    run_kind,
+                    match_bg,
+                    current_bg,
+                ));
+                seg_start = i;
+                run_kind = next_kind;
+            }
+        }
+        if seg_start < len {
+            out.push(styled_segment(
+                style,
+                &text[seg_start..len],
+                run_kind,
+                match_bg,
+                current_bg,
+            ));
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchKind {
+    None,
+    Match,
+    Current,
+}
+
+fn kind_at(abs: usize, ranges: &[Range<usize>], current: Option<&Range<usize>>) -> MatchKind {
+    if let Some(c) = current {
+        if c.start <= abs && abs < c.end {
+            return MatchKind::Current;
+        }
+    }
+    for r in ranges {
+        if r.start <= abs && abs < r.end {
+            return MatchKind::Match;
+        }
+    }
+    MatchKind::None
+}
+
+fn styled_segment(
+    base: Style,
+    text: &str,
+    kind: MatchKind,
+    match_bg: Color,
+    current_bg: Color,
+) -> (Style, String) {
+    let style = match kind {
+        MatchKind::None => base,
+        MatchKind::Match => apply_search_bg(base, match_bg),
+        MatchKind::Current => apply_search_bg(base, current_bg),
+    };
+    (style, text.to_string())
+}
+
+fn apply_search_bg(base: Style, bg: Color) -> Style {
+    if base.bg.is_none() {
+        base.bg(bg)
+    } else {
+        // Diff rows already carry a bg — flip fg/bg so the match stays visible.
+        base.add_modifier(Modifier::REVERSED)
+    }
 }
 
 #[cfg(test)]
@@ -259,5 +370,119 @@ mod tests {
         let out = clip_spans(&tokens, 1, 10);
         let joined: String = out.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(joined, "bc");
+    }
+
+    // ── overlay_match_highlight ──────────────────────────────────────────────
+
+    fn collect_text(v: &[(Style, String)]) -> String {
+        v.iter().map(|(_, s)| s.as_str()).collect()
+    }
+
+    #[test]
+    fn overlay_no_ranges_is_identity() {
+        let tokens = vec![(Style::default(), "hello".to_string())];
+        let out = overlay_match_highlight(
+            tokens.clone(),
+            &[],
+            None,
+            ratatui::style::Color::Yellow,
+            ratatui::style::Color::Red,
+        );
+        assert_eq!(out, tokens);
+    }
+
+    #[test]
+    fn overlay_single_match_splits_and_colors() {
+        let tokens = vec![(Style::default(), "abcdef".to_string())];
+        let r = 2..4;
+        let out = overlay_match_highlight(
+            tokens,
+            std::slice::from_ref(&r),
+            None,
+            ratatui::style::Color::Yellow,
+            ratatui::style::Color::Red,
+        );
+        assert_eq!(collect_text(&out), "abcdef");
+        // 3 segments: before, match, after.
+        assert_eq!(out.len(), 3);
+        assert!(out[0].0.bg.is_none());
+        assert_eq!(out[1].0.bg, Some(ratatui::style::Color::Yellow));
+        assert!(out[2].0.bg.is_none());
+        assert_eq!(out[1].1, "cd");
+    }
+
+    #[test]
+    fn overlay_match_spans_token_boundary() {
+        let tokens = vec![
+            (Style::default(), "abc".to_string()),
+            (
+                Style::default().fg(ratatui::style::Color::Red),
+                "def".to_string(),
+            ),
+        ];
+        // Range "bcde" — crosses boundary.
+        let r = 1..5;
+        let out = overlay_match_highlight(
+            tokens,
+            std::slice::from_ref(&r),
+            None,
+            ratatui::style::Color::Yellow,
+            ratatui::style::Color::Red,
+        );
+        assert_eq!(collect_text(&out), "abcdef");
+        // Boundaries: a | bc | de | f  (4 segments, preserving fg styling)
+        assert_eq!(out.len(), 4);
+        assert!(out[0].0.bg.is_none());
+        assert_eq!(out[0].1, "a");
+        assert_eq!(out[1].0.bg, Some(ratatui::style::Color::Yellow));
+        assert_eq!(out[1].1, "bc");
+        assert_eq!(out[2].0.bg, Some(ratatui::style::Color::Yellow));
+        assert_eq!(out[2].1, "de");
+        assert_eq!(out[2].0.fg, Some(ratatui::style::Color::Red));
+        assert!(out[3].0.bg.is_none());
+    }
+
+    #[test]
+    fn overlay_current_overrides_match() {
+        let tokens = vec![(Style::default(), "foofoo".to_string())];
+        let out = overlay_match_highlight(
+            tokens,
+            &[0..3, 3..6],
+            Some(3..6),
+            ratatui::style::Color::Yellow,
+            ratatui::style::Color::Red,
+        );
+        assert_eq!(collect_text(&out), "foofoo");
+        assert_eq!(out[0].0.bg, Some(ratatui::style::Color::Yellow));
+        assert_eq!(out[1].0.bg, Some(ratatui::style::Color::Red));
+    }
+
+    #[test]
+    fn overlay_reverses_when_bg_already_set() {
+        let base = Style::default().bg(ratatui::style::Color::Green);
+        let tokens = vec![(base, "abcdef".to_string())];
+        let r = 2..4;
+        let out = overlay_match_highlight(
+            tokens,
+            std::slice::from_ref(&r),
+            None,
+            ratatui::style::Color::Yellow,
+            ratatui::style::Color::Red,
+        );
+        assert_eq!(out[1].0.bg, Some(ratatui::style::Color::Green));
+        assert!(out[1].0.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn overlay_preserves_text_across_segments() {
+        let tokens = vec![(Style::default(), "hello world".to_string())];
+        let out = overlay_match_highlight(
+            tokens,
+            &[0..5, 6..11],
+            None,
+            ratatui::style::Color::Yellow,
+            ratatui::style::Color::Red,
+        );
+        assert_eq!(collect_text(&out), "hello world");
     }
 }

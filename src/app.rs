@@ -22,10 +22,11 @@ impl Tab {
     pub const ALL: &'static [Tab] = &[Tab::Files, Tab::Git, Tab::Graph];
 
     pub fn label(self) -> &'static str {
+        use crate::i18n::{Msg, t};
         match self {
-            Tab::Files => " 📁 Files ",
-            Tab::Git => " ⎇ Git ",
-            Tab::Graph => " ⑂ Graph ",
+            Tab::Files => t(Msg::TabFiles),
+            Tab::Git => t(Msg::TabGit),
+            Tab::Graph => t(Msg::TabGraph),
         }
     }
 }
@@ -614,16 +615,18 @@ impl App {
                 self.push_rx = None;
                 match result {
                     Ok(()) => {
+                        use crate::i18n::{Msg, t};
                         self.git_status.push_error = None;
                         self.toasts.push(Toast::info(if force {
-                            "强制推送成功"
+                            t(Msg::ForcePushSuccess)
                         } else {
-                            "推送成功"
+                            t(Msg::PushSuccess)
                         }));
                     }
                     Err(e) => {
                         self.git_status.push_error = Some(e.clone());
-                        self.toasts.push(Toast::error(format!("推送失败: {e}")));
+                        self.toasts
+                            .push(Toast::error(crate::i18n::push_failed_toast(&e)));
                     }
                 }
                 // Push advances remote-tracking refs — invalidate the graph
@@ -640,7 +643,8 @@ impl App {
                 // itself always sends). Recover so the user can retry.
                 self.push_in_flight = false;
                 self.push_rx = None;
-                self.toasts.push(Toast::error("推送线程异常退出，请重试"));
+                self.toasts
+                    .push(Toast::error(crate::i18n::t(crate::i18n::Msg::PushThreadCrashed)));
             }
         }
     }

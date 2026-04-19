@@ -12,6 +12,7 @@ pub mod theme;
 pub mod toast;
 
 use crate::app::{App, Tab};
+use crate::i18n::{Msg, t};
 use crate::ui::mouse::ClickAction;
 use crate::ui::toast::ToastLevel;
 use ratatui::Frame;
@@ -92,14 +93,14 @@ fn render_no_repo(f: &mut Frame, app: &App, area: Rect) {
     let msg = Paragraph::new(Text::from(vec![
         Line::from(""),
         Line::from(Span::styled(
-            "Not a git repository",
+            t(Msg::NoRepoTitle),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "Run `git init` to initialise one, or open reef inside a git repo.",
+            t(Msg::NoRepoHint),
             Style::default().fg(th.fg_secondary),
         )),
     ]))
@@ -203,7 +204,7 @@ fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Fill rest of row
     let remaining = (area.width as usize).saturating_sub(x.saturating_sub(area.x) as usize);
-    let keys_hint = " 1:Files 2:Git 3:Graph";
+    let keys_hint = t(Msg::TabBarHint);
     let pad = remaining.saturating_sub(UnicodeWidthStr::width(keys_hint));
     spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bg)));
     spans.push(Span::styled(
@@ -291,7 +292,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "  拖拽鼠标选择文字，按 v 退出选择模式",
+                t(Msg::SelectModeHint),
                 Style::default().fg(Color::Yellow).bg(th.chrome_bg),
             ),
         ]);
@@ -319,7 +320,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
             Style::default().bg(th.chrome_bg),
         ),
         Span::styled(
-            " q:退出 Tab:切换 s:暂存 u:取消 r:刷新 h:帮助 ",
+            t(Msg::StatusBarHint),
             Style::default().fg(th.chrome_muted_fg).bg(th.chrome_bg),
         ),
     ]);
@@ -327,7 +328,6 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_search_prompt(f: &mut Frame, app: &App, area: Rect) {
-    use crate::search::WrapMsg;
     let th = app.theme;
     let prefix = if app.search.backwards { '?' } else { '/' };
     let query = app.search.query.as_str();
@@ -340,10 +340,8 @@ fn render_search_prompt(f: &mut Frame, app: &App, area: Rect) {
         query.is_empty(),
     ) {
         (0, _, _, true) => String::new(),
-        (0, _, _, false) => "no match ".to_string(),
-        (n, Some(i), Some(WrapMsg::Bottom), _) => format!("{}/{}  ↻ top ", i + 1, n),
-        (n, Some(i), Some(WrapMsg::Top), _) => format!("{}/{}  ↻ bottom ", i + 1, n),
-        (n, Some(i), _, _) => format!("{}/{} ", i + 1, n),
+        (0, _, _, false) => t(Msg::SearchNoMatch).to_string(),
+        (n, Some(i), wrap, _) => crate::i18n::search_counter(i, n, wrap),
         _ => String::new(),
     };
 
@@ -388,12 +386,11 @@ fn render_search_dormant(f: &mut Frame, app: &App, area: Rect) {
     let th = app.theme;
     let prefix = if app.search.backwards { '?' } else { '/' };
     let counter = match app.search.current {
-        Some(i) => format!(
-            " {}{}  {}/{}  n/N 切换 ",
+        Some(i) => crate::i18n::search_dormant_with_counter(
             prefix,
-            app.search.query,
-            i + 1,
-            app.search.matches.len()
+            &app.search.query,
+            i,
+            app.search.matches.len(),
         ),
         None => format!(" {}{} ", prefix, app.search.query),
     };
@@ -413,27 +410,27 @@ fn render_search_dormant(f: &mut Frame, app: &App, area: Rect) {
 fn render_help(f: &mut Frame, app: &App, screen: Rect) {
     let th = app.theme;
     let core_entries: &[(&str, &str)] = &[
-        ("q / Ctrl+C", "退出"),
-        ("Tab", "切换顶部标签页（Files ↔ Git ↔ Graph）"),
-        ("Shift+Tab", "切换焦点面板（侧边栏 ↔ 编辑区）"),
-        ("1 … 9", "跳转到第 N 个标签页"),
-        ("↑ / k", "向上导航 / 向上滚动"),
-        ("↓ / j", "向下导航 / 向下滚动"),
-        ("PageUp", "快速向上翻页"),
-        ("PageDown", "快速向下翻页"),
-        ("← / →", "横向滚动（Diff/预览 面板聚焦时）"),
-        ("Shift+← / Shift+→", "横向快速滚动（10 列）"),
-        ("Home / End", "回到行首 / 跳到行尾"),
-        ("Shift+滚轮 / 触控板横划", "鼠标横向滚动"),
-        ("s / u", "暂存 / 取消暂存（Git tab）"),
-        ("d → y", "还原工作树文件（Git tab）"),
-        ("m", "切换 Diff 布局（上下 ↔ 左右）"),
-        ("f", "切换 Diff 模式（局部 ↔ 全量）"),
-        ("t", "切换列表 / 树形视图"),
-        ("r", "刷新"),
-        ("v", "文字选择模式"),
-        ("h", "显示 / 关闭此帮助"),
-        ("任意键", "关闭帮助"),
+        ("q / Ctrl+C", t(Msg::HelpQuit)),
+        ("Tab", t(Msg::HelpSwitchTab)),
+        ("Shift+Tab", t(Msg::HelpSwitchPanel)),
+        ("1 … 9", t(Msg::HelpJumpTab)),
+        ("↑ / k", t(Msg::HelpNavUp)),
+        ("↓ / j", t(Msg::HelpNavDown)),
+        ("PageUp", t(Msg::HelpPageUp)),
+        ("PageDown", t(Msg::HelpPageDown)),
+        ("← / →", t(Msg::HelpHScroll)),
+        ("Shift+← / Shift+→", t(Msg::HelpHScrollFast)),
+        ("Home / End", t(Msg::HelpHomeEnd)),
+        (t(Msg::HelpKeyMouseHScroll), t(Msg::HelpMouseHScroll)),
+        ("s / u", t(Msg::HelpStageUnstage)),
+        ("d → y", t(Msg::HelpDiscard)),
+        ("m", t(Msg::HelpDiffLayout)),
+        ("f", t(Msg::HelpDiffMode)),
+        ("t", t(Msg::HelpToggleView)),
+        ("r", t(Msg::HelpRefresh)),
+        ("v", t(Msg::HelpSelectMode)),
+        ("h", t(Msg::HelpShowHelp)),
+        (t(Msg::HelpKeyAnyKey), t(Msg::HelpAnyKey)),
     ];
 
     let popup_w = 72u16;
@@ -448,7 +445,7 @@ fn render_help(f: &mut Frame, app: &App, screen: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(th.accent))
         .title(Span::styled(
-            " 快捷键帮助 ",
+            t(Msg::HelpTitle),
             Style::default()
                 .fg(th.fg_primary)
                 .add_modifier(Modifier::BOLD),

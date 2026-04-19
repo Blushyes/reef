@@ -4,6 +4,7 @@
 use crate::app::App;
 use crate::git::RefLabel;
 use crate::git::graph::{GraphRow, LaneCell};
+use crate::i18n::{Msg, t};
 use crate::search::SearchTarget;
 use crate::ui::mouse::ClickAction;
 use crate::ui::text::overlay_match_highlight;
@@ -23,7 +24,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
 
     if app.git_graph.rows.is_empty() {
         let line = Line::from(Span::styled(
-            "  无 commit",
+            t(Msg::NoCommits),
             Style::default().fg(app.theme.fg_secondary),
         ));
         f.render_widget(line, area);

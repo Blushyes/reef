@@ -1,5 +1,6 @@
 use crate::app::{App, DiffLayout};
 use crate::git::{DiffContent, DiffHunk, LineTag};
+use crate::i18n::{Msg, t};
 use crate::search::SearchTarget;
 use crate::ui::text::{clip_spans, overlay_match_highlight, skip_n_columns, truncate_to_width};
 use crate::ui::theme::Theme;
@@ -35,7 +36,7 @@ fn render_empty(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let msg = Line::from(Span::styled(
-        "选择一个文件查看 diff",
+        t(Msg::DiffEmpty),
         Style::default().fg(app.theme.fg_secondary),
     ));
     let y = area.y + area.height / 2;
@@ -464,15 +465,15 @@ fn render_file_header(
 
     let th = app.theme;
     let layout_label = match app.diff_layout {
-        DiffLayout::Unified => "上下",
-        DiffLayout::SideBySide => "左右",
+        DiffLayout::Unified => t(Msg::LayoutUnified),
+        DiffLayout::SideBySide => t(Msg::LayoutSideBySide),
     };
     let mode_label = match app.diff_mode {
-        crate::app::DiffMode::Compact => "局部",
-        crate::app::DiffMode::FullFile => "全量",
+        crate::app::DiffMode::Compact => t(Msg::ModeCompact),
+        crate::app::DiffMode::FullFile => t(Msg::ModeFullFile),
     };
 
-    let tag_str = format!("  [{}][{}]  m/f 切换", layout_label, mode_label);
+    let tag_str = crate::i18n::diff_mode_hint(layout_label, mode_label);
     let tag_len = UnicodeWidthStr::width(tag_str.as_str()) as u16;
     let path_max = area.width.saturating_sub(tag_len) as usize;
     let path_display = truncate_to_width(&diff.file_path, path_max);

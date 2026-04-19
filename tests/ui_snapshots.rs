@@ -17,6 +17,18 @@ use test_support::{HomeGuard, commit_file, tempdir_repo, write_file};
 
 static CWD_LOCK: Mutex<()> = Mutex::new(());
 
+/// Pin the UI language so the snapshot is stable regardless of the test
+/// host's system locale. Called under `CWD_LOCK`; the first call seeds
+/// i18n's OnceLock cache for the process so all three snapshot tests
+/// render in the same language.
+fn force_en_lang() {
+    // SAFETY: test-only; `CWD_LOCK` serialises the three snapshot tests
+    // and no other test in this binary touches env vars.
+    unsafe {
+        std::env::set_var("REEF_LANG", "en");
+    }
+}
+
 struct CwdGuard {
     original: std::path::PathBuf,
 }
@@ -74,6 +86,7 @@ fn with_filters<F: FnOnce()>(body: F) {
 #[test]
 fn snapshot_empty_repo() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
     let (tmp, _raw) = tempdir_repo();
     // HOME must point outside the workdir — prefs creates `.config/reef`
     // and the file tree now shows dotfiles.
@@ -89,6 +102,7 @@ fn snapshot_empty_repo() {
 #[test]
 fn snapshot_with_staged_and_unstaged() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
     let (tmp, raw) = tempdir_repo();
     commit_file(&raw, "tracked.txt", "v1\n", "init");
     write_file(&raw, "tracked.txt", "v2\n"); // unstaged modification
@@ -114,6 +128,7 @@ fn snapshot_with_staged_and_unstaged_light_theme() {
     // intentionally asserts "same content, same layout" — not color fidelity.
     // Color fidelity is verified by the unit tests in `src/ui/theme.rs`.
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
     let (tmp, raw) = tempdir_repo();
     commit_file(&raw, "tracked.txt", "v1\n", "init");
     write_file(&raw, "tracked.txt", "v2\n");

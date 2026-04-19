@@ -9,6 +9,7 @@
 use crate::app::{App, Panel, SelectedFile};
 use crate::git::tree::{self as gtree, Node};
 use crate::git::{FileEntry, FileStatus};
+use crate::i18n::{Msg, t};
 use crate::search::SearchTarget;
 use crate::ui::mouse::ClickAction;
 use crate::ui::text::overlay_match_highlight;
@@ -460,7 +461,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     // Non-interactive: user just waits for tick() to drain the result.
     if app.push_in_flight {
         rows.push(Row::new(vec![RowSpan::styled(
-            "  ⋯ 推送中…",
+            t(Msg::PushingHint),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -475,11 +476,11 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
         rows.push(
             Row::new(vec![
                 RowSpan::styled(
-                    "  ✖ 推送失败: ",
+                    t(Msg::PushFailedPrefix),
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ),
                 RowSpan::styled(msg, Style::default().fg(theme.fg_primary)),
-                RowSpan::styled("  [关闭]", Style::default().fg(theme.fg_secondary)),
+                RowSpan::styled(t(Msg::DismissClose), Style::default().fg(theme.fg_secondary)),
             ])
             .on_click("git.dismissPushError", Value::Null),
         );
@@ -499,21 +500,21 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
         if force {
             rows.push(Row::new(vec![
                 RowSpan::styled(
-                    "  ⚠ 强制推送？",
+                    t(Msg::ForcePushPrompt),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
                 RowSpan::styled(
-                    "（会覆盖远端，使用 --force-with-lease）",
+                    t(Msg::ForcePushWarning),
                     Style::default().fg(Color::Yellow),
                 ),
             ]));
         } else {
             let msg = if ahead > 0 {
-                format!("  推送 {ahead} 个提交到远端？")
+                crate::i18n::push_n_commits_prompt(ahead)
             } else {
-                "  推送到远端？".to_string()
+                t(Msg::PushToRemote).to_string()
             };
             rows.push(Row::new(vec![RowSpan::styled(
                 msg,
@@ -524,9 +525,9 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
         }
 
         let (confirm_label, confirm_bg, confirm_cmd) = if force {
-            (" 确认强制推送 ", Color::Red, "git.forcePushConfirm")
+            (t(Msg::ConfirmForcePush), Color::Red, "git.forcePushConfirm")
         } else {
-            (" 确认推送 ", Color::Green, "git.pushConfirm")
+            (t(Msg::ConfirmPush), Color::Green, "git.pushConfirm")
         };
         let cancel_cmd = if force {
             "git.forcePushCancel"
@@ -545,14 +546,14 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
             .on_click(confirm_cmd, Value::Null),
             RowSpan::plain("  "),
             RowSpan::styled(
-                " 取消 ",
+                t(Msg::Cancel),
                 Style::default()
                     .fg(theme.chrome_fg)
                     .bg(theme.chrome_muted_fg),
             )
             .on_click(cancel_cmd, Value::Null),
             RowSpan::plain("  "),
-            RowSpan::styled("(y / Esc)", Style::default().fg(theme.fg_secondary)),
+            RowSpan::styled(t(Msg::YEscHint), Style::default().fg(theme.fg_secondary)),
         ]));
         rows.push(Row::blank());
     }
@@ -579,7 +580,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
         truncate_in_place(&mut display, max_path);
         rows.push(Row::new(vec![
             RowSpan::styled(
-                "  ⚠ 还原 ",
+                t(Msg::DiscardPromptPrefix),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -590,12 +591,12 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
-            RowSpan::styled("？（不可撤销）", Style::default().fg(Color::Yellow)),
+            RowSpan::styled(t(Msg::DiscardPromptSuffix), Style::default().fg(Color::Yellow)),
         ]));
         rows.push(Row::new(vec![
             RowSpan::plain("  "),
             RowSpan::styled(
-                " 确认还原 ",
+                t(Msg::ConfirmDiscard),
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Red)
@@ -604,21 +605,21 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
             .on_click("git.discardConfirm", Value::Null),
             RowSpan::plain("  "),
             RowSpan::styled(
-                " 取消 ",
+                t(Msg::Cancel),
                 Style::default().fg(Color::White).bg(Color::DarkGray),
             )
             .on_click("git.discardCancel", Value::Null),
             RowSpan::plain("  "),
-            RowSpan::styled("(y / Esc)", Style::default().fg(Color::DarkGray)),
+            RowSpan::styled(t(Msg::YEscHint), Style::default().fg(Color::DarkGray)),
         ]));
         rows.push(Row::blank());
     }
 
     // View mode toggle
     let mode_label = if status.tree_mode {
-        "视图: 树形"
+        t(Msg::ViewModeTree)
     } else {
-        "视图: 列表"
+        t(Msg::ViewModeList)
     };
     rows.push(
         Row::new(vec![RowSpan::styled(
@@ -633,11 +634,11 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     if !app.staged_files.is_empty() {
         rows.push(section_header(
             app.staged_collapsed,
-            "暂存的更改",
+            t(Msg::StagedChanges),
             app.staged_files.len(),
             Color::Green,
             "git.toggleStaged",
-            Some(("取消全部", "git.unstageAll", Color::Red)),
+            Some((t(Msg::UnstageAll), "git.unstageAll", Color::Red)),
             width,
             theme,
         ));
@@ -651,11 +652,11 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     let unstaged_button = if app.unstaged_files.is_empty() {
         None
     } else {
-        Some(("暂存全部", "git.stageAll", Color::Green))
+        Some((t(Msg::StageAll), "git.stageAll", Color::Green))
     };
     rows.push(section_header(
         app.unstaged_collapsed,
-        "更改",
+        t(Msg::Changes),
         app.unstaged_files.len(),
         Color::Blue,
         "git.toggleUnstaged",
@@ -675,7 +676,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
         );
         if app.unstaged_files.is_empty() {
             rows.push(Row::new(vec![RowSpan::styled(
-                "  无文件",
+                t(Msg::NoFiles),
                 Style::default().fg(theme.fg_secondary),
             )]));
         }
@@ -991,7 +992,7 @@ fn push_indicator_row(ahead: usize, behind: usize) -> Option<Row> {
         (a, 0) => Some(Row::new(vec![
             RowSpan::plain("  "),
             RowSpan {
-                text: format!(" ↑ 推送 ({a}) "),
+                text: crate::i18n::push_button(a),
                 style: Style::default()
                     .fg(Color::Black)
                     .bg(Color::Green)
@@ -1001,13 +1002,13 @@ fn push_indicator_row(ahead: usize, behind: usize) -> Option<Row> {
             },
         ])),
         (0, b) => Some(Row::new(vec![RowSpan::styled(
-            format!("  ↓ 落后远端 {b} 次提交 — 请先 fetch/pull"),
+            crate::i18n::behind_remote(b),
             Style::default().fg(Color::Yellow),
         )])),
         (a, b) => Some(Row::new(vec![
             RowSpan::plain("  "),
             RowSpan {
-                text: format!(" ⚠ 已分叉 ↑{a} ↓{b} — 强制推送 "),
+                text: crate::i18n::diverged_force_push(a, b),
                 style: Style::default()
                     .fg(Color::Black)
                     .bg(Color::Yellow)

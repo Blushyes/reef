@@ -64,8 +64,7 @@ impl FileTree {
 
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            // Skip hidden files and .git
-            if name.starts_with('.') {
+            if name == ".git" {
                 continue;
             }
             let path = entry.path();

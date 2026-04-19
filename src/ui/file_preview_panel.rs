@@ -1,5 +1,6 @@
 use crate::app::App;
 use crate::file_tree::PreviewContent;
+use crate::i18n::{Msg, t};
 use crate::search::SearchTarget;
 use crate::ui::text::{clip_spans, overlay_match_highlight};
 use ratatui::Frame;
@@ -36,7 +37,7 @@ fn render_empty(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let msg = Line::from(Span::styled(
-        "选择一个文件预览内容",
+        t(Msg::PreviewEmpty),
         Style::default().fg(app.theme.fg_secondary),
     ));
     let y = area.y + area.height / 2;

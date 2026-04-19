@@ -1,4 +1,5 @@
 use crate::app::App;
+use crate::i18n::{Msg, t};
 use crate::search::SearchTarget;
 use crate::ui::mouse::ClickAction;
 use crate::ui::text::overlay_match_highlight;
@@ -26,7 +27,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     let entries = &app.file_tree.entries;
     if entries.is_empty() {
         let msg = Line::from(Span::styled(
-            "(empty)",
+            t(Msg::EmptyDir),
             Style::default().fg(th.fg_secondary),
         ));
         f.render_widget(msg, Rect::new(padded.x, padded.y, padded.width, 1));

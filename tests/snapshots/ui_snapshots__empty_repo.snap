@@ -1,5 +1,6 @@
 ---
-source: crates/reef-host/tests/ui_snapshots.rs
+source: tests/ui_snapshots.rs
+assertion_line: 86
 expression: output
 ---
  reef  [TMPDIR]  ⎇ (detached)
@@ -12,7 +13,7 @@ expression: output
                        │
                        │
                        │
-                       │                  选 择 一 个 文 件 预 览 内 容
+                       │                  Select a file to preview
                        │
                        │
                        │
@@ -21,4 +22,4 @@ expression: output
                        │
                        │
                        │
-                     q:退 出  Tab:切 换  s:暂 存  u:取 消  r:刷 新  h:帮 助
+                     q:quit Tab:switch s:stage u:unstage r:refresh h:help

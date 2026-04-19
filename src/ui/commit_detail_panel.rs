@@ -4,6 +4,7 @@
 use crate::app::{App, DiffLayout, DiffMode};
 use crate::git::tree::{self as gtree, Node};
 use crate::git::{DiffContent, FileEntry, FileStatus, LineTag};
+use crate::i18n::{Msg, t};
 use crate::search::SearchTarget;
 use crate::ui::git_graph_panel;
 use crate::ui::mouse::ClickAction;
@@ -269,7 +270,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
 
     let Some(detail) = &cd.detail else {
         rows.push(Row::new(vec![RowSpan::styled(
-            "  选择一个 commit 查看详情",
+            t(Msg::CommitDetailEmpty),
             Style::default().fg(theme.fg_secondary),
         )]));
         return rows;
@@ -280,7 +281,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     let max_path = (width as usize).saturating_sub(6);
 
     rows.push(Row::new(vec![
-        RowSpan::styled("commit ", Style::default().fg(theme.fg_secondary)),
+        RowSpan::styled(t(Msg::CommitLabel), Style::default().fg(theme.fg_secondary)),
         RowSpan::styled(
             info.oid.clone(),
             Style::default()
@@ -289,14 +290,14 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
         ),
     ]));
     rows.push(Row::new(vec![
-        RowSpan::styled("Author: ", Style::default().fg(theme.fg_secondary)),
+        RowSpan::styled(t(Msg::AuthorLabel), Style::default().fg(theme.fg_secondary)),
         RowSpan::styled(
             format!("{} <{}>", info.author_name, info.author_email),
             Style::default().fg(theme.fg_primary),
         ),
     ]));
     rows.push(Row::new(vec![
-        RowSpan::styled("Date:   ", Style::default().fg(theme.fg_secondary)),
+        RowSpan::styled(t(Msg::DateLabel), Style::default().fg(theme.fg_secondary)),
         RowSpan::styled(
             format_timestamp(info.time),
             Style::default().fg(theme.fg_primary),
@@ -305,7 +306,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
 
     if let Some(labels) = app.git_graph.ref_map.get(&info.oid) {
         let mut spans: Vec<RowSpan> = vec![RowSpan::styled(
-            "Refs:   ",
+            t(Msg::RefsLabel),
             Style::default().fg(theme.fg_secondary),
         )];
         for label in labels {
@@ -329,19 +330,19 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     rows.push(Row::blank());
 
     let view_label = if cd.files_tree_mode {
-        "树形"
+        t(Msg::ViewTree)
     } else {
-        "列表"
+        t(Msg::ViewList)
     };
     rows.push(Row::new(vec![
         RowSpan::styled(
-            format!("Changed files ({})", detail.files.len()),
+            crate::i18n::changed_files_header(detail.files.len()),
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ),
         RowSpan::styled(
-            format!("  [{}]  t 切换", view_label),
+            crate::i18n::view_toggle_hint(view_label),
             Style::default().fg(theme.fg_secondary),
         )
         .on_click("git.toggleCommitFilesView", Value::Null),
@@ -487,14 +488,14 @@ fn diff_header_row(
     theme: &Theme,
 ) -> Row {
     let layout_label = match layout {
-        DiffLayout::Unified => "上下",
-        DiffLayout::SideBySide => "左右",
+        DiffLayout::Unified => t(Msg::LayoutUnified),
+        DiffLayout::SideBySide => t(Msg::LayoutSideBySide),
     };
     let mode_label = match mode {
-        DiffMode::Compact => "局部",
-        DiffMode::FullFile => "全量",
+        DiffMode::Compact => t(Msg::ModeCompact),
+        DiffMode::FullFile => t(Msg::ModeFullFile),
     };
-    let tag_str = format!("  [{}][{}]  m/f 切换", layout_label, mode_label);
+    let tag_str = crate::i18n::diff_mode_hint(layout_label, mode_label);
     let tag_w = UnicodeWidthStr::width(tag_str.as_str());
     let path_max = (width as usize).saturating_sub(tag_w);
     let path_display = truncate_to_display_width(path, path_max).to_string();

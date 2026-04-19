@@ -6,6 +6,7 @@ use crossterm::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use reef::app::App;
+use reef::i18n;
 use reef::ui::theme::Theme;
 use reef::ui::toast::Toast;
 use reef::{editor, input, ui};
@@ -114,7 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mouse_was_on = !app.select_mode;
             if let Err(e) = editor::launch(&mut terminal, &path, mouse_was_on) {
                 app.toasts
-                    .push(Toast::error(format!("打开编辑器失败: {e}")));
+                    .push(Toast::error(i18n::edit_open_failed(&e.to_string())));
             }
             // Pick up on-disk changes immediately rather than waiting for
             // the fs-watcher debounce.

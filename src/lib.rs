@@ -7,6 +7,7 @@ pub mod editor;
 pub mod file_tree;
 pub mod fs_watcher;
 pub mod git;
+pub mod i18n;
 pub mod input;
 pub mod prefs;
 pub mod search;

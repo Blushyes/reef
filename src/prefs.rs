@@ -9,6 +9,10 @@
 //!   - `commit.diff_layout` / `commit.diff_mode` — Graph tab commit-file diff
 //!   - `status.tree_mode`                       — Git tab left-side list/tree
 //!   - `commit.files_tree_mode`                 — Graph tab commit files list/tree
+//!   - `ui.theme`                               — `dark` | `light` | `auto` (default `auto`).
+//!                                                Read once in `main.rs` before raw-mode
+//!                                                entry; `auto` probes the terminal's
+//!                                                background via OSC 11.
 //!
 //! Writers must go through `set()` (not raw `std::fs::write`) so that
 //! updating one key doesn't erase all the others.

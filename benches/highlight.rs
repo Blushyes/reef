@@ -15,7 +15,7 @@ fn synth_rust_lines(n: usize) -> Vec<String> {
 fn bench_highlight_rust(c: &mut Criterion) {
     let lines = synth_rust_lines(1000);
     c.bench_function("highlight_file/rust_1000_lines", |b| {
-        b.iter(|| highlight_file(black_box("bench.rs"), black_box(&lines)));
+        b.iter(|| highlight_file(black_box("bench.rs"), black_box(&lines), true));
     });
 }
 

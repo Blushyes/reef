@@ -11,6 +11,7 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use reef::app::App;
 use reef::ui;
+use reef::ui::theme::Theme;
 use std::sync::Mutex;
 use test_support::{HomeGuard, commit_file, tempdir_repo, write_file};
 
@@ -80,7 +81,7 @@ fn snapshot_empty_repo() {
     let _h = HomeGuard::enter(home.path());
     let _g = CwdGuard::enter(tmp.path());
 
-    let mut app = App::new();
+    let mut app = App::new(Theme::dark());
     let output = render_app(&mut app, 80, 20);
     with_filters(|| insta::assert_snapshot!("empty_repo", output));
 }
@@ -96,10 +97,33 @@ fn snapshot_with_staged_and_unstaged() {
     let _h = HomeGuard::enter(home.path());
     let _g = CwdGuard::enter(tmp.path());
 
-    let mut app = App::new();
+    let mut app = App::new(Theme::dark());
     // Switch to Git tab to show staged/unstaged sections
     app.active_tab = reef::app::Tab::Git;
     app.refresh_status();
     let output = render_app(&mut app, 80, 20);
     with_filters(|| insta::assert_snapshot!("with_staged_and_unstaged", output));
+}
+
+#[test]
+fn snapshot_with_staged_and_unstaged_light_theme() {
+    // Locks in the light-theme wiring: a dark-vs-light snapshot diff must exist
+    // somewhere, otherwise the Theme plumbing could silently regress to dark.
+    // Text content should match the dark snapshot; only style bytes differ, but
+    // TestBackend's `Cell::symbol()` drops styles, so the plain-text dump here
+    // intentionally asserts "same content, same layout" — not color fidelity.
+    // Color fidelity is verified by the unit tests in `src/ui/theme.rs`.
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "tracked.txt", "v1\n", "init");
+    write_file(&raw, "tracked.txt", "v2\n");
+    write_file(&raw, "new.txt", "new\n");
+    let _h = HomeGuard::enter(tmp.path());
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::light());
+    app.active_tab = reef::app::Tab::Git;
+    app.refresh_status();
+    let output = render_app(&mut app, 80, 20);
+    with_filters(|| insta::assert_snapshot!("with_staged_and_unstaged_light", output));
 }

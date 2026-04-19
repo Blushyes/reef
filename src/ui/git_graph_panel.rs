@@ -21,7 +21,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
     if app.git_graph.rows.is_empty() {
         let line = Line::from(Span::styled(
             "  无 commit",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(app.theme.fg_secondary),
         ));
         f.render_widget(line, area);
         return;
@@ -46,6 +46,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
     app.git_graph.scroll = scroll;
 
     let rows: Vec<&GraphRow> = app.git_graph.rows.iter().collect();
+    let theme = app.theme;
     for (i, row) in rows.iter().skip(scroll).take(height).enumerate() {
         let idx = scroll + i;
         let y = area.y + i as u16;
@@ -58,6 +59,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
             head_oid.as_deref(),
             &app.git_graph.ref_map,
             hover,
+            &theme,
         );
         f.render_widget(line, Rect::new(area.x, y, area.width, 1));
 
@@ -141,9 +143,10 @@ fn build_row_line(
     head_oid: Option<&str>,
     ref_map: &std::collections::HashMap<String, Vec<RefLabel>>,
     hover: bool,
+    theme: &crate::ui::theme::Theme,
 ) -> (Line<'static>, u16) {
     let oid = row.commit.oid.clone();
-    let sel_bg = Color::Rgb(40, 60, 100);
+    let sel_bg = theme.selection_bg;
     let is_head = head_oid == Some(oid.as_str());
 
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -174,13 +177,13 @@ fn build_row_line(
         truncate_in_place(&mut author, 12);
         spans.push(Span::styled(
             format!("{:<12}", author),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(theme.accent),
         ));
         spans.push(Span::raw(" "));
         let rel = relative_time(row.commit.time);
         spans.push(Span::styled(
             format!("{:>4}", rel),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.fg_secondary),
         ));
         spans.push(Span::raw(" "));
     }
@@ -194,7 +197,7 @@ fn build_row_line(
 
     let mut subject = row.commit.subject.clone();
     truncate_in_place(&mut subject, max_subject);
-    spans.push(Span::styled(subject, Style::default().fg(Color::White)));
+    spans.push(Span::styled(subject, Style::default().fg(theme.fg_primary)));
 
     if selected {
         spans = spans
@@ -207,7 +210,7 @@ fn build_row_line(
         spans = spans
             .into_iter()
             .map(|s| {
-                let style = crate::ui::hover::apply(s.style, true);
+                let style = crate::ui::hover::apply(s.style, true, theme.hover_bg);
                 Span::styled(s.content.into_owned(), style)
             })
             .collect();

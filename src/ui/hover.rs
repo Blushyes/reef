@@ -1,14 +1,13 @@
 //! Shared mouse-hover row tinting for the three inline git panels.
 //!
-//! The subtle `Rgb(40, 40, 50)` wash is applied only to spans that don't
-//! already carry a background — so selection highlights (`Rgb(40, 60, 100)`)
-//! and banner buttons keep their identity under the cursor.
+//! The subtle hover wash is applied only to spans that don't already carry a
+//! background — so selection highlights and banner buttons keep their identity
+//! under the cursor. Callers pass the theme's `hover_bg` explicitly so this
+//! module stays free of a back-dependency on `ui::theme`.
 
 use crate::app::App;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
-
-const HOVER_BG: Color = Color::Rgb(40, 40, 50);
 
 /// True when the mouse is over row `y` within `area`.
 pub fn is_hover(app: &App, area: Rect, y: u16) -> bool {
@@ -22,9 +21,9 @@ pub fn is_hover(app: &App, area: Rect, y: u16) -> bool {
 /// Return `style` with the hover bg applied, but only when the span doesn't
 /// already have its own bg — that way selection / button chrome keeps its
 /// specific color.
-pub fn apply(style: Style, hover: bool) -> Style {
+pub fn apply(style: Style, hover: bool, hover_bg: Color) -> Style {
     if hover && style.bg.is_none() {
-        style.bg(HOVER_BG)
+        style.bg(hover_bg)
     } else {
         style
     }

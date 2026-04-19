@@ -10,6 +10,7 @@ use crate::app::{App, Panel, SelectedFile};
 use crate::git::tree::{self as gtree, Node};
 use crate::git::{FileEntry, FileStatus};
 use crate::ui::mouse::ClickAction;
+use crate::ui::theme::Theme;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -30,7 +31,8 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
     // do it while the Git tab is being drawn.
     app.refresh_status();
 
-    let rows = build_rows(app, area.width);
+    let theme = app.theme;
+    let rows = build_rows(app, area.width, &theme);
     let total = rows.len();
 
     // Clamp scroll to a valid range so content can't be scrolled past its end.
@@ -47,7 +49,12 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
         let spans: Vec<Span<'static>> = row
             .spans
             .iter()
-            .map(|s| Span::styled(s.text.clone(), crate::ui::hover::apply(s.style, hover)))
+            .map(|s| {
+                Span::styled(
+                    s.text.clone(),
+                    crate::ui::hover::apply(s.style, hover, app.theme.hover_bg),
+                )
+            })
             .collect();
         f.render_widget(Line::from(spans), Rect::new(area.x, y, area.width, 1));
 
@@ -407,7 +414,7 @@ impl Row {
 
 // ─── Row builders ─────────────────────────────────────────────────────────────
 
-fn build_rows(app: &App, width: u16) -> Vec<Row> {
+fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
     let status = &app.git_status;
     // Slightly narrower budget to accommodate the ↺ discard button on unstaged rows.
@@ -435,8 +442,8 @@ fn build_rows(app: &App, width: u16) -> Vec<Row> {
                     "  ✖ 推送失败: ",
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ),
-                RowSpan::styled(msg, Style::default().fg(Color::White)),
-                RowSpan::styled("  [关闭]", Style::default().fg(Color::DarkGray)),
+                RowSpan::styled(msg, Style::default().fg(theme.fg_primary)),
+                RowSpan::styled("  [关闭]", Style::default().fg(theme.fg_secondary)),
             ])
             .on_click("git.dismissPushError", Value::Null),
         );
@@ -475,7 +482,7 @@ fn build_rows(app: &App, width: u16) -> Vec<Row> {
             rows.push(Row::new(vec![RowSpan::styled(
                 msg,
                 Style::default()
-                    .fg(Color::White)
+                    .fg(theme.fg_primary)
                     .add_modifier(Modifier::BOLD),
             )]));
         }
@@ -503,11 +510,13 @@ fn build_rows(app: &App, width: u16) -> Vec<Row> {
             RowSpan::plain("  "),
             RowSpan::styled(
                 " 取消 ",
-                Style::default().fg(Color::White).bg(Color::DarkGray),
+                Style::default()
+                    .fg(theme.chrome_fg)
+                    .bg(theme.chrome_muted_fg),
             )
             .on_click(cancel_cmd, Value::Null),
             RowSpan::plain("  "),
-            RowSpan::styled("(y / Esc)", Style::default().fg(Color::DarkGray)),
+            RowSpan::styled("(y / Esc)", Style::default().fg(theme.fg_secondary)),
         ]));
         rows.push(Row::blank());
     }
@@ -578,7 +587,7 @@ fn build_rows(app: &App, width: u16) -> Vec<Row> {
     rows.push(
         Row::new(vec![RowSpan::styled(
             mode_label,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.fg_secondary),
         )])
         .on_click("git.toggleTree", Value::Null),
     );
@@ -594,9 +603,10 @@ fn build_rows(app: &App, width: u16) -> Vec<Row> {
             "git.toggleStaged",
             Some(("取消全部", "git.unstageAll", Color::Red)),
             width,
+            theme,
         ));
         if !app.staged_collapsed {
-            render_files(&mut rows, app, &app.staged_files, true, max_path);
+            render_files(&mut rows, app, &app.staged_files, true, max_path, theme);
         }
         rows.push(Row::blank());
     }
@@ -615,13 +625,14 @@ fn build_rows(app: &App, width: u16) -> Vec<Row> {
         "git.toggleUnstaged",
         unstaged_button,
         width,
+        theme,
     ));
     if !app.unstaged_collapsed {
-        render_files(&mut rows, app, &app.unstaged_files, false, max_path);
+        render_files(&mut rows, app, &app.unstaged_files, false, max_path, theme);
         if app.unstaged_files.is_empty() {
             rows.push(Row::new(vec![RowSpan::styled(
                 "  无文件",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.fg_secondary),
             )]));
         }
     }
@@ -646,6 +657,7 @@ fn render_files(
     files: &[FileEntry],
     is_staged: bool,
     max_path: usize,
+    theme: &Theme,
 ) {
     let status = &app.git_status;
     let sel_path = selected_path_for(app, is_staged);
@@ -659,6 +671,7 @@ fn render_files(
             max_path,
             &status.collapsed_dirs,
             &sel_path,
+            theme,
         );
     } else {
         for file in files {
@@ -671,6 +684,7 @@ fn render_files(
                 max_path,
                 is_sel,
                 "  ",
+                theme,
             ));
         }
     }
@@ -685,6 +699,7 @@ fn walk_tree(
     max_path: usize,
     collapsed: &std::collections::HashSet<String>,
     selected_path: &Option<String>,
+    theme: &Theme,
 ) {
     let mut entries: Vec<(&String, &Node)> = tree.iter().collect();
     entries.sort_by(|a, b| {
@@ -702,7 +717,7 @@ fn walk_tree(
             Node::Dir { path, children } => {
                 let key = gtree::collapsed_key(is_staged, path);
                 let is_collapsed = collapsed.contains(&key);
-                rows.push(dir_row(name, path, is_staged, depth, is_collapsed));
+                rows.push(dir_row(name, path, is_staged, depth, is_collapsed, theme));
                 if !is_collapsed {
                     walk_tree(
                         rows,
@@ -712,6 +727,7 @@ fn walk_tree(
                         max_path,
                         collapsed,
                         selected_path,
+                        theme,
                     );
                 }
             }
@@ -727,21 +743,32 @@ fn walk_tree(
                     max_path,
                     is_sel,
                     &indent,
+                    theme,
                 ));
             }
         }
     }
 }
 
-fn dir_row(name: &str, path: &str, is_staged: bool, depth: usize, is_collapsed: bool) -> Row {
+fn dir_row(
+    name: &str,
+    path: &str,
+    is_staged: bool,
+    depth: usize,
+    is_collapsed: bool,
+    theme: &Theme,
+) -> Row {
     let arrow = if is_collapsed { "›" } else { "⌄" };
     Row::new(vec![
         RowSpan::plain("  ".repeat(depth)),
-        RowSpan::styled(format!("{} ", arrow), Style::default().fg(Color::DarkGray)),
+        RowSpan::styled(
+            format!("{} ", arrow),
+            Style::default().fg(theme.fg_secondary),
+        ),
         RowSpan::styled(
             format!("{}/", name),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ),
     ])
@@ -751,6 +778,7 @@ fn dir_row(name: &str, path: &str, is_staged: bool, depth: usize, is_collapsed: 
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn file_row(
     path: &str,
     display: &str,
@@ -759,6 +787,7 @@ fn file_row(
     max_path: usize,
     is_selected: bool,
     indent: &str,
+    theme: &Theme,
 ) -> Row {
     let status_color = match status {
         FileStatus::Modified => Color::Yellow,
@@ -785,14 +814,17 @@ fn file_row(
         display.to_string()
     };
 
-    let sel_bg = Color::Rgb(40, 60, 100);
-    let base_bg = if is_selected { Some(sel_bg) } else { None };
+    let base_bg = if is_selected {
+        Some(theme.selection_bg)
+    } else {
+        None
+    };
 
     let mut spans: Vec<RowSpan> = vec![
         RowSpan::styled(indent.to_string(), apply_bg(Style::default(), base_bg)),
         RowSpan::styled(
             display_path,
-            apply_bg(Style::default().fg(Color::White), base_bg),
+            apply_bg(Style::default().fg(theme.fg_primary), base_bg),
         ),
         RowSpan::styled(
             format!(" {} ", status_label),
@@ -843,6 +875,7 @@ fn apply_bg(style: Style, bg: Option<Color>) -> Style {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn section_header(
     collapsed: bool,
     label: &str,
@@ -851,6 +884,7 @@ fn section_header(
     toggle_cmd: &str,
     action: Option<(&str, &str, Color)>,
     width: u16,
+    theme: &Theme,
 ) -> Row {
     let arrow = if collapsed { "›" } else { "⌄" };
     let prefix = format!("{} ", arrow);
@@ -863,11 +897,11 @@ fn section_header(
     let padding = (width as usize).saturating_sub(used);
 
     let mut spans = vec![
-        RowSpan::styled(prefix, Style::default().fg(Color::White)),
+        RowSpan::styled(prefix, Style::default().fg(theme.fg_primary)),
         RowSpan::styled(
             label.to_string(),
             Style::default()
-                .fg(Color::White)
+                .fg(theme.fg_primary)
                 .add_modifier(Modifier::BOLD),
         ),
         RowSpan::styled(count_str, Style::default().fg(count_color)),

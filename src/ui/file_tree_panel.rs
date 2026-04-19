@@ -7,9 +7,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders};
 
 pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
+    let th = app.theme;
     let block = Block::default()
         .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(th.border));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -24,7 +25,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     if entries.is_empty() {
         let msg = Line::from(Span::styled(
             "(empty)",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(th.fg_secondary),
         ));
         f.render_widget(msg, Rect::new(padded.x, padded.y, padded.width, 1));
         return;
@@ -68,24 +69,22 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         };
 
         let name_style = if entry.is_dir {
-            Style::default()
-                .fg(Color::Blue)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(th.fg_primary)
         };
 
         let bg = if is_selected {
-            Color::Rgb(40, 60, 100)
+            th.selection_bg
         } else if is_hovered {
-            Color::Rgb(40, 40, 50)
+            th.hover_bg
         } else {
             Color::Reset
         };
 
         let mut spans = vec![
             Span::styled(&indent, Style::default().bg(bg)),
-            Span::styled(icon, Style::default().fg(Color::DarkGray).bg(bg)),
+            Span::styled(icon, Style::default().fg(th.fg_secondary).bg(bg)),
             Span::styled(&entry.name, name_style.bg(bg)),
         ];
 
@@ -96,7 +95,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
                 'A' => Color::Green,
                 'D' => Color::Red,
                 'U' | '?' => Color::Green,
-                _ => Color::DarkGray,
+                _ => th.fg_secondary,
             };
             spans.push(Span::styled(
                 format!(" {}", ch),

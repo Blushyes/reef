@@ -148,14 +148,14 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
                 if app.active_tab != tab {
                     app.search.clear();
                 }
-                app.active_tab = tab;
+                app.set_active_tab(tab);
             }
             return;
         }
         KeyCode::Tab => {
             let tabs = Tab::ALL;
             let cur = tabs.iter().position(|&t| t == app.active_tab).unwrap_or(0);
-            app.active_tab = tabs[(cur + 1) % tabs.len()];
+            app.set_active_tab(tabs[(cur + 1) % tabs.len()]);
             app.search.clear();
             return;
         }
@@ -413,7 +413,7 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
             if let Some(entry) = app.file_tree.entries.get(idx) {
                 if entry.is_dir {
                     app.file_tree.toggle_expand(idx);
-                    app.load_preview();
+                    app.refresh_file_tree_with_target(app.file_tree.selected_path());
                 } else {
                     // File: hand off to the main loop, which owns the
                     // terminal and can suspend it around `$EDITOR`.

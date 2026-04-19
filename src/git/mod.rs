@@ -111,6 +111,11 @@ impl GitRepo {
         Ok(Self { repo })
     }
 
+    pub fn open_at(workdir: &Path) -> Result<Self, git2::Error> {
+        let repo = Repository::discover(workdir)?;
+        Ok(Self { repo })
+    }
+
     pub fn workdir_path(&self) -> Option<PathBuf> {
         self.repo.workdir().map(|p| p.to_path_buf())
     }

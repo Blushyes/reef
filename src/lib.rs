@@ -12,4 +12,5 @@ pub mod input;
 pub mod prefs;
 pub mod quick_open;
 pub mod search;
+pub mod tasks;
 pub mod ui;

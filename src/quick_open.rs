@@ -163,9 +163,10 @@ pub fn accept(app: &mut App) {
     save_mru_to_prefs(&app.quick_open.mru);
 
     app.quick_open.active = false;
-    app.active_tab = Tab::Files;
+    app.set_active_tab(Tab::Files);
     app.file_tree.reveal(&rel);
-    app.load_preview();
+    app.refresh_file_tree_with_target(Some(rel.clone()));
+    app.load_preview_for_path(rel);
 }
 
 /// Dispatch one key while the palette is active. The caller (input.rs)

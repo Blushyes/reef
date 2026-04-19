@@ -1,6 +1,7 @@
 /target
 node_modules
 .claude
+.codex/
 npm/**/bin/reef
 npm/**/bin/reef.exe
 

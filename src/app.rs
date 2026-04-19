@@ -75,6 +75,12 @@ pub struct GitGraphState {
     pub selected_idx: usize,
     pub selected_commit: Option<String>,
     pub scroll: usize,
+    /// `selected_idx` observed on the previous render. Used to distinguish
+    /// selection-change follow (bring the selected commit into view) from
+    /// user-initiated scroll (leave the viewport alone). Mirrors #13's fix
+    /// for the Files tab — without this, mouse-wheel scroll snapped back to
+    /// the selected commit on the next tick.
+    pub last_rendered_selected: Option<usize>,
 }
 
 /// State for the inline commit-detail editor panel (Tab::Graph right side).

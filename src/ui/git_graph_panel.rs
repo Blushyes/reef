@@ -34,18 +34,26 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
     let max_subject = (area.width as usize).saturating_sub(if show_meta { 40 } else { 14 });
     let head_oid = app.repo.as_ref().and_then(|r| r.head_oid());
 
-    // Clamp scroll and auto-scroll to keep the selected row in view.
+    // Clamp scroll to a valid range. Auto-scroll into view only when the
+    // selection actually moved since the last render — running this every
+    // frame meant mouse-wheel scroll (which only changes `scroll`, not
+    // `selected_idx`) got snapped back to the selected commit on the next
+    // tick. Graph-tab equivalent of #10 / follow-up to #13.
     let total = app.git_graph.rows.len();
     let height = area.height as usize;
-    let sel = app.git_graph.selected_idx;
-    let mut scroll = app.git_graph.scroll;
-    if sel < scroll {
-        scroll = sel;
-    } else if sel >= scroll + height && height > 0 {
-        scroll = sel + 1 - height;
-    }
     let max_scroll = total.saturating_sub(height);
-    scroll = scroll.min(max_scroll);
+    let mut scroll = app.git_graph.scroll.min(max_scroll);
+
+    let sel = app.git_graph.selected_idx;
+    if app.git_graph.last_rendered_selected != Some(sel) {
+        if sel < scroll {
+            scroll = sel;
+        } else if sel >= scroll + height && height > 0 {
+            scroll = sel + 1 - height;
+        }
+        scroll = scroll.min(max_scroll);
+        app.git_graph.last_rendered_selected = Some(sel);
+    }
     app.git_graph.scroll = scroll;
 
     let rows: Vec<&GraphRow> = app.git_graph.rows.iter().collect();

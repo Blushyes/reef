@@ -221,6 +221,11 @@ pub struct App {
     /// `ui::file_preview_panel` alongside the in-panel `/` search highlight.
     pub preview_highlight: Option<PreviewHighlight>,
 
+    /// VSCode-style drag-and-drop destination picker. While `place_mode.active`,
+    /// input is routed exclusively to `input::handle_key` / `handle_mouse`
+    /// place-mode branches (see `crate::place_mode`).
+    pub place_mode: crate::place_mode::PlaceModeState,
+
     /// Timestamp of the most recent bare-Space keystroke in the global
     /// keymap. `Some(t)` means a Space leader is primed and waiting for a
     /// follow-up key within `input::LEADER_TIMEOUT`. The palette-side
@@ -250,6 +255,11 @@ pub struct App {
     /// `GlobalSearchDone`; we use `begin()` at kickoff, plain generation
     /// comparisons on each chunk, and `complete_ok` on `Done`.
     pub global_search_load: AsyncState,
+    /// Tracks the in-flight drag-and-drop copy kicked off from place mode.
+    /// Used to drop stale results (the user could cancel + re-enter place
+    /// mode before a long directory copy finishes) and to show a "copying…"
+    /// hint if the operation takes long enough to notice.
+    pub file_copy_load: AsyncState,
     next_git_revalidate_at: Instant,
     next_graph_revalidate_at: Instant,
 }
@@ -362,6 +372,7 @@ impl App {
             quick_open: crate::quick_open::QuickOpenState::from_prefs(),
             global_search: crate::global_search::GlobalSearchState::default(),
             preview_highlight: None,
+            place_mode: crate::place_mode::PlaceModeState::default(),
             space_leader_at: None,
             last_preview_view_h: 0,
             last_diff_view_h: 0,
@@ -375,6 +386,7 @@ impl App {
             commit_detail_load: AsyncState::default(),
             commit_file_diff_load: AsyncState::default(),
             global_search_load: AsyncState::default(),
+            file_copy_load: AsyncState::default(),
             next_git_revalidate_at: now + Duration::from_millis(800),
             next_graph_revalidate_at: now + Duration::from_millis(1200),
         };
@@ -389,6 +401,83 @@ impl App {
         let generation = self.git_status_load.begin();
         self.tasks
             .refresh_status(generation, self.file_tree.root.clone());
+    }
+
+    /// Enter the drag-and-drop destination picker. Switches to the Files
+    /// tab so the user can see the tree they're about to drop into, then
+    /// stores the sources for the banner + eventual copy. Called from
+    /// `input::handle_paste` when a paste payload resolves to existing
+    /// on-disk paths.
+    ///
+    /// Refuses the transition in two situations that would otherwise
+    /// leave the user stranded:
+    ///
+    /// - `select_mode` is active — mouse capture is off in that mode,
+    ///   so the user would have no way to click a drop target. The
+    ///   toast points them at the `v` escape hatch.
+    /// - a place-mode copy is already in flight — overwriting
+    ///   `sources` would invalidate the worker's generation and the
+    ///   previous copy's completion result (including the success
+    ///   toast and tree refresh) would be silently dropped.
+    pub fn enter_place_mode(&mut self, sources: Vec<PathBuf>) {
+        if sources.is_empty() {
+            return;
+        }
+        if self.select_mode {
+            self.toasts
+                .push(Toast::warn(crate::i18n::place_mode_blocked_by_select_mode()));
+            return;
+        }
+        if self.file_copy_load.loading {
+            self.toasts.push(Toast::warn(
+                crate::i18n::place_mode_blocked_by_in_flight_copy(),
+            ));
+            return;
+        }
+        // Close any competing modal UI so place mode is the single
+        // source of truth. Without this, a drop during a quick-open
+        // palette session would leave both modal flags true: the
+        // palette keeps owning keyboard input (priority-ordered above
+        // place mode in `handle_key`), the search prompt would still
+        // commandeer the status bar instead of the PLACE badge, and
+        // the user would need two Esc presses to fully unwind.
+        self.quick_open.active = false;
+        if self.search.active {
+            crate::search::exit_cancel(self);
+        }
+        self.show_help = false;
+        self.set_active_tab(Tab::Files);
+        self.place_mode.active = true;
+        self.place_mode.sources = sources;
+    }
+
+    /// Leave place mode without copying — Esc, right-click, or a click on a
+    /// non-droppable area all land here.
+    pub fn exit_place_mode(&mut self) {
+        self.place_mode.active = false;
+        self.place_mode.sources.clear();
+    }
+
+    /// Kick off the async copy into `dest_dir`. Takes `self.place_mode.sources`
+    /// by clone so the state can be cleared by the caller if it chooses to —
+    /// but in normal flow we keep sources around until the worker result
+    /// arrives so the banner stays visible while copying.
+    ///
+    /// De-duped against in-flight copies: a rage-click on a second folder
+    /// before the first copy returns would otherwise `begin()` a new
+    /// generation and invalidate the prior one — the first copy still
+    /// runs on disk but its completion toast / tree refresh never fire.
+    /// `enter_place_mode` has the same guard for paste-level entry; this
+    /// handles the mouse-level commit path.
+    pub fn request_file_copy(&mut self, sources: Vec<PathBuf>, dest_dir: PathBuf) {
+        if self.file_copy_load.loading {
+            self.toasts.push(Toast::warn(
+                crate::i18n::place_mode_blocked_by_in_flight_copy(),
+            ));
+            return;
+        }
+        let generation = self.file_copy_load.begin();
+        self.tasks.copy_files(generation, sources, dest_dir);
     }
 
     /// Rebuild the file tree from disk, applying git decorations when a repo is open.
@@ -950,6 +1039,35 @@ impl App {
                     }
                 }
             }
+            WorkerResult::FileCopy { generation, result } => match result {
+                Ok(count) => {
+                    if self.file_copy_load.complete_ok(generation) {
+                        self.toasts
+                            .push(Toast::info(crate::i18n::place_mode_copied(count)));
+                        self.exit_place_mode();
+                        // The fs-watcher will eventually notice, but refresh
+                        // synchronously so the user sees their newly-placed
+                        // files immediately.
+                        self.refresh_file_tree();
+                    }
+                }
+                Err(error) => {
+                    if self.file_copy_load.complete_err(generation, error.clone()) {
+                        self.toasts
+                            .push(Toast::error(crate::i18n::place_mode_copy_failed(&error)));
+                        self.exit_place_mode();
+                        // `complete_err` sets stale=true + error=Some so
+                        // `should_request()` would re-fire, and
+                        // `activity_message` would surface "copy error:
+                        // …" in the status bar indefinitely after the
+                        // toast is gone. The error has already been
+                        // surfaced; clear the flags so the status bar
+                        // goes back to normal on the next frame.
+                        self.file_copy_load.stale = false;
+                        self.file_copy_load.error = None;
+                    }
+                }
+            },
         }
     }
 
@@ -991,7 +1109,8 @@ impl App {
         }
 
         match self.active_tab {
-            Tab::Files => from_state("files", &self.file_tree_load)
+            Tab::Files => from_state("copy", &self.file_copy_load)
+                .or_else(|| from_state("files", &self.file_tree_load))
                 .or_else(|| from_state("preview", &self.preview_load)),
             Tab::Git => from_state("git", &self.git_status_load)
                 .or_else(|| from_state("diff", &self.diff_load)),
@@ -1078,6 +1197,33 @@ impl App {
                 if self.active_tab == Tab::Search {
                     self.global_search.tab_input_focused = true;
                 }
+            }
+            ClickAction::PlaceModeFolder(index) => {
+                // Confirm a place-mode drop onto a specific folder. Resolve
+                // the entry's absolute path and hand off to the worker.
+                // Stale indices (e.g. the tree rebuilt out from under us)
+                // or accidental clicks on non-directory rows fall back to a
+                // cancel — safer than silently dropping to an unrelated
+                // destination.
+                let dest = self.file_tree.entries.get(index).and_then(|entry| {
+                    if entry.is_dir {
+                        Some(self.file_tree.root.join(&entry.path))
+                    } else {
+                        None
+                    }
+                });
+                match dest {
+                    Some(dest_dir) => {
+                        let sources = self.place_mode.sources.clone();
+                        self.request_file_copy(sources, dest_dir);
+                    }
+                    None => self.exit_place_mode(),
+                }
+            }
+            ClickAction::PlaceModeRoot => {
+                let sources = self.place_mode.sources.clone();
+                let dest_dir = self.file_tree.root.clone();
+                self.request_file_copy(sources, dest_dir);
             }
         }
     }
@@ -1173,6 +1319,7 @@ impl App {
         self.drain_preview_sync_debounce();
         self.drain_push_result();
         self.kick_active_tab_work();
+        self.tick_place_mode_auto_expand();
         self.drain_task_results();
     }
 
@@ -1279,6 +1426,43 @@ impl App {
             self.file_tree.root.clone(),
             self.global_search.query.clone(),
         );
+    }
+
+    /// VSCode-style hover auto-expand. When the cursor rests on a
+    /// collapsed folder for `HOVER_EXPAND_DELAY`, expand it so the user
+    /// can keep drilling into deep targets without round-tripping through
+    /// a click. Render writes the hover tracker; we just check the
+    /// timer here.
+    ///
+    /// Guarded on `file_tree_load.loading` so a slow tree rebuild doesn't
+    /// re-fire the expand on every tick — we'd otherwise pile up tree
+    /// rebuild generations until the worker caught up.
+    fn tick_place_mode_auto_expand(&mut self) {
+        if !self.place_mode.active {
+            return;
+        }
+        if self.file_tree_load.loading {
+            return;
+        }
+        let Some(idx) = self.place_mode.auto_expand_due(Instant::now()) else {
+            return;
+        };
+        let should_expand = self
+            .file_tree
+            .entries
+            .get(idx)
+            .map(|e| e.is_dir && !e.is_expanded)
+            .unwrap_or(false);
+        // Clear the timer regardless of whether we expand — hovering on
+        // an already-expanded folder shouldn't keep re-firing every
+        // frame, and leaving the timestamp set would do exactly that.
+        self.place_mode.hover_since = None;
+        if !should_expand {
+            return;
+        }
+        self.file_tree.toggle_expand(idx);
+        let selected_path = self.file_tree.selected_path();
+        self.refresh_file_tree_with_target(selected_path);
     }
 
     fn kick_active_tab_work(&mut self) {

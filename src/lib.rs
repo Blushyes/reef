@@ -11,6 +11,7 @@ pub mod global_search;
 pub mod i18n;
 pub mod input;
 pub mod input_edit;
+pub mod place_mode;
 pub mod prefs;
 pub mod quick_open;
 pub mod search;

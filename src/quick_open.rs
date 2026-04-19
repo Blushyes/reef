@@ -294,6 +294,24 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     }
 }
 
+/// Bracketed-paste arrival while the palette is active. Stripping newlines
+/// keeps a multi-line paste from breaking the single-line query model; CRs
+/// from Windows clipboards get the same treatment. Tabs stay as literal
+/// characters — users searching for odd filenames can type them on purpose
+/// and we don't want to drop that signal.
+///
+/// Called from `input::handle_paste` after the drop-path parser has already
+/// ruled out the payload as a file drop.
+pub fn handle_paste(s: &str, app: &mut App) {
+    for c in s.chars() {
+        if c == '\n' || c == '\r' {
+            continue;
+        }
+        input_edit::insert_char(&mut app.quick_open.query, &mut app.quick_open.cursor, c);
+    }
+    filter(&mut app.quick_open);
+}
+
 /// Dispatch one mouse event while the palette is active. The caller
 /// (input.rs) routes all events here instead of the normal mouse pipeline,
 /// so the underlying panels can't receive clicks through the overlay.

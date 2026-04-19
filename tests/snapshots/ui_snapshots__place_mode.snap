@@ -1,0 +1,24 @@
+---
+source: tests/ui_snapshots.rs
+expression: output
+---
+ reef  [TMPDIR]  ⎇ master
+ 📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph           1:Files 2:Search 3:Git 4:Graph
+╔══════════════════════╗
+║ 📋  Placing README.md ║
+║ ▸ src                ║
+║   README.md          ║
+║                      ║
+║                      ║
+║                      ║
+║                      ║
+║                      ║                  Select a file to preview
+║                      ║
+║                      ║
+║                      ║
+║                      ║
+║                      ║
+║                      ║
+║                      ║
+╚══════════════════════╝
+ 📋  PLACE   Click a folder to drop · click empty to drop at root · Esc / right-c

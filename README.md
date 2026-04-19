@@ -72,6 +72,7 @@ Reef works anywhere, but the Git and Graph tabs only light up inside a git repo.
 | `↑`/`↓`, `j`/`k` | navigate |
 | `PgUp` / `PgDn` | page |
 | `Enter` | expand/collapse directory, or open file in `$EDITOR` |
+| `e` | open selected file in `$EDITOR` (no-op on dirs) |
 | `r` | rebuild tree |
 
 ### Git tab
@@ -80,6 +81,7 @@ Reef works anywhere, but the Git and Graph tabs only light up inside a git repo.
 | --- | --- |
 | `s` / `u` | stage / unstage |
 | `d` → `y` | discard unstaged file (confirm) |
+| `Enter` / `e` | open selected file in `$EDITOR` |
 | `r` | refresh |
 | `t` | tree / flat view |
 | `m` | unified ↔ side-by-side |

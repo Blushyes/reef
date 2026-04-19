@@ -192,6 +192,17 @@ fn handle_key_git(key: KeyEvent, app: &mut App) {
         KeyCode::Char('f') => {
             app.toggle_diff_mode();
         }
+        KeyCode::Char('e') | KeyCode::Enter => {
+            // Edit the currently selected changed file. Ignore if nothing's
+            // selected (empty status) or the repo's gone. A Deleted-status
+            // file will be recreated by the editor if the user writes — same
+            // behaviour you'd get running `$EDITOR path/to/deleted` in a shell.
+            if let (Some(repo), Some(sel)) = (&app.repo, &app.selected_file) {
+                if let Some(workdir) = repo.workdir_path() {
+                    app.pending_edit = Some(workdir.join(&sel.path));
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -271,6 +282,16 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
         }
         KeyCode::Char('r') => {
             app.refresh_file_tree();
+        }
+        KeyCode::Char('e') => {
+            // Explicit alias for "edit selected entry". Unlike Enter, this
+            // never expands a directory — on a dir it's a no-op.
+            let idx = app.file_tree.selected;
+            if let Some(entry) = app.file_tree.entries.get(idx) {
+                if !entry.is_dir {
+                    app.pending_edit = Some(app.file_tree.root.join(&entry.path));
+                }
+            }
         }
         _ => {}
     }

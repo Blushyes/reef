@@ -74,7 +74,10 @@ fn with_filters<F: FnOnce()>(body: F) {
 fn snapshot_empty_repo() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, _raw) = tempdir_repo();
-    let _h = HomeGuard::enter(tmp.path());
+    // HOME must point outside the workdir — prefs creates `.config/reef`
+    // and the file tree now shows dotfiles.
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new();
@@ -89,7 +92,8 @@ fn snapshot_with_staged_and_unstaged() {
     commit_file(&raw, "tracked.txt", "v1\n", "init");
     write_file(&raw, "tracked.txt", "v2\n"); // unstaged modification
     write_file(&raw, "new.txt", "new\n"); // untracked
-    let _h = HomeGuard::enter(tmp.path());
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new();

@@ -132,6 +132,11 @@ pub struct App {
     pub file_tree: FileTree,
     pub preview_content: Option<PreviewContent>,
     pub tree_scroll: usize,
+    /// The `file_tree.selected` value we observed on the previous render.
+    /// Used by the Files-tab tree panel to distinguish "selection just changed
+    /// (scroll the viewport to keep it visible)" from "user scrolled the
+    /// viewport themselves (leave it alone)".
+    pub last_rendered_tree_selected: Option<usize>,
     pub preview_scroll: usize,
     pub preview_h_scroll: usize,
 
@@ -228,6 +233,7 @@ impl App {
             file_tree,
             preview_content: None,
             tree_scroll: 0,
+            last_rendered_tree_selected: None,
             preview_scroll: 0,
             preview_h_scroll: 0,
             split_percent: 30,

@@ -33,18 +33,25 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    // Clamp scroll
+    // Clamp scroll to valid range
     let max_scroll = entries.len().saturating_sub(padded.height as usize);
     app.tree_scroll = app.tree_scroll.min(max_scroll);
 
-    // Ensure selected is visible
-    if app.file_tree.selected < app.tree_scroll {
-        app.tree_scroll = app.file_tree.selected;
-    } else if app.file_tree.selected >= app.tree_scroll + padded.height as usize {
-        app.tree_scroll = app
-            .file_tree
-            .selected
-            .saturating_sub(padded.height as usize - 1);
+    // Keep the selection visible, but only when the selection actually moved
+    // since the last render. Running this every frame meant mouse-wheel scroll
+    // (which only changes tree_scroll, not selected) got snapped back to the
+    // opened file on the next tick — so the scroll appeared locked. See #10.
+    let selection_changed = app.last_rendered_tree_selected != Some(app.file_tree.selected);
+    if selection_changed {
+        if app.file_tree.selected < app.tree_scroll {
+            app.tree_scroll = app.file_tree.selected;
+        } else if app.file_tree.selected >= app.tree_scroll + padded.height as usize {
+            app.tree_scroll = app
+                .file_tree
+                .selected
+                .saturating_sub(padded.height as usize - 1);
+        }
+        app.last_rendered_tree_selected = Some(app.file_tree.selected);
     }
 
     let scroll = app.tree_scroll;

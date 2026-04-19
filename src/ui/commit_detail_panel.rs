@@ -6,6 +6,7 @@ use crate::git::tree::{self as gtree, Node};
 use crate::git::{DiffContent, FileEntry, FileStatus, LineTag};
 use crate::ui::git_graph_panel;
 use crate::ui::mouse::ClickAction;
+use crate::ui::theme::Theme;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -19,7 +20,8 @@ const DIFF_GUTTER_WIDTH: usize = 15;
 const SBS_GUTTER_WIDTH: usize = 7;
 
 pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
-    let rows = build_rows(app, area.width);
+    let theme = app.theme;
+    let rows = build_rows(app, area.width, &theme);
     let total = rows.len();
 
     let max_scroll = total.saturating_sub(area.height as usize);
@@ -39,7 +41,12 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
         let spans: Vec<Span<'static>> = row
             .spans
             .iter()
-            .map(|s| Span::styled(s.text.clone(), crate::ui::hover::apply(s.style, hover)))
+            .map(|s| {
+                Span::styled(
+                    s.text.clone(),
+                    crate::ui::hover::apply(s.style, hover, app.theme.hover_bg),
+                )
+            })
             .collect();
         f.render_widget(Line::from(spans), Rect::new(area.x, y, area.width, 1));
 
@@ -224,14 +231,14 @@ fn from_ratatui_span(span: Span<'static>) -> RowSpan {
 
 // ─── Row construction ─────────────────────────────────────────────────────────
 
-fn build_rows(app: &App, width: u16) -> Vec<Row> {
+fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
     let cd = &app.commit_detail;
 
     let Some(detail) = &cd.detail else {
         rows.push(Row::new(vec![RowSpan::styled(
             "  选择一个 commit 查看详情",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.fg_secondary),
         )]));
         return rows;
     };
@@ -241,7 +248,7 @@ fn build_rows(app: &App, width: u16) -> Vec<Row> {
     let max_path = (width as usize).saturating_sub(6);
 
     rows.push(Row::new(vec![
-        RowSpan::styled("commit ", Style::default().fg(Color::DarkGray)),
+        RowSpan::styled("commit ", Style::default().fg(theme.fg_secondary)),
         RowSpan::styled(
             info.oid.clone(),
             Style::default()
@@ -250,24 +257,24 @@ fn build_rows(app: &App, width: u16) -> Vec<Row> {
         ),
     ]));
     rows.push(Row::new(vec![
-        RowSpan::styled("Author: ", Style::default().fg(Color::DarkGray)),
+        RowSpan::styled("Author: ", Style::default().fg(theme.fg_secondary)),
         RowSpan::styled(
             format!("{} <{}>", info.author_name, info.author_email),
-            Style::default().fg(Color::White),
+            Style::default().fg(theme.fg_primary),
         ),
     ]));
     rows.push(Row::new(vec![
-        RowSpan::styled("Date:   ", Style::default().fg(Color::DarkGray)),
+        RowSpan::styled("Date:   ", Style::default().fg(theme.fg_secondary)),
         RowSpan::styled(
             format_timestamp(info.time),
-            Style::default().fg(Color::White),
+            Style::default().fg(theme.fg_primary),
         ),
     ]));
 
     if let Some(labels) = app.git_graph.ref_map.get(&info.oid) {
         let mut spans: Vec<RowSpan> = vec![RowSpan::styled(
             "Refs:   ",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.fg_secondary),
         )];
         for label in labels {
             spans.push(from_ratatui_span(git_graph_panel::ref_label_span(label)));
@@ -283,7 +290,7 @@ fn build_rows(app: &App, width: u16) -> Vec<Row> {
         truncate_in_place(&mut msg, max_msg);
         rows.push(Row::new(vec![
             RowSpan::plain("    "),
-            RowSpan::styled(msg, Style::default().fg(Color::White)),
+            RowSpan::styled(msg, Style::default().fg(theme.fg_primary)),
         ]));
     }
 
@@ -303,22 +310,23 @@ fn build_rows(app: &App, width: u16) -> Vec<Row> {
         ),
         RowSpan::styled(
             format!("  [{}]  t 切换", view_label),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.fg_secondary),
         )
         .on_click("git.toggleCommitFilesView", Value::Null),
     ]));
 
     let ctx = CommitFilesCtx {
         selected_file: cd.file_diff.as_ref().map(|(p, _)| p.as_str()),
-        sel_bg: Color::Rgb(40, 60, 100),
+        sel_bg: theme.selection_bg,
         max_path,
         commit_oid: &info.oid,
         collapsed: &cd.files_collapsed,
+        fg: theme.fg_primary,
     };
 
     if cd.files_tree_mode {
         let nodes = gtree::build(&detail.files);
-        render_commit_file_tree(&nodes, 1, &ctx, &mut rows);
+        render_commit_file_tree(&nodes, 1, &ctx, &mut rows, theme);
     } else {
         for file in &detail.files {
             rows.push(commit_file_row(file, &file.path, "  ", &ctx));
@@ -327,9 +335,15 @@ fn build_rows(app: &App, width: u16) -> Vec<Row> {
 
     if let Some((path, diff)) = &cd.file_diff {
         rows.push(Row::blank());
-        rows.push(diff_header_row(path, cd.diff_layout, cd.diff_mode, width));
-        rows.push(diff_separator_row(width));
-        append_diff_rows(&mut rows, diff, cd.diff_layout, width);
+        rows.push(diff_header_row(
+            path,
+            cd.diff_layout,
+            cd.diff_mode,
+            width,
+            theme,
+        ));
+        rows.push(diff_separator_row(width, theme));
+        append_diff_rows(&mut rows, diff, cd.diff_layout, width, theme);
     }
 
     rows
@@ -341,6 +355,7 @@ struct CommitFilesCtx<'a> {
     max_path: usize,
     commit_oid: &'a str,
     collapsed: &'a std::collections::HashSet<String>,
+    fg: Color,
 }
 
 fn commit_file_row(
@@ -368,10 +383,7 @@ fn commit_file_row(
             format!("{} ", file.status.label()),
             apply_bg(Style::default().fg(status_color), base_bg),
         ),
-        RowSpan::styled(
-            display,
-            apply_bg(Style::default().fg(Color::White), base_bg),
-        ),
+        RowSpan::styled(display, apply_bg(Style::default().fg(ctx.fg), base_bg)),
     ];
 
     Row::new(spans).on_click(
@@ -385,6 +397,7 @@ fn render_commit_file_tree(
     depth: usize,
     ctx: &CommitFilesCtx,
     rows: &mut Vec<Row>,
+    theme: &Theme,
 ) {
     let mut entries: Vec<(&String, &Node)> = nodes.iter().collect();
     entries.sort_by(|a, b| {
@@ -408,19 +421,19 @@ fn render_commit_file_tree(
                         RowSpan::plain(indent),
                         RowSpan::styled(
                             format!("{} ", arrow),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(theme.fg_secondary),
                         ),
                         RowSpan::styled(
                             format!("{}/", name),
                             Style::default()
-                                .fg(Color::Cyan)
+                                .fg(theme.accent)
                                 .add_modifier(Modifier::BOLD),
                         ),
                     ])
                     .on_click("git.toggleCommitDir", serde_json::json!({ "path": path })),
                 );
                 if !is_collapsed {
-                    render_commit_file_tree(children, depth + 1, ctx, rows);
+                    render_commit_file_tree(children, depth + 1, ctx, rows, theme);
                 }
             }
             Node::File(entry) => {
@@ -434,7 +447,13 @@ fn render_commit_file_tree(
 
 // ─── Inline diff rendering ────────────────────────────────────────────────────
 
-fn diff_header_row(path: &str, layout: DiffLayout, mode: DiffMode, width: u16) -> Row {
+fn diff_header_row(
+    path: &str,
+    layout: DiffLayout,
+    mode: DiffMode,
+    width: u16,
+    theme: &Theme,
+) -> Row {
     let layout_label = match layout {
         DiffLayout::Unified => "上下",
         DiffLayout::SideBySide => "左右",
@@ -452,48 +471,56 @@ fn diff_header_row(path: &str, layout: DiffLayout, mode: DiffMode, width: u16) -
         RowSpan::styled(
             path_display,
             Style::default()
-                .fg(Color::White)
+                .fg(theme.fg_primary)
                 .add_modifier(Modifier::BOLD),
         ),
-        RowSpan::styled(tag_str, Style::default().fg(Color::DarkGray)),
+        RowSpan::styled(tag_str, Style::default().fg(theme.fg_secondary)),
     ])
 }
 
-fn diff_separator_row(width: u16) -> Row {
+fn diff_separator_row(width: u16, theme: &Theme) -> Row {
     Row::new(vec![RowSpan::styled(
         "─".repeat(width as usize),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme.fg_secondary),
     )])
 }
 
-fn append_diff_rows(rows: &mut Vec<Row>, diff: &DiffContent, layout: DiffLayout, width: u16) {
+fn append_diff_rows(
+    rows: &mut Vec<Row>,
+    diff: &DiffContent,
+    layout: DiffLayout,
+    width: u16,
+    theme: &Theme,
+) {
     match layout {
-        DiffLayout::Unified => append_unified_diff(rows, diff, width),
-        DiffLayout::SideBySide => append_side_by_side_diff(rows, diff, width),
+        DiffLayout::Unified => append_unified_diff(rows, diff, width, theme),
+        DiffLayout::SideBySide => append_side_by_side_diff(rows, diff, width, theme),
     }
 }
 
-fn append_unified_diff(rows: &mut Vec<Row>, diff: &DiffContent, width: u16) {
-    let added_bg = Color::Rgb(0, 40, 0);
-    let removed_bg = Color::Rgb(60, 0, 0);
+fn append_unified_diff(rows: &mut Vec<Row>, diff: &DiffContent, width: u16, theme: &Theme) {
+    let added_bg = theme.added_bg;
+    let removed_bg = theme.removed_bg;
 
     for (i, hunk) in diff.hunks.iter().enumerate() {
         if i > 0 {
             rows.push(Row::new(vec![RowSpan::styled(
                 format!(" {:>5}  {:>5}  ⋯", "", ""),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.fg_secondary),
             )]));
         }
         rows.push(Row::new(vec![RowSpan::styled(
             format!(" {:>5}  {:>5}  {}", "", "", hunk.header),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::DIM),
         )]));
 
         for line in &hunk.lines {
             let (prefix, fg, bg) = match line.tag {
-                LineTag::Added => ("+", Color::Green, Some(added_bg)),
-                LineTag::Removed => ("-", Color::Red, Some(removed_bg)),
-                LineTag::Context => (" ", Color::White, None),
+                LineTag::Added => ("+", theme.added_accent, Some(added_bg)),
+                LineTag::Removed => ("-", theme.removed_accent, Some(removed_bg)),
+                LineTag::Context => (" ", theme.fg_primary, None),
             };
             let old_no = fmt_diff_lineno(line.old_lineno);
             let new_no = fmt_diff_lineno(line.new_lineno);
@@ -501,7 +528,7 @@ fn append_unified_diff(rows: &mut Vec<Row>, diff: &DiffContent, width: u16) {
             let content = truncate_to_display_width(&line.content, max_text).to_string();
             let pad = max_text.saturating_sub(UnicodeWidthStr::width(content.as_str()));
 
-            let gutter_style = Style::default().fg(Color::DarkGray);
+            let gutter_style = Style::default().fg(theme.fg_secondary);
             let mark_style = Style::default().fg(fg);
             let text_style = Style::default().fg(fg);
             let (g, m, t, p) = match bg {
@@ -523,7 +550,7 @@ fn append_unified_diff(rows: &mut Vec<Row>, diff: &DiffContent, width: u16) {
     }
 }
 
-fn append_side_by_side_diff(rows: &mut Vec<Row>, diff: &DiffContent, width: u16) {
+fn append_side_by_side_diff(rows: &mut Vec<Row>, diff: &DiffContent, width: u16, theme: &Theme) {
     let half = width.saturating_sub(1) / 2;
     let right_w = width.saturating_sub(half + 1);
 
@@ -531,16 +558,18 @@ fn append_side_by_side_diff(rows: &mut Vec<Row>, diff: &DiffContent, width: u16)
         if i > 0 {
             rows.push(Row::new(vec![RowSpan::styled(
                 format!(" {:>5}  ⋯", ""),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.fg_secondary),
             )]));
         }
         rows.push(Row::new(vec![RowSpan::styled(
             format!(" {:>5}  {}", "", hunk.header),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::DIM),
         )]));
 
         for row in pair_hunk_lines(hunk) {
-            rows.push(render_sbs_row(&row, half, right_w));
+            rows.push(render_sbs_row(&row, half, right_w, theme));
         }
     }
 }
@@ -554,13 +583,10 @@ struct SbsRow {
     right_text: String,
 }
 
-fn render_sbs_row(row: &SbsRow, half_w: u16, right_w: u16) -> Row {
-    let added_bg = Color::Rgb(0, 40, 0);
-    let removed_bg = Color::Rgb(60, 0, 0);
-
+fn render_sbs_row(row: &SbsRow, half_w: u16, right_w: u16, theme: &Theme) -> Row {
     let mut spans: Vec<RowSpan> = Vec::new();
-    let (left_fg, left_bg) = side_style(row.left_tag, added_bg, removed_bg);
-    let (right_fg, right_bg) = side_style(row.right_tag, added_bg, removed_bg);
+    let (left_fg, left_bg) = side_style(row.left_tag, theme);
+    let (right_fg, right_bg) = side_style(row.right_tag, theme);
 
     push_sbs_half(
         &mut spans,
@@ -569,10 +595,11 @@ fn render_sbs_row(row: &SbsRow, half_w: u16, right_w: u16) -> Row {
         left_fg,
         left_bg,
         half_w,
+        theme,
     );
     spans.push(RowSpan::styled(
         "│".to_string(),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme.fg_secondary),
     ));
     push_sbs_half(
         &mut spans,
@@ -581,6 +608,7 @@ fn render_sbs_row(row: &SbsRow, half_w: u16, right_w: u16) -> Row {
         right_fg,
         right_bg,
         right_w,
+        theme,
     );
     Row::new(spans)
 }
@@ -592,12 +620,13 @@ fn push_sbs_half(
     fg: Color,
     bg: Option<Color>,
     width: u16,
+    theme: &Theme,
 ) {
     let content_w = (width as usize).saturating_sub(SBS_GUTTER_WIDTH);
     let trimmed = truncate_to_display_width(text, content_w);
     let pad = content_w.saturating_sub(UnicodeWidthStr::width(trimmed));
 
-    let gutter_style = Style::default().fg(Color::DarkGray);
+    let gutter_style = Style::default().fg(theme.fg_secondary);
     let body_style = Style::default().fg(fg);
     let (g, b, p) = match bg {
         Some(bg) => (
@@ -612,11 +641,11 @@ fn push_sbs_half(
     spans.push(RowSpan::styled(" ".repeat(pad), p));
 }
 
-fn side_style(tag: LineTag, added_bg: Color, removed_bg: Color) -> (Color, Option<Color>) {
+fn side_style(tag: LineTag, theme: &Theme) -> (Color, Option<Color>) {
     match tag {
-        LineTag::Added => (Color::Green, Some(added_bg)),
-        LineTag::Removed => (Color::Red, Some(removed_bg)),
-        LineTag::Context => (Color::White, None),
+        LineTag::Added => (theme.added_accent, Some(theme.added_bg)),
+        LineTag::Removed => (theme.removed_accent, Some(theme.removed_bg)),
+        LineTag::Context => (theme.fg_primary, None),
     }
 }
 

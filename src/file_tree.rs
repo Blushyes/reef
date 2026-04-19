@@ -167,7 +167,10 @@ impl FileTree {
 }
 
 /// Load a file for preview. Returns None if the file can't be read.
-pub fn load_preview(root: &Path, rel_path: &Path) -> Option<PreviewContent> {
+///
+/// `dark` picks the syntect theme (OneHalfDark vs OneHalfLight) so the
+/// highlighted tokens read correctly against whichever UI theme is active.
+pub fn load_preview(root: &Path, rel_path: &Path, dark: bool) -> Option<PreviewContent> {
     let full = root.join(rel_path);
     if !full.is_file() {
         return None;
@@ -201,7 +204,7 @@ pub fn load_preview(root: &Path, rel_path: &Path) -> Option<PreviewContent> {
 
     let rel_str = rel_path.to_string_lossy().to_string();
     let highlighted = if raw.len() <= 512 * 1024 && lines.len() <= 5_000 {
-        crate::ui::highlight::highlight_file(&rel_str, &lines)
+        crate::ui::highlight::highlight_file(&rel_str, &lines, dark)
     } else {
         None
     };

@@ -3,7 +3,7 @@ use crate::file_tree::PreviewContent;
 use crate::ui::text::{clip_spans, skip_n_columns, truncate_to_width};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding};
 use unicode_width::UnicodeWidthStr;
@@ -15,14 +15,14 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
 
     let preview = match app.preview_content.take() {
         None => {
-            render_empty(f, inner);
+            render_empty(f, app, inner);
             return;
         }
         Some(preview) => preview,
     };
 
     if preview.is_binary {
-        render_binary(f, inner, &preview.file_path);
+        render_binary(f, app, inner, &preview.file_path);
     } else {
         render_content(f, app, inner, &preview);
     }
@@ -30,34 +30,35 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     app.preview_content = Some(preview);
 }
 
-fn render_empty(f: &mut Frame, area: Rect) {
+fn render_empty(f: &mut Frame, app: &App, area: Rect) {
     if area.height < 1 {
         return;
     }
     let msg = Line::from(Span::styled(
         "选择一个文件预览内容",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(app.theme.fg_secondary),
     ));
     let y = area.y + area.height / 2;
     let x = area.x + area.width.saturating_sub(20) / 2;
     f.render_widget(msg, Rect::new(x, y, area.width, 1));
 }
 
-fn render_binary(f: &mut Frame, area: Rect, path: &str) {
+fn render_binary(f: &mut Frame, app: &App, area: Rect, path: &str) {
     if area.height < 2 {
         return;
     }
+    let th = app.theme;
     let header = Line::from(Span::styled(
         path,
         Style::default()
-            .fg(Color::White)
+            .fg(th.fg_primary)
             .add_modifier(Modifier::BOLD),
     ));
     f.render_widget(header, Rect::new(area.x, area.y, area.width, 1));
 
     let msg = Line::from(Span::styled(
         "(binary file)",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(th.fg_secondary),
     ));
     let y = area.y + area.height / 2;
     let x = area.x + area.width.saturating_sub(14) / 2;
@@ -65,6 +66,7 @@ fn render_binary(f: &mut Frame, area: Rect, path: &str) {
 }
 
 fn render_content(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewContent) {
+    let th = app.theme;
     let mut y = area.y;
     let max_y = area.y + area.height;
 
@@ -73,7 +75,7 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewCon
         let header = Line::from(Span::styled(
             preview.file_path.as_str(),
             Style::default()
-                .fg(Color::White)
+                .fg(th.fg_primary)
                 .add_modifier(Modifier::BOLD),
         ));
         f.render_widget(header, Rect::new(area.x, y, area.width, 1));
@@ -84,7 +86,7 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewCon
     if y < max_y {
         let sep = Line::from(Span::styled(
             "─".repeat(area.width as usize),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(th.fg_secondary),
         ));
         f.render_widget(sep, Rect::new(area.x, y, area.width, 1));
         y += 1;
@@ -120,7 +122,7 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewCon
 
         let gutter = Span::styled(
             format!("{:>5} ", lineno),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(th.fg_secondary),
         );
 
         let mut spans = vec![gutter];
@@ -129,7 +131,7 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewCon
             None => {
                 let shifted = skip_n_columns(line, h);
                 let display = truncate_to_width(shifted, content_w);
-                spans.push(Span::styled(display, Style::default().fg(Color::Gray)));
+                spans.push(Span::styled(display, Style::default().fg(th.fg_primary)));
             }
         }
 

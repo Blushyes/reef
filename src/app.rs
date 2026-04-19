@@ -3,6 +3,7 @@ use crate::fs_watcher;
 use crate::git::graph::GraphRow;
 use crate::git::{CommitDetail, DiffContent, FileEntry, GitRepo, RefLabel};
 use crate::ui::mouse::{ClickAction, HitTestRegistry};
+use crate::ui::theme::Theme;
 use crate::ui::toast::Toast;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -168,6 +169,10 @@ pub struct App {
     pub should_quit: bool,
     pub select_mode: bool,
     pub show_help: bool,
+
+    /// Active color theme. Chosen in `main.rs` before raw-mode entry (so the
+    /// OSC 11 probe doesn't leak onto the TUI) and passed into `App::new`.
+    pub theme: Theme,
 }
 
 #[derive(Debug, Clone)]
@@ -177,7 +182,7 @@ pub struct SelectedFile {
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(theme: Theme) -> Self {
         // Fold pre-1.0 unprefixed keys (`layout=`, `mode=`) and the retired
         // `~/.config/reef/git.prefs` into the current prefixed namespace
         // BEFORE any `prefs::get` runs. Order matters: `load_prefs` below
@@ -245,6 +250,7 @@ impl App {
             should_quit: false,
             select_mode: false,
             show_help: false,
+            theme,
         };
         app.refresh_status();
         app
@@ -291,7 +297,8 @@ impl App {
     pub fn load_preview(&mut self) {
         if let Some(entry) = self.file_tree.selected_entry() {
             if !entry.is_dir {
-                let new_content = file_tree::load_preview(&self.file_tree.root, &entry.path);
+                let new_content =
+                    file_tree::load_preview(&self.file_tree.root, &entry.path, self.theme.is_dark);
                 // Preserve scroll when reloading the same file (fs-watcher refresh);
                 // reset only when the selected path actually changed (navigation).
                 let same_file = matches!(

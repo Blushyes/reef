@@ -6,6 +6,7 @@ use crossterm::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use reef::app::App;
+use reef::ui::theme::Theme;
 use reef::{input, ui};
 use std::io;
 use std::panic;
@@ -20,6 +21,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         original_hook(panic_info);
     }));
 
+    // Probe terminal background BEFORE raw mode / alt-screen so the OSC 11
+    // reply doesn't fragment onto the TUI. `Theme::resolve` also honours the
+    // `ui.theme` pref override and a non-TTY fallback.
+    let theme = Theme::resolve();
+
     // Terminal setup
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -28,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     // App init
-    let mut app = App::new();
+    let mut app = App::new(theme);
 
     // Main loop
     loop {

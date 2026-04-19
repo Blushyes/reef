@@ -10,9 +10,15 @@ pub type StyledToken = (Style, String);
 
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_no_newlines);
 
-static THEME: LazyLock<Theme> = LazyLock::new(|| {
+static THEME_DARK: LazyLock<Theme> = LazyLock::new(|| {
     two_face::theme::extra()
         .get(EmbeddedThemeName::OneHalfDark)
+        .clone()
+});
+
+static THEME_LIGHT: LazyLock<Theme> = LazyLock::new(|| {
+    two_face::theme::extra()
+        .get(EmbeddedThemeName::OneHalfLight)
         .clone()
 });
 
@@ -54,9 +60,10 @@ fn resolve_syntax(path: &str, lines: &[String]) -> Option<&'static SyntaxReferen
     None
 }
 
-pub fn highlight_file(path: &str, lines: &[String]) -> Option<Vec<Vec<StyledToken>>> {
+pub fn highlight_file(path: &str, lines: &[String], dark: bool) -> Option<Vec<Vec<StyledToken>>> {
     let syntax = resolve_syntax(path, lines)?;
-    let mut h = HighlightLines::new(syntax, &THEME);
+    let theme: &Theme = if dark { &THEME_DARK } else { &THEME_LIGHT };
+    let mut h = HighlightLines::new(syntax, theme);
 
     let mut out = Vec::with_capacity(lines.len());
     for line in lines {
@@ -93,7 +100,7 @@ mod tests {
     #[test]
     fn highlight_rust_line() {
         let lines = vec!["fn main() { let x = \"hi\"; }".to_string()];
-        let out = highlight_file("foo.rs", &lines).expect("rust must highlight");
+        let out = highlight_file("foo.rs", &lines, true).expect("rust must highlight");
         println!("tokens: {:#?}", out);
         assert_eq!(out.len(), 1);
         assert!(
@@ -114,7 +121,7 @@ mod tests {
         let mut missing = vec![];
         for ext in exts {
             let path = format!("foo.{}", ext);
-            if highlight_file(&path, &["hello".to_string()]).is_none() {
+            if highlight_file(&path, &["hello".to_string()], true).is_none() {
                 missing.push(ext);
             }
         }
@@ -130,7 +137,7 @@ mod tests {
             "Rakefile",
             "CMakeLists.txt",
         ] {
-            let result = highlight_file(name, &["x = y".to_string()]);
+            let result = highlight_file(name, &["x = y".to_string()], true);
             assert!(result.is_some(), "{} should resolve a syntax", name);
         }
     }
@@ -140,13 +147,14 @@ mod tests {
         let result = highlight_file(
             "no_extension_file",
             &["#!/usr/bin/env python".to_string(), "print(1)".to_string()],
+            true,
         );
         assert!(result.is_some(), "shebang should resolve python");
     }
 
     #[test]
     fn highlight_empty_lines_returns_empty_vec() {
-        let result = highlight_file("foo.rs", &[]);
+        let result = highlight_file("foo.rs", &[], true);
         // A known syntax with zero lines should return Some([])
         assert!(
             matches!(result, Some(ref v) if v.is_empty()),
@@ -156,13 +164,13 @@ mod tests {
 
     #[test]
     fn highlight_unknown_extension_returns_none() {
-        assert!(highlight_file("foo.xyz", &["hello".to_string()]).is_none());
+        assert!(highlight_file("foo.xyz", &["hello".to_string()], true).is_none());
     }
 
     #[test]
     fn highlight_returns_same_line_count() {
         let lines: Vec<String> = (0..10).map(|i| format!("let x{} = {};", i, i)).collect();
-        let result = highlight_file("foo.rs", &lines).expect("rust must highlight");
+        let result = highlight_file("foo.rs", &lines, true).expect("rust must highlight");
         assert_eq!(result.len(), lines.len());
     }
 
@@ -170,7 +178,7 @@ mod tests {
     fn highlight_many_lines_all_returned() {
         // highlight_file has no line-count limit — all lines are processed
         let lines: Vec<String> = (0..100).map(|i| format!("let x{i} = {i};")).collect();
-        let result = highlight_file("foo.rs", &lines).expect("rust must highlight");
+        let result = highlight_file("foo.rs", &lines, true).expect("rust must highlight");
         assert_eq!(result.len(), 100);
     }
 
@@ -178,8 +186,19 @@ mod tests {
     fn highlight_toml_file_recognized() {
         let lines = vec!["[package]".to_string(), "name = \"reef\"".to_string()];
         assert!(
-            highlight_file("Cargo.toml", &lines).is_some(),
+            highlight_file("Cargo.toml", &lines, true).is_some(),
             "toml should be recognized"
         );
+    }
+
+    #[test]
+    fn highlight_light_theme_smoke() {
+        // Light theme uses OneHalfLight; token colors come from a different
+        // palette but structure must match (same line count, multiple tokens
+        // for a non-trivial rust line).
+        let lines = vec!["fn main() { let x = \"hi\"; }".to_string()];
+        let out = highlight_file("foo.rs", &lines, false).expect("light theme must highlight");
+        assert_eq!(out.len(), 1);
+        assert!(out[0].len() > 1);
     }
 }

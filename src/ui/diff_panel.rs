@@ -1,6 +1,7 @@
 use crate::app::{App, DiffLayout};
 use crate::git::{DiffContent, DiffHunk, LineTag};
 use crate::ui::text::{skip_n_columns, truncate_to_width};
+use crate::ui::theme::Theme;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -15,7 +16,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
 
     match app.diff_content.take() {
         None => {
-            render_empty(f, inner);
+            render_empty(f, app, inner);
         }
         Some(diff) => {
             match app.diff_layout {
@@ -27,13 +28,13 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn render_empty(f: &mut Frame, area: Rect) {
+fn render_empty(f: &mut Frame, app: &App, area: Rect) {
     if area.height < 1 {
         return;
     }
     let msg = Line::from(Span::styled(
         "选择一个文件查看 diff",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(app.theme.fg_secondary),
     ));
     let y = area.y + area.height / 2;
     let x = area.x + area.width.saturating_sub(22) / 2;
@@ -45,6 +46,7 @@ fn render_empty(f: &mut Frame, area: Rect) {
 fn render_unified(f: &mut Frame, app: &mut App, area: Rect, diff: &DiffContent) {
     let mut y = area.y;
     let max_y = area.y + area.height;
+    let theme = app.theme;
 
     render_file_header(f, app, area, diff, &mut y, max_y);
 
@@ -89,24 +91,33 @@ fn render_unified(f: &mut Frame, app: &mut App, area: Rect, diff: &DiffContent) 
         if y >= max_y {
             break;
         }
-        render_unified_line(f, area, y, dl, h);
+        render_unified_line(f, area, y, dl, h, &theme);
         y += 1;
     }
 }
 
-fn render_unified_line(f: &mut Frame, area: Rect, y: u16, dl: &UnifiedLine, h_scroll: usize) {
+fn render_unified_line(
+    f: &mut Frame,
+    area: Rect,
+    y: u16,
+    dl: &UnifiedLine,
+    h_scroll: usize,
+    theme: &Theme,
+) {
     match dl {
         UnifiedLine::Separator => {
             let line = Line::from(Span::styled(
                 format!(" {:>5}  {:>5}  ⋯", "", ""),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.fg_secondary),
             ));
             f.render_widget(line, Rect::new(area.x, y, area.width, 1));
         }
         UnifiedLine::HunkHeader(header) => {
             let line = Line::from(Span::styled(
                 format!(" {}", header),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::DIM),
             ));
             f.render_widget(line, Rect::new(area.x, y, area.width, 1));
         }
@@ -116,7 +127,7 @@ fn render_unified_line(f: &mut Frame, area: Rect, y: u16, dl: &UnifiedLine, h_sc
             new_lineno,
             text,
         } => {
-            let (prefix, fg, bg) = line_style(*tag);
+            let (prefix, fg, bg) = line_style(*tag, theme);
             let old_num = fmt_lineno(*old_lineno);
             let new_num = fmt_lineno(*new_lineno);
 
@@ -129,7 +140,7 @@ fn render_unified_line(f: &mut Frame, area: Rect, y: u16, dl: &UnifiedLine, h_sc
             let line = Line::from(vec![
                 Span::styled(
                     format!(" {}  {} ", old_num, new_num),
-                    Style::default().fg(Color::DarkGray).bg(bg),
+                    Style::default().fg(theme.fg_secondary).bg(bg),
                 ),
                 Span::styled(format!("{} ", prefix), Style::default().fg(fg).bg(bg)),
                 Span::styled(display_text.to_string(), Style::default().fg(fg).bg(bg)),
@@ -248,6 +259,7 @@ fn build_sbs_lines(hunk: &DiffHunk) -> Vec<SbsDisplayLine> {
 fn render_side_by_side(f: &mut Frame, app: &mut App, area: Rect, diff: &DiffContent) {
     let mut y = area.y;
     let max_y = area.y + area.height;
+    let theme = app.theme;
 
     render_file_header(f, app, area, diff, &mut y, max_y);
 
@@ -302,25 +314,28 @@ fn render_side_by_side(f: &mut Frame, app: &mut App, area: Rect, diff: &DiffCont
                         "",
                         " ".repeat(area.width.saturating_sub(10) as usize)
                     ),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.fg_secondary),
                 ));
                 f.render_widget(line, Rect::new(area.x, y, area.width, 1));
             }
             SbsDisplayLine::HunkHeader(header) => {
                 let line = Line::from(Span::styled(
                     format!(" {}", header),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::DIM),
                 ));
                 f.render_widget(line, Rect::new(area.x, y, area.width, 1));
             }
             SbsDisplayLine::Row(row) => {
-                render_sbs_row(f, area, y, row, half_w, right_w, h);
+                render_sbs_row(f, area, y, row, half_w, right_w, h, &theme);
             }
         }
         y += 1;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_sbs_row(
     f: &mut Frame,
     area: Rect,
@@ -329,13 +344,14 @@ fn render_sbs_row(
     half_w: u16,
     right_w: u16,
     h_scroll: usize,
+    theme: &Theme,
 ) {
     // Gutter: " XXXXX " = 7 cols
     let gutter = 7usize;
 
     // ── Left half ──
     let left_content_w = (half_w as usize).saturating_sub(gutter);
-    let (_, left_fg, left_bg) = line_style(row.left_tag);
+    let (_, left_fg, left_bg) = line_style(row.left_tag, theme);
     let left_no = fmt_lineno(row.left_no);
     let left_shifted = skip_n_columns(&row.left_text, h_scroll);
     let left_text = truncate_to_width(left_shifted, left_content_w);
@@ -344,7 +360,7 @@ fn render_sbs_row(
     let left_line = Line::from(vec![
         Span::styled(
             format!(" {} ", left_no),
-            Style::default().fg(Color::DarkGray).bg(left_bg),
+            Style::default().fg(theme.fg_secondary).bg(left_bg),
         ),
         Span::styled(
             left_text.to_string(),
@@ -356,12 +372,12 @@ fn render_sbs_row(
 
     // ── Divider ──
     let div_x = area.x + half_w;
-    let div_line = Line::from(Span::styled("│", Style::default().fg(Color::DarkGray)));
+    let div_line = Line::from(Span::styled("│", Style::default().fg(theme.fg_secondary)));
     f.render_widget(div_line, Rect::new(div_x, y, 1, 1));
 
     // ── Right half ──
     let right_content_w = (right_w as usize).saturating_sub(gutter);
-    let (_, right_fg, right_bg) = line_style(row.right_tag);
+    let (_, right_fg, right_bg) = line_style(row.right_tag, theme);
     let right_no = fmt_lineno(row.right_no);
     let right_shifted = skip_n_columns(&row.right_text, h_scroll);
     let right_text = truncate_to_width(right_shifted, right_content_w);
@@ -370,7 +386,7 @@ fn render_sbs_row(
     let right_line = Line::from(vec![
         Span::styled(
             format!(" {} ", right_no),
-            Style::default().fg(Color::DarkGray).bg(right_bg),
+            Style::default().fg(theme.fg_secondary).bg(right_bg),
         ),
         Span::styled(
             right_text.to_string(),
@@ -395,6 +411,7 @@ fn render_file_header(
         return;
     }
 
+    let th = app.theme;
     let layout_label = match app.diff_layout {
         DiffLayout::Unified => "上下",
         DiffLayout::SideBySide => "左右",
@@ -413,10 +430,10 @@ fn render_file_header(
         Span::styled(
             path_display.to_string(),
             Style::default()
-                .fg(Color::White)
+                .fg(th.fg_primary)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(tag_str, Style::default().fg(Color::DarkGray)),
+        Span::styled(tag_str, Style::default().fg(th.fg_secondary)),
     ]);
     f.render_widget(header, Rect::new(area.x, *y, area.width, 1));
     *y += 1;
@@ -427,17 +444,17 @@ fn render_file_header(
     }
     let sep = Line::from(Span::styled(
         "─".repeat(area.width as usize),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(th.fg_secondary),
     ));
     f.render_widget(sep, Rect::new(area.x, *y, area.width, 1));
     *y += 1;
 }
 
-fn line_style(tag: LineTag) -> (&'static str, Color, Color) {
+fn line_style(tag: LineTag, theme: &Theme) -> (&'static str, Color, Color) {
     match tag {
-        LineTag::Added => ("+", Color::Green, Color::Rgb(0, 40, 0)),
-        LineTag::Removed => ("-", Color::Red, Color::Rgb(60, 0, 0)),
-        LineTag::Context => (" ", Color::Gray, Color::Reset),
+        LineTag::Added => ("+", theme.added_accent, theme.added_bg),
+        LineTag::Removed => ("-", theme.removed_accent, theme.removed_bg),
+        LineTag::Context => (" ", theme.fg_primary, Color::Reset),
     }
 }
 
@@ -494,21 +511,24 @@ mod tests {
 
     #[test]
     fn line_style_added() {
-        let (prefix, fg, _bg) = line_style(LineTag::Added);
+        let theme = Theme::dark();
+        let (prefix, fg, _bg) = line_style(LineTag::Added, &theme);
         assert_eq!(prefix, "+");
         assert_eq!(fg, Color::Green);
     }
 
     #[test]
     fn line_style_removed() {
-        let (prefix, fg, _bg) = line_style(LineTag::Removed);
+        let theme = Theme::dark();
+        let (prefix, fg, _bg) = line_style(LineTag::Removed, &theme);
         assert_eq!(prefix, "-");
         assert_eq!(fg, Color::Red);
     }
 
     #[test]
     fn line_style_context() {
-        let (prefix, _fg, _bg) = line_style(LineTag::Context);
+        let theme = Theme::dark();
+        let (prefix, _fg, _bg) = line_style(LineTag::Context, &theme);
         assert_eq!(prefix, " ");
     }
 

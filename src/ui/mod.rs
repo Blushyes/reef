@@ -8,6 +8,7 @@ pub mod highlight;
 pub mod hover;
 pub mod mouse;
 pub mod text;
+pub mod theme;
 pub mod toast;
 
 use crate::app::{App, Tab};
@@ -59,7 +60,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     match app.active_tab {
         Tab::Git => {
             if app.repo.is_none() {
-                render_no_repo(f, body_layout[0]);
+                render_no_repo(f, app, body_layout[0]);
             } else {
                 render_git_sidebar(f, app, body_layout[0]);
                 render_git_editor(f, app, body_layout[1]);
@@ -78,15 +79,16 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_status_bar(f, app, main_layout[3]);
 
     if app.show_help {
-        render_help(f, size);
+        render_help(f, app, size);
     }
 }
 
 /// Full-width message shown in the Git tab when not inside a git repository.
-fn render_no_repo(f: &mut Frame, area: Rect) {
+fn render_no_repo(f: &mut Frame, app: &App, area: Rect) {
+    let th = app.theme;
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(th.border));
     let msg = Paragraph::new(Text::from(vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -98,7 +100,7 @@ fn render_no_repo(f: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from(Span::styled(
             "Run `git init` to initialise one, or open reef inside a git repo.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(th.fg_secondary),
         )),
     ]))
     .alignment(ratatui::layout::Alignment::Center)
@@ -110,7 +112,7 @@ fn render_no_repo(f: &mut Frame, area: Rect) {
 fn render_git_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(app.theme.border));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -133,7 +135,7 @@ fn render_git_editor(f: &mut Frame, app: &mut App, area: Rect) {
 fn render_graph_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(app.theme.border));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -160,7 +162,8 @@ fn render_graph_editor(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
-    let bg = Color::Rgb(30, 30, 40);
+    let th = app.theme;
+    let bg = th.chrome_bg;
     let tabs = Tab::ALL;
 
     let mut spans: Vec<Span> = Vec::new();
@@ -171,11 +174,11 @@ fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
         let is_active = app.active_tab == *tab;
         let style = if is_active {
             Style::default()
-                .fg(Color::White)
-                .bg(Color::Rgb(60, 60, 80))
+                .fg(th.chrome_active_fg)
+                .bg(th.chrome_active_bg)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray).bg(bg)
+            Style::default().fg(th.chrome_muted_fg).bg(bg)
         };
         let span = Span::styled(label, style);
         // Hit-registry uses terminal columns (display width), not bytes — tab
@@ -192,7 +195,7 @@ fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
         if i < tabs.len() - 1 {
             spans.push(Span::styled(
                 "│",
-                Style::default().fg(Color::DarkGray).bg(bg),
+                Style::default().fg(th.chrome_muted_fg).bg(bg),
             ));
             x += 1;
         }
@@ -205,13 +208,14 @@ fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
     spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bg)));
     spans.push(Span::styled(
         keys_hint,
-        Style::default().fg(Color::DarkGray).bg(bg),
+        Style::default().fg(th.chrome_muted_fg).bg(bg),
     ));
 
     f.render_widget(Line::from(spans), area);
 }
 
 fn render_title_bar(f: &mut Frame, app: &App, area: Rect) {
+    let th = app.theme;
     let repo_name = app
         .repo
         .as_ref()
@@ -227,16 +231,16 @@ fn render_title_bar(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(
             " reef ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Blue)
+                .fg(th.badge_fg)
+                .bg(th.badge_bg)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" ", Style::default().bg(Color::Rgb(30, 30, 40))),
+        Span::styled(" ", Style::default().bg(th.chrome_bg)),
         Span::styled(
             &repo_name,
             Style::default()
-                .fg(Color::White)
-                .bg(Color::Rgb(30, 30, 40))
+                .fg(th.chrome_fg)
+                .bg(th.chrome_bg)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
@@ -245,7 +249,7 @@ fn render_title_bar(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 format!("  ⎇ {}", branch)
             },
-            Style::default().fg(Color::Cyan).bg(Color::Rgb(30, 30, 40)),
+            Style::default().fg(th.accent).bg(th.chrome_bg),
         ),
         Span::styled(
             " ".repeat(
@@ -253,13 +257,14 @@ fn render_title_bar(f: &mut Frame, app: &App, area: Rect) {
                     .saturating_sub(repo_name.len() as u16 + branch.len() as u16 + 10)
                     as usize,
             ),
-            Style::default().bg(Color::Rgb(30, 30, 40)),
+            Style::default().bg(th.chrome_bg),
         ),
     ]);
     f.render_widget(title, area);
 }
 
 fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
+    let th = app.theme;
     if app.select_mode {
         let hint = Line::from(vec![
             Span::styled(
@@ -271,9 +276,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled(
                 "  拖拽鼠标选择文字，按 v 退出选择模式",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .bg(Color::Rgb(30, 30, 40)),
+                Style::default().fg(Color::Yellow).bg(th.chrome_bg),
             ),
         ]);
         f.render_widget(hint, area);
@@ -294,25 +297,21 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let status = Line::from(vec![
-        Span::styled(
-            notif,
-            Style::default().fg(notif_color).bg(Color::Rgb(30, 30, 40)),
-        ),
+        Span::styled(notif, Style::default().fg(notif_color).bg(th.chrome_bg)),
         Span::styled(
             " ".repeat(area.width.saturating_sub(60) as usize),
-            Style::default().bg(Color::Rgb(30, 30, 40)),
+            Style::default().bg(th.chrome_bg),
         ),
         Span::styled(
             " q:退出 Tab:切换 s:暂存 u:取消 r:刷新 h:帮助 ",
-            Style::default()
-                .fg(Color::DarkGray)
-                .bg(Color::Rgb(30, 30, 40)),
+            Style::default().fg(th.chrome_muted_fg).bg(th.chrome_bg),
         ),
     ]);
     f.render_widget(status, area);
 }
 
-fn render_help(f: &mut Frame, screen: Rect) {
+fn render_help(f: &mut Frame, app: &App, screen: Rect) {
+    let th = app.theme;
     let core_entries: &[(&str, &str)] = &[
         ("q / Ctrl+C", "退出"),
         ("Tab", "切换顶部标签页（Files ↔ Git ↔ Graph）"),
@@ -347,11 +346,11 @@ fn render_help(f: &mut Frame, screen: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Blue))
+        .border_style(Style::default().fg(th.accent))
         .title(Span::styled(
             " 快捷键帮助 ",
             Style::default()
-                .fg(Color::White)
+                .fg(th.fg_primary)
                 .add_modifier(Modifier::BOLD),
         ))
         .padding(Padding::new(1, 1, 0, 0));
@@ -373,7 +372,7 @@ fn render_help(f: &mut Frame, screen: Rect) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(*desc, Style::default().fg(Color::White)),
+            Span::styled(*desc, Style::default().fg(th.fg_primary)),
         ]);
         f.render_widget(line, Rect::new(inner.x, row_y, inner.width, 1));
         row_y += 1;

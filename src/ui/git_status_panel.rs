@@ -480,7 +480,10 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ),
                 RowSpan::styled(msg, Style::default().fg(theme.fg_primary)),
-                RowSpan::styled(t(Msg::DismissClose), Style::default().fg(theme.fg_secondary)),
+                RowSpan::styled(
+                    t(Msg::DismissClose),
+                    Style::default().fg(theme.fg_secondary),
+                ),
             ])
             .on_click("git.dismissPushError", Value::Null),
         );
@@ -505,10 +508,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
-                RowSpan::styled(
-                    t(Msg::ForcePushWarning),
-                    Style::default().fg(Color::Yellow),
-                ),
+                RowSpan::styled(t(Msg::ForcePushWarning), Style::default().fg(Color::Yellow)),
             ]));
         } else {
             let msg = if ahead > 0 {
@@ -591,7 +591,10 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
-            RowSpan::styled(t(Msg::DiscardPromptSuffix), Style::default().fg(Color::Yellow)),
+            RowSpan::styled(
+                t(Msg::DiscardPromptSuffix),
+                Style::default().fg(Color::Yellow),
+            ),
         ]));
         rows.push(Row::new(vec![
             RowSpan::plain("  "),

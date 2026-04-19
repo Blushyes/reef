@@ -30,6 +30,7 @@ use std::time::Instant;
 
 use crate::app::{App, Tab};
 use crate::input::DOUBLE_CLICK_WINDOW;
+use crate::input_edit;
 use crate::prefs;
 use crate::ui::mouse::ClickAction;
 
@@ -237,19 +238,19 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         // fixterms-style protocol; older terminals collapse Alt+Backspace
         // onto plain Backspace, so Ctrl+W stays as the reliable fallback.
         KeyCode::Backspace if alt || ctrl => {
-            delete_word_backward(&mut app.quick_open);
+            input_edit::delete_word_backward(&mut app.quick_open.query, &mut app.quick_open.cursor);
             filter(&mut app.quick_open);
         }
         KeyCode::Char('w') if ctrl => {
-            delete_word_backward(&mut app.quick_open);
+            input_edit::delete_word_backward(&mut app.quick_open.query, &mut app.quick_open.cursor);
             filter(&mut app.quick_open);
         }
         KeyCode::Char('u') if ctrl => {
-            clear_query(&mut app.quick_open);
+            input_edit::clear(&mut app.quick_open.query, &mut app.quick_open.cursor);
             filter(&mut app.quick_open);
         }
         KeyCode::Backspace => {
-            backspace(&mut app.quick_open);
+            input_edit::backspace(&mut app.quick_open.query, &mut app.quick_open.cursor);
             filter(&mut app.quick_open);
         }
 
@@ -270,8 +271,12 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         }
 
         // ── Edit-cursor movement ─────────────────────────────────
-        KeyCode::Left => move_cursor(&mut app.quick_open, -1),
-        KeyCode::Right => move_cursor(&mut app.quick_open, 1),
+        KeyCode::Left => {
+            input_edit::move_cursor(&app.quick_open.query, &mut app.quick_open.cursor, -1);
+        }
+        KeyCode::Right => {
+            input_edit::move_cursor(&app.quick_open.query, &mut app.quick_open.cursor, 1);
+        }
         KeyCode::Home => {
             app.quick_open.cursor = 0;
         }
@@ -282,7 +287,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         // Any other Ctrl-combo is a no-op; we don't want Ctrl+A etc.
         // landing as a literal 'a' in the query.
         KeyCode::Char(c) if !ctrl => {
-            insert_char(&mut app.quick_open, c);
+            input_edit::insert_char(&mut app.quick_open.query, &mut app.quick_open.cursor, c);
             filter(&mut app.quick_open);
         }
         _ => {}
@@ -503,75 +508,10 @@ fn save_mru_to_prefs(mru: &VecDeque<PathBuf>) {
 }
 
 // ─── Input helpers ───────────────────────────────────────────────────────────
-
-fn insert_char(state: &mut QuickOpenState, c: char) {
-    state.query.insert(state.cursor, c);
-    state.cursor += c.len_utf8();
-}
-
-fn backspace(state: &mut QuickOpenState) {
-    if state.cursor == 0 {
-        return;
-    }
-    let prev = prev_char_boundary(&state.query, state.cursor);
-    state.query.replace_range(prev..state.cursor, "");
-    state.cursor = prev;
-}
-
-/// Delete the word immediately before the cursor. A "word" here is a run of
-/// alphanumeric chars (plus `_`); any trailing non-word chars (whitespace,
-/// `/`, `.`, `-`) are swept up first so deleting `"src/ui/|"` once lands on
-/// `"src/"` — matching how readline / Alt+Backspace behave in most editors.
-/// No-op at the start of the query.
-fn delete_word_backward(state: &mut QuickOpenState) {
-    if state.cursor == 0 {
-        return;
-    }
-    // Walk backwards char-by-char, not byte-by-byte — the query can contain
-    // CJK, emoji, etc. once a user pastes a non-ASCII path component.
-    let chars: Vec<(usize, char)> = state.query[..state.cursor].char_indices().collect();
-    let mut i = chars.len();
-
-    // Phase 1: sweep trailing non-word chars. Without this `"src/ui/|"`
-    // would delete nothing visible on the first press (cursor sits on `/`).
-    while i > 0 && !is_word_char(chars[i - 1].1) {
-        i -= 1;
-    }
-    // Phase 2: swallow the word.
-    while i > 0 && is_word_char(chars[i - 1].1) {
-        i -= 1;
-    }
-
-    let start = chars.get(i).map(|&(b, _)| b).unwrap_or(0);
-    state.query.replace_range(start..state.cursor, "");
-    state.cursor = start;
-}
-
-fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
-}
-
-/// Wipe the whole query and reset the cursor. Bound to Ctrl+U — readline's
-/// "kill to beginning" collapses to "clear everything" in a single-line
-/// input, which is the more useful operation for a palette.
-fn clear_query(state: &mut QuickOpenState) {
-    state.query.clear();
-    state.cursor = 0;
-}
-
-fn move_cursor(state: &mut QuickOpenState, delta: i32) {
-    if delta < 0 {
-        if state.cursor == 0 {
-            return;
-        }
-        state.cursor = prev_char_boundary(&state.query, state.cursor);
-    } else {
-        if state.cursor >= state.query.len() {
-            return;
-        }
-        state.cursor = next_char_boundary(&state.query, state.cursor);
-    }
-}
+//
+// Text-editing primitives (insert/backspace/delete_word_backward/clear/
+// move_cursor) live in `crate::input_edit` and are shared with
+// `crate::global_search`.
 
 fn move_selection(state: &mut QuickOpenState, delta: i32) {
     if state.matches.is_empty() {
@@ -582,22 +522,6 @@ fn move_selection(state: &mut QuickOpenState, delta: i32) {
     let cur = state.selected as i32;
     let next = (cur + delta).clamp(0, last as i32) as usize;
     state.selected = next;
-}
-
-fn prev_char_boundary(s: &str, offset: usize) -> usize {
-    s[..offset]
-        .char_indices()
-        .last()
-        .map(|(i, _)| i)
-        .unwrap_or(0)
-}
-
-fn next_char_boundary(s: &str, offset: usize) -> usize {
-    s[offset..]
-        .chars()
-        .next()
-        .map(|c| offset + c.len_utf8())
-        .unwrap_or(offset)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -680,42 +604,6 @@ mod tests {
     }
 
     #[test]
-    fn insert_and_backspace_roundtrip() {
-        let mut s = QuickOpenState::default();
-        insert_char(&mut s, 'h');
-        insert_char(&mut s, 'i');
-        assert_eq!(s.query, "hi");
-        assert_eq!(s.cursor, 2);
-        backspace(&mut s);
-        assert_eq!(s.query, "h");
-        assert_eq!(s.cursor, 1);
-    }
-
-    #[test]
-    fn backspace_at_start_is_noop() {
-        let mut s = QuickOpenState::default();
-        backspace(&mut s);
-        assert_eq!(s.query, "");
-        assert_eq!(s.cursor, 0);
-    }
-
-    #[test]
-    fn cursor_moves_respect_char_boundaries() {
-        let mut s = QuickOpenState::default();
-        s.query = "a你b".to_string();
-        s.cursor = s.query.len();
-        // back over 'b' (1 byte)
-        move_cursor(&mut s, -1);
-        assert_eq!(s.cursor, 4);
-        // back over '你' (3 bytes)
-        move_cursor(&mut s, -1);
-        assert_eq!(s.cursor, 1);
-        // forward over '你'
-        move_cursor(&mut s, 1);
-        assert_eq!(s.cursor, 4);
-    }
-
-    #[test]
     fn move_selection_clamps() {
         let mut s = mk_state(&["a.rs", "b.rs", "c.rs"]);
         filter(&mut s);
@@ -723,67 +611,6 @@ mod tests {
         assert_eq!(s.selected, 2);
         move_selection(&mut s, -99);
         assert_eq!(s.selected, 0);
-    }
-
-    #[test]
-    fn delete_word_backward_at_start_is_noop() {
-        let mut s = QuickOpenState::default();
-        delete_word_backward(&mut s);
-        assert_eq!(s.query, "");
-        assert_eq!(s.cursor, 0);
-    }
-
-    fn state_with(query: &str, cursor: usize) -> QuickOpenState {
-        QuickOpenState {
-            query: query.to_string(),
-            cursor,
-            ..QuickOpenState::default()
-        }
-    }
-
-    #[test]
-    fn delete_word_backward_consumes_one_word() {
-        let mut s = state_with("hello world", "hello world".len());
-        delete_word_backward(&mut s);
-        assert_eq!(s.query, "hello ");
-        assert_eq!(s.cursor, 6);
-    }
-
-    #[test]
-    fn delete_word_backward_sweeps_trailing_separators() {
-        // Path-like query: cursor sits after the trailing '/'. One press
-        // must kill the '/' AND the 'ui' word it delimits.
-        let mut s = state_with("src/ui/", "src/ui/".len());
-        delete_word_backward(&mut s);
-        assert_eq!(s.query, "src/");
-        assert_eq!(s.cursor, 4);
-    }
-
-    #[test]
-    fn delete_word_backward_handles_cjk() {
-        let mut s = state_with("测试 文件", "测试 文件".len());
-        delete_word_backward(&mut s);
-        assert_eq!(s.query, "测试 ");
-        // cursor lands at the byte position after the space
-        assert_eq!(s.cursor, "测试 ".len());
-    }
-
-    #[test]
-    fn delete_word_backward_respects_midquery_cursor() {
-        // Cursor in the middle of the string: only the word to the left of
-        // the cursor should vanish; text after the cursor is preserved.
-        let mut s = state_with("foo bar baz", 7); // right after "bar"
-        delete_word_backward(&mut s);
-        assert_eq!(s.query, "foo  baz");
-        assert_eq!(s.cursor, 4);
-    }
-
-    #[test]
-    fn clear_query_wipes_all() {
-        let mut s = state_with("anything", 4);
-        clear_query(&mut s);
-        assert_eq!(s.query, "");
-        assert_eq!(s.cursor, 0);
     }
 
     #[test]

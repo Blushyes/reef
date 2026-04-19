@@ -4,10 +4,12 @@ pub mod file_preview_panel;
 pub mod file_tree_panel;
 pub mod git_graph_panel;
 pub mod git_status_panel;
+pub mod global_search_panel;
 pub mod highlight;
 pub mod hover;
 pub mod mouse;
 pub mod quick_open_panel;
+pub mod search_tab;
 pub mod text;
 pub mod theme;
 pub mod toast;
@@ -76,6 +78,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
             render_graph_sidebar(f, app, body_layout[0]);
             render_graph_editor(f, app, body_layout[1]);
         }
+        Tab::Search => {
+            search_tab::render_sidebar(f, app, body_layout[0]);
+            file_preview_panel::render(f, app, body_layout[1]);
+        }
     }
 
     render_status_bar(f, app, main_layout[3]);
@@ -87,8 +93,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // Render last so the palette overlays help if both are somehow active
     // (shouldn't happen in practice — opening one dismisses the other via
     // input-priority — but the ordering here is a belt-and-braces guard).
+    // Global-search after quick-open: if both flags were somehow true the
+    // later render wins on overlap, and having global-search on top matches
+    // its priority in input dispatch.
     if app.quick_open.active {
         quick_open_panel::render(f, app, size);
+    }
+    if app.global_search.active {
+        global_search_panel::render(f, app, size);
     }
 }
 
@@ -438,6 +450,7 @@ fn render_help(f: &mut Frame, app: &App, screen: Rect) {
         ("v", t(Msg::HelpSelectMode)),
         ("h", t(Msg::HelpShowHelp)),
         ("Space p", t(Msg::HelpQuickOpen)),
+        ("Space f", t(Msg::HelpGlobalSearch)),
         (t(Msg::HelpKeyAnyKey), t(Msg::HelpAnyKey)),
     ];
 

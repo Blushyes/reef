@@ -138,9 +138,22 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewCon
                 Some(tokens) => tokens.clone(),
                 None => vec![(Style::default().fg(th.fg_primary), line.clone())],
             };
-        let (ranges, cur) = app
+        let (mut ranges, mut cur) = app
             .search
             .ranges_on_row(SearchTarget::FilePreview, real_idx);
+        // `global_search::accept` stashes a single-row highlight at the
+        // matching line so we can light it up once the async preview lands.
+        // Applied alongside the `/` search ranges using the same overlay
+        // helper — the existing "current match" slot is natural, since there
+        // is only ever one global-search highlight per preview.
+        if let Some(hl) = app.preview_highlight.as_ref() {
+            if preview.file_path == hl.path.to_string_lossy() && hl.row == real_idx {
+                ranges.push(hl.byte_range.clone());
+                if cur.is_none() {
+                    cur = Some(hl.byte_range.clone());
+                }
+            }
+        }
         let tokens = if ranges.is_empty() {
             base_tokens
         } else {

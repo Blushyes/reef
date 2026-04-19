@@ -16,16 +16,24 @@ pub enum Tab {
     Git,
     Files,
     Graph,
+    /// Persistent global-search view. Shares `app.global_search` state with
+    /// the Space+F overlay — picking up a running query seamlessly when the
+    /// user pins the overlay via Alt/Ctrl+Enter, or starts fresh by
+    /// switching in via digit key / Tab cycle.
+    Search,
 }
 
 impl Tab {
-    /// Canonical ordering shared by the tab bar renderer and the digit shortcut.
-    pub const ALL: &'static [Tab] = &[Tab::Files, Tab::Git, Tab::Graph];
+    /// Canonical ordering shared by the tab bar renderer and the digit
+    /// shortcut. Order mirrors VSCode's Activity Bar (Files → Search → …)
+    /// so Search sits adjacent to Files, where it belongs mentally.
+    pub const ALL: &'static [Tab] = &[Tab::Files, Tab::Search, Tab::Git, Tab::Graph];
 
     pub fn label(self) -> &'static str {
         use crate::i18n::{Msg, t};
         match self {
             Tab::Files => t(Msg::TabFiles),
+            Tab::Search => t(Msg::TabSearch),
             Tab::Git => t(Msg::TabGit),
             Tab::Graph => t(Msg::TabGraph),
         }
@@ -202,6 +210,17 @@ pub struct App {
     /// exclusively to `crate::quick_open::handle_key` (see input.rs).
     pub quick_open: crate::quick_open::QuickOpenState,
 
+    /// VSCode-style global-search (Ctrl+Shift+F) palette. While `active`,
+    /// input is routed exclusively to `crate::global_search::handle_key`.
+    pub global_search: crate::global_search::GlobalSearchState,
+
+    /// Row-scoped highlight to apply in the Files-tab file preview — set by
+    /// `global_search::accept` right before it kicks off an async preview
+    /// load, consumed when that preview arrives (for scroll centering) and
+    /// cleared when the active preview path changes. Rendered by
+    /// `ui::file_preview_panel` alongside the in-panel `/` search highlight.
+    pub preview_highlight: Option<PreviewHighlight>,
+
     /// Timestamp of the most recent bare-Space keystroke in the global
     /// keymap. `Some(t)` means a Space leader is primed and waiting for a
     /// follow-up key within `input::LEADER_TIMEOUT`. The palette-side
@@ -225,6 +244,12 @@ pub struct App {
     pub graph_load: AsyncState,
     pub commit_detail_load: AsyncState,
     pub commit_file_diff_load: AsyncState,
+    /// Tracks generation + loading for the streaming global-search worker.
+    /// Unlike other workers (one request → one `WorkerResult`), global
+    /// search emits many `GlobalSearchChunk`s and a terminating
+    /// `GlobalSearchDone`; we use `begin()` at kickoff, plain generation
+    /// comparisons on each chunk, and `complete_ok` on `Done`.
+    pub global_search_load: AsyncState,
     next_git_revalidate_at: Instant,
     next_graph_revalidate_at: Instant,
 }
@@ -233,6 +258,17 @@ pub struct App {
 pub struct SelectedFile {
     pub path: String,
     pub is_staged: bool,
+}
+
+/// Row-scoped preview highlight carried from `global_search::accept()` to
+/// the `file_preview_panel` renderer. Survives the async preview round-trip
+/// so the match row gets highlighted the frame the preview lands. Cleared
+/// whenever the active preview path no longer matches `path`.
+#[derive(Debug, Clone)]
+pub struct PreviewHighlight {
+    pub path: std::path::PathBuf,
+    pub row: usize,
+    pub byte_range: std::ops::Range<usize>,
 }
 
 impl App {
@@ -324,6 +360,8 @@ impl App {
             theme,
             search: crate::search::SearchState::default(),
             quick_open: crate::quick_open::QuickOpenState::from_prefs(),
+            global_search: crate::global_search::GlobalSearchState::default(),
+            preview_highlight: None,
             space_leader_at: None,
             last_preview_view_h: 0,
             last_diff_view_h: 0,
@@ -336,6 +374,7 @@ impl App {
             graph_load: AsyncState::default(),
             commit_detail_load: AsyncState::default(),
             commit_file_diff_load: AsyncState::default(),
+            global_search_load: AsyncState::default(),
             next_git_revalidate_at: now + Duration::from_millis(800),
             next_graph_revalidate_at: now + Duration::from_millis(1200),
         };
@@ -379,6 +418,15 @@ impl App {
     }
 
     pub fn load_preview_for_path(&mut self, rel_path: PathBuf) {
+        // Drop any global-search highlight that points at a different file.
+        // `global_search::accept` sets the highlight AND calls this with the
+        // target path, so a matching path leaves the highlight intact; a
+        // user-driven file switch (navigate_files etc.) clears it.
+        if let Some(hl) = self.preview_highlight.as_ref() {
+            if hl.path != rel_path {
+                self.preview_highlight = None;
+            }
+        }
         let generation = self.preview_load.begin();
         self.tasks.load_preview(
             generation,
@@ -738,6 +786,21 @@ impl App {
                             self.preview_scroll = 0;
                             self.preview_h_scroll = 0;
                         }
+                        // If `global_search::accept` stashed a highlight for
+                        // this file, re-center once the preview actually
+                        // lands. `load_preview_for_path` runs async, so the
+                        // scroll has to happen here — setting it inside
+                        // `accept()` before the preview exists wouldn't know
+                        // the final line count / view height.
+                        if let (Some(hl), Some(preview)) = (
+                            self.preview_highlight.as_ref(),
+                            self.preview_content.as_ref(),
+                        ) {
+                            if preview.file_path == hl.path.to_string_lossy() {
+                                let view_h = self.last_preview_view_h as usize;
+                                self.preview_scroll = crate::search::center_scroll(hl.row, view_h);
+                            }
+                        }
                     }
                 }
                 Err(error) => {
@@ -847,6 +910,46 @@ impl App {
                     self.commit_file_diff_load.complete_err(generation, error);
                 }
             },
+            WorkerResult::GlobalSearchChunk { generation, hits } => {
+                // Intermediate event — compare generation manually since
+                // AsyncState only has a `complete_ok` helper for terminal
+                // results. Leaves `loading=true` while chunks keep arriving.
+                if generation == self.global_search_load.generation {
+                    self.global_search.results.extend(hits);
+                    // Keep same-file hits adjacent. We could maintain this
+                    // invariant incrementally since the walker emits files
+                    // in directory order, but a per-chunk sort is cheap and
+                    // defends against any future parallelisation.
+                    self.global_search
+                        .results
+                        .sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+                    // Chunk arrival can rotate which hit is at `selected`
+                    // (typical: query changed, results reset to 0, and the
+                    // new top hit differs from the previous preview). Sync
+                    // the right panel lazily — only reload when stale, so
+                    // streaming a bunch of chunks for one file doesn't
+                    // thrash the preview worker.
+                    self.sync_search_preview_if_stale();
+                }
+            }
+            WorkerResult::GlobalSearchDone {
+                generation,
+                truncated,
+            } => {
+                // Terminal event — `complete_ok` flips loading off and
+                // returns false if superseded (then we skip the truncation
+                // update too, since the whole result set belongs to an
+                // older generation).
+                if self.global_search_load.complete_ok(generation) {
+                    self.global_search.truncated = truncated;
+                    // Zero results: clear the hit-scoped highlight so the
+                    // right panel's current preview isn't misleadingly
+                    // decorated with a line bar from the previous query.
+                    if self.global_search.results.is_empty() && self.active_tab == Tab::Search {
+                        self.preview_highlight = None;
+                    }
+                }
+            }
         }
     }
 
@@ -862,6 +965,14 @@ impl App {
                 if self.file_tree.entries.is_empty() {
                     self.file_tree_load.mark_stale();
                 }
+            }
+            // Search has no background fetch to mark stale, but we do need
+            // to resync the right panel's preview — `preview_highlight`
+            // may have been cleared by a file-tree navigation in some
+            // other tab, leaving the Search tab's preview pointing at the
+            // wrong file.
+            Tab::Search => {
+                self.sync_search_preview_if_stale();
             }
         }
     }
@@ -887,6 +998,15 @@ impl App {
             Tab::Graph => from_state("graph", &self.graph_load)
                 .or_else(|| from_state("commit", &self.commit_detail_load))
                 .or_else(|| from_state("commit diff", &self.commit_file_diff_load)),
+            // Search activity is surfaced in the tab's own footer (`N / M ·
+            // scanning…`), not in the global status bar.
+            Tab::Search => {
+                if self.global_search_load.loading {
+                    Some("search scanning…".into())
+                } else {
+                    from_state("preview", &self.preview_load)
+                }
+            }
         }
     }
 
@@ -936,13 +1056,29 @@ impl App {
                 }
                 let _ = crate::ui::commit_detail_panel::handle_command(self, &command, &args);
             }
-            // Quick-open palette clicks are dispatched inline by
-            // `quick_open::handle_mouse` (single-click select, double-click
-            // accept) rather than routed through `handle_action`, because
-            // the double-click distinction needs `last_click` timing that's
-            // only available at the input layer. This arm is unreachable
-            // under normal flow but keeps the match exhaustive.
+            // Palette clicks are dispatched inline by their respective
+            // `handle_mouse` fns (single-click select, double-click accept)
+            // rather than routed through `handle_action`, because the
+            // double-click distinction needs `last_click` timing that's only
+            // available at the input layer.
             ClickAction::QuickOpenSelect(_) => {}
+            // Tab::Search result clicks DO route through here — the tab is
+            // not an overlay, so input::handle_mouse lets the click fall
+            // through to hit_test + handle_action. Update the selection and
+            // trigger live preview.
+            ClickAction::GlobalSearchSelect(idx) => {
+                if self.active_tab == Tab::Search {
+                    self.global_search.selected = idx;
+                    crate::global_search::navigate_to_selected(self);
+                }
+                // Overlay case is unreachable via this path — handled inline
+                // in `global_search::handle_mouse`.
+            }
+            ClickAction::GlobalSearchFocusInput => {
+                if self.active_tab == Tab::Search {
+                    self.global_search.tab_input_focused = true;
+                }
+            }
         }
     }
 
@@ -1033,9 +1169,116 @@ impl App {
             crate::quick_open::mark_stale(&mut self.quick_open);
         }
 
+        self.maybe_kick_global_search();
+        self.drain_preview_sync_debounce();
         self.drain_push_result();
         self.kick_active_tab_work();
         self.drain_task_results();
+    }
+
+    /// Fire a debounced preview-sync if its deadline has elapsed. Scheduled
+    /// by `global_search::schedule_preview_sync` (called from keyboard
+    /// navigation); coalesces bursts so holding ↓ doesn't spam the preview
+    /// worker. Click / chunk-arrival / pin go through `navigate_to_selected`
+    /// directly and bypass this.
+    fn drain_preview_sync_debounce(&mut self) {
+        let Some(t) = self.global_search.preview_sync_at else {
+            return;
+        };
+        if Instant::now() < t {
+            return;
+        }
+        self.global_search.preview_sync_at = None;
+        crate::global_search::navigate_to_selected(self);
+    }
+
+    /// Reload the Search tab's right-side preview iff the currently-selected
+    /// hit no longer matches what `preview_highlight` is pointing at.
+    /// Called after every global-search chunk arrives — without this the
+    /// right panel goes stale between "user types new query" and "user
+    /// presses ↑↓ manually," which looks like a bug.
+    ///
+    /// Gated on `active_tab == Tab::Search` so the overlay (which doesn't
+    /// render a preview) doesn't waste preview-worker cycles. Cheap when a
+    /// burst of chunks all point at the same hit — the staleness check
+    /// short-circuits.
+    fn sync_search_preview_if_stale(&mut self) {
+        if self.active_tab != Tab::Search {
+            return;
+        }
+        let Some(hit) = self
+            .global_search
+            .results
+            .get(self.global_search.selected)
+            .cloned()
+        else {
+            return;
+        };
+        let stale = match &self.preview_highlight {
+            Some(hl) => hl.path != hit.path || hl.row != hit.line,
+            None => true,
+        };
+        if stale {
+            crate::global_search::navigate_to_selected(self);
+        }
+    }
+
+    /// Fire a global-search task if the query has changed and the debounce
+    /// window has elapsed. Uses `AsyncState::begin()` for the generation
+    /// bump + loading flag (same pattern as every other worker); adds a
+    /// cooperative `cancel` flag swap since AsyncState doesn't model abort.
+    fn maybe_kick_global_search(&mut self) {
+        let Some(t) = self.global_search.last_keystroke_at else {
+            return;
+        };
+        if Instant::now().duration_since(t) < crate::global_search::DEBOUNCE {
+            return;
+        }
+        if self.global_search.query == self.global_search.last_searched_query {
+            self.global_search.last_keystroke_at = None;
+            return;
+        }
+
+        // Tell the previous worker (if any) to bail. A fresh Arc makes sure
+        // the new task's observation of `cancel` is independent from the
+        // flag we just flipped.
+        self.global_search
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let new_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.global_search.cancel = new_cancel.clone();
+
+        self.global_search.results.clear();
+        self.global_search.truncated = false;
+        self.global_search.selected = 0;
+        self.global_search.scroll = 0;
+        // New query → fresh results → start from smart-view. Leaving a
+        // stale h-scroll here would mean the first chunks land already
+        // offset, which looks like a bug.
+        self.global_search.results_h_scroll = 0;
+        self.global_search.last_searched_query = self.global_search.query.clone();
+        self.global_search.last_keystroke_at = None;
+
+        if self.global_search.query.is_empty() {
+            // No worker to send. Still bump+complete the AsyncState so any
+            // late Done from the previous (now-cancelled) worker is dropped
+            // via generation mismatch, and `loading` correctly reads false.
+            let g = self.global_search_load.begin();
+            self.global_search_load.complete_ok(g);
+            // Clear the hit-scoped preview highlight too — without results
+            // there's nothing to point at, and keeping the old one leaves
+            // a ghost band on the right panel's last-loaded file.
+            self.preview_highlight = None;
+            return;
+        }
+
+        let new_gen = self.global_search_load.begin();
+        self.tasks.search_all(
+            new_gen,
+            new_cancel,
+            self.file_tree.root.clone(),
+            self.global_search.query.clone(),
+        );
     }
 
     fn kick_active_tab_work(&mut self) {
@@ -1079,6 +1322,29 @@ impl App {
                 }
                 if self.commit_file_diff_load.should_request() {
                     self.reload_commit_file_diff();
+                }
+            }
+            Tab::Search => {
+                // The search worker is kicked by `maybe_kick_global_search`
+                // at the top of tick() — only user keystrokes re-run it, not
+                // tab activation. Preview is demand-driven by selection
+                // changes via `sync_search_preview_if_stale` /
+                // `navigate_to_selected`.
+                //
+                // What we DO handle here: fs-watcher marks `preview_load`
+                // stale → reload the currently-selected hit's file. Using
+                // `self.load_preview()` would be wrong — it reads
+                // `file_tree.selected`, which in the Search tab points at
+                // whatever the Files tab was looking at last, not at the
+                // current hit.
+                if self.preview_load.should_request()
+                    && let Some(hit) = self
+                        .global_search
+                        .results
+                        .get(self.global_search.selected)
+                        .cloned()
+                {
+                    self.load_preview_for_path(hit.path);
                 }
             }
         }

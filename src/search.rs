@@ -214,6 +214,11 @@ fn resolve_target(app: &App) -> Option<SearchTarget> {
         (Tab::Git, Panel::Diff) => Some(SearchTarget::Diff),
         (Tab::Graph, Panel::Files) => Some(SearchTarget::CommitGraph),
         (Tab::Graph, Panel::Diff) => Some(SearchTarget::CommitDetail),
+        // Left panel of the Search tab is already a search input — `/` there
+        // would be ambiguous, so it's a no-op for now. Right panel mirrors
+        // Files-tab preview.
+        (Tab::Search, Panel::Files) => None,
+        (Tab::Search, Panel::Diff) => Some(SearchTarget::FilePreview),
     }
 }
 
@@ -495,7 +500,7 @@ fn jump_to_current(app: &mut App) {
     }
 }
 
-fn center_scroll(row: usize, view_h: usize) -> usize {
+pub(crate) fn center_scroll(row: usize, view_h: usize) -> usize {
     if view_h <= 1 {
         return row;
     }

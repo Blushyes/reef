@@ -9,6 +9,7 @@
 //! just add indirection.
 
 use crate::app::{App, Panel, Tab};
+use crate::quick_open;
 use crate::search;
 use crate::ui;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -18,14 +19,117 @@ use std::time::{Duration, Instant};
 
 pub const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
 
+/// How long a primed Space leader stays valid before being discarded. Long
+/// enough for a deliberate "Space, p" chord on a keyboard, short enough
+/// that a forgotten leader doesn't steal the next unrelated keypress.
+pub const LEADER_TIMEOUT: Duration = Duration::from_millis(800);
+
+/// One-keystroke verdict for the Space-leader chord.
+///
+/// The chord lives in two places (global toggle and palette-side close), so
+/// the decision is pulled out of both call sites into a pure function that
+/// both drive off the same state machine.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LeaderVerdict {
+    /// Arm the leader now — caller writes `Some(Instant::now())` into its
+    /// state slot and returns without further dispatch.
+    Arm,
+    /// Fire the chord — caller triggers the target action (open / close)
+    /// and clears the leader slot.
+    Fire,
+    /// Leader was armed but this keystroke isn't the chord target. Caller
+    /// clears the leader slot and falls through to normal key dispatch so
+    /// the key still does whatever it would have done without the leader.
+    Consume,
+    /// No leader interaction; dispatch the key normally.
+    None,
+}
+
+/// Pure leader-decision state machine. Returns what the caller should do
+/// about `key` given whether arming is permitted in this context
+/// (`allow_arm`) and whether a leader is already pending (`leader_at`).
+///
+/// Rules in one paragraph: when nothing is armed, a bare Space with
+/// `allow_arm` asks to arm. When a leader is armed and `key` is a bare `p`
+/// or `P` within `timeout`, fire. When a leader is armed and the user
+/// presses Space again with `allow_arm`, re-arm (double-Space is more
+/// usefully "reset the chord" than "lose it"). Any other key with a primed
+/// leader consumes the leader — the user changed their mind.
+pub fn leader_decision(
+    key: &KeyEvent,
+    allow_arm: bool,
+    leader_at: Option<Instant>,
+    now: Instant,
+    timeout: Duration,
+) -> LeaderVerdict {
+    let is_bare_space = key.code == KeyCode::Char(' ') && key.modifiers.is_empty();
+    let is_bare_p =
+        matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P')) && key.modifiers.is_empty();
+
+    // Fresh-arm path: no leader pending, space pressed, context allows.
+    if allow_arm && leader_at.is_none() && is_bare_space {
+        return LeaderVerdict::Arm;
+    }
+
+    // A leader is pending — resolve it.
+    if let Some(t) = leader_at {
+        let within = now.duration_since(t) < timeout;
+        if within && is_bare_p {
+            return LeaderVerdict::Fire;
+        }
+        // Re-arm on a second Space so the user can stutter their leader.
+        if allow_arm && is_bare_space {
+            return LeaderVerdict::Arm;
+        }
+        return LeaderVerdict::Consume;
+    }
+
+    LeaderVerdict::None
+}
+
 // ─── Keyboard ────────────────────────────────────────────────────────────────
 
 pub fn handle_key(key: KeyEvent, app: &mut App) {
+    // Quick-open palette has the highest priority — while active it fully
+    // owns input (character append, cursor, Enter/Esc, Space-P close).
+    if app.quick_open.active {
+        quick_open::handle_key(key, app);
+        return;
+    }
+
     // Search mode has priority over everything else — the prompt fully owns
     // input (character append, Backspace, Enter/Esc) while active.
     if app.search.active {
         search::handle_key_in_search_mode(key, app);
         return;
+    }
+
+    // Space-leader chord: bare Space primes, bare P opens the quick-open
+    // palette. Bare Space has no other meaning globally, so the chord
+    // doesn't collide with any existing binding. Context: we're already
+    // past the quick_open / search gates, so the leader is only in play
+    // during normal tab navigation.
+    match leader_decision(
+        &key,
+        /* allow_arm */ true,
+        app.space_leader_at,
+        Instant::now(),
+        LEADER_TIMEOUT,
+    ) {
+        LeaderVerdict::Arm => {
+            app.space_leader_at = Some(Instant::now());
+            return;
+        }
+        LeaderVerdict::Fire => {
+            app.space_leader_at = None;
+            quick_open::begin(app);
+            return;
+        }
+        LeaderVerdict::Consume => {
+            app.space_leader_at = None;
+            // Fall through — the current key still gets its normal meaning.
+        }
+        LeaderVerdict::None => {}
     }
 
     // Global keys (work on all tabs)
@@ -337,6 +441,15 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
 // ─── Mouse ───────────────────────────────────────────────────────────────────
 
 pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Terminal<B>) {
+    // Quick-open palette, like the keyboard path, fully owns mouse input
+    // while active: the overlay shouldn't let clicks leak to the hidden
+    // panels behind it, and scroll wheels inside the popup should move the
+    // candidate selection — not scroll the underlying diff.
+    if app.quick_open.active {
+        quick_open::handle_mouse(mouse, app);
+        return;
+    }
+
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             let now = Instant::now();
@@ -494,4 +607,115 @@ fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: 
     } else {
         target.saturating_add(delta as usize)
     };
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod leader_tests {
+    use super::*;
+    use crossterm::event::KeyEventKind;
+
+    fn ke(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        }
+    }
+
+    fn space() -> KeyEvent {
+        ke(KeyCode::Char(' '), KeyModifiers::empty())
+    }
+
+    fn lower_p() -> KeyEvent {
+        ke(KeyCode::Char('p'), KeyModifiers::empty())
+    }
+
+    fn upper_p() -> KeyEvent {
+        ke(KeyCode::Char('P'), KeyModifiers::empty())
+    }
+
+    #[test]
+    fn space_with_no_leader_arms() {
+        let now = Instant::now();
+        let v = leader_decision(&space(), true, None, now, LEADER_TIMEOUT);
+        assert_eq!(v, LeaderVerdict::Arm);
+    }
+
+    #[test]
+    fn space_when_arm_not_allowed_does_not_arm() {
+        // Palette has non-empty query → bare Space is a literal char.
+        let now = Instant::now();
+        let v = leader_decision(&space(), false, None, now, LEADER_TIMEOUT);
+        assert_eq!(v, LeaderVerdict::None);
+    }
+
+    #[test]
+    fn p_after_arm_within_window_fires() {
+        let now = Instant::now();
+        let v = leader_decision(&lower_p(), true, Some(now), now, LEADER_TIMEOUT);
+        assert_eq!(v, LeaderVerdict::Fire);
+    }
+
+    #[test]
+    fn uppercase_p_after_arm_also_fires() {
+        // Accept both cases so CapsLock or Shift doesn't defeat the chord.
+        let now = Instant::now();
+        let v = leader_decision(&upper_p(), true, Some(now), now, LEADER_TIMEOUT);
+        assert_eq!(v, LeaderVerdict::Fire);
+    }
+
+    #[test]
+    fn p_after_window_expired_consumes() {
+        let armed = Instant::now();
+        let now = armed + LEADER_TIMEOUT + Duration::from_millis(50);
+        let v = leader_decision(&lower_p(), true, Some(armed), now, LEADER_TIMEOUT);
+        assert_eq!(v, LeaderVerdict::Consume);
+    }
+
+    #[test]
+    fn p_with_ctrl_does_not_fire_even_when_armed() {
+        // Ctrl+P is bound to "prev candidate" inside the palette; the
+        // chord must not accidentally swallow it.
+        let now = Instant::now();
+        let ctrl_p = ke(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        let v = leader_decision(&ctrl_p, true, Some(now), now, LEADER_TIMEOUT);
+        assert_eq!(v, LeaderVerdict::Consume);
+    }
+
+    #[test]
+    fn second_space_rearms_the_leader() {
+        // Double-Space is more usefully "reset the chord" than "lose it"
+        // — otherwise Space+Space+P wouldn't open the palette.
+        let first = Instant::now();
+        let second = first + Duration::from_millis(100);
+        let v = leader_decision(&space(), true, Some(first), second, LEADER_TIMEOUT);
+        assert_eq!(v, LeaderVerdict::Arm);
+    }
+
+    #[test]
+    fn non_chord_key_after_arm_consumes() {
+        let now = Instant::now();
+        let j = ke(KeyCode::Char('j'), KeyModifiers::empty());
+        let v = leader_decision(&j, true, Some(now), now, LEADER_TIMEOUT);
+        assert_eq!(v, LeaderVerdict::Consume);
+    }
+
+    #[test]
+    fn no_leader_and_non_space_is_passthrough() {
+        let now = Instant::now();
+        let j = ke(KeyCode::Char('j'), KeyModifiers::empty());
+        let v = leader_decision(&j, true, None, now, LEADER_TIMEOUT);
+        assert_eq!(v, LeaderVerdict::None);
+    }
+
+    #[test]
+    fn shift_space_does_not_arm() {
+        let now = Instant::now();
+        let shift_space = ke(KeyCode::Char(' '), KeyModifiers::SHIFT);
+        let v = leader_decision(&shift_space, true, None, now, LEADER_TIMEOUT);
+        assert_eq!(v, LeaderVerdict::None);
+    }
 }

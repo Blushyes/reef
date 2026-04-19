@@ -137,6 +137,7 @@ pub enum Msg {
     HelpRefresh,
     HelpSelectMode,
     HelpShowHelp,
+    HelpQuickOpen,
     HelpAnyKey,
 }
 
@@ -221,6 +222,7 @@ fn t_zh(m: Msg) -> &'static str {
         HelpRefresh => "刷新",
         HelpSelectMode => "文字选择模式",
         HelpShowHelp => "显示 / 关闭此帮助",
+        HelpQuickOpen => "打开 / 关闭快速打开浮层（全局模糊搜索）",
         HelpAnyKey => "关闭帮助",
     }
 }
@@ -299,6 +301,7 @@ fn t_en(m: Msg) -> &'static str {
         HelpRefresh => "Refresh",
         HelpSelectMode => "Text selection mode",
         HelpShowHelp => "Show / close this help",
+        HelpQuickOpen => "Toggle quick-open palette (global fuzzy search)",
         HelpAnyKey => "Close help",
     }
 }

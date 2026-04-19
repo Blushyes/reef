@@ -10,5 +10,6 @@ pub mod git;
 pub mod i18n;
 pub mod input;
 pub mod prefs;
+pub mod quick_open;
 pub mod search;
 pub mod ui;

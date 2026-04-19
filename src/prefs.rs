@@ -13,6 +13,10 @@
 //!                                                Read once in `main.rs` before raw-mode
 //!                                                entry; `auto` probes the terminal's
 //!                                                background via OSC 11.
+//!   - `quickopen.mru`                          — Quick-open palette MRU; tab-separated
+//!                                                workdir-relative paths, newest-first,
+//!                                                capped at 50 entries. Written on every
+//!                                                accept, read once in `App::new`.
 //!
 //! Writers must go through `set()` (not raw `std::fs::write`) so that
 //! updating one key doesn't erase all the others.

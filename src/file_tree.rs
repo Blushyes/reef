@@ -132,6 +132,24 @@ impl FileTree {
         self.entries.get(self.selected)
     }
 
+    /// Expand every ancestor directory of `rel` and move `selected` to the
+    /// row that displays `rel` in the flattened tree. Used by the quick-open
+    /// palette on accept, so the chosen file is visible and the preview
+    /// panel shows it immediately. Silently no-ops if the file isn't in the
+    /// tree after rebuild (e.g. deleted between index and accept).
+    pub fn reveal(&mut self, rel: &Path) {
+        for ancestor in rel.ancestors().skip(1) {
+            if ancestor.as_os_str().is_empty() {
+                break;
+            }
+            self.expanded.insert(ancestor.to_path_buf());
+        }
+        self.rebuild();
+        if let Some(idx) = self.entries.iter().position(|e| e.path == rel) {
+            self.selected = idx;
+        }
+    }
+
     /// Merge git status from the host's file lists.
     pub fn refresh_git_statuses(
         &mut self,

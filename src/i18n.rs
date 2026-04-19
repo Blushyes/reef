@@ -46,6 +46,7 @@ fn detect() -> Lang {
 pub enum Msg {
     // Tab labels + tab bar hint
     TabFiles,
+    TabSearch,
     TabGit,
     TabGraph,
     TabBarHint,
@@ -138,6 +139,7 @@ pub enum Msg {
     HelpSelectMode,
     HelpShowHelp,
     HelpQuickOpen,
+    HelpGlobalSearch,
     HelpAnyKey,
 }
 
@@ -152,9 +154,10 @@ fn t_zh(m: Msg) -> &'static str {
     use Msg::*;
     match m {
         TabFiles => " 📁 文件 ",
+        TabSearch => " 🔎 搜索 ",
         TabGit => " ⎇ Git ",
         TabGraph => " ⑂ 图表 ",
-        TabBarHint => " 1:文件 2:Git 3:图表",
+        TabBarHint => " 1:文件 2:搜索 3:Git 4:图表",
         StatusBarHint => " q:退出 Tab:切换 s:暂存 u:取消 r:刷新 h:帮助 ",
         SelectModeHint => "  拖拽鼠标选择文字，按 v 退出选择模式",
         HelpTitle => " 快捷键帮助 ",
@@ -223,6 +226,7 @@ fn t_zh(m: Msg) -> &'static str {
         HelpSelectMode => "文字选择模式",
         HelpShowHelp => "显示 / 关闭此帮助",
         HelpQuickOpen => "打开 / 关闭快速打开浮层（全局模糊搜索）",
+        HelpGlobalSearch => "打开全局内容搜索浮层",
         HelpAnyKey => "关闭帮助",
     }
 }
@@ -231,9 +235,10 @@ fn t_en(m: Msg) -> &'static str {
     use Msg::*;
     match m {
         TabFiles => " 📁 Files ",
+        TabSearch => " 🔎 Search ",
         TabGit => " ⎇ Git ",
         TabGraph => " ⑂ Graph ",
-        TabBarHint => " 1:Files 2:Git 3:Graph",
+        TabBarHint => " 1:Files 2:Search 3:Git 4:Graph",
         StatusBarHint => " q:quit Tab:switch s:stage u:unstage r:refresh h:help ",
         SelectModeHint => "  Drag to select text, press v to exit select mode",
         HelpTitle => " Keybindings ",
@@ -302,6 +307,7 @@ fn t_en(m: Msg) -> &'static str {
         HelpSelectMode => "Text selection mode",
         HelpShowHelp => "Show / close this help",
         HelpQuickOpen => "Toggle quick-open palette (global fuzzy search)",
+        HelpGlobalSearch => "Open global content-search palette",
         HelpAnyKey => "Close help",
     }
 }

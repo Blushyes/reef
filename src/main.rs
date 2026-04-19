@@ -1,5 +1,8 @@
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -19,7 +22,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let original_hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        // Best-effort teardown — also pop the kbd enhancement flags in case
+        // they were pushed. An unmatched pop is harmless on terminals that
+        // don't support the protocol (they ignore the CSI sequence).
+        let _ = execute!(
+            io::stdout(),
+            PopKeyboardEnhancementFlags,
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        );
         original_hook(panic_info);
     }));
 
@@ -32,6 +43,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Kitty keyboard protocol: ask the terminal to disambiguate escape
+    // sequences so `Alt+Arrow` / `Ctrl+Arrow` / `Shift+Enter` etc. arrive
+    // as `KeyEvent { code, modifiers }` instead of being collapsed onto
+    // default xterm sequences. Silently ignored by terminals that don't
+    // support it (most old ones). Supported today by Ghostty, Kitty,
+    // WezTerm, foot, iTerm2 ≥3.5, Alacritty (with --with-flags), etc.
+    let kitty_flags_pushed = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS,
+        )
+    )
+    .is_ok();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -73,11 +98,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // because it's the only input that needs to poke the terminal
                     // backend mid-loop.
                     //
-                    // When the quick-open palette is active it owns every key
-                    // unconditionally — 'v' must land as a literal in the query
-                    // and 'any key' must not dismiss help/palette — so route to
-                    // handle_key first and let it delegate to quick_open.
-                    if app.quick_open.active {
+                    // When any palette (quick-open or global-search) is active
+                    // it owns every key unconditionally — 'v' must land as a
+                    // literal in the query, and 'any key' must not dismiss
+                    // help — so route to handle_key first and let it delegate
+                    // to the palette.
+                    if app.quick_open.active || app.global_search.active {
                         input::handle_key(key, &mut app);
                     } else if key.code == KeyCode::Char('v') && key.modifiers.is_empty() {
                         app.select_mode = !app.select_mode;
@@ -135,8 +161,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Restore terminal
+    // Restore terminal. Pop the keyboard enhancement flags only if the
+    // push succeeded earlier — popping on a terminal that never received
+    // the push is harmless but noisy if we ever change err handling.
     disable_raw_mode()?;
+    if kitty_flags_pushed {
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,

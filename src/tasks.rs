@@ -7,9 +7,12 @@
 use crate::file_tree::{self, PreviewContent, TreeEntry};
 use crate::git::graph::GraphRow;
 use crate::git::{CommitDetail, DiffContent, FileEntry, GitRepo, RefLabel};
+use crate::global_search::MatchHit;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
@@ -110,6 +113,17 @@ pub enum WorkerResult {
         generation: u64,
         result: Result<Option<(String, DiffContent)>, String>,
     },
+    /// A batch of global-search hits. Streamed from the worker so the UI
+    /// stays responsive on big workdirs; can fire multiple times per search
+    /// before the matching `GlobalSearchDone`. Consumers drop the payload
+    /// when `generation` doesn't match the current search.
+    GlobalSearchChunk {
+        generation: u64,
+        hits: Vec<MatchHit>,
+    },
+    /// End-of-stream marker for a global search. `truncated=true` means we
+    /// hit the result cap; the UI shows "refine query" hinting.
+    GlobalSearchDone { generation: u64, truncated: bool },
 }
 
 enum FilesTask {
@@ -143,6 +157,15 @@ enum GitTask {
     },
 }
 
+enum GlobalSearchTask {
+    Run {
+        generation: u64,
+        cancel: Arc<AtomicBool>,
+        root: PathBuf,
+        query: String,
+    },
+}
+
 enum GraphTask {
     RefreshGraph {
         generation: u64,
@@ -167,6 +190,7 @@ pub struct TaskCoordinator {
     files_tx: mpsc::Sender<FilesTask>,
     git_tx: mpsc::Sender<GitTask>,
     graph_tx: mpsc::Sender<GraphTask>,
+    global_search_tx: mpsc::Sender<GlobalSearchTask>,
     result_rx: mpsc::Receiver<WorkerResult>,
 }
 
@@ -176,7 +200,8 @@ impl TaskCoordinator {
         Self {
             files_tx: spawn_files_worker(result_tx.clone()),
             git_tx: spawn_git_worker(result_tx.clone()),
-            graph_tx: spawn_graph_worker(result_tx),
+            graph_tx: spawn_graph_worker(result_tx.clone()),
+            global_search_tx: spawn_global_search_worker(result_tx),
             result_rx,
         }
     }
@@ -267,6 +292,28 @@ impl TaskCoordinator {
             oid,
             path,
             context_lines,
+        });
+    }
+
+    /// Kick off a workdir-wide content search. The worker walks `root`
+    /// (respecting `.gitignore` via the same `ignore` crate path the
+    /// quick-open index uses), runs `grep-searcher` with a smart-case
+    /// literal `RegexMatcher`, and streams hits back as
+    /// `WorkerResult::GlobalSearchChunk` followed by a terminal
+    /// `GlobalSearchDone`. Flipping `cancel` to `true` asks the worker to
+    /// bail on its next file-boundary poll.
+    pub fn search_all(
+        &self,
+        generation: u64,
+        cancel: Arc<AtomicBool>,
+        root: PathBuf,
+        query: String,
+    ) {
+        let _ = self.global_search_tx.send(GlobalSearchTask::Run {
+            generation,
+            cancel,
+            root,
+            query,
         });
     }
 }
@@ -450,4 +497,247 @@ fn hash_ref_map(map: &HashMap<String, Vec<RefLabel>>) -> u64 {
         }
     }
     hasher.finish()
+}
+
+// ─── Global-search worker ───────────────────────────────────────────────────
+
+fn spawn_global_search_worker(
+    result_tx: mpsc::Sender<WorkerResult>,
+) -> mpsc::Sender<GlobalSearchTask> {
+    let (tx, rx) = mpsc::channel();
+    let _ = thread::Builder::new()
+        .name("reef-global-search-worker".into())
+        .spawn(move || {
+            // Drain new tasks as they arrive. A task starting while the previous
+            // one is still running won't happen in practice (App::tick only
+            // kicks off a new task after flipping the old `cancel` flag), but
+            // if it did, the previous search would finish and then this one
+            // would run — the old `generation` keeps its chunks from leaking.
+            while let Ok(task) = rx.recv() {
+                match task {
+                    GlobalSearchTask::Run {
+                        generation,
+                        cancel,
+                        root,
+                        query,
+                    } => {
+                        let truncated =
+                            run_global_search(generation, cancel, &root, &query, &result_tx);
+                        // If the search was cancelled mid-walk we still send
+                        // Done so the UI can flip in_flight=false; the UI side
+                        // will drop late chunks via generation mismatch anyway.
+                        let _ = result_tx.send(WorkerResult::GlobalSearchDone {
+                            generation,
+                            truncated,
+                        });
+                    }
+                }
+            }
+        });
+    tx
+}
+
+/// Run one global search, streaming chunks into `result_tx`. Returns
+/// `truncated` = true iff we hit [`crate::global_search::MAX_RESULTS`]
+/// before the walker finished.
+///
+/// Error handling: any per-file IO / decode error is silently skipped — the
+/// user sees fewer hits, which is strictly better than the whole search
+/// falling over on a single weird file. A malformed query is also absorbed:
+/// `RegexMatcherBuilder::fixed_strings(true)` means we'd only fail on some
+/// extremely pathological input, in which case we return early with
+/// truncated=false and no results.
+fn run_global_search(
+    generation: u64,
+    cancel: Arc<AtomicBool>,
+    root: &Path,
+    query: &str,
+    result_tx: &mpsc::Sender<WorkerResult>,
+) -> bool {
+    use grep_regex::RegexMatcherBuilder;
+    use grep_searcher::{BinaryDetection, SearcherBuilder};
+
+    if query.is_empty() {
+        return false;
+    }
+
+    let matcher = match RegexMatcherBuilder::new()
+        .case_smart(true)
+        .fixed_strings(true)
+        .build(query)
+    {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .filter_entry(|dent| dent.file_name() != ".git")
+        .build();
+
+    // BinaryDetection::quit(0) skips any file whose first 8 KiB contains a
+    // NUL byte (matches ripgrep's default). Default `Searcher::new()` is
+    // `none` which would happily return hits from inside binaries.
+    let mut searcher = SearcherBuilder::new()
+        .binary_detection(BinaryDetection::quit(0))
+        .build();
+    let mut total: usize = 0;
+    let mut pending: Vec<MatchHit> = Vec::with_capacity(CHUNK_SIZE);
+    let mut truncated = false;
+
+    'walk: for result in walker {
+        // Poll cancel at every file boundary. Cheap (relaxed atomic load)
+        // and lets a superseded search bail within a handful of files.
+        if cancel.load(Ordering::Relaxed) {
+            break 'walk;
+        }
+
+        let Ok(entry) = result else { continue };
+        let is_file = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false);
+        if !is_file {
+            continue;
+        }
+        let abs = entry.path();
+        let Ok(rel) = abs.strip_prefix(root) else {
+            continue;
+        };
+        let display = rel.to_string_lossy().to_string();
+        if display.is_empty() {
+            continue;
+        }
+
+        let mut sink = ChunkSink {
+            rel_path: rel.to_path_buf(),
+            display: display.clone(),
+            pending: &mut pending,
+            total: &mut total,
+            cap: crate::global_search::MAX_RESULTS,
+            truncated: &mut truncated,
+            generation,
+            result_tx,
+            matcher: &matcher,
+        };
+        // search_path internally handles binary detection (NUL byte) and
+        // UTF-8 decoding; errors are per-file and we just skip them.
+        let _ = searcher.search_path(&matcher, abs, &mut sink);
+
+        // Flush any buffered hits at each file boundary — keeps the UI
+        // updating steadily on big workdirs even if a particular file
+        // contributes few matches.
+        if !pending.is_empty() {
+            let chunk = std::mem::replace(&mut pending, Vec::with_capacity(CHUNK_SIZE));
+            let _ = result_tx.send(WorkerResult::GlobalSearchChunk {
+                generation,
+                hits: chunk,
+            });
+        }
+
+        if truncated {
+            break;
+        }
+    }
+
+    // Flush trailing buffer (only reached on cancel between a file's sink
+    // finishing and the per-file flush — in practice rare, but defensive).
+    if !pending.is_empty() {
+        let _ = result_tx.send(WorkerResult::GlobalSearchChunk {
+            generation,
+            hits: pending,
+        });
+    }
+
+    truncated
+}
+
+const CHUNK_SIZE: usize = 50;
+
+/// Implements `grep_searcher::Sink`. Accumulates matches into `pending`,
+/// checks total against `cap`, sets `truncated` when hit. Doesn't send
+/// chunks itself — `run_global_search` flushes on file boundaries to keep
+/// the streaming cadence tied to a natural unit (per-file) rather than an
+/// arbitrary in-file batch size that breaks on single-file-heavy workdirs.
+struct ChunkSink<'a> {
+    rel_path: PathBuf,
+    display: String,
+    pending: &'a mut Vec<MatchHit>,
+    total: &'a mut usize,
+    cap: usize,
+    truncated: &'a mut bool,
+    generation: u64,
+    result_tx: &'a mpsc::Sender<WorkerResult>,
+    /// Borrowed so we can re-run `Matcher::find` on the line bytes to
+    /// recover the in-line byte range for the highlight overlay. The
+    /// `Searcher` already has this info but `SinkMatch` doesn't surface
+    /// it — one extra `find` per hit is cheap for fixed-strings.
+    matcher: &'a grep_regex::RegexMatcher,
+}
+
+impl<'a> grep_searcher::Sink for ChunkSink<'a> {
+    type Error = std::io::Error;
+
+    fn matched(
+        &mut self,
+        _searcher: &grep_searcher::Searcher,
+        mat: &grep_searcher::SinkMatch<'_>,
+    ) -> Result<bool, Self::Error> {
+        use grep_matcher::Matcher;
+
+        if *self.total >= self.cap {
+            *self.truncated = true;
+            return Ok(false);
+        }
+
+        // SinkMatch.bytes() contains the full matched line (including the
+        // trailing newline); trim it. line_number() is 1-indexed per ripgrep
+        // convention — convert to 0-indexed to match our MatchLoc scheme.
+        let raw = mat.bytes();
+        let raw = strip_trailing_newline(raw);
+        let line_text_full = match std::str::from_utf8(raw) {
+            Ok(s) => s,
+            Err(_) => return Ok(true), // non-UTF-8 line: skip, continue file
+        };
+        let line_text = crate::global_search::truncate_line(line_text_full);
+
+        // Recover in-line match byte range. `fixed_strings + case_smart`
+        // can't match a newline, so a single `find` on the line's bytes
+        // suffices. Clip to the truncated line length so the renderer
+        // doesn't slice past its end.
+        let byte_range = self
+            .matcher
+            .find(raw)
+            .ok()
+            .flatten()
+            .and_then(|m| crate::global_search::clip_range(m.start()..m.end(), line_text.len()))
+            .unwrap_or(0..0);
+
+        let hit = MatchHit {
+            path: self.rel_path.clone(),
+            display: self.display.clone(),
+            line: mat.line_number().unwrap_or(1).saturating_sub(1) as usize,
+            line_text,
+            byte_range,
+        };
+        self.pending.push(hit);
+        *self.total += 1;
+
+        if self.pending.len() >= CHUNK_SIZE {
+            let chunk = std::mem::replace(self.pending, Vec::with_capacity(CHUNK_SIZE));
+            let _ = self.result_tx.send(WorkerResult::GlobalSearchChunk {
+                generation: self.generation,
+                hits: chunk,
+            });
+        }
+        Ok(true)
+    }
+}
+
+fn strip_trailing_newline(bytes: &[u8]) -> &[u8] {
+    let mut end = bytes.len();
+    if end > 0 && bytes[end - 1] == b'\n' {
+        end -= 1;
+    }
+    if end > 0 && bytes[end - 1] == b'\r' {
+        end -= 1;
+    }
+    &bytes[..end]
 }

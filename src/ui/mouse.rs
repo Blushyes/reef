@@ -21,6 +21,16 @@ pub enum ClickAction {
     /// owns mouse when active, so we don't round-trip through
     /// `App::handle_action` for it.
     QuickOpenSelect(usize),
+    /// Click on a row in the global-search (Space+F) palette. The `usize`
+    /// indexes into `GlobalSearchState.results`. Like `QuickOpenSelect`,
+    /// dispatched inside `global_search::handle_mouse` (not via
+    /// `App::handle_action`) so the palette keeps exclusive mouse ownership.
+    GlobalSearchSelect(usize),
+    /// Click on the input row of the Search tab's left panel while in
+    /// list mode. Flips `tab_input_focused` so the user can mouse-drive
+    /// the mode switch instead of hunting for `/` or `i`. Only registered
+    /// when the input isn't already focused (overlay always is).
+    GlobalSearchFocusInput,
     /// Invoke an inline Git panel command (`git.stage`, `git.selectCommit`, …).
     /// `dbl_command`/`dbl_args`, if present, are fired on double-click instead.
     GitCommand {

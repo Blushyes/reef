@@ -124,6 +124,14 @@ pub enum WorkerResult {
     /// End-of-stream marker for a global search. `truncated=true` means we
     /// hit the result cap; the UI shows "refine query" hinting.
     GlobalSearchDone { generation: u64, truncated: bool },
+    /// Place-mode drag-and-drop copy completion.
+    /// `Ok(count)` is the number of top-level items successfully placed
+    /// at the destination (a directory source counts as 1 regardless of
+    /// how many files were recursively copied beneath it).
+    FileCopy {
+        generation: u64,
+        result: Result<usize, String>,
+    },
 }
 
 enum FilesTask {
@@ -140,6 +148,15 @@ enum FilesTask {
         root: PathBuf,
         rel_path: PathBuf,
         dark: bool,
+    },
+    /// Drag-and-drop copy: each source lands under `dest_dir`. A name
+    /// collision auto-renames VSCode-style (`foo.txt` → `foo (1).txt`).
+    /// Directory sources are copied recursively; symlinks are skipped
+    /// (documented in `copy_sources`).
+    CopyFiles {
+        generation: u64,
+        sources: Vec<PathBuf>,
+        dest_dir: PathBuf,
     },
 }
 
@@ -235,6 +252,14 @@ impl TaskCoordinator {
             root,
             rel_path,
             dark,
+        });
+    }
+
+    pub fn copy_files(&self, generation: u64, sources: Vec<PathBuf>, dest_dir: PathBuf) {
+        let _ = self.files_tx.send(FilesTask::CopyFiles {
+            generation,
+            sources,
+            dest_dir,
         });
     }
 
@@ -351,10 +376,157 @@ fn spawn_files_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Fil
                         let result = Ok(file_tree::load_preview(&root, &rel_path, dark));
                         let _ = result_tx.send(WorkerResult::Preview { generation, result });
                     }
+                    FilesTask::CopyFiles {
+                        generation,
+                        sources,
+                        dest_dir,
+                    } => {
+                        let result = copy_sources(&sources, &dest_dir);
+                        let _ = result_tx.send(WorkerResult::FileCopy { generation, result });
+                    }
                 }
             }
         });
     tx
+}
+
+// ─── Drag-and-drop copy helpers ──────────────────────────────────────────────
+
+/// Copy every `source` into `dest_dir`, auto-renaming on name collision
+/// (`foo.txt` → `foo (1).txt` → `foo (2).txt`, …). Directory sources are
+/// recursively copied; the rename rule only applies to the top-level name.
+///
+/// Symlinks encountered during a recursive directory walk are skipped —
+/// Finder's default would be to dereference them and copy the target, but
+/// that widens scope (cycles, broken links, permission surprises) beyond
+/// what this first cut needs to handle. The renderer-side banner flags
+/// "recursive copy"; if symlink fidelity becomes important we can revisit.
+///
+/// Returns the count of top-level items successfully placed, or the first
+/// error encountered. We fail fast on the first error rather than
+/// best-effort so a partial copy doesn't silently miss a file and leave
+/// the user thinking everything succeeded.
+fn copy_sources(sources: &[PathBuf], dest_dir: &Path) -> Result<usize, String> {
+    if !dest_dir.is_dir() {
+        return Err(format!("destination is not a directory: {:?}", dest_dir));
+    }
+    // Canonicalise dest_dir once up front so the self-reference check below
+    // works even when `dest_dir` was passed in as a relative or symlinked
+    // path. `canonicalize` resolves symlinks to their real targets, which
+    // is exactly what we want — a symlinked dest pointing INTO a source
+    // is just as dangerous as a direct path.
+    let canon_dest = dest_dir
+        .canonicalize()
+        .map_err(|e| format!("cannot canonicalize destination {:?}: {}", dest_dir, e))?;
+    let mut count = 0;
+    for source in sources {
+        let basename = source
+            .file_name()
+            .ok_or_else(|| format!("source has no basename: {:?}", source))?;
+
+        // P0 safety: block copying a directory INTO itself or any of its
+        // descendants. Without this, `copy_dir_recursive` walks the
+        // source tree while the destination (which we just created under
+        // it) keeps appearing as a new subdirectory — producing an
+        // infinite nest of folders until the filesystem rejects the
+        // path length. Seen concretely when a user drags a project's
+        // `src/` folder out of Finder and drops it back onto `src/` in
+        // the file tree.
+        if source.is_dir() {
+            let canon_src = source
+                .canonicalize()
+                .map_err(|e| format!("cannot canonicalize source {:?}: {}", source, e))?;
+            if canon_dest == canon_src || canon_dest.starts_with(&canon_src) {
+                return Err(format!(
+                    "cannot copy {:?} into itself or a descendant {:?}",
+                    source, dest_dir
+                ));
+            }
+        }
+
+        let final_dest = resolve_name_conflict(dest_dir, basename);
+        if source.is_dir() {
+            copy_dir_recursive(source, &final_dest)
+                .map_err(|e| format!("copy {:?} → {:?}: {}", source, final_dest, e))?;
+        } else {
+            std::fs::copy(source, &final_dest)
+                .map_err(|e| format!("copy {:?} → {:?}: {}", source, final_dest, e))?;
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Find the first non-existing destination filename by appending
+/// ` (N)` to the stem for N = 1, 2, 3… . Matches VSCode's Finder-style
+/// duplicate behavior. Dotfiles (leading-dot, no extension) get the
+/// counter after the whole name: `.env` → `.env (1)`.
+fn resolve_name_conflict(dest_dir: &Path, basename: &std::ffi::OsStr) -> PathBuf {
+    let candidate = dest_dir.join(basename);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let name = basename.to_string_lossy().into_owned();
+    let (stem, ext) = split_stem_ext(&name);
+    for n in 1..u32::MAX {
+        let renamed = match ext {
+            Some(e) => format!("{} ({}).{}", stem, n, e),
+            None => format!("{} ({})", stem, n),
+        };
+        let c = dest_dir.join(&renamed);
+        if !c.exists() {
+            return c;
+        }
+    }
+    // Astronomically unlikely; fall back to a timestamp-style name so we
+    // never loop forever or panic in a production run.
+    dest_dir.join(format!(
+        "{}-{}",
+        name,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ))
+}
+
+/// Split a filename into `(stem, ext)` at the LAST dot — matching the way
+/// users read filenames. Leading-dot files (no embedded dot) are treated
+/// as "no extension" so `.env` → (".env", None), not ("", "env").
+fn split_stem_ext(name: &str) -> (&str, Option<&str>) {
+    // A leading dot doesn't count as an extension separator.
+    let trimmed = name.trim_start_matches('.');
+    let leading_dots = name.len() - trimmed.len();
+    match trimmed.rfind('.') {
+        Some(rel) => {
+            let abs = leading_dots + rel;
+            let (stem, ext) = name.split_at(abs);
+            // ext starts with '.', skip it
+            (stem, Some(&ext[1..]))
+        }
+        None => (name, None),
+    }
+}
+
+/// Recursive directory copy using a plain DFS walk. Mirrors the source
+/// tree under `dst`, creating intermediate directories as needed.
+/// Symlinks are intentionally skipped (see `copy_sources` doc comment).
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let sub_src = entry.path();
+        let sub_dst = dst.join(entry.file_name());
+        if file_type.is_symlink() {
+            continue;
+        } else if file_type.is_dir() {
+            copy_dir_recursive(&sub_src, &sub_dst)?;
+        } else if file_type.is_file() {
+            std::fs::copy(&sub_src, &sub_dst)?;
+        }
+    }
+    Ok(())
 }
 
 fn spawn_git_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<GitTask> {
@@ -740,4 +912,172 @@ fn strip_trailing_newline(bytes: &[u8]) -> &[u8] {
         end -= 1;
     }
     &bytes[..end]
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn split_stem_ext_basic() {
+        assert_eq!(split_stem_ext("foo.txt"), ("foo", Some("txt")));
+        assert_eq!(
+            split_stem_ext("archive.tar.gz"),
+            ("archive.tar", Some("gz"))
+        );
+        assert_eq!(split_stem_ext("README"), ("README", None));
+        // Leading dot alone is not an extension separator.
+        assert_eq!(split_stem_ext(".env"), (".env", None));
+        // But `.env.local` has a real separator after the leading dot.
+        assert_eq!(split_stem_ext(".env.local"), (".env", Some("local")));
+    }
+
+    #[test]
+    fn resolve_name_conflict_increments() {
+        let tmp = TempDir::new().unwrap();
+        let basename = std::ffi::OsString::from("foo.txt");
+
+        // First call returns the plain name.
+        let p0 = resolve_name_conflict(tmp.path(), &basename);
+        assert_eq!(p0.file_name().unwrap(), "foo.txt");
+
+        // Once the plain name exists, the next call renames to "(1)".
+        fs::write(&p0, "").unwrap();
+        let p1 = resolve_name_conflict(tmp.path(), &basename);
+        assert_eq!(p1.file_name().unwrap(), "foo (1).txt");
+
+        fs::write(&p1, "").unwrap();
+        let p2 = resolve_name_conflict(tmp.path(), &basename);
+        assert_eq!(p2.file_name().unwrap(), "foo (2).txt");
+    }
+
+    #[test]
+    fn resolve_name_conflict_dotfile() {
+        let tmp = TempDir::new().unwrap();
+        let basename = std::ffi::OsString::from(".env");
+        fs::write(tmp.path().join(".env"), "").unwrap();
+        let p = resolve_name_conflict(tmp.path(), &basename);
+        assert_eq!(p.file_name().unwrap(), ".env (1)");
+    }
+
+    #[test]
+    fn copy_sources_file_into_dir() {
+        let src_tmp = TempDir::new().unwrap();
+        let dst_tmp = TempDir::new().unwrap();
+        let src = src_tmp.path().join("alpha.txt");
+        fs::write(&src, "hello").unwrap();
+
+        let count = copy_sources(&[src], dst_tmp.path()).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            fs::read_to_string(dst_tmp.path().join("alpha.txt")).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn copy_sources_recurses_into_directories() {
+        let src_tmp = TempDir::new().unwrap();
+        let dst_tmp = TempDir::new().unwrap();
+
+        let pkg = src_tmp.path().join("pkg");
+        fs::create_dir(&pkg).unwrap();
+        fs::write(pkg.join("one.txt"), "1").unwrap();
+        fs::create_dir(pkg.join("nested")).unwrap();
+        fs::write(pkg.join("nested").join("two.txt"), "2").unwrap();
+
+        let count = copy_sources(std::slice::from_ref(&pkg), dst_tmp.path()).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            fs::read_to_string(dst_tmp.path().join("pkg").join("one.txt")).unwrap(),
+            "1"
+        );
+        assert_eq!(
+            fs::read_to_string(dst_tmp.path().join("pkg").join("nested").join("two.txt")).unwrap(),
+            "2"
+        );
+    }
+
+    #[test]
+    fn copy_sources_auto_renames_on_collision() {
+        let src_tmp = TempDir::new().unwrap();
+        let dst_tmp = TempDir::new().unwrap();
+
+        let src = src_tmp.path().join("dup.txt");
+        fs::write(&src, "new").unwrap();
+        // Pre-populate dest with the same basename.
+        fs::write(dst_tmp.path().join("dup.txt"), "old").unwrap();
+
+        copy_sources(&[src], dst_tmp.path()).unwrap();
+        // Original untouched.
+        assert_eq!(
+            fs::read_to_string(dst_tmp.path().join("dup.txt")).unwrap(),
+            "old"
+        );
+        // New landed with counter.
+        assert_eq!(
+            fs::read_to_string(dst_tmp.path().join("dup (1).txt")).unwrap(),
+            "new"
+        );
+    }
+
+    #[test]
+    fn copy_sources_rejects_non_directory_dest() {
+        let dst_tmp = TempDir::new().unwrap();
+        let not_a_dir = dst_tmp.path().join("nope.txt");
+        fs::write(&not_a_dir, "").unwrap();
+        let src_tmp = TempDir::new().unwrap();
+        let src = src_tmp.path().join("x");
+        fs::write(&src, "").unwrap();
+        assert!(copy_sources(&[src], &not_a_dir).is_err());
+    }
+
+    #[test]
+    fn copy_sources_blocks_copy_into_self() {
+        // Regression guard for the infinite-recursion bug where dropping
+        // a directory onto itself would walk the tree while creating
+        // new subdirectories under the walked path, blowing out
+        // PATH_MAX. Users hit this by dragging `src/` from Finder and
+        // dropping it onto `src/` in the tree — the bug fills disk.
+        let tmp = TempDir::new().unwrap();
+        let pkg = tmp.path().join("pkg");
+        fs::create_dir(&pkg).unwrap();
+        fs::write(pkg.join("a.txt"), "").unwrap();
+        let err = copy_sources(std::slice::from_ref(&pkg), &pkg).unwrap_err();
+        assert!(
+            err.contains("into itself") || err.contains("descendant"),
+            "expected self-copy rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn copy_sources_blocks_copy_into_descendant() {
+        // Subcase: dropping `src/` onto `src/ui/` — still recursive,
+        // still blocked.
+        let tmp = TempDir::new().unwrap();
+        let pkg = tmp.path().join("pkg");
+        let nested = pkg.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let err = copy_sources(std::slice::from_ref(&pkg), &nested).unwrap_err();
+        assert!(err.contains("into itself") || err.contains("descendant"));
+    }
+
+    #[test]
+    fn copy_sources_allows_sibling_dest_same_parent() {
+        // Sanity check: dropping `src/` onto its parent directory (so
+        // the copy lands as an auto-renamed sibling) must still work.
+        // This is the most common "duplicate" case.
+        let tmp = TempDir::new().unwrap();
+        let pkg = tmp.path().join("pkg");
+        fs::create_dir(&pkg).unwrap();
+        fs::write(pkg.join("a.txt"), "hello").unwrap();
+        let count = copy_sources(std::slice::from_ref(&pkg), tmp.path()).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("pkg (1)").join("a.txt")).unwrap(),
+            "hello"
+        );
+    }
 }

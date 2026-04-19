@@ -116,11 +116,31 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         return;
     }
 
+    // Place mode (drag-and-drop destination picker) is mouse-first —
+    // most keystrokes are ignored so a stray keypress can't accidentally
+    // commit a copy. Exceptions: Esc cancels the mode, and the two
+    // terminal-standard quit keys (bare `q` and Ctrl+C) still fire so a
+    // user who feels stuck can always bail out of the whole app without
+    // Esc'ing first.
+    if app.place_mode.active {
+        match key.code {
+            KeyCode::Esc => app.exit_place_mode(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.should_quit = true;
+            }
+            KeyCode::Char('q') if key.modifiers.is_empty() => {
+                app.should_quit = true;
+            }
+            _ => {}
+        }
+        return;
+    }
+
     // Space-leader chord: bare Space primes, bare `p` opens the quick-open
     // palette, bare `f` opens the global-search palette. Bare Space has no
     // other global meaning, so the chord doesn't collide with any existing
-    // binding. Context: we're already past the palette / search gates, so
-    // the leader is only in play during normal tab navigation.
+    // binding. Context: we're already past the palette / search / place
+    // gates, so the leader is only in play during normal tab navigation.
     //
     // Exception: when the Tab::Search search input is focused (modal
     // `tab_input_focused`), bare Space is a literal separator in a
@@ -818,6 +838,11 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
         return;
     }
 
+    if app.place_mode.active {
+        handle_mouse_place_mode(mouse, app);
+        return;
+    }
+
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             let now = Instant::now();
@@ -1015,6 +1040,197 @@ fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: 
     };
 }
 
+// ─── Place mode (drag-and-drop destination picker) ───────────────────────────
+
+fn handle_mouse_place_mode(mouse: MouseEvent, app: &mut App) {
+    match mouse.kind {
+        MouseEventKind::Moved => {
+            app.hover_row = Some(mouse.row);
+            app.hover_col = Some(mouse.column);
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Only PlaceMode* click actions are meaningful here. Any other
+            // hit (e.g. a file row that we no longer register, or the tab
+            // bar) is treated as "clicked outside the droppable area" and
+            // cancels the modal.
+            match app.hit_registry.hit_test(mouse.column, mouse.row) {
+                Some(ui::mouse::ClickAction::PlaceModeFolder(idx)) => {
+                    app.handle_action(ui::mouse::ClickAction::PlaceModeFolder(idx));
+                }
+                Some(ui::mouse::ClickAction::PlaceModeRoot) => {
+                    app.handle_action(ui::mouse::ClickAction::PlaceModeRoot);
+                }
+                _ => {
+                    app.exit_place_mode();
+                }
+            }
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            app.exit_place_mode();
+        }
+        MouseEventKind::ScrollUp => {
+            app.tree_scroll = app.tree_scroll.saturating_sub(3);
+        }
+        MouseEventKind::ScrollDown => {
+            app.tree_scroll = app.tree_scroll.saturating_add(3);
+        }
+        _ => {}
+    }
+}
+
+// ─── Bracketed paste dispatch ────────────────────────────────────────────────
+
+/// Entry point for `Event::Paste(s)` from the main loop. Priorities:
+///
+/// 1. If the payload parses as one or more existing absolute paths, enter
+///    drag-and-drop place mode with those sources.
+/// 2. Otherwise, if an input field has focus (quick-open palette, search
+///    prompt), forward the payload as typed text.
+/// 3. Otherwise drop silently — a paste landing on plain tab navigation
+///    has no sensible target.
+pub fn handle_paste(s: String, app: &mut App) {
+    let paths = parse_dropped_paths(&s);
+    if !paths.is_empty() {
+        app.enter_place_mode(paths);
+        return;
+    }
+    if app.quick_open.active {
+        quick_open::handle_paste(&s, app);
+    } else if app.search.active {
+        search::handle_paste(&s, app);
+    }
+    // No focused input; intentionally dropped. A stray paste into the
+    // global keymap has no defined meaning, and we don't want to
+    // accidentally trigger an action.
+}
+
+/// Extract filesystem paths from a bracketed-paste payload.
+///
+/// Terminals normalise file drops into paste content, but the exact
+/// framing varies:
+///
+/// - iTerm2: single-quote wrapped, `\ ` for spaces, one path per line.
+/// - Ghostty / WezTerm / Alacritty / Kitty: raw path with `\ ` escapes.
+/// - GNOME Terminal / older: `file:///…` URI with `%xx` URL-encoding.
+///
+/// We tolerate all of the above, then demand that every candidate be an
+/// absolute path (drops from Finder always are) that `exists()` on disk.
+/// Relative paths and non-existent strings are rejected outright — a
+/// user pasting the word `settings.json` into the quick-open palette
+/// must NOT trip place mode, and the absolute-path requirement is what
+/// makes that reliable.
+///
+/// Returns an empty vector when the payload is "not a drop"; callers
+/// use that as the signal to forward the paste to the focused text input.
+pub fn parse_dropped_paths(s: &str) -> Vec<std::path::PathBuf> {
+    let trimmed = s.trim_matches(|c: char| c == '\n' || c == '\r');
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    // Newline is the common multi-file separator across every terminal we
+    // support. Single-segment → single path (even if it contains spaces);
+    // multi-segment → one path per line.
+    let mut out = Vec::new();
+    for segment in trimmed.split('\n') {
+        let seg = segment.trim().trim_end_matches('\r');
+        if seg.is_empty() {
+            continue;
+        }
+        let Some(p) = normalize_segment(seg) else {
+            continue;
+        };
+        if p.is_absolute() && p.exists() {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Strip one layer of framing from a single dropped-path segment:
+/// matched outer quotes → removed; `file://` scheme → stripped + URL
+/// decoded; backslash escapes → unescaped. Returns `None` if the segment
+/// ends up empty or can't be interpreted as a path.
+fn normalize_segment(raw: &str) -> Option<std::path::PathBuf> {
+    let mut s = raw.to_string();
+
+    // Outer quote pair — some terminals (iTerm2 by default) wrap drag
+    // payloads in single quotes; paste-from-clipboard in others may use
+    // double quotes. Only strip if both ends match.
+    if s.len() >= 2 {
+        let first = s.chars().next().unwrap();
+        let last = s.chars().last().unwrap();
+        if (first == '\'' && last == '\'') || (first == '"' && last == '"') {
+            s = s[1..s.len() - 1].to_string();
+        }
+    }
+
+    // `file://` URI → filesystem path + URL decode. We accept both
+    // `file:///Users/...` (triple-slash, most common) and `file://localhost/...`
+    // (hostname-qualified, older macOS) by stripping the authority.
+    if let Some(rest) = s.strip_prefix("file://") {
+        let path_part = rest.strip_prefix("localhost").unwrap_or(rest).to_string();
+        s = url_decode(&path_part);
+    }
+
+    s = unescape_backslashes(&s);
+
+    if s.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(s))
+}
+
+/// Minimal `%xx` percent-decoder, enough for common file URIs. Invalid
+/// escapes are left as-is (we never fail the whole parse over a stray `%`).
+fn url_decode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
+                out.push((hi * 16 + lo) as char);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Unescape shell-style backslash sequences commonly used by terminals
+/// when injecting dropped paths: `\ ` → ` `, `\\` → `\`, `\t` → tab, etc.
+/// A trailing unmatched backslash is passed through verbatim.
+fn unescape_backslashes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some(other) => out.push(other),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1151,5 +1367,118 @@ mod leader_tests {
         let shift_space = ke(KeyCode::Char(' '), KeyModifiers::SHIFT);
         let v = leader_decision(&shift_space, true, None, now, LEADER_TIMEOUT);
         assert_eq!(v, LeaderVerdict::None);
+    }
+}
+
+#[cfg(test)]
+mod paste_parser_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn touch(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        fs::write(&p, "").unwrap();
+        p
+    }
+
+    #[test]
+    fn non_path_text_is_not_a_drop() {
+        // User pastes a regular word into an input — must not activate
+        // place mode. The absolute-path requirement is what makes this
+        // robust.
+        assert!(parse_dropped_paths("settings.json").is_empty());
+        assert!(parse_dropped_paths("let x = 1;").is_empty());
+        assert!(parse_dropped_paths("").is_empty());
+    }
+
+    #[test]
+    fn relative_paths_rejected_even_if_they_exist() {
+        // Even if `src/main.rs` exists from the cwd, a relative path is
+        // never what a drop would produce — reject to avoid false
+        // positives on pasted code snippets.
+        assert!(parse_dropped_paths("src/main.rs").is_empty());
+    }
+
+    #[test]
+    fn plain_absolute_path_is_accepted() {
+        let tmp = TempDir::new().unwrap();
+        let file = touch(tmp.path(), "a.txt");
+        let paste = file.to_string_lossy().to_string();
+        let got = parse_dropped_paths(&paste);
+        assert_eq!(got, vec![file]);
+    }
+
+    #[test]
+    fn file_uri_is_decoded_and_accepted() {
+        let tmp = TempDir::new().unwrap();
+        let file = touch(tmp.path(), "hello world.txt");
+        let uri = format!("file://{}", file.to_string_lossy().replace(' ', "%20"));
+        let got = parse_dropped_paths(&uri);
+        assert_eq!(got, vec![file]);
+    }
+
+    #[test]
+    fn single_quoted_iterm2_style() {
+        let tmp = TempDir::new().unwrap();
+        let file = touch(tmp.path(), "quoted.txt");
+        let paste = format!("'{}'", file.to_string_lossy());
+        let got = parse_dropped_paths(&paste);
+        assert_eq!(got, vec![file]);
+    }
+
+    #[test]
+    fn backslash_escaped_spaces() {
+        let tmp = TempDir::new().unwrap();
+        let file = touch(tmp.path(), "name with space.txt");
+        let escaped = file.to_string_lossy().replace(' ', r"\ ").to_string();
+        let got = parse_dropped_paths(&escaped);
+        assert_eq!(got, vec![file]);
+    }
+
+    #[test]
+    fn multi_file_newline_separated() {
+        let tmp = TempDir::new().unwrap();
+        let a = touch(tmp.path(), "a.txt");
+        let b = touch(tmp.path(), "b.txt");
+        let paste = format!("{}\n{}", a.to_string_lossy(), b.to_string_lossy());
+        let got = parse_dropped_paths(&paste);
+        assert_eq!(got, vec![a, b]);
+    }
+
+    #[test]
+    fn trailing_newline_tolerated() {
+        let tmp = TempDir::new().unwrap();
+        let file = touch(tmp.path(), "a.txt");
+        let paste = format!("{}\n", file.to_string_lossy());
+        let got = parse_dropped_paths(&paste);
+        assert_eq!(got, vec![file]);
+    }
+
+    #[test]
+    fn non_existent_absolute_path_rejected() {
+        // Absolute and looks like a path, but doesn't exist on disk.
+        // A drop would only ever hand us a real file, so reject to
+        // avoid pasting arbitrary fake paths into place mode.
+        let got = parse_dropped_paths("/this/does/not/exist/abc.xyz");
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn mixed_valid_and_invalid_keeps_only_valid() {
+        let tmp = TempDir::new().unwrap();
+        let file = touch(tmp.path(), "ok.txt");
+        let paste = format!("{}\n/nope/nope/nope", file.to_string_lossy());
+        let got = parse_dropped_paths(&paste);
+        assert_eq!(got, vec![file]);
+    }
+
+    #[test]
+    fn file_localhost_prefix_stripped() {
+        let tmp = TempDir::new().unwrap();
+        let file = touch(tmp.path(), "loc.txt");
+        let paste = format!("file://localhost{}", file.to_string_lossy());
+        let got = parse_dropped_paths(&paste);
+        assert_eq!(got, vec![file]);
     }
 }

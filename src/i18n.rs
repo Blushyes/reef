@@ -117,6 +117,7 @@ pub enum Msg {
     // Help popup — key column
     HelpKeyAnyKey,
     HelpKeyMouseHScroll,
+    HelpKeyDragDrop,
     // Help popup — descriptions
     HelpQuit,
     HelpSwitchTab,
@@ -140,6 +141,7 @@ pub enum Msg {
     HelpShowHelp,
     HelpQuickOpen,
     HelpGlobalSearch,
+    HelpDragDrop,
     HelpAnyKey,
 }
 
@@ -205,6 +207,7 @@ fn t_zh(m: Msg) -> &'static str {
         EmptyDir => "(空)",
         HelpKeyAnyKey => "任意键",
         HelpKeyMouseHScroll => "Shift+滚轮 / 触控板横划",
+        HelpKeyDragDrop => "拖文件进终端",
         HelpQuit => "退出",
         HelpSwitchTab => "切换顶部标签页（文件 ↔ Git ↔ 图表）",
         HelpSwitchPanel => "切换焦点面板（侧边栏 ↔ 编辑区）",
@@ -227,6 +230,7 @@ fn t_zh(m: Msg) -> &'static str {
         HelpShowHelp => "显示 / 关闭此帮助",
         HelpQuickOpen => "打开 / 关闭快速打开浮层（全局模糊搜索）",
         HelpGlobalSearch => "打开全局内容搜索浮层",
+        HelpDragDrop => "进入放置模式：点击文件夹复制到那里，Esc / 右键 取消",
         HelpAnyKey => "关闭帮助",
     }
 }
@@ -286,6 +290,7 @@ fn t_en(m: Msg) -> &'static str {
         EmptyDir => "(empty)",
         HelpKeyAnyKey => "any key",
         HelpKeyMouseHScroll => "Shift+Wheel / trackpad",
+        HelpKeyDragDrop => "Drag file into terminal",
         HelpQuit => "Quit",
         HelpSwitchTab => "Cycle top tabs (Files ↔ Git ↔ Graph)",
         HelpSwitchPanel => "Switch focused panel (sidebar ↔ editor)",
@@ -308,6 +313,9 @@ fn t_en(m: Msg) -> &'static str {
         HelpShowHelp => "Show / close this help",
         HelpQuickOpen => "Toggle quick-open palette (global fuzzy search)",
         HelpGlobalSearch => "Open global content-search palette",
+        HelpDragDrop => {
+            "Enter place mode: click a folder to copy there, Esc / right-click to cancel"
+        }
         HelpAnyKey => "Close help",
     }
 }
@@ -397,9 +405,92 @@ pub fn search_dormant_with_counter(prefix: char, query: &str, i: usize, n: usize
     }
 }
 
+pub fn place_mode_banner(primary_name: &str, count: usize) -> String {
+    let extra = count.saturating_sub(1);
+    match lang() {
+        Lang::Zh => {
+            if extra == 0 {
+                format!(" 📋 放置 {primary_name} ")
+            } else {
+                format!(" 📋 放置 {primary_name} +{extra} 项 ")
+            }
+        }
+        Lang::En => {
+            if extra == 0 {
+                format!(" 📋 Placing {primary_name} ")
+            } else {
+                format!(" 📋 Placing {primary_name} +{extra} more ")
+            }
+        }
+    }
+}
+
+/// Status-bar hint shown while place mode is active. Mirrors how select-mode
+/// commandeers the status bar with a high-contrast badge — the two
+/// correspond to distinct modal states the user needs to exit explicitly.
+pub fn place_mode_status_hint() -> &'static str {
+    match lang() {
+        Lang::Zh => "  点击文件夹放置 · 点击空白放到根目录 · Esc / 右键 取消",
+        Lang::En => {
+            "  Click a folder to drop · click empty to drop at root · Esc / right-click to cancel"
+        }
+    }
+}
+
+pub fn place_mode_copied(count: usize) -> String {
+    match lang() {
+        Lang::Zh => format!("已复制 {count} 项"),
+        Lang::En => format!("Copied {count} item(s)"),
+    }
+}
+
+pub fn place_mode_copy_failed(e: &str) -> String {
+    match lang() {
+        Lang::Zh => format!("复制失败: {e}"),
+        Lang::En => format!("Copy failed: {e}"),
+    }
+}
+
+/// Warning when a drop arrives while the user is in select-mode. Mouse
+/// capture is off in that state, so entering place mode would leave
+/// the user with no way to click a target.
+pub fn place_mode_blocked_by_select_mode() -> String {
+    match lang() {
+        Lang::Zh => "拖拽被选择模式拦住了：按 v 退出选择模式后再试".to_string(),
+        Lang::En => "Drop blocked by select mode — press v to exit, then retry".to_string(),
+    }
+}
+
+/// Warning when a drop arrives while a previous copy is still running.
+/// Entering place mode would overwrite the sources and invalidate the
+/// in-flight generation, silently losing the earlier result toast.
+pub fn place_mode_blocked_by_in_flight_copy() -> String {
+    match lang() {
+        Lang::Zh => "上次拷贝还没完成，先等一下".to_string(),
+        Lang::En => "A copy is still in progress — please wait".to_string(),
+    }
+}
+
+/// Status hint shown while a place-mode copy is running. Replaces the
+/// normal "Placing X" banner so the user sees that work is actually
+/// happening for large copies that take more than a few frames.
+pub fn place_mode_copying_banner() -> String {
+    match lang() {
+        Lang::Zh => " ⋯ 正在复制… ".to_string(),
+        Lang::En => " ⋯ Copying… ".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn place_mode_strings_are_nonempty() {
+        assert!(!place_mode_copied(3).is_empty());
+        assert!(!place_mode_copy_failed("boom").is_empty());
+        assert!(!place_mode_banner("x.txt", 1).is_empty());
+    }
 
     #[test]
     fn t_returns_translation_for_both_langs() {

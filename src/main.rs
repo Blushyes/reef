@@ -1,7 +1,8 @@
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -22,14 +23,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let original_hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {
         let _ = disable_raw_mode();
-        // Best-effort teardown — also pop the kbd enhancement flags in case
-        // they were pushed. An unmatched pop is harmless on terminals that
-        // don't support the protocol (they ignore the CSI sequence).
+        // Best-effort teardown — pop the kbd enhancement flags and disable
+        // bracketed paste in case they were enabled. An unmatched pop / a
+        // redundant disable is harmless on terminals that never received
+        // the matching push (they ignore the CSI sequence).
         let _ = execute!(
             io::stdout(),
             PopKeyboardEnhancementFlags,
             LeaveAlternateScreen,
-            DisableMouseCapture
+            DisableMouseCapture,
+            DisableBracketedPaste
         );
         original_hook(panic_info);
     }));
@@ -42,7 +45,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Terminal setup
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     // Kitty keyboard protocol: ask the terminal to disambiguate escape
     // sequences so `Alt+Arrow` / `Ctrl+Arrow` / `Shift+Enter` etc. arrive
     // as `KeyEvent { code, modifiers }` instead of being collapsed onto
@@ -123,6 +131,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         input::handle_mouse(mouse, &mut app, &terminal);
                     }
                 }
+                Event::Paste(s) => {
+                    input::handle_paste(s, &mut app);
+                }
                 Event::Resize(_, _) => {}
                 _ => {}
             }
@@ -171,7 +182,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
 

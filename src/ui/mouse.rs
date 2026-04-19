@@ -39,6 +39,13 @@ pub enum ClickAction {
         dbl_command: Option<String>,
         dbl_args: Option<serde_json::Value>,
     },
+    /// Place-mode destination: dropping onto a specific folder row.
+    /// Index into `file_tree.entries`; must point at a directory entry.
+    PlaceModeFolder(usize),
+    /// Place-mode destination: dropping onto the root drop-zone (the dashed
+    /// border surrounding the whole file tree, or any tree-panel spot that
+    /// isn't a folder row).
+    PlaceModeRoot,
 }
 
 #[derive(Debug, Clone)]

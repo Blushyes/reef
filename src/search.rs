@@ -171,6 +171,26 @@ pub fn handle_key_in_search_mode(key: KeyEvent, app: &mut App) {
     }
 }
 
+/// Bracketed-paste arrival while the search prompt is active. Same shape
+/// as `quick_open::handle_paste`: fold the payload in as typed chars,
+/// dropping newlines so a multi-line paste doesn't break the single-line
+/// prompt model. Called from `input::handle_paste` after the drop-path
+/// parser has declined the payload.
+pub fn handle_paste(s: &str, app: &mut App) {
+    let mut added = false;
+    for c in s.chars() {
+        if c == '\n' || c == '\r' {
+            continue;
+        }
+        app.search.query.push(c);
+        added = true;
+    }
+    if added {
+        app.search.wrap_msg = None;
+        recompute_and_jump(app, /*from_step=*/ false);
+    }
+}
+
 /// Move to next (`reverse=false`) or previous (`reverse=true`) match. Wraps
 /// around with a Top/Bottom status flash.
 pub fn step(app: &mut App, reverse: bool) {

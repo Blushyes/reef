@@ -316,6 +316,39 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    // Place-mode modal indicator. Mirrors the select-mode pattern: a loud
+    // badge in the accent color so the user can't miss that a mode is
+    // active, plus a hint describing how to commit or cancel. When a
+    // copy is actively running the hint swaps to a copying indicator so
+    // the status bar proves the worker is still alive on big transfers.
+    if app.place_mode.active {
+        let copying = app.file_copy_load.loading;
+        let (badge_text, hint_text) = if copying {
+            (" 📋 COPYING ", crate::i18n::place_mode_copying_banner())
+        } else {
+            (
+                " 📋 PLACE ",
+                crate::i18n::place_mode_status_hint().to_string(),
+            )
+        };
+        let hint = Line::from(vec![
+            Span::styled(
+                badge_text,
+                Style::default()
+                    .fg(th.chrome_bg)
+                    .bg(th.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(hint_text, Style::default().fg(th.accent).bg(th.chrome_bg)),
+            Span::styled(
+                " ".repeat(area.width.saturating_sub(80) as usize),
+                Style::default().bg(th.chrome_bg),
+            ),
+        ]);
+        f.render_widget(hint, area);
+        return;
+    }
+
     // Show the most recent toast (push success/failure etc.) inline.
     let (notif, notif_color) = match app.toasts.last() {
         Some(t) => (
@@ -451,6 +484,7 @@ fn render_help(f: &mut Frame, app: &App, screen: Rect) {
         ("h", t(Msg::HelpShowHelp)),
         ("Space p", t(Msg::HelpQuickOpen)),
         ("Space f", t(Msg::HelpGlobalSearch)),
+        (t(Msg::HelpKeyDragDrop), t(Msg::HelpDragDrop)),
         (t(Msg::HelpKeyAnyKey), t(Msg::HelpAnyKey)),
     ];
 

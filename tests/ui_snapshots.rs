@@ -135,6 +135,50 @@ fn snapshot_with_staged_and_unstaged() {
 }
 
 #[test]
+fn snapshot_place_mode_renders_banner_and_border() {
+    // Lock in the VSCode-style drag-and-drop picker visuals: double-line
+    // accent border + top banner + dimmed file rows vs. accent folder rows.
+    // Regressions here would indicate the place-mode render path drifted
+    // — the shape of the banner and the root drop zone are both part of
+    // the feature's UX contract.
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
+    let (tmp, raw) = tempdir_repo();
+    // A small tree with a folder and a file so the snapshot exercises
+    // both row styles.
+    commit_file(&raw, "README.md", "# hi\n", "init");
+    std::fs::create_dir(tmp.path().join("src")).unwrap();
+    write_file(&raw, "src/main.rs", "fn main() {}\n");
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark());
+    // Force a tree rebuild so `src/` and `README.md` show up before the
+    // snapshot draw (the async load fires from `App::new` via tick).
+    app.refresh_file_tree();
+    // Drain worker results until the tree is populated.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        app.tick();
+        if !app.file_tree_load.loading && !app.file_tree.entries.is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Source file used for the banner — has to exist on disk because
+    // place mode itself is entered via `enter_place_mode` which accepts
+    // any `Vec<PathBuf>`, but users would only ever land here with real
+    // paths thanks to `parse_dropped_paths`.
+    let source = tmp.path().join("README.md");
+    app.enter_place_mode(vec![source]);
+
+    let output = render_app(&mut app, 80, 20);
+    with_filters(|| insta::assert_snapshot!("place_mode", output));
+}
+
+#[test]
 fn snapshot_with_staged_and_unstaged_light_theme() {
     // Locks in the light-theme wiring: a dark-vs-light snapshot diff must exist
     // somewhere, otherwise the Theme plumbing could silently regress to dark.

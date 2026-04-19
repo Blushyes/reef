@@ -19,8 +19,10 @@ No autocomplete. No linter. No language server. Not even a text editor. Write wi
 ## What's in the box
 
 - **Files tab** — tree navigator with a read-only preview pane
+- **Search tab** — workdir-wide content search (ripgrep-powered, honours `.gitignore`) with live preview on the right; modal list / input modes, whole-row horizontal scroll, 1000-hit cap
 - **Git tab** — status, stage / unstage (keyboard or double-click), unified or side-by-side diff, compact or full-file context, discard with confirmation, push / force-push (`--force-with-lease`) with confirm banner
 - **Graph tab** — commit DAG with ref chips, selectable rows, inline commit detail and per-file diff
+- **Palettes** — <kbd>Space</kbd> <kbd>P</kbd> quick-open a file by fuzzy path, <kbd>Space</kbd> <kbd>F</kbd> global content search (same backend as the Search tab; <kbd>Alt</kbd>+<kbd>Enter</kbd> pins the query into the tab)
 - **Keyboard first**, mouse where it earns its keep — drag to resize the split, double-click to toggle staging, scroll the panel under the cursor
 - **Persistent prefs** — diff layout and mode survive restarts
 
@@ -59,10 +61,12 @@ Reef works anywhere, but the Git and Graph tabs only light up inside a git repo.
 | Key | Action |
 | --- | --- |
 | `q`, `Ctrl+C` | quit |
-| `1` / `2` / `3` | Files / Git / Graph tab |
+| `1` / `2` / `3` / `4` | Files / Search / Git / Graph tab |
 | `Tab` | cycle tabs |
 | `Shift+Tab` | switch focused panel |
 | `h` | help |
+| `Space p` | quick-open file (fuzzy path) |
+| `Space f` | global content search overlay |
 | `v` | toggle mouse capture (for terminal text selection) |
 
 ### Files tab
@@ -74,6 +78,20 @@ Reef works anywhere, but the Git and Graph tabs only light up inside a git repo.
 | `Enter` | expand/collapse directory, or open file in `$EDITOR` |
 | `e` | open selected file in `$EDITOR` (no-op on dirs) |
 | `r` | rebuild tree |
+
+### Search tab
+
+Left panel is modal. List mode is the default: global shortcuts (`h`, `q`, digit keys, …) stay live; press `/` or `i` to focus the input, `Esc` to return. Typing updates results live.
+
+| Key | Action |
+| --- | --- |
+| `↑`/`↓`, `j`/`k`, `Ctrl+N`/`Ctrl+P` | navigate results |
+| `/` or `i` | focus the search input |
+| `Esc` | return to list mode |
+| `Enter`, double-click | reveal match in Files tab (matched line highlighted) |
+| `r` | reload current query |
+| `←`/`→`, `Shift+←`/`Shift+→` | horizontal scroll (whole row) |
+| `Home` / `End` | reset / jump h-scroll |
 
 ### Git tab
 

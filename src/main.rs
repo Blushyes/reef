@@ -7,7 +7,8 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use reef::app::App;
 use reef::ui::theme::Theme;
-use reef::{input, ui};
+use reef::ui::toast::Toast;
+use reef::{editor, input, ui};
 use std::io;
 use std::panic;
 use std::time::Duration;
@@ -104,6 +105,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|s| (s.path.clone(), s.is_staged));
         if sel_after != sel_before {
             app.load_diff();
+        }
+
+        // Handle an edit request *after* event drain so the terminal is
+        // idle. Suspends the TUI, runs `$EDITOR`, resumes. Mouse capture
+        // tracks `select_mode` — off in select mode, on otherwise.
+        if let Some(path) = app.pending_edit.take() {
+            let mouse_was_on = !app.select_mode;
+            if let Err(e) = editor::launch(&mut terminal, &path, mouse_was_on) {
+                app.toasts
+                    .push(Toast::error(format!("打开编辑器失败: {e}")));
+            }
+            // Pick up on-disk changes immediately rather than waiting for
+            // the fs-watcher debounce.
+            app.refresh_file_tree();
+            app.load_preview();
         }
 
         if app.should_quit {

@@ -643,8 +643,9 @@ impl App {
                 // itself always sends). Recover so the user can retry.
                 self.push_in_flight = false;
                 self.push_rx = None;
-                self.toasts
-                    .push(Toast::error(crate::i18n::t(crate::i18n::Msg::PushThreadCrashed)));
+                self.toasts.push(Toast::error(crate::i18n::t(
+                    crate::i18n::Msg::PushThreadCrashed,
+                )));
             }
         }
     }

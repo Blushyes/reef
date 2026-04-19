@@ -1,6 +1,6 @@
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use reef_host::git::CommitInfo;
-use reef_host::git::graph::build_graph;
+use reef::git::CommitInfo;
+use reef::git::graph::build_graph;
 
 /// Deterministically build a commit sequence of `n` commits with a light
 /// fork/merge pattern. Every 5th commit has two parents to exercise merge

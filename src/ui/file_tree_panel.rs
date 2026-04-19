@@ -1,5 +1,5 @@
 use crate::app::App;
-use crate::mouse::ClickAction;
+use crate::ui::mouse::ClickAction;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};

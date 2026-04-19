@@ -9,8 +9,8 @@
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
-use reef_host::app::App;
-use reef_host::ui;
+use reef::app::App;
+use reef::ui;
 use std::sync::Mutex;
 use test_support::{HomeGuard, commit_file, tempdir_repo, write_file};
 
@@ -94,7 +94,7 @@ fn snapshot_with_staged_and_unstaged() {
 
     let mut app = App::new();
     // Switch to Git tab to show staged/unstaged sections
-    app.active_tab = reef_host::app::Tab::Git;
+    app.active_tab = reef::app::Tab::Git;
     app.refresh_status();
     let output = render_app(&mut app, 80, 20);
     with_filters(|| insta::assert_snapshot!("with_staged_and_unstaged", output));

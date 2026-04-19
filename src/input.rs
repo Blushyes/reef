@@ -1,126 +1,25 @@
-use crossterm::{
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseButton, MouseEvent, MouseEventKind,
-    },
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
+//! Keyboard + mouse dispatch. `main.rs` delegates everything below the
+//! event-drain loop to `handle_key` and `handle_mouse` here, so the binary
+//! entry point stays focused on terminal bootstrap.
+//!
+//! The one exception is the `v` (select mode toggle) and `show_help`
+//! dismiss — those stay inline in `main.rs` because the first needs
+//! `execute!(terminal.backend_mut(), ...)` to flip crossterm's mouse
+//! capture mode, and both are simple enough that splitting them out would
+//! just add indirection.
+
+use crate::app::{App, Panel, Tab};
+use crate::ui;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
-use reef_host::app::{App, Panel, Tab};
-use reef_host::mouse;
-use reef_host::ui;
-use std::io;
-use std::panic;
+use ratatui::backend::Backend;
 use std::time::{Duration, Instant};
 
-const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
+pub const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Set up panic hook to restore terminal
-    let original_hook = panic::take_hook();
-    panic::set_hook(Box::new(move |panic_info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
-        original_hook(panic_info);
-    }));
+// ─── Keyboard ────────────────────────────────────────────────────────────────
 
-    // Terminal setup
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    // App init
-    let mut app = App::new();
-
-    // Main loop
-    loop {
-        app.tick();
-        terminal.draw(|f| ui::render(f, &mut app))?;
-
-        // Block until at least one event arrives (or 16ms timeout for ~60fps)
-        if !event::poll(Duration::from_millis(16))? {
-            continue;
-        }
-
-        // Snapshot selection before processing events
-        let sel_before = app
-            .selected_file
-            .as_ref()
-            .map(|s| (s.path.clone(), s.is_staged));
-
-        // Drain ALL pending events so rapid key repeats coalesce — only one
-        // render + diff-load runs per frame, regardless of how many events fired.
-        loop {
-            match event::read()? {
-                Event::Key(key) => {
-                    // Crossterm emits Press + Release (and Repeat on hold) for every
-                    // physical keystroke on Windows Terminal, in terminals that enable
-                    // the kitty keyboard protocol, and on some macOS configurations.
-                    // Without this filter each keypress runs handle_key twice, so j/k
-                    // navigate 2 rows instead of 1 (and 3+ when held).
-                    if key.kind != KeyEventKind::Press {
-                        continue;
-                    }
-
-                    // v toggles select mode regardless of active panel
-                    if key.code == KeyCode::Char('v') && key.modifiers.is_empty() {
-                        app.select_mode = !app.select_mode;
-                        if app.select_mode {
-                            execute!(terminal.backend_mut(), DisableMouseCapture)?;
-                        } else {
-                            execute!(terminal.backend_mut(), EnableMouseCapture)?;
-                        }
-                    } else if app.show_help {
-                        app.show_help = false;
-                    } else {
-                        handle_key(key, &mut app);
-                    }
-                }
-                Event::Mouse(mouse) => {
-                    if !app.select_mode {
-                        handle_mouse(mouse, &mut app, &terminal);
-                    }
-                }
-                Event::Resize(_, _) => {}
-                _ => {}
-            }
-            // Stop draining if no more events are immediately available
-            if !event::poll(Duration::from_millis(0))? {
-                break;
-            }
-        }
-
-        // After draining, sync selection state
-        let sel_after = app
-            .selected_file
-            .as_ref()
-            .map(|s| (s.path.clone(), s.is_staged));
-        if sel_after != sel_before {
-            app.load_diff();
-        }
-
-        if app.should_quit {
-            break;
-        }
-    }
-
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-
-    Ok(())
-}
-
-fn handle_key(key: event::KeyEvent, app: &mut App) {
+pub fn handle_key(key: KeyEvent, app: &mut App) {
     // Global keys (work on all tabs)
     match key.code {
         KeyCode::Char('q') => {
@@ -165,8 +64,8 @@ fn handle_key(key: event::KeyEvent, app: &mut App) {
     }
 }
 
-fn handle_key_graph(key: event::KeyEvent, app: &mut App) {
-    use reef_host::ui::{commit_detail_panel, git_graph_panel};
+fn handle_key_graph(key: KeyEvent, app: &mut App) {
+    use ui::{commit_detail_panel, git_graph_panel};
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => match app.active_panel {
             Panel::Files => {
@@ -215,7 +114,7 @@ fn handle_key_graph(key: event::KeyEvent, app: &mut App) {
     }
 }
 
-fn handle_key_git(key: event::KeyEvent, app: &mut App) {
+fn handle_key_git(key: KeyEvent, app: &mut App) {
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => match app.active_panel {
             Panel::Files => app.navigate_files(-1),
@@ -264,28 +163,28 @@ fn handle_key_git(key: event::KeyEvent, app: &mut App) {
             app.diff_h_scroll = usize::MAX; // render 自动钳到实际最大值
         }
         KeyCode::Char('s') => {
-            reef_host::ui::git_status_panel::handle_key(app, "s");
+            ui::git_status_panel::handle_key(app, "s");
         }
         KeyCode::Char('u') => {
-            reef_host::ui::git_status_panel::handle_key(app, "u");
+            ui::git_status_panel::handle_key(app, "u");
         }
         KeyCode::Char('d') => {
-            reef_host::ui::git_status_panel::handle_key(app, "d");
+            ui::git_status_panel::handle_key(app, "d");
         }
         KeyCode::Char('y') => {
-            reef_host::ui::git_status_panel::handle_key(app, "y");
+            ui::git_status_panel::handle_key(app, "y");
         }
         KeyCode::Char('n') => {
-            reef_host::ui::git_status_panel::handle_key(app, "n");
+            ui::git_status_panel::handle_key(app, "n");
         }
         KeyCode::Esc => {
-            reef_host::ui::git_status_panel::handle_key(app, "Escape");
+            ui::git_status_panel::handle_key(app, "Escape");
         }
         KeyCode::Char('r') => {
-            reef_host::ui::git_status_panel::handle_key(app, "r");
+            ui::git_status_panel::handle_key(app, "r");
         }
         KeyCode::Char('t') => {
-            reef_host::ui::git_status_panel::handle_key(app, "t");
+            ui::git_status_panel::handle_key(app, "t");
         }
         KeyCode::Char('m') => {
             app.toggle_diff_layout();
@@ -297,7 +196,7 @@ fn handle_key_git(key: event::KeyEvent, app: &mut App) {
     }
 }
 
-fn handle_key_files(key: event::KeyEvent, app: &mut App) {
+fn handle_key_files(key: KeyEvent, app: &mut App) {
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => match app.active_panel {
             Panel::Files => {
@@ -373,11 +272,9 @@ fn handle_key_files(key: event::KeyEvent, app: &mut App) {
     }
 }
 
-fn handle_mouse<B: ratatui::backend::Backend>(
-    mouse: MouseEvent,
-    app: &mut App,
-    terminal: &Terminal<B>,
-) {
+// ─── Mouse ───────────────────────────────────────────────────────────────────
+
+pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Terminal<B>) {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             let now = Instant::now();
@@ -393,13 +290,13 @@ fn handle_mouse<B: ratatui::backend::Backend>(
                 // On double-click: if the region carries a dbl action, swap to it
                 // and run through handle_action so host-side side effects fire.
                 let effective = if is_double {
-                    if let crate::mouse::ClickAction::GitCommand {
+                    if let ui::mouse::ClickAction::GitCommand {
                         dbl_command: Some(ref cmd),
                         ref dbl_args,
                         ..
                     } = action
                     {
-                        crate::mouse::ClickAction::GitCommand {
+                        ui::mouse::ClickAction::GitCommand {
                             command: cmd.clone(),
                             args: dbl_args.clone().unwrap_or(serde_json::Value::Null),
                             dbl_command: None,
@@ -445,7 +342,7 @@ fn handle_mouse<B: ratatui::backend::Backend>(
             match app.active_tab {
                 Tab::Git => {
                     if is_left {
-                        reef_host::ui::git_status_panel::scroll(app, -3);
+                        ui::git_status_panel::scroll(app, -3);
                     } else {
                         app.diff_scroll = app.diff_scroll.saturating_sub(3);
                     }
@@ -459,9 +356,9 @@ fn handle_mouse<B: ratatui::backend::Backend>(
                 }
                 Tab::Graph => {
                     if is_left {
-                        reef_host::ui::git_graph_panel::scroll(app, -3);
+                        ui::git_graph_panel::scroll(app, -3);
                     } else {
-                        reef_host::ui::commit_detail_panel::scroll(app, -3);
+                        ui::commit_detail_panel::scroll(app, -3);
                     }
                 }
             }
@@ -477,7 +374,7 @@ fn handle_mouse<B: ratatui::backend::Backend>(
             match app.active_tab {
                 Tab::Git => {
                     if is_left {
-                        reef_host::ui::git_status_panel::scroll(app, 3);
+                        ui::git_status_panel::scroll(app, 3);
                     } else {
                         app.diff_scroll += 3;
                     }
@@ -491,9 +388,9 @@ fn handle_mouse<B: ratatui::backend::Backend>(
                 }
                 Tab::Graph => {
                     if is_left {
-                        reef_host::ui::git_graph_panel::scroll(app, 3);
+                        ui::git_graph_panel::scroll(app, 3);
                     } else {
-                        reef_host::ui::commit_detail_panel::scroll(app, 3);
+                        ui::commit_detail_panel::scroll(app, 3);
                     }
                 }
             }

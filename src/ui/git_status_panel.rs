@@ -9,7 +9,7 @@
 use crate::app::{App, Panel, SelectedFile};
 use crate::git::tree::{self as gtree, Node};
 use crate::git::{FileEntry, FileStatus};
-use crate::mouse::ClickAction;
+use crate::ui::mouse::ClickAction;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};

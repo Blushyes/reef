@@ -14,7 +14,7 @@ const DEBOUNCE: Duration = Duration::from_millis(300);
 pub fn spawn(workdir: PathBuf) -> mpsc::Receiver<()> {
     let (out_tx, out_rx) = mpsc::channel::<()>();
     let _ = thread::Builder::new()
-        .name("reef-host-fs-watcher".into())
+        .name("reef-fs-watcher".into())
         .spawn(move || run(workdir, out_tx));
     out_rx
 }

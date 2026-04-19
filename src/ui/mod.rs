@@ -4,12 +4,15 @@ pub mod file_preview_panel;
 pub mod file_tree_panel;
 pub mod git_graph_panel;
 pub mod git_status_panel;
+pub mod highlight;
 pub mod hover;
+pub mod mouse;
 pub mod text;
+pub mod toast;
 
 use crate::app::{App, Tab};
-use crate::mouse::ClickAction;
-use crate::toast::ToastLevel;
+use crate::ui::mouse::ClickAction;
+use crate::ui::toast::ToastLevel;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};

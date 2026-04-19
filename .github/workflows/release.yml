@@ -60,12 +60,12 @@ jobs:
 
       - name: Build (cargo)
         if: '!matrix.use_cross'
-        run: cargo build --release --locked --target ${{ matrix.target }} -p reef-host
+        run: cargo build --release --locked --target ${{ matrix.target }} -p reef
         shell: bash
 
       - name: Build (cross)
         if: matrix.use_cross
-        run: cross build --release --locked --target ${{ matrix.target }} -p reef-host
+        run: cross build --release --locked --target ${{ matrix.target }} -p reef
         shell: bash
 
       - name: Stage binary

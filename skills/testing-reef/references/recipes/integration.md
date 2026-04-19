@@ -1,6 +1,6 @@
 # Integration test recipe
 
-For tests that use real `git2::Repository` or real filesystem. Live under `crates/reef-host/tests/<name>_integration.rs`.
+For tests that use real `git2::Repository` or real filesystem. Live under `tests/<name>_integration.rs`.
 
 ## Basic skeleton
 
@@ -48,7 +48,7 @@ The `CwdGuard` and `CWD_LOCK` pattern is identical across files (`git_repo_integ
 
 ## HOME isolation pattern
 
-For tests that call `App::new()` or anything else that reads `std::env::var("HOME")` — specifically `crates/reef-host/src/prefs.rs`:
+For tests that call `App::new()` or anything else that reads `std::env::var("HOME")` — specifically `src/prefs.rs`:
 
 ```rust
 static HOME_LOCK: Mutex<()> = Mutex::new(());   // or reuse CWD_LOCK if paired

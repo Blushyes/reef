@@ -201,7 +201,7 @@ pub fn load_preview(root: &Path, rel_path: &Path) -> Option<PreviewContent> {
 
     let rel_str = rel_path.to_string_lossy().to_string();
     let highlighted = if raw.len() <= 512 * 1024 && lines.len() <= 5_000 {
-        crate::highlight::highlight_file(&rel_str, &lines)
+        crate::ui::highlight::highlight_file(&rel_str, &lines)
     } else {
         None
     };

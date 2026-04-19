@@ -1,7 +1,7 @@
 //! Integration tests for the host-owned fs watcher. Drives `fs_watcher::spawn`
 //! against a real tempdir and asserts the debounced channel contract.
 
-use reef_host::fs_watcher;
+use reef::fs_watcher;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;

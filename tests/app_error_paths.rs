@@ -2,7 +2,7 @@
 //! environment is missing pieces — most importantly when the cwd is not
 //! inside a git repo, so `GitRepo::open()` returns `None`.
 
-use reef_host::app::App;
+use reef::app::App;
 use std::sync::Mutex;
 use tempfile::TempDir;
 

@@ -47,14 +47,14 @@ write_file(&raw, "new.txt", "untracked");        // untracked
 
 There are no span-level helpers here for ratatui output. When a test needs to assert that specific text appears in a rendered panel, use the snapshot recipe (`references/recipes/snapshot.md`) to render to a `TestBackend` and assert against the buffer as a string. Ratatui's `Line` / `Span` types aren't meant to be introspected in tests — span boundaries shift as layouts evolve and every index-based assertion becomes a trap.
 
-For the inline panels' pure logic (e.g. `tree::build` in `crates/reef-host/src/git/tree.rs`), assert on the returned data structure directly — don't route through rendering.
+For the inline panels' pure logic (e.g. `tree::build` in `src/git/tree.rs`), assert on the returned data structure directly — don't route through rendering.
 
 ## Commit graph fixtures
 
 If you need a `CommitInfo` for graph algorithm tests, build one by hand — it's six fields, half trivial:
 
 ```rust
-use reef_host::git::CommitInfo;
+use reef::git::CommitInfo;
 
 fn fake_commit(oid: &str, parents: &[&str]) -> CommitInfo {
     CommitInfo {
@@ -71,9 +71,9 @@ fn fake_commit(oid: &str, parents: &[&str]) -> CommitInfo {
 
 Existing examples:
 
-- `crates/reef-host/src/git/graph.rs` — unit tests inside the module itself
-- `crates/reef-host/tests/git_graph_properties.rs` — the proptest version, which generates topologically-ordered commit vectors from a random shape
-- `crates/reef-host/benches/graph.rs` — the bench version with a deterministic fork/merge pattern
+- `src/git/graph.rs` — unit tests inside the module itself
+- `tests/git_graph_properties.rs` — the proptest version, which generates topologically-ordered commit vectors from a random shape
+- `benches/graph.rs` — the bench version with a deterministic fork/merge pattern
 
 Topological order (child before parent) is the caller's responsibility — `build_graph` assumes it.
 

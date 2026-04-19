@@ -326,7 +326,7 @@ fn handle_key_search(key: KeyEvent, app: &mut App) {
                     app.preview_h_scroll = usize::MAX;
                 }
                 KeyCode::Enter => {
-                    open_selected_in_editor(app);
+                    global_search::accept(app);
                 }
                 _ => {}
             }
@@ -407,7 +407,7 @@ fn handle_key_search_list_mode(key: KeyEvent, app: &mut App, ctrl: bool) {
         }
 
         // ── Accept ─────────────────────────────────────────────
-        KeyCode::Enter => open_selected_in_editor(app),
+        KeyCode::Enter => global_search::accept(app),
 
         // Esc is a no-op in list mode: nothing to escape from, and we
         // don't want it to close/jump away unexpectedly.
@@ -527,7 +527,7 @@ fn handle_key_search_input_mode(key: KeyEvent, app: &mut App, ctrl: bool, alt: b
         }
 
         // ── Accept ─────────────────────────────────────────────
-        KeyCode::Enter => open_selected_in_editor(app),
+        KeyCode::Enter => global_search::accept(app),
 
         // ── Edit query ─────────────────────────────────────────
         KeyCode::Backspace if alt || ctrl => {
@@ -567,24 +567,6 @@ fn handle_key_search_input_mode(key: KeyEvent, app: &mut App, ctrl: bool, alt: b
             global_search::mark_query_edited(&mut app.global_search);
         }
         _ => {}
-    }
-}
-
-/// Shared helper: open the hit at `selected` in $EDITOR via `pending_edit`.
-/// Silently ignores missing files (the MRU-style `exists()` tripwire is
-/// also in `accept()` for the overlay; here we just skip the edit).
-fn open_selected_in_editor(app: &mut App) {
-    if let Some(hit) = app
-        .global_search
-        .results
-        .get(app.global_search.selected)
-        .cloned()
-    {
-        let root = app.file_tree.root.clone();
-        let full = root.join(&hit.path);
-        if full.exists() {
-            app.pending_edit = Some(full);
-        }
     }
 }
 
@@ -848,14 +830,16 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
             );
 
             if let Some(action) = app.hit_registry.hit_test(mouse.column, mouse.row) {
-                // Double-click on a search result row opens the hit's file
-                // in `$EDITOR` (symmetric with Enter). Single-click falls
-                // through to handle_action for "select + live preview."
+                // Double-click on a search result row commits the hit:
+                // switch to Files tab, reveal the file, and load its preview
+                // with the matched line highlighted — same as the overlay's
+                // Enter. Single-click falls through to handle_action for
+                // "select + live preview" without leaving the Search tab.
                 // Handled here rather than in `handle_action` because the
                 // is_double signal isn't threaded through App methods.
                 if is_double && let ui::mouse::ClickAction::GlobalSearchSelect(idx) = action {
                     app.global_search.selected = idx;
-                    open_selected_in_editor(app);
+                    global_search::accept(app);
                     app.last_click = None;
                     return;
                 }

@@ -11,6 +11,11 @@
 //! Finder finishes animating the selection.
 
 use std::path::Path;
+// `Command` is only constructed inside the macOS / Windows cfg
+// blocks below. Scope the import to those platforms so a Linux
+// build doesn't trip `-D unused-imports` under the workspace's
+// `-D warnings` CI flag.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::process::Command;
 
 /// Open the platform file manager with `path` selected. Returns

@@ -16,6 +16,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::ops::Range;
 use unicode_width::UnicodeWidthStr;
 
 // Matches the Git-tab diff panel's gutter widths (" NNNNN  NNNNN  " / " NNNNN ").
@@ -98,6 +99,13 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
         let hover = crate::ui::hover::is_hover(app, area, y);
 
         if let Some(sbs) = &row.sbs {
+            // SBS rows still get search highlighting: ranges are flat byte
+            // offsets into the row's searchable_rows concat, so we split
+            // them into left-body-local and right-body-local ranges and
+            // apply overlay per half before clipping.
+            let (ranges, cur) = app
+                .search
+                .ranges_on_row(SearchTarget::CommitDetail, row_idx);
             render_sbs_row_live(
                 f,
                 area,
@@ -107,6 +115,8 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
                 sbs_right_h,
                 hover,
                 app.theme.hover_bg,
+                &ranges,
+                cur,
                 &theme,
             );
             continue;
@@ -190,7 +200,9 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
 /// Render an SBS row with independent per-half h_scroll. Each half —
 /// left (old version) and right (new version) — is built into its own
 /// token stream, clipped by its own `skip_cols`, padded to half/right_w,
-/// and composed with a stable `│` separator in between.
+/// and composed with a stable `│` separator in between. Search matches
+/// are split across the two halves by flat-row byte offset so highlights
+/// survive the per-half clip pipeline.
 #[allow(clippy::too_many_arguments)]
 fn render_sbs_row_live(
     f: &mut Frame,
@@ -201,6 +213,8 @@ fn render_sbs_row_live(
     right_h: usize,
     hover: bool,
     hover_bg: Color,
+    ranges: &[Range<usize>],
+    cur: Option<Range<usize>>,
     theme: &Theme,
 ) {
     let half_w = area.width.saturating_sub(1) / 2;
@@ -211,58 +225,168 @@ fn render_sbs_row_live(
     let (left_fg, left_bg) = side_style(sbs.left_tag, theme);
     let (right_fg, right_bg) = side_style(sbs.right_tag, theme);
 
+    // Byte offsets of the two body spans inside the searchable flat row:
+    //   [lg:7][left_text][│:3][rg:7][right_text]
+    // `searchable_rows` joins spans.text in the same order, so ranges from
+    // `search::ranges_on_row` resolve to these offsets.
+    let left_body_byte_start = SBS_GUTTER_WIDTH;
+    let left_body_byte_end = left_body_byte_start + sbs.left_text.len();
+    let sep_byte_end = left_body_byte_end + "│".len();
+    let right_body_byte_start = sep_byte_end + SBS_GUTTER_WIDTH;
+    let right_body_byte_end = right_body_byte_start + sbs.right_text.len();
+    let split = split_sbs_ranges(
+        ranges,
+        cur.as_ref(),
+        left_body_byte_start,
+        left_body_byte_end,
+        right_body_byte_start,
+        right_body_byte_end,
+    );
+    let SbsRanges {
+        left: left_ranges,
+        left_cur,
+        right: right_ranges,
+        right_cur,
+    } = split;
+
     let apply_hover = |s: Style| crate::ui::hover::apply(s, hover, hover_bg);
 
-    let l_gutter = apply_hover(style_with_bg(
+    let l_gutter_style = apply_hover(style_with_bg(
         Style::default().fg(theme.fg_secondary),
         left_bg,
     ));
-    let l_body = apply_hover(style_with_bg(Style::default().fg(left_fg), left_bg));
-    let l_pad = apply_hover(style_with_bg(Style::default(), left_bg));
-    let r_gutter = apply_hover(style_with_bg(
+    let l_body_base = style_with_bg(Style::default().fg(left_fg), left_bg);
+    let l_pad_style = apply_hover(style_with_bg(Style::default(), left_bg));
+    let r_gutter_style = apply_hover(style_with_bg(
         Style::default().fg(theme.fg_secondary),
         right_bg,
     ));
-    let r_body = apply_hover(style_with_bg(Style::default().fg(right_fg), right_bg));
-    let r_pad = apply_hover(style_with_bg(Style::default(), right_bg));
+    let r_body_base = style_with_bg(Style::default().fg(right_fg), right_bg);
+    let r_pad_style = apply_hover(style_with_bg(Style::default(), right_bg));
     let sep_style = apply_hover(Style::default().fg(theme.fg_secondary));
 
-    // Left half: gutter(fixed) + clipped body + pad to left_body_w.
-    let left_tokens = [(l_body, sbs.left_text.clone())];
-    let left_clipped: Vec<Span> = clip_spans(&left_tokens, left_h, left_body_w);
+    // Left body: base → overlay match highlight → hover → clip.
+    let left_base_tokens: Vec<(Style, String)> = vec![(l_body_base, sbs.left_text.clone())];
+    let left_overlaid = if left_ranges.is_empty() {
+        left_base_tokens
+    } else {
+        overlay_match_highlight(
+            left_base_tokens,
+            &left_ranges,
+            left_cur,
+            theme.search_match,
+            theme.search_current,
+        )
+    };
+    let left_hovered: Vec<(Style, String)> = left_overlaid
+        .into_iter()
+        .map(|(s, t)| (apply_hover(s), t))
+        .collect();
+    let left_clipped = clip_spans(&left_hovered, left_h, left_body_w);
     let left_clipped_w: usize = left_clipped
         .iter()
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
         .sum();
     let left_pad_w = left_body_w.saturating_sub(left_clipped_w);
 
-    let mut out: Vec<Span> = Vec::with_capacity(8);
-    out.push(Span::styled(
-        format!(" {} ", fmt_diff_lineno(sbs.left_no)),
-        l_gutter,
-    ));
-    out.extend(left_clipped);
-    out.push(Span::styled(" ".repeat(left_pad_w), l_pad));
-
-    // Separator at the fixed boundary.
-    out.push(Span::styled("│".to_string(), sep_style));
-
-    // Right half: symmetric to left.
-    let right_tokens = [(r_body, sbs.right_text.clone())];
-    let right_clipped: Vec<Span> = clip_spans(&right_tokens, right_h, right_body_w);
+    // Right body: mirror of left.
+    let right_base_tokens: Vec<(Style, String)> = vec![(r_body_base, sbs.right_text.clone())];
+    let right_overlaid = if right_ranges.is_empty() {
+        right_base_tokens
+    } else {
+        overlay_match_highlight(
+            right_base_tokens,
+            &right_ranges,
+            right_cur,
+            theme.search_match,
+            theme.search_current,
+        )
+    };
+    let right_hovered: Vec<(Style, String)> = right_overlaid
+        .into_iter()
+        .map(|(s, t)| (apply_hover(s), t))
+        .collect();
+    let right_clipped = clip_spans(&right_hovered, right_h, right_body_w);
     let right_clipped_w: usize = right_clipped
         .iter()
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
         .sum();
     let right_pad_w = right_body_w.saturating_sub(right_clipped_w);
+
+    let mut out: Vec<Span> = Vec::with_capacity(8);
+    out.push(Span::styled(
+        format!(" {} ", fmt_diff_lineno(sbs.left_no)),
+        l_gutter_style,
+    ));
+    out.extend(left_clipped);
+    out.push(Span::styled(" ".repeat(left_pad_w), l_pad_style));
+    out.push(Span::styled("│".to_string(), sep_style));
     out.push(Span::styled(
         format!(" {} ", fmt_diff_lineno(sbs.right_no)),
-        r_gutter,
+        r_gutter_style,
     ));
     out.extend(right_clipped);
-    out.push(Span::styled(" ".repeat(right_pad_w), r_pad));
+    out.push(Span::styled(" ".repeat(right_pad_w), r_pad_style));
 
     f.render_widget(Line::from(out), Rect::new(area.x, y, area.width, 1));
+}
+
+struct SbsRanges {
+    left: Vec<Range<usize>>,
+    left_cur: Option<Range<usize>>,
+    right: Vec<Range<usize>>,
+    right_cur: Option<Range<usize>>,
+}
+
+/// Split search ranges (flat byte offsets into the SBS row's searchable
+/// text) into left-body-local and right-body-local ranges. Matches inside
+/// gutters / separator, or straddling boundaries, are dropped — they
+/// don't correspond to visible body content. Byte offsets are passed
+/// through unchanged (ranges keep their byte-offset semantics inside
+/// each half's text).
+fn split_sbs_ranges(
+    ranges: &[Range<usize>],
+    cur: Option<&Range<usize>>,
+    left_start: usize,
+    left_end: usize,
+    right_start: usize,
+    right_end: usize,
+) -> SbsRanges {
+    let to_side = |r: &Range<usize>| -> Option<(bool, Range<usize>)> {
+        if r.start >= left_start && r.end <= left_end {
+            Some((true, (r.start - left_start)..(r.end - left_start)))
+        } else if r.start >= right_start && r.end <= right_end {
+            Some((false, (r.start - right_start)..(r.end - right_start)))
+        } else {
+            None
+        }
+    };
+
+    let mut out = SbsRanges {
+        left: Vec::new(),
+        left_cur: None,
+        right: Vec::new(),
+        right_cur: None,
+    };
+    for r in ranges {
+        if let Some((is_left, local)) = to_side(r) {
+            if is_left {
+                out.left.push(local);
+            } else {
+                out.right.push(local);
+            }
+        }
+    }
+    if let Some(c) = cur {
+        if let Some((is_left, local)) = to_side(c) {
+            if is_left {
+                out.left_cur = Some(local);
+            } else {
+                out.right_cur = Some(local);
+            }
+        }
+    }
+    out
 }
 
 pub fn handle_key(app: &mut App, key: &str) -> bool {
@@ -1124,6 +1248,54 @@ mod tests {
         let marker = row.sbs.as_ref().expect("SBS row must carry sbs marker");
         assert_eq!(marker.left_text, "old");
         assert_eq!(marker.right_text, "new");
+    }
+
+    /// SBS search highlight regression test: ranges in a flat row string
+    /// ("lg | left | │ | rg | right") must map to body-local ranges on
+    /// the correct side, and in-gutter / on-separator / straddling matches
+    /// must be dropped (the render pipeline has nothing to highlight there).
+    #[test]
+    fn sbs_ranges_split_maps_to_correct_half() {
+        // left_text.len() = 10, right_text.len() = 15.
+        // Byte layout:
+        //   [0, 7)  lg
+        //   [7, 17) left_text
+        //   [17, 20) │ (3 bytes)
+        //   [20, 27) rg
+        //   [27, 42) right_text
+        let left_start = 7;
+        let left_end = 17;
+        let right_start = 20 + 7; // 27
+        let right_end = right_start + 15; // 42
+
+        let match_in_left = 9..12; // inside left body
+        let match_in_right = 30..35; // inside right body
+        let match_in_gutter = 3..5; // inside left gutter → dropped
+        let match_on_sep = 17..18; // on separator → dropped
+        let match_straddle = 15..25; // crosses body/sep/gutter → dropped
+
+        let ranges = vec![
+            match_in_left.clone(),
+            match_in_right.clone(),
+            match_in_gutter,
+            match_on_sep,
+            match_straddle,
+        ];
+        let cur = Some(match_in_right.clone());
+
+        let split = split_sbs_ranges(
+            &ranges,
+            cur.as_ref(),
+            left_start,
+            left_end,
+            right_start,
+            right_end,
+        );
+
+        assert_eq!(split.left, vec![(9 - 7)..(12 - 7)]);
+        assert_eq!(split.right, vec![(30 - 27)..(35 - 27)]);
+        assert_eq!(split.right_cur, Some((30 - 27)..(35 - 27)));
+        assert!(split.left_cur.is_none());
     }
 
     /// Independent clamps: the left and right SBS h_scroll are computed from

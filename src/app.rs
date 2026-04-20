@@ -1082,6 +1082,12 @@ impl App {
     /// and any previously-selected file diff whenever the target changes.
     pub fn load_commit_detail(&mut self) {
         self.commit_detail.file_diff = None;
+        // Different commit → different content; reset all three h_scrolls so
+        // the panel starts at the left edge. Keeps the scrollbar out of
+        // "offset that only made sense for the prior commit" states.
+        self.commit_detail.diff_h_scroll = 0;
+        self.commit_detail.sbs_left_h_scroll = 0;
+        self.commit_detail.sbs_right_h_scroll = 0;
         let Some(oid) = self.git_graph.selected_commit.clone() else {
             self.commit_detail.detail = None;
             return;
@@ -1108,6 +1114,20 @@ impl App {
         if self.repo.is_none() {
             self.commit_detail.file_diff = None;
             return;
+        }
+        // Different file → reset h_scrolls so the new diff starts at the
+        // left edge. Same-path reload (e.g. after toggling diff_mode) keeps
+        // scroll state so the user doesn't lose their place.
+        let is_new_file = self
+            .commit_detail
+            .file_diff
+            .as_ref()
+            .map(|(p, _)| p.as_str() != path)
+            .unwrap_or(true);
+        if is_new_file {
+            self.commit_detail.diff_h_scroll = 0;
+            self.commit_detail.sbs_left_h_scroll = 0;
+            self.commit_detail.sbs_right_h_scroll = 0;
         }
         let generation = self.commit_file_diff_load.begin();
         self.tasks.load_commit_file_diff(

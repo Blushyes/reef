@@ -34,7 +34,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
     let virtual_w = (area.width as usize)
         .saturating_add(h)
         .min(u16::MAX as usize) as u16;
-    let rows = build_rows(app, virtual_w, &theme);
+    let rows = build_rows(app, virtual_w, area.width, &theme);
     let total = rows.len();
 
     let max_scroll = total.saturating_sub(area.height as usize);
@@ -309,7 +309,13 @@ fn from_ratatui_span(span: Span<'static>) -> RowSpan {
 
 // ─── Row construction ─────────────────────────────────────────────────────────
 
-fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
+/// `width` is the *virtual* width (viewport + h_scroll) — it controls how
+/// far pad/decoration extends to the right so `clip_spans` can reveal more
+/// content as `h_scroll` grows. `display_w` is the *real* viewport width,
+/// stable across frames; SBS's `half` / `│` position must use it (not
+/// `width`) or the separator drifts every frame as the user over-scrolls
+/// past max_h, producing visible jitter at the right edge.
+fn build_rows(app: &App, width: u16, display_w: u16, theme: &Theme) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
     let cd = &app.commit_detail;
 
@@ -430,7 +436,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
             theme,
         ));
         rows.push(diff_separator_row(width, theme));
-        append_diff_rows(&mut rows, diff, cd.diff_layout, width, theme);
+        append_diff_rows(&mut rows, diff, cd.diff_layout, width, display_w, theme);
     }
 
     rows
@@ -591,11 +597,15 @@ fn append_diff_rows(
     diff: &DiffContent,
     layout: DiffLayout,
     width: u16,
+    display_w: u16,
     theme: &Theme,
 ) {
     match layout {
         DiffLayout::Unified => append_unified_diff(rows, diff, width, theme),
-        DiffLayout::SideBySide => append_side_by_side_diff(rows, diff, width, theme),
+        // SBS layout (half / right_w / separator position) uses the stable
+        // viewport width, not virtual_w, so the separator doesn't drift
+        // when the user over-scrolls past max_h.
+        DiffLayout::SideBySide => append_side_by_side_diff(rows, diff, display_w, theme),
     }
 }
 
@@ -725,17 +735,16 @@ fn render_sbs_row(row: &SbsRow, half_w: u16, right_w: u16, theme: &Theme) -> Row
         right_w,
         theme,
     );
-    // Content width: both halves' gutters + their real text widths + the
-    // 1-col separator. Excludes the trailing pad in each half, so clamp
-    // converges on the real content instead of `virtual_w`.
-    let left_tw = UnicodeWidthStr::width(row.left_text.as_str());
-    let right_tw = UnicodeWidthStr::width(row.right_text.as_str());
-    let content_w = SBS_GUTTER_WIDTH
-        .saturating_add(left_tw)
-        .saturating_add(1)
-        .saturating_add(SBS_GUTTER_WIDTH)
-        .saturating_add(right_tw);
-    Row::new(spans).with_content_width(content_w)
+    // SBS rows are laid out at the stable display_w (half_w + 1 + right_w
+    // = display_w by construction); content_width matches that so SBS rows
+    // never extend max_h beyond the viewport. Long lines past the half's
+    // capacity are truncated by `push_sbs_half`'s `truncate_to_display_width`
+    // — to read them, switch to Unified layout (`m` key). h_scroll on SBS
+    // rows alone would make the separator drift each frame as virtual_w
+    // changes; capping max_h at display_w (for SBS-driven rows) keeps the
+    // layout rock-stable.
+    let row_w = (half_w as usize) + 1 + (right_w as usize);
+    Row::new(spans).with_content_width(row_w)
 }
 
 fn push_sbs_half(
@@ -896,11 +905,11 @@ fn format_timestamp(secs: i64) -> String {
 
 /// Flattens the panel's row stream into plain text — one string per rendered
 /// row. Used by `crate::search` so match row indices line up 1:1 with
-/// `commit_detail.scroll` and with what the panel draws. Width is passed as
-/// `u16::MAX` so row construction skips display-width truncation and the
-/// searchable text mirrors the underlying data.
+/// `commit_detail.scroll` and with what the panel draws. Both width params
+/// are passed as `u16::MAX` so row construction skips display-width
+/// truncation and the searchable text mirrors the underlying data.
 pub fn searchable_rows(app: &App) -> Vec<String> {
-    let rows = build_rows(app, u16::MAX, &app.theme);
+    let rows = build_rows(app, u16::MAX, u16::MAX, &app.theme);
     rows.into_iter()
         .map(|r| {
             r.spans
@@ -985,6 +994,33 @@ mod tests {
         assert_eq!(
             row.content_width, 0,
             "decorative separator must not gate h_scroll clamp"
+        );
+    }
+
+    /// Regression test for the SBS jitter at the right edge: SBS rows must
+    /// be laid out at display_w (stable across frames) and report content_width
+    /// = display_w, so over-scrolling doesn't shift the `│` separator. Before
+    /// this fix, half/right_w were derived from virtual_w and drifted by
+    /// ~0.5 col every time the user scrolled past max_h.
+    #[test]
+    fn sbs_row_content_width_pinned_to_display_w() {
+        let theme = crate::ui::theme::Theme::dark();
+        let row = SbsRow {
+            left_tag: LineTag::Context,
+            left_no: Some(1),
+            left_text: "x".repeat(100), // overflows the half
+            right_tag: LineTag::Context,
+            right_no: Some(1),
+            right_text: "y".repeat(100),
+        };
+        // display_w = 80 → half = 39, right_w = 40, sum = 80.
+        let half: u16 = 39;
+        let right_w: u16 = 40;
+        let result = render_sbs_row(&row, half, right_w, &theme);
+        assert_eq!(
+            result.content_width,
+            (half as usize) + 1 + (right_w as usize),
+            "SBS row must report layout width as content_width to keep separator stable"
         );
     }
 }

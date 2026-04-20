@@ -602,10 +602,10 @@ fn append_diff_rows(
 ) {
     match layout {
         DiffLayout::Unified => append_unified_diff(rows, diff, width, theme),
-        // SBS layout (half / right_w / separator position) uses the stable
-        // viewport width, not virtual_w, so the separator doesn't drift
-        // when the user over-scrolls past max_h.
-        DiffLayout::SideBySide => append_side_by_side_diff(rows, diff, display_w, theme),
+        // SBS uses display_w for the stable separator position (so the `│`
+        // doesn't drift when virtual_w changes), and width (= virtual_w) for
+        // the right-side pad fill so bg extends to the viewport's right edge.
+        DiffLayout::SideBySide => append_side_by_side_diff(rows, diff, width, display_w, theme),
     }
 }
 
@@ -675,9 +675,17 @@ fn append_unified_diff(rows: &mut Vec<Row>, diff: &DiffContent, width: u16, them
     }
 }
 
-fn append_side_by_side_diff(rows: &mut Vec<Row>, diff: &DiffContent, width: u16, theme: &Theme) {
-    let half = width.saturating_sub(1) / 2;
-    let right_w = width.saturating_sub(half + 1);
+fn append_side_by_side_diff(
+    rows: &mut Vec<Row>,
+    diff: &DiffContent,
+    virtual_w: u16,
+    display_w: u16,
+    theme: &Theme,
+) {
+    // half / right_w_layout based on display_w (stable across frames) — this
+    // is what pins the `│` separator position. virtual_w is forwarded to
+    // render_sbs_row only to drive bg-pad fill on the right side.
+    let half = display_w.saturating_sub(1) / 2;
 
     for (i, hunk) in diff.hunks.iter().enumerate() {
         if i > 0 {
@@ -694,7 +702,7 @@ fn append_side_by_side_diff(rows: &mut Vec<Row>, diff: &DiffContent, width: u16,
         )]));
 
         for row in pair_hunk_lines(hunk) {
-            rows.push(render_sbs_row(&row, half, right_w, theme));
+            rows.push(render_sbs_row(&row, half, virtual_w, theme));
         }
     }
 }
@@ -708,11 +716,15 @@ struct SbsRow {
     right_text: String,
 }
 
-fn render_sbs_row(row: &SbsRow, half_w: u16, right_w: u16, theme: &Theme) -> Row {
+fn render_sbs_row(row: &SbsRow, half_w: u16, virtual_w: u16, theme: &Theme) -> Row {
     let mut spans: Vec<RowSpan> = Vec::new();
     let (left_fg, left_bg) = side_style(row.left_tag, theme);
     let (right_fg, right_bg) = side_style(row.right_tag, theme);
 
+    // LEFT half — fixed width = half_w. Truncated to half_w - 7 so the
+    // separator at logical col half_w stays put across frames. Long left
+    // text isn't reachable via h_scroll (the right half's overflow is what
+    // h_scroll reveals); use Unified layout to read very long left content.
     push_sbs_half(
         &mut spans,
         row.left_no,
@@ -722,29 +734,44 @@ fn render_sbs_row(row: &SbsRow, half_w: u16, right_w: u16, theme: &Theme) -> Row
         half_w,
         theme,
     );
+
+    // SEPARATOR at logical col half_w — stable.
     spans.push(RowSpan::styled(
         "│".to_string(),
         Style::default().fg(theme.fg_secondary),
     ));
-    push_sbs_half(
-        &mut spans,
-        row.right_no,
-        &row.right_text,
-        right_fg,
-        right_bg,
-        right_w,
-        theme,
-    );
-    // SBS rows are laid out at the stable display_w (half_w + 1 + right_w
-    // = display_w by construction); content_width matches that so SBS rows
-    // never extend max_h beyond the viewport. Long lines past the half's
-    // capacity are truncated by `push_sbs_half`'s `truncate_to_display_width`
-    // — to read them, switch to Unified layout (`m` key). h_scroll on SBS
-    // rows alone would make the separator drift each frame as virtual_w
-    // changes; capping max_h at display_w (for SBS-driven rows) keeps the
-    // layout rock-stable.
-    let row_w = (half_w as usize) + 1 + (right_w as usize);
-    Row::new(spans).with_content_width(row_w)
+
+    // RIGHT half — NOT truncated. Pad fills out to virtual_w so the
+    // right-side bg covers the rest of the viewport. Pad length varies
+    // with virtual_w but it's *trailing* and clipped past the viewport,
+    // so the visible layout is stable.
+    let right_tw = UnicodeWidthStr::width(row.right_text.as_str());
+    let right_used = SBS_GUTTER_WIDTH.saturating_add(right_tw);
+    let row_used = (half_w as usize) + 1 + right_used;
+    let right_pad = (virtual_w as usize).saturating_sub(row_used);
+
+    let r_gutter_style = Style::default().fg(theme.fg_secondary);
+    let r_body_style = Style::default().fg(right_fg);
+    let (rg, rb, rp) = match right_bg {
+        Some(bg) => (
+            r_gutter_style.bg(bg),
+            r_body_style.bg(bg),
+            Style::default().bg(bg),
+        ),
+        None => (r_gutter_style, r_body_style, Style::default()),
+    };
+    spans.push(RowSpan::styled(
+        format!(" {} ", fmt_diff_lineno(row.right_no)),
+        rg,
+    ));
+    spans.push(RowSpan::styled(row.right_text.clone(), rb));
+    spans.push(RowSpan::styled(" ".repeat(right_pad), rp));
+
+    // content_width = end of useful right text (= where the right body span
+    // ends in row-logical coords). Lets h_scroll converge on the right half's
+    // last column. Doesn't depend on virtual_w → stable max_h, no jitter.
+    let content_width = (half_w as usize) + 1 + SBS_GUTTER_WIDTH + right_tw;
+    Row::new(spans).with_content_width(content_width)
 }
 
 fn push_sbs_half(
@@ -997,30 +1024,34 @@ mod tests {
         );
     }
 
-    /// Regression test for the SBS jitter at the right edge: SBS rows must
-    /// be laid out at display_w (stable across frames) and report content_width
-    /// = display_w, so over-scrolling doesn't shift the `│` separator. Before
-    /// this fix, half/right_w were derived from virtual_w and drifted by
-    /// ~0.5 col every time the user scrolled past max_h.
+    /// Regression test for SBS jitter + scroll-lock: SBS rows must
+    /// (1) report content_width that lets the user h_scroll to the right
+    /// text's end (so SBS isn't a dead-zone for h_scroll when only diff
+    /// rows are in view), and (2) compute that content_width *independent
+    /// of virtual_w* so max_h doesn't drift between frames.
     #[test]
-    fn sbs_row_content_width_pinned_to_display_w() {
+    fn sbs_row_content_width_reaches_right_text_end() {
         let theme = crate::ui::theme::Theme::dark();
         let row = SbsRow {
             left_tag: LineTag::Context,
             left_no: Some(1),
-            left_text: "x".repeat(100), // overflows the half
+            left_text: "x".repeat(100), // overflows the half (truncated in render)
             right_tag: LineTag::Context,
             right_no: Some(1),
-            right_text: "y".repeat(100),
+            right_text: "y".repeat(100), // overflows; should be reachable via h_scroll
         };
-        // display_w = 80 → half = 39, right_w = 40, sum = 80.
+        // display_w = 80 → half = 39. Expected content_width = half + 1 + 7 + right_tw.
         let half: u16 = 39;
-        let right_w: u16 = 40;
-        let result = render_sbs_row(&row, half, right_w, &theme);
+        let expected = (half as usize) + 1 + SBS_GUTTER_WIDTH + 100;
+        let result_a = render_sbs_row(&row, half, 80, &theme); // virtual_w = display_w
+        let result_b = render_sbs_row(&row, half, 200, &theme); // virtual_w grew
         assert_eq!(
-            result.content_width,
-            (half as usize) + 1 + (right_w as usize),
-            "SBS row must report layout width as content_width to keep separator stable"
+            result_a.content_width, expected,
+            "SBS content_width must reach the right text's last col"
+        );
+        assert_eq!(
+            result_b.content_width, result_a.content_width,
+            "SBS content_width must be virtual_w-independent (no clamp drift)"
         );
     }
 }

@@ -537,8 +537,8 @@ fn render_help(f: &mut Frame, app: &App, screen: Rect) {
         ("Space f", t(Msg::HelpGlobalSearch)),
         (t(Msg::HelpKeyDragDrop), t(Msg::HelpDragDrop)),
         ("F2", t(Msg::HelpRenameEntry)),
-        ("Del / ⌫", t(Msg::HelpDeleteEntry)),
-        ("Shift+Del", t(Msg::HelpHardDeleteEntry)),
+        ("d / Del / ⌫", t(Msg::HelpDeleteEntry)),
+        ("Shift+D / Shift+Del", t(Msg::HelpHardDeleteEntry)),
         (t(Msg::HelpKeyRightClick), t(Msg::HelpRightClickMenu)),
         (t(Msg::HelpKeyAnyKey), t(Msg::HelpAnyKey)),
     ];

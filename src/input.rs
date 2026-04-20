@@ -871,13 +871,33 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
             // users (who don't have a real Delete key on most
             // keyboards) get the same action.
             let hard = key.modifiers.contains(KeyModifiers::SHIFT);
-            let idx = app.file_tree.selected;
-            if let Some(entry) = app.file_tree.entries.get(idx).cloned() {
-                let abs = app.file_tree.root.join(&entry.path);
-                app.prompt_tree_delete(abs, entry.is_dir, hard);
-            }
+            prompt_delete_selected(app, hard);
+        }
+        // Vim-style alias: `d` = Move to Trash, `D` (Shift+d) = hard
+        // delete. Parallels `dd` in Vim semantics (delete the current
+        // line/selection) — the tree has no motion to compose with, so
+        // the single-key form stands in for the chord. Scoped to the
+        // Files tab so Git-tab's `d → y` discard chord stays unambiguous.
+        // Ctrl / Alt modifiers are rejected so chord bindings like
+        // Ctrl+D aren't silently stolen.
+        KeyCode::Char(c)
+            if matches!(c, 'd' | 'D')
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            let hard = c == 'D' || key.modifiers.contains(KeyModifiers::SHIFT);
+            prompt_delete_selected(app, hard);
         }
         _ => {}
+    }
+}
+
+fn prompt_delete_selected(app: &mut App, hard: bool) {
+    let idx = app.file_tree.selected;
+    if let Some(entry) = app.file_tree.entries.get(idx).cloned() {
+        let abs = app.file_tree.root.join(&entry.path);
+        app.prompt_tree_delete(abs, entry.is_dir, hard);
     }
 }
 

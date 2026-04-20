@@ -252,7 +252,11 @@ impl GitRepo {
                 let (file_status, path) = if status.contains(git2::Status::INDEX_RENAMED) {
                     let new_path = entry
                         .head_to_index()
-                        .and_then(|d| d.new_file().path().map(|p| p.to_string_lossy().into_owned()))
+                        .and_then(|d| {
+                            d.new_file()
+                                .path()
+                                .map(|p| p.to_string_lossy().into_owned())
+                        })
                         .or_else(|| fallback_path.clone());
                     (FileStatus::Renamed, new_path)
                 } else if status.contains(git2::Status::INDEX_NEW) {
@@ -263,8 +267,7 @@ impl GitRepo {
                     (FileStatus::Deleted, fallback_path.clone())
                 };
                 if let Some(path) = path {
-                    let (additions, deletions) =
-                        staged_stats.get(&path).copied().unwrap_or((0, 0));
+                    let (additions, deletions) = staged_stats.get(&path).copied().unwrap_or((0, 0));
                     staged.push(FileEntry {
                         path,
                         status: file_status,
@@ -286,7 +289,11 @@ impl GitRepo {
                 let (file_status, path) = if status.contains(git2::Status::WT_RENAMED) {
                     let new_path = entry
                         .index_to_workdir()
-                        .and_then(|d| d.new_file().path().map(|p| p.to_string_lossy().into_owned()))
+                        .and_then(|d| {
+                            d.new_file()
+                                .path()
+                                .map(|p| p.to_string_lossy().into_owned())
+                        })
                         .or_else(|| fallback_path.clone());
                     (FileStatus::Renamed, new_path)
                 } else if status.contains(git2::Status::WT_NEW) {
@@ -322,10 +329,7 @@ impl GitRepo {
 
     fn diff_line_counts_staged(&self) -> HashMap<String, (u32, u32)> {
         let head_tree = self.repo.head().ok().and_then(|h| h.peel_to_tree().ok());
-        let mut diff = match self
-            .repo
-            .diff_tree_to_index(head_tree.as_ref(), None, None)
-        {
+        let mut diff = match self.repo.diff_tree_to_index(head_tree.as_ref(), None, None) {
             Ok(d) => d,
             Err(_) => return HashMap::new(),
         };

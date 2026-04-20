@@ -436,6 +436,9 @@ fn get_status_detects_staged_rename_with_line_counts() {
         .find(|f| f.status == FileStatus::Renamed)
         .expect("a renamed entry exists in staged");
     assert_eq!(entry.path, "b.txt", "Renamed entry keys on new path");
-    assert_eq!(entry.additions, 1, "exactly one line added on top of rename");
+    assert_eq!(
+        entry.additions, 1,
+        "exactly one line added on top of rename"
+    );
     assert_eq!(entry.deletions, 0);
 }

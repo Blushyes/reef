@@ -402,8 +402,14 @@ pub fn discard_folder_prefix(is_staged: bool) -> String {
 /// otherwise render as an awkward `）？（` double-bracket.
 pub fn discard_section_prefix_and_count(is_staged: bool, count: usize) -> (String, String) {
     match (lang(), is_staged) {
-        (Lang::Zh, true) => ("  ⚠ 撤回全部已暂存的 ".to_string(), format!("{count} 个文件")),
-        (Lang::Zh, false) => ("  ⚠ 撤回全部未暂存的 ".to_string(), format!("{count} 个文件")),
+        (Lang::Zh, true) => (
+            "  ⚠ 撤回全部已暂存的 ".to_string(),
+            format!("{count} 个文件"),
+        ),
+        (Lang::Zh, false) => (
+            "  ⚠ 撤回全部未暂存的 ".to_string(),
+            format!("{count} 个文件"),
+        ),
         (Lang::En, true) => (
             "  ⚠ Discard all staged changes ".to_string(),
             format!("({count} files)"),

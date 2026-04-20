@@ -316,8 +316,7 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             if !path.is_empty() {
-                app.git_status.confirm_discard =
-                    Some(DiscardTarget::Folder { is_staged, path });
+                app.git_status.confirm_discard = Some(DiscardTarget::Folder { is_staged, path });
             }
             true
         }
@@ -776,8 +775,7 @@ fn render_files(
         for (i, file) in files.iter().enumerate() {
             let is_sel = sel_path.as_deref() == Some(file.path.as_str());
             rows.push(
-                file_row(file, &file.path, "  ", is_sel, &ctx)
-                    .with_search_row(search_base + i),
+                file_row(file, &file.path, "  ", is_sel, &ctx).with_search_row(search_base + i),
             );
         }
     }
@@ -1173,7 +1171,11 @@ fn build_spans_with_path_overlay(
 /// Compute the three banner parts (yellow prefix, white-bold highlight,
 /// yellow suffix) for the discard confirmation. `max_path` trims long paths
 /// so the banner stays inside the sidebar width.
-fn discard_banner_parts(target: &DiscardTarget, app: &App, max_path: usize) -> (String, String, String) {
+fn discard_banner_parts(
+    target: &DiscardTarget,
+    app: &App,
+    max_path: usize,
+) -> (String, String, String) {
     match target {
         DiscardTarget::File(path) => {
             let mut display = path.clone();

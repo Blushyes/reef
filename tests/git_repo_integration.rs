@@ -374,3 +374,71 @@ fn push_without_upstream_returns_error_message() {
         .expect_err("push must fail without a remote");
     assert!(!err.is_empty(), "error message should be non-empty");
 }
+
+// ─── numstat + rename detection ─────────────────────────────────────────────
+
+#[test]
+fn get_status_fills_unstaged_line_counts() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "a.txt", "line1\nline2\n", "init");
+    // Delete line2, add line3 → 1 addition, 1 deletion.
+    write_file(&raw, "a.txt", "line1\nline3\n");
+
+    let (_g, repo) = open_in(tmp.path());
+    let (_staged, unstaged) = repo.get_status();
+    let entry = unstaged
+        .iter()
+        .find(|f| f.path == "a.txt")
+        .expect("a.txt in unstaged");
+    assert_eq!(entry.additions, 1);
+    assert_eq!(entry.deletions, 1);
+}
+
+#[test]
+fn get_status_counts_untracked_file_lines() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, raw) = tempdir_repo();
+    // Need at least one commit so `get_status` has a valid HEAD.
+    commit_file(&raw, "seed.txt", "seed\n", "init");
+    write_file(&raw, "new.txt", "a\nb\nc\n");
+
+    let (_g, repo) = open_in(tmp.path());
+    let (_staged, unstaged) = repo.get_status();
+    let entry = unstaged
+        .iter()
+        .find(|f| f.path == "new.txt")
+        .expect("new.txt in unstaged");
+    assert_eq!(entry.status, FileStatus::Untracked);
+    assert_eq!(entry.additions, 3);
+    assert_eq!(entry.deletions, 0);
+}
+
+#[test]
+fn get_status_detects_staged_rename_with_line_counts() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, raw) = tempdir_repo();
+    // Commit a.txt then stage a "rename to b.txt, plus one added line".
+    // libgit2's find_similar should collapse (delete a.txt, add b.txt) into
+    // a single Renamed delta keyed on b.txt, and merge_renames carries that
+    // through so the sidebar's FileEntry has the right +1 count.
+    commit_file(&raw, "a.txt", "line1\nline2\nline3\n", "init");
+    fs::remove_file(tmp.path().join("a.txt")).unwrap();
+    write_file(&raw, "b.txt", "line1\nline2\nline3\nline4\n");
+
+    let (_g, repo) = open_in(tmp.path());
+    repo.stage_file("a.txt").expect("stage deletion");
+    repo.stage_file("b.txt").expect("stage addition");
+
+    let (staged, _unstaged) = repo.get_status();
+    let entry = staged
+        .iter()
+        .find(|f| f.status == FileStatus::Renamed)
+        .expect("a renamed entry exists in staged");
+    assert_eq!(entry.path, "b.txt", "Renamed entry keys on new path");
+    assert_eq!(
+        entry.additions, 1,
+        "exactly one line added on top of rename"
+    );
+    assert_eq!(entry.deletions, 0);
+}

@@ -73,6 +73,8 @@ mod tests {
         FileEntry {
             path: path.to_string(),
             status: FileStatus::Modified,
+            additions: 0,
+            deletions: 0,
         }
     }
 

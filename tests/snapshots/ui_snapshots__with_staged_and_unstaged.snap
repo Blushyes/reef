@@ -1,5 +1,6 @@
 ---
 source: tests/ui_snapshots.rs
+assertion_line: 134
 expression: output
 ---
  reef  [TMPDIR]  ⎇ master
@@ -7,8 +8,8 @@ expression: output
  View: list            │
                        │
  ⌄ Changes  2 Stage all│
-   new.txt U + ↺       │
-   tracked.txt M + ↺   │
+   new.txt +1 U + ↺    │
+   ...txt +1 -1 M + ↺  │
                        │
                        │
                        │

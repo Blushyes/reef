@@ -6,7 +6,7 @@
 //! go through `App`'s methods (`stage_file`, `confirm_discard`, `run_push`,
 //! …) which keeps host side state coherent.
 
-use crate::app::{App, Panel, SelectedFile};
+use crate::app::{App, DiscardTarget, Panel, SelectedFile};
 use crate::git::tree::{self as gtree, Node};
 use crate::git::{FileEntry, FileStatus};
 use crate::i18n::{Msg, t};
@@ -143,7 +143,7 @@ pub fn handle_key(app: &mut App, key: &str) -> bool {
                         .map(|f| f.path.clone())
                 });
             if let Some(path) = path {
-                app.git_status.confirm_discard = Some(path);
+                app.git_status.confirm_discard = Some(DiscardTarget::File(path));
             }
             true
         }
@@ -298,10 +298,40 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
                     path: path.clone(),
                     is_staged: false,
                 });
-                app.git_status.confirm_discard = Some(path);
+                app.git_status.confirm_discard = Some(DiscardTarget::File(path));
                 app.diff_scroll = 0;
                 app.diff_h_scroll = 0;
                 app.load_diff();
+            }
+            true
+        }
+        "git.discardFolderPrompt" => {
+            let path = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let is_staged = args
+                .get("staged")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !path.is_empty() {
+                app.git_status.confirm_discard = Some(DiscardTarget::Folder { is_staged, path });
+            }
+            true
+        }
+        "git.discardAllPrompt" => {
+            let is_staged = args
+                .get("staged")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let has_any = if is_staged {
+                !app.staged_files.is_empty()
+            } else {
+                !app.unstaged_files.is_empty()
+            };
+            if has_any {
+                app.git_status.confirm_discard = Some(DiscardTarget::Section { is_staged });
             }
             true
         }
@@ -561,26 +591,22 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     }
 
     // Discard confirmation banner
-    if let Some(ref path) = status.confirm_discard {
-        let mut display = path.clone();
-        truncate_in_place(&mut display, max_path);
+    if let Some(ref target) = status.confirm_discard {
+        let (prefix_msg, highlight, suffix_msg) = discard_banner_parts(target, app, max_path);
         rows.push(Row::new(vec![
             RowSpan::styled(
-                t(Msg::DiscardPromptPrefix),
+                prefix_msg,
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
             RowSpan::styled(
-                display,
+                highlight,
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
-            RowSpan::styled(
-                t(Msg::DiscardPromptSuffix),
-                Style::default().fg(Color::Yellow),
-            ),
+            RowSpan::styled(suffix_msg, Style::default().fg(Color::Yellow)),
         ]));
         rows.push(Row::new(vec![
             RowSpan::plain("  "),
@@ -621,13 +647,27 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
 
     // Staged section
     if !app.staged_files.is_empty() {
+        let staged_actions = vec![
+            HeaderAction {
+                label: t(Msg::UnstageAll).to_string(),
+                cmd: "git.unstageAll".into(),
+                args: Value::Null,
+                color: Color::Red,
+            },
+            HeaderAction {
+                label: t(Msg::DiscardAll).to_string(),
+                cmd: "git.discardAllPrompt".into(),
+                args: serde_json::json!({ "staged": true }),
+                color: Color::Red,
+            },
+        ];
         rows.push(section_header(
             app.staged_collapsed,
             t(Msg::StagedChanges),
             app.staged_files.len(),
             Color::Green,
             "git.toggleStaged",
-            Some((t(Msg::UnstageAll), "git.unstageAll", Color::Red)),
+            &staged_actions,
             width,
             theme,
         ));
@@ -638,10 +678,23 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     }
 
     // Unstaged section
-    let unstaged_button = if app.unstaged_files.is_empty() {
-        None
+    let unstaged_actions: Vec<HeaderAction> = if app.unstaged_files.is_empty() {
+        Vec::new()
     } else {
-        Some((t(Msg::StageAll), "git.stageAll", Color::Green))
+        vec![
+            HeaderAction {
+                label: t(Msg::StageAll).to_string(),
+                cmd: "git.stageAll".into(),
+                args: Value::Null,
+                color: Color::Green,
+            },
+            HeaderAction {
+                label: t(Msg::DiscardAll).to_string(),
+                cmd: "git.discardAllPrompt".into(),
+                args: serde_json::json!({ "staged": false }),
+                color: Color::Red,
+            },
+        ]
     };
     rows.push(section_header(
         app.unstaged_collapsed,
@@ -649,7 +702,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
         app.unstaged_files.len(),
         Color::Blue,
         "git.toggleUnstaged",
-        unstaged_button,
+        &unstaged_actions,
         width,
         theme,
     ));
@@ -714,20 +767,15 @@ fn render_files(
             search_base,
         );
     } else {
+        let ctx = FileRowCtx {
+            is_staged,
+            max_path,
+            theme,
+        };
         for (i, file) in files.iter().enumerate() {
             let is_sel = sel_path.as_deref() == Some(file.path.as_str());
             rows.push(
-                file_row(
-                    &file.path,
-                    &file.path,
-                    file.status,
-                    is_staged,
-                    max_path,
-                    is_sel,
-                    "  ",
-                    theme,
-                )
-                .with_search_row(search_base + i),
+                file_row(file, &file.path, "  ", is_sel, &ctx).with_search_row(search_base + i),
             );
         }
     }
@@ -785,16 +833,12 @@ fn walk_tree(
                 let is_sel = selected_path.as_deref() == Some(entry.path.as_str());
                 let basename = entry.path.rsplit('/').next().unwrap_or(&entry.path);
                 let indent = "  ".repeat(depth);
-                let mut row = file_row(
-                    &entry.path,
-                    basename,
-                    entry.status,
+                let ctx = FileRowCtx {
                     is_staged,
                     max_path,
-                    is_sel,
-                    &indent,
                     theme,
-                );
+                };
+                let mut row = file_row(entry, basename, &indent, is_sel, &ctx);
                 if let Some(pos) = flat_files.iter().position(|f| f.path == entry.path) {
                     row = row.with_search_row(search_base + pos);
                 }
@@ -813,7 +857,7 @@ fn dir_row(
     theme: &Theme,
 ) -> Row {
     let arrow = if is_collapsed { "›" } else { "⌄" };
-    Row::new(vec![
+    let spans = vec![
         RowSpan::plain("  ".repeat(depth)),
         RowSpan::styled(
             format!("{} ", arrow),
@@ -825,42 +869,89 @@ fn dir_row(
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ),
-    ])
-    .on_click(
+        // Per-folder revert button. Clicking this stages a Folder discard
+        // target; the root-row click (below) still toggles expand/collapse.
+        RowSpan::plain(" "),
+        RowSpan {
+            text: "↺".into(),
+            style: Style::default().fg(Color::Red),
+            click: Some((
+                "git.discardFolderPrompt".into(),
+                serde_json::json!({ "path": path, "staged": is_staged }),
+            )),
+            dbl: None,
+        },
+    ];
+    Row::new(spans).on_click(
         "git.toggleDir",
         serde_json::json!({ "path": path, "staged": is_staged }),
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn file_row(
-    path: &str,
-    display: &str,
-    status: FileStatus,
+/// Per-render constants shared by every file row in a section: the section's
+/// staged-ness, the width budget for the path column, and the theme. Kept
+/// as a borrowed struct so callers don't have to repack args on every row.
+struct FileRowCtx<'a> {
     is_staged: bool,
     max_path: usize,
-    is_selected: bool,
+    theme: &'a Theme,
+}
+
+fn file_row(
+    file: &FileEntry,
+    display: &str,
     indent: &str,
-    theme: &Theme,
+    is_selected: bool,
+    ctx: &FileRowCtx<'_>,
 ) -> Row {
-    let status_color = match status {
+    let status_color = match file.status {
         FileStatus::Modified => Color::Yellow,
         FileStatus::Added => Color::Green,
         FileStatus::Deleted => Color::Red,
         FileStatus::Renamed => Color::Cyan,
         FileStatus::Untracked => Color::Green,
     };
-    let status_label = status.label();
-    let button = if is_staged { "−" } else { "+" };
-    let button_color = if is_staged { Color::Red } else { Color::Green };
-    let button_cmd = if is_staged {
+    let status_label = file.status.label();
+    let button = if ctx.is_staged { "−" } else { "+" };
+    let button_color = if ctx.is_staged {
+        Color::Red
+    } else {
+        Color::Green
+    };
+    let button_cmd = if ctx.is_staged {
         "git.unstage"
     } else {
         "git.stage"
     };
 
-    let display_path = if display.chars().count() > max_path {
-        let kept = max_path.saturating_sub(3);
+    // Tighter path budget here — numstat and status chrome share the row,
+    // so add their widths to the 10-char reservation from `build_rows`.
+    let add_label = if file.additions > 0 {
+        format!("+{}", file.additions)
+    } else {
+        String::new()
+    };
+    let del_label = if file.deletions > 0 {
+        format!("-{}", file.deletions)
+    } else {
+        String::new()
+    };
+    let numstat_w = add_label.width()
+        + del_label.width()
+        + if !add_label.is_empty() && !del_label.is_empty() {
+            1
+        } else {
+            0
+        }
+        + if !add_label.is_empty() || !del_label.is_empty() {
+            1
+        } else {
+            0
+        };
+    let path_budget = ctx.max_path.saturating_sub(numstat_w);
+
+    let display_path = if display.chars().count() > path_budget {
+        let kept = path_budget.saturating_sub(3);
         let start = display.chars().count().saturating_sub(kept);
         let trailing: String = display.chars().skip(start).collect();
         format!("...{}", trailing)
@@ -869,7 +960,7 @@ fn file_row(
     };
 
     let base_bg = if is_selected {
-        Some(theme.selection_bg)
+        Some(ctx.theme.selection_bg)
     } else {
         None
     };
@@ -878,33 +969,53 @@ fn file_row(
         RowSpan::styled(indent.to_string(), apply_bg(Style::default(), base_bg)),
         RowSpan::styled(
             display_path,
-            apply_bg(Style::default().fg(theme.fg_primary), base_bg),
+            apply_bg(Style::default().fg(ctx.theme.fg_primary), base_bg),
         ),
-        RowSpan::styled(
-            format!(" {} ", status_label),
-            apply_bg(Style::default().fg(status_color), base_bg),
-        ),
-        RowSpan {
-            text: button.into(),
-            style: apply_bg(
-                Style::default()
-                    .fg(button_color)
-                    .add_modifier(Modifier::BOLD),
-                base_bg,
-            ),
-            click: Some((button_cmd.to_string(), serde_json::json!({ "path": path }))),
-            dbl: None,
-        },
-        RowSpan::styled(" ".to_string(), apply_bg(Style::default(), base_bg)),
     ];
 
-    if !is_staged {
+    if !add_label.is_empty() {
+        spans.push(RowSpan::styled(
+            format!(" {}", add_label),
+            apply_bg(Style::default().fg(Color::Green), base_bg),
+        ));
+    }
+    if !del_label.is_empty() {
+        spans.push(RowSpan::styled(
+            format!(" {}", del_label),
+            apply_bg(Style::default().fg(Color::Red), base_bg),
+        ));
+    }
+
+    spans.push(RowSpan::styled(
+        format!(" {} ", status_label),
+        apply_bg(Style::default().fg(status_color), base_bg),
+    ));
+    spans.push(RowSpan {
+        text: button.into(),
+        style: apply_bg(
+            Style::default()
+                .fg(button_color)
+                .add_modifier(Modifier::BOLD),
+            base_bg,
+        ),
+        click: Some((
+            button_cmd.to_string(),
+            serde_json::json!({ "path": file.path }),
+        )),
+        dbl: None,
+    });
+    spans.push(RowSpan::styled(
+        " ".to_string(),
+        apply_bg(Style::default(), base_bg),
+    ));
+
+    if !ctx.is_staged {
         spans.push(RowSpan {
             text: "↺".into(),
             style: apply_bg(Style::default().fg(Color::Red), base_bg),
             click: Some((
                 "git.discardPrompt".to_string(),
-                serde_json::json!({ "path": path }),
+                serde_json::json!({ "path": file.path }),
             )),
             dbl: None,
         });
@@ -917,9 +1028,9 @@ fn file_row(
     Row::new(spans)
         .on_click(
             "git.selectFile",
-            serde_json::json!({ "path": path, "staged": is_staged }),
+            serde_json::json!({ "path": file.path, "staged": ctx.is_staged }),
         )
-        .on_dbl_click(button_cmd, serde_json::json!({ "path": path }))
+        .on_dbl_click(button_cmd, serde_json::json!({ "path": file.path }))
 }
 
 fn apply_bg(style: Style, bg: Option<Color>) -> Style {
@@ -929,6 +1040,16 @@ fn apply_bg(style: Style, bg: Option<Color>) -> Style {
     }
 }
 
+/// One header-level button: `(label, command, args, color)`. The args are
+/// owned so callers can stamp in `{ "staged": true }` for the discard-all
+/// variant without extra plumbing.
+struct HeaderAction {
+    label: String,
+    cmd: String,
+    args: Value,
+    color: Color,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn section_header(
     collapsed: bool,
@@ -936,18 +1057,16 @@ fn section_header(
     count: usize,
     count_color: Color,
     toggle_cmd: &str,
-    action: Option<(&str, &str, Color)>,
+    actions: &[HeaderAction],
     width: u16,
     theme: &Theme,
 ) -> Row {
     let arrow = if collapsed { "›" } else { "⌄" };
     let prefix = format!("{} ", arrow);
     let count_str = format!("  {}", count);
-    let button_text = action.as_ref().map(|(t, _, _)| format!(" {} ", t));
-    let used = prefix.width()
-        + label.width()
-        + count_str.width()
-        + button_text.as_deref().map(str::width).unwrap_or(0);
+    let button_texts: Vec<String> = actions.iter().map(|a| format!(" {} ", a.label)).collect();
+    let buttons_w: usize = button_texts.iter().map(|s| s.width()).sum();
+    let used = prefix.width() + label.width() + count_str.width() + buttons_w;
     let padding = (width as usize).saturating_sub(used);
 
     let mut spans = vec![
@@ -963,11 +1082,13 @@ fn section_header(
     if padding > 0 {
         spans.push(RowSpan::plain(" ".repeat(padding)));
     }
-    if let (Some(text), Some((_, cmd, color))) = (button_text, action) {
+    for (text, action) in button_texts.into_iter().zip(actions.iter()) {
         spans.push(RowSpan {
             text,
-            style: Style::default().fg(color).add_modifier(Modifier::BOLD),
-            click: Some((cmd.to_string(), Value::Null)),
+            style: Style::default()
+                .fg(action.color)
+                .add_modifier(Modifier::BOLD),
+            click: Some((action.cmd.clone(), action.args.clone())),
             dbl: None,
         });
     }
@@ -1045,6 +1166,46 @@ fn build_spans_with_path_overlay(
         }
     }
     out
+}
+
+/// Compute the three banner parts (yellow prefix, white-bold highlight,
+/// yellow suffix) for the discard confirmation. `max_path` trims long paths
+/// so the banner stays inside the sidebar width.
+fn discard_banner_parts(
+    target: &DiscardTarget,
+    app: &App,
+    max_path: usize,
+) -> (String, String, String) {
+    match target {
+        DiscardTarget::File(path) => {
+            let mut display = path.clone();
+            truncate_in_place(&mut display, max_path);
+            (
+                t(Msg::DiscardPromptPrefix).to_string(),
+                display,
+                t(Msg::DiscardPromptSuffix).to_string(),
+            )
+        }
+        DiscardTarget::Folder { is_staged, path } => {
+            let mut display = path.clone();
+            truncate_in_place(&mut display, max_path);
+            (
+                crate::i18n::discard_folder_prefix(*is_staged),
+                format!("{}/", display),
+                t(Msg::DiscardPromptSuffix).to_string(),
+            )
+        }
+        DiscardTarget::Section { is_staged } => {
+            let count = if *is_staged {
+                app.staged_files.len()
+            } else {
+                app.unstaged_files.len()
+            };
+            let (prefix, highlight) =
+                crate::i18n::discard_section_prefix_and_count(*is_staged, count);
+            (prefix, highlight, t(Msg::DiscardPromptSuffix).to_string())
+        }
+    }
 }
 
 fn truncate_in_place(s: &mut String, max: usize) {

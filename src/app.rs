@@ -109,6 +109,17 @@ pub struct CommitDetailState {
     /// offset covers the whole view — the commit detail is rendered as a
     /// single list rather than split scroll regions.
     pub scroll: usize,
+    /// Horizontal scroll for Unified layout. Shared across the header /
+    /// files list / diff rows — the panel renders as a single list, and
+    /// `clip_spans` applies this offset uniformly per row. SBS uses the
+    /// two fields below instead (each half scrolls independently).
+    pub diff_h_scroll: usize,
+    /// Horizontal scroll for the SBS left half (old version). Independent
+    /// of the right half and of `diff_h_scroll` — switching diff layouts
+    /// preserves all three.
+    pub sbs_left_h_scroll: usize,
+    /// Horizontal scroll for the SBS right half (new version).
+    pub sbs_right_h_scroll: usize,
 }
 
 impl Default for CommitDetailState {
@@ -121,6 +132,9 @@ impl Default for CommitDetailState {
             files_tree_mode: false,
             files_collapsed: HashSet::new(),
             scroll: 0,
+            diff_h_scroll: 0,
+            sbs_left_h_scroll: 0,
+            sbs_right_h_scroll: 0,
         }
     }
 }
@@ -1068,6 +1082,12 @@ impl App {
     /// and any previously-selected file diff whenever the target changes.
     pub fn load_commit_detail(&mut self) {
         self.commit_detail.file_diff = None;
+        // Different commit → different content; reset all three h_scrolls so
+        // the panel starts at the left edge. Keeps the scrollbar out of
+        // "offset that only made sense for the prior commit" states.
+        self.commit_detail.diff_h_scroll = 0;
+        self.commit_detail.sbs_left_h_scroll = 0;
+        self.commit_detail.sbs_right_h_scroll = 0;
         let Some(oid) = self.git_graph.selected_commit.clone() else {
             self.commit_detail.detail = None;
             return;
@@ -1094,6 +1114,20 @@ impl App {
         if self.repo.is_none() {
             self.commit_detail.file_diff = None;
             return;
+        }
+        // Different file → reset h_scrolls so the new diff starts at the
+        // left edge. Same-path reload (e.g. after toggling diff_mode) keeps
+        // scroll state so the user doesn't lose their place.
+        let is_new_file = self
+            .commit_detail
+            .file_diff
+            .as_ref()
+            .map(|(p, _)| p.as_str() != path)
+            .unwrap_or(true);
+        if is_new_file {
+            self.commit_detail.diff_h_scroll = 0;
+            self.commit_detail.sbs_left_h_scroll = 0;
+            self.commit_detail.sbs_right_h_scroll = 0;
         }
         let generation = self.commit_file_diff_load.begin();
         self.tasks.load_commit_file_diff(

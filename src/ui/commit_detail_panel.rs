@@ -8,7 +8,7 @@ use crate::i18n::{Msg, t};
 use crate::search::SearchTarget;
 use crate::ui::git_graph_panel;
 use crate::ui::mouse::ClickAction;
-use crate::ui::text::overlay_match_highlight;
+use crate::ui::text::{clip_spans, overlay_match_highlight};
 use crate::ui::theme::Theme;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -16,6 +16,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::ops::Range;
 use unicode_width::UnicodeWidthStr;
 
 // Matches the Git-tab diff panel's gutter widths (" NNNNN  NNNNN  " / " NNNNN ").
@@ -24,9 +25,23 @@ const SBS_GUTTER_WIDTH: usize = 7;
 
 pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
     let theme = app.theme;
-    // Cache viewport so search-jump can center.
     app.last_commit_detail_view_h = area.height;
-    let rows = build_rows(app, area.width, &theme);
+
+    // Layout split — Unified uses a single h_scroll across all rows and builds
+    // rows at virtual_w (= viewport + h_scroll) so pad/content extends past
+    // the viewport for clip_spans to reveal. SBS uses two independent
+    // h_scrolls (left & right halves) applied per-half at render time; rows
+    // build at virtual_w = area.width (non-SBS rows don't h-scroll in SBS mode).
+    let is_sbs = matches!(app.commit_detail.diff_layout, DiffLayout::SideBySide);
+    let h_unified = if is_sbs {
+        0
+    } else {
+        app.commit_detail.diff_h_scroll
+    };
+    let virtual_w = (area.width as usize)
+        .saturating_add(h_unified)
+        .min(u16::MAX as usize) as u16;
+    let rows = build_rows(app, virtual_w, area.width, &theme);
     let total = rows.len();
 
     let max_scroll = total.saturating_sub(area.height as usize);
@@ -34,6 +49,44 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
         app.commit_detail.scroll = max_scroll;
     }
     let scroll = app.commit_detail.scroll;
+    let visible = rows.iter().skip(scroll).take(area.height as usize);
+
+    // Clamp the relevant h_scrolls to the widest content in view.
+    if !is_sbs {
+        let max_visible_w: usize = visible.clone().map(|r| r.content_width).max().unwrap_or(0);
+        let max_h = max_visible_w.saturating_sub(area.width as usize);
+        if app.commit_detail.diff_h_scroll > max_h {
+            app.commit_detail.diff_h_scroll = max_h;
+        }
+    } else {
+        // SBS: clamp each half against the widest corresponding side in view.
+        let half_w = (area.width.saturating_sub(1) / 2) as usize;
+        let right_w = (area.width as usize).saturating_sub(half_w + 1);
+        let left_body_w = half_w.saturating_sub(SBS_GUTTER_WIDTH);
+        let right_body_w = right_w.saturating_sub(SBS_GUTTER_WIDTH);
+        let (max_left_tw, max_right_tw) =
+            visible
+                .clone()
+                .filter_map(|r| r.sbs.as_ref())
+                .fold((0usize, 0usize), |(l, r), p| {
+                    (
+                        l.max(UnicodeWidthStr::width(p.left_text.as_str())),
+                        r.max(UnicodeWidthStr::width(p.right_text.as_str())),
+                    )
+                });
+        let max_left_h = max_left_tw.saturating_sub(left_body_w);
+        let max_right_h = max_right_tw.saturating_sub(right_body_w);
+        if app.commit_detail.sbs_left_h_scroll > max_left_h {
+            app.commit_detail.sbs_left_h_scroll = max_left_h;
+        }
+        if app.commit_detail.sbs_right_h_scroll > max_right_h {
+            app.commit_detail.sbs_right_h_scroll = max_right_h;
+        }
+    }
+
+    let h_unified = app.commit_detail.diff_h_scroll;
+    let sbs_left_h = app.commit_detail.sbs_left_h_scroll;
+    let sbs_right_h = app.commit_detail.sbs_right_h_scroll;
 
     for (i, row) in rows
         .iter()
@@ -44,72 +97,296 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
         let y = area.y + i as u16;
         let row_idx = scroll + i;
         let hover = crate::ui::hover::is_hover(app, area, y);
+
+        if let Some(sbs) = &row.sbs {
+            // SBS rows still get search highlighting: ranges are flat byte
+            // offsets into the row's searchable_rows concat, so we split
+            // them into left-body-local and right-body-local ranges and
+            // apply overlay per half before clipping.
+            let (ranges, cur) = app
+                .search
+                .ranges_on_row(SearchTarget::CommitDetail, row_idx);
+            render_sbs_row_live(
+                f,
+                area,
+                y,
+                sbs,
+                sbs_left_h,
+                sbs_right_h,
+                hover,
+                app.theme.hover_bg,
+                &ranges,
+                cur,
+                &theme,
+            );
+            continue;
+        }
+
+        // Standard (Unified / non-diff) row — single clip_spans pipeline.
+        // In SBS mode we render these with h=0 (no horizontal scroll on
+        // header / files / hunk rows — to read long message, switch to
+        // Unified via `m`).
+        let h = if is_sbs { 0 } else { h_unified };
+
         let (ranges, cur) = app
             .search
             .ranges_on_row(SearchTarget::CommitDetail, row_idx);
 
-        let spans: Vec<Span<'static>> = if ranges.is_empty() {
-            row.spans
-                .iter()
-                .map(|s| {
-                    Span::styled(
-                        s.text.clone(),
-                        crate::ui::hover::apply(s.style, hover, app.theme.hover_bg),
-                    )
-                })
-                .collect()
+        let base: Vec<(Style, String)> = row
+            .spans
+            .iter()
+            .map(|s| (s.style, s.text.clone()))
+            .collect();
+        let overlaid = if ranges.is_empty() {
+            base
         } else {
-            let segments: Vec<(Style, String)> = row
-                .spans
-                .iter()
-                .map(|s| (s.style, s.text.clone()))
-                .collect();
-            let overlaid = overlay_match_highlight(
-                segments,
-                &ranges,
-                cur,
-                theme.search_match,
-                theme.search_current,
-            );
-            overlaid
-                .into_iter()
-                .map(|(style, text)| {
-                    Span::styled(
-                        text,
-                        crate::ui::hover::apply(style, hover, app.theme.hover_bg),
-                    )
-                })
-                .collect()
+            overlay_match_highlight(base, &ranges, cur, theme.search_match, theme.search_current)
         };
-        f.render_widget(Line::from(spans), Rect::new(area.x, y, area.width, 1));
+        let final_tokens: Vec<(Style, String)> = overlaid
+            .into_iter()
+            .map(|(style, text)| {
+                (
+                    crate::ui::hover::apply(style, hover, app.theme.hover_bg),
+                    text,
+                )
+            })
+            .collect();
+        let clipped = clip_spans(&final_tokens, h, area.width as usize);
+        f.render_widget(Line::from(clipped), Rect::new(area.x, y, area.width, 1));
 
-        let mut x = area.x;
+        // Hit registry: project logical spans onto screen after h_scroll.
+        let mut x_logical: usize = 0;
         for span in &row.spans {
-            let w = UnicodeWidthStr::width(span.text.as_str()) as u16;
+            let w = UnicodeWidthStr::width(span.text.as_str());
             if w == 0 {
                 continue;
             }
+            let start = x_logical;
+            let end = x_logical + w;
+            x_logical = end;
+
             let (cmd, args) = match (&span.click, &row.row_click) {
                 (Some(c), _) => (Some(c.0.clone()), Some(c.1.clone())),
                 (None, Some(r)) => (Some(r.0.clone()), Some(r.1.clone())),
                 (None, None) => (None, None),
             };
-            if let Some(cmd) = cmd {
-                app.hit_registry.register_row(
-                    x,
-                    y,
-                    w,
-                    ClickAction::GitCommand {
-                        command: cmd,
-                        args: args.unwrap_or(Value::Null),
-                        dbl_command: None,
-                        dbl_args: None,
-                    },
-                );
+            let Some(cmd) = cmd else {
+                continue;
+            };
+
+            let vis_start = start.max(h);
+            let vis_end = end.min(h.saturating_add(area.width as usize));
+            if vis_start >= vis_end {
+                continue;
             }
-            x = x.saturating_add(w);
+            let screen_x = area.x.saturating_add((vis_start - h) as u16);
+            let screen_w = (vis_end - vis_start) as u16;
+
+            app.hit_registry.register_row(
+                screen_x,
+                y,
+                screen_w,
+                ClickAction::GitCommand {
+                    command: cmd,
+                    args: args.unwrap_or(Value::Null),
+                    dbl_command: None,
+                    dbl_args: None,
+                },
+            );
         }
     }
+}
+
+/// Render an SBS row with independent per-half h_scroll. Each half —
+/// left (old version) and right (new version) — is built into its own
+/// token stream, clipped by its own `skip_cols`, padded to half/right_w,
+/// and composed with a stable `│` separator in between. Search matches
+/// are split across the two halves by flat-row byte offset so highlights
+/// survive the per-half clip pipeline.
+#[allow(clippy::too_many_arguments)]
+fn render_sbs_row_live(
+    f: &mut Frame,
+    area: Rect,
+    y: u16,
+    sbs: &SbsParts,
+    left_h: usize,
+    right_h: usize,
+    hover: bool,
+    hover_bg: Color,
+    ranges: &[Range<usize>],
+    cur: Option<Range<usize>>,
+    theme: &Theme,
+) {
+    let half_w = area.width.saturating_sub(1) / 2;
+    let right_w = area.width.saturating_sub(half_w + 1);
+    let left_body_w = (half_w as usize).saturating_sub(SBS_GUTTER_WIDTH);
+    let right_body_w = (right_w as usize).saturating_sub(SBS_GUTTER_WIDTH);
+
+    let (left_fg, left_bg) = side_style(sbs.left_tag, theme);
+    let (right_fg, right_bg) = side_style(sbs.right_tag, theme);
+
+    // Byte offsets of the two body spans inside the searchable flat row:
+    //   [lg:7][left_text][│:3][rg:7][right_text]
+    // `searchable_rows` joins spans.text in the same order, so ranges from
+    // `search::ranges_on_row` resolve to these offsets.
+    let left_body_byte_start = SBS_GUTTER_WIDTH;
+    let left_body_byte_end = left_body_byte_start + sbs.left_text.len();
+    let sep_byte_end = left_body_byte_end + "│".len();
+    let right_body_byte_start = sep_byte_end + SBS_GUTTER_WIDTH;
+    let right_body_byte_end = right_body_byte_start + sbs.right_text.len();
+    let split = split_sbs_ranges(
+        ranges,
+        cur.as_ref(),
+        left_body_byte_start,
+        left_body_byte_end,
+        right_body_byte_start,
+        right_body_byte_end,
+    );
+    let SbsRanges {
+        left: left_ranges,
+        left_cur,
+        right: right_ranges,
+        right_cur,
+    } = split;
+
+    let apply_hover = |s: Style| crate::ui::hover::apply(s, hover, hover_bg);
+
+    let l_gutter_style = apply_hover(style_with_bg(
+        Style::default().fg(theme.fg_secondary),
+        left_bg,
+    ));
+    let l_body_base = style_with_bg(Style::default().fg(left_fg), left_bg);
+    let l_pad_style = apply_hover(style_with_bg(Style::default(), left_bg));
+    let r_gutter_style = apply_hover(style_with_bg(
+        Style::default().fg(theme.fg_secondary),
+        right_bg,
+    ));
+    let r_body_base = style_with_bg(Style::default().fg(right_fg), right_bg);
+    let r_pad_style = apply_hover(style_with_bg(Style::default(), right_bg));
+    let sep_style = apply_hover(Style::default().fg(theme.fg_secondary));
+
+    // Left body: base → overlay match highlight → hover → clip.
+    let left_base_tokens: Vec<(Style, String)> = vec![(l_body_base, sbs.left_text.clone())];
+    let left_overlaid = if left_ranges.is_empty() {
+        left_base_tokens
+    } else {
+        overlay_match_highlight(
+            left_base_tokens,
+            &left_ranges,
+            left_cur,
+            theme.search_match,
+            theme.search_current,
+        )
+    };
+    let left_hovered: Vec<(Style, String)> = left_overlaid
+        .into_iter()
+        .map(|(s, t)| (apply_hover(s), t))
+        .collect();
+    let left_clipped = clip_spans(&left_hovered, left_h, left_body_w);
+    let left_clipped_w: usize = left_clipped
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
+    let left_pad_w = left_body_w.saturating_sub(left_clipped_w);
+
+    // Right body: mirror of left.
+    let right_base_tokens: Vec<(Style, String)> = vec![(r_body_base, sbs.right_text.clone())];
+    let right_overlaid = if right_ranges.is_empty() {
+        right_base_tokens
+    } else {
+        overlay_match_highlight(
+            right_base_tokens,
+            &right_ranges,
+            right_cur,
+            theme.search_match,
+            theme.search_current,
+        )
+    };
+    let right_hovered: Vec<(Style, String)> = right_overlaid
+        .into_iter()
+        .map(|(s, t)| (apply_hover(s), t))
+        .collect();
+    let right_clipped = clip_spans(&right_hovered, right_h, right_body_w);
+    let right_clipped_w: usize = right_clipped
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
+    let right_pad_w = right_body_w.saturating_sub(right_clipped_w);
+
+    let mut out: Vec<Span> = Vec::with_capacity(8);
+    out.push(Span::styled(
+        format!(" {} ", fmt_diff_lineno(sbs.left_no)),
+        l_gutter_style,
+    ));
+    out.extend(left_clipped);
+    out.push(Span::styled(" ".repeat(left_pad_w), l_pad_style));
+    out.push(Span::styled("│".to_string(), sep_style));
+    out.push(Span::styled(
+        format!(" {} ", fmt_diff_lineno(sbs.right_no)),
+        r_gutter_style,
+    ));
+    out.extend(right_clipped);
+    out.push(Span::styled(" ".repeat(right_pad_w), r_pad_style));
+
+    f.render_widget(Line::from(out), Rect::new(area.x, y, area.width, 1));
+}
+
+struct SbsRanges {
+    left: Vec<Range<usize>>,
+    left_cur: Option<Range<usize>>,
+    right: Vec<Range<usize>>,
+    right_cur: Option<Range<usize>>,
+}
+
+/// Split search ranges (flat byte offsets into the SBS row's searchable
+/// text) into left-body-local and right-body-local ranges. Matches inside
+/// gutters / separator, or straddling boundaries, are dropped — they
+/// don't correspond to visible body content. Byte offsets are passed
+/// through unchanged (ranges keep their byte-offset semantics inside
+/// each half's text).
+fn split_sbs_ranges(
+    ranges: &[Range<usize>],
+    cur: Option<&Range<usize>>,
+    left_start: usize,
+    left_end: usize,
+    right_start: usize,
+    right_end: usize,
+) -> SbsRanges {
+    let to_side = |r: &Range<usize>| -> Option<(bool, Range<usize>)> {
+        if r.start >= left_start && r.end <= left_end {
+            Some((true, (r.start - left_start)..(r.end - left_start)))
+        } else if r.start >= right_start && r.end <= right_end {
+            Some((false, (r.start - right_start)..(r.end - right_start)))
+        } else {
+            None
+        }
+    };
+
+    let mut out = SbsRanges {
+        left: Vec::new(),
+        left_cur: None,
+        right: Vec::new(),
+        right_cur: None,
+    };
+    for r in ranges {
+        if let Some((is_left, local)) = to_side(r) {
+            if is_left {
+                out.left.push(local);
+            } else {
+                out.right.push(local);
+            }
+        }
+    }
+    if let Some(c) = cur {
+        if let Some((is_left, local)) = to_side(c) {
+            if is_left {
+                out.left_cur = Some(local);
+            } else {
+                out.right_cur = Some(local);
+            }
+        }
+    }
+    out
 }
 
 pub fn handle_key(app: &mut App, key: &str) -> bool {
@@ -215,6 +492,27 @@ struct RowSpan {
 struct Row {
     spans: Vec<RowSpan>,
     row_click: Option<(String, Value)>,
+    /// Effective content width excluding trailing pad / decorative fill.
+    /// Defaults to the sum of span widths (correct for rows without pad);
+    /// rows that fill out to `virtual_w` (unified diff content, SBS halves,
+    /// the `─`-separator) override this via `with_content_width` so the
+    /// h_scroll clamp in `render` converges instead of tracking virtual_w.
+    content_width: usize,
+    /// Marks an SBS content row — rendered via a per-half clip pipeline
+    /// (each half has its own h_scroll) instead of the flat row clip_spans
+    /// path. `spans` for SBS rows is still populated with a flat concat
+    /// so `searchable_rows` can produce the same plain text as before.
+    sbs: Option<SbsParts>,
+}
+
+#[derive(Debug, Clone)]
+struct SbsParts {
+    left_tag: LineTag,
+    left_no: Option<u32>,
+    left_text: String,
+    right_tag: LineTag,
+    right_no: Option<u32>,
+    right_text: String,
 }
 
 impl RowSpan {
@@ -240,9 +538,15 @@ impl RowSpan {
 
 impl Row {
     fn new(spans: Vec<RowSpan>) -> Self {
+        let content_width = spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.text.as_str()))
+            .sum();
         Self {
             spans,
             row_click: None,
+            content_width,
+            sbs: None,
         }
     }
     fn blank() -> Self {
@@ -250,6 +554,14 @@ impl Row {
     }
     fn on_click(mut self, cmd: &str, args: Value) -> Self {
         self.row_click = Some((cmd.to_string(), args));
+        self
+    }
+    fn with_content_width(mut self, w: usize) -> Self {
+        self.content_width = w;
+        self
+    }
+    fn with_sbs(mut self, parts: SbsParts) -> Self {
+        self.sbs = Some(parts);
         self
     }
 }
@@ -264,7 +576,13 @@ fn from_ratatui_span(span: Span<'static>) -> RowSpan {
 
 // ─── Row construction ─────────────────────────────────────────────────────────
 
-fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
+/// `width` is the *virtual* width (viewport + h_scroll) — it controls how
+/// far pad/decoration extends to the right so `clip_spans` can reveal more
+/// content as `h_scroll` grows. `display_w` is the *real* viewport width,
+/// stable across frames; SBS's `half` / `│` position must use it (not
+/// `width`) or the separator drifts every frame as the user over-scrolls
+/// past max_h, producing visible jitter at the right edge.
+fn build_rows(app: &App, width: u16, display_w: u16, theme: &Theme) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
     let cd = &app.commit_detail;
 
@@ -319,12 +637,21 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     rows.push(Row::blank());
 
     for raw in detail.message.lines() {
+        // content_width uses the *raw* line width (pre-truncation) so clamp
+        // converges to the real end of the message; otherwise content_width
+        // would equal virtual_w while the line is truncated, and max_h
+        // would track the user's h_scroll indefinitely — then snap back
+        // when the line finally fits (the "jitter" you see at the right edge).
+        let raw_w = UnicodeWidthStr::width(raw);
         let mut msg = raw.to_string();
         truncate_in_place(&mut msg, max_msg);
-        rows.push(Row::new(vec![
-            RowSpan::plain("    "),
-            RowSpan::styled(msg, Style::default().fg(theme.fg_primary)),
-        ]));
+        rows.push(
+            Row::new(vec![
+                RowSpan::plain("    "),
+                RowSpan::styled(msg, Style::default().fg(theme.fg_primary)),
+            ])
+            .with_content_width(4 + raw_w),
+        );
     }
 
     rows.push(Row::blank());
@@ -376,7 +703,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
             theme,
         ));
         rows.push(diff_separator_row(width, theme));
-        append_diff_rows(&mut rows, diff, cd.diff_layout, width, theme);
+        append_diff_rows(&mut rows, diff, cd.diff_layout, width, display_w, theme);
     }
 
     rows
@@ -404,6 +731,10 @@ fn commit_file_row(
         FileStatus::Renamed => Color::Cyan,
         FileStatus::Untracked => Color::Green,
     };
+    // content_width uses the raw (pre-truncation) path width so clamp
+    // converges on the full path instead of chasing virtual_w.
+    let indent_w = UnicodeWidthStr::width(indent);
+    let full_display_w = UnicodeWidthStr::width(display_path);
     let mut display = display_path.to_string();
     truncate_in_place(&mut display, ctx.max_path);
 
@@ -419,10 +750,12 @@ fn commit_file_row(
         RowSpan::styled(display, apply_bg(Style::default().fg(ctx.fg), base_bg)),
     ];
 
-    Row::new(spans).on_click(
-        "git.selectCommitFile",
-        serde_json::json!({ "oid": ctx.commit_oid, "path": file.path }),
-    )
+    Row::new(spans)
+        .on_click(
+            "git.selectCommitFile",
+            serde_json::json!({ "oid": ctx.commit_oid, "path": file.path }),
+        )
+        .with_content_width(indent_w + 2 + full_display_w)
 }
 
 fn render_commit_file_tree(
@@ -499,6 +832,9 @@ fn diff_header_row(
     let tag_w = UnicodeWidthStr::width(tag_str.as_str());
     let path_max = (width as usize).saturating_sub(tag_w);
     let path_display = truncate_to_display_width(path, path_max).to_string();
+    // content_width uses the full path width so clamp converges independent
+    // of virtual_w (see commit message row for the full rationale).
+    let full_path_w = UnicodeWidthStr::width(path);
 
     Row::new(vec![
         RowSpan::styled(
@@ -509,13 +845,18 @@ fn diff_header_row(
         ),
         RowSpan::styled(tag_str, Style::default().fg(theme.fg_secondary)),
     ])
+    .with_content_width(full_path_w + tag_w)
 }
 
 fn diff_separator_row(width: u16, theme: &Theme) -> Row {
+    // Purely decorative — fills to `width` so it always spans the viewport,
+    // but its "content" is zero. Excluding it from the h_scroll clamp keeps
+    // virtual_w from pinning max_h to itself.
     Row::new(vec![RowSpan::styled(
         "─".repeat(width as usize),
         Style::default().fg(theme.fg_secondary),
     )])
+    .with_content_width(0)
 }
 
 fn append_diff_rows(
@@ -523,11 +864,15 @@ fn append_diff_rows(
     diff: &DiffContent,
     layout: DiffLayout,
     width: u16,
+    display_w: u16,
     theme: &Theme,
 ) {
     match layout {
         DiffLayout::Unified => append_unified_diff(rows, diff, width, theme),
-        DiffLayout::SideBySide => append_side_by_side_diff(rows, diff, width, theme),
+        // SBS uses display_w for the stable separator position (so the `│`
+        // doesn't drift when virtual_w changes), and width (= virtual_w) for
+        // the right-side pad fill so bg extends to the viewport's right edge.
+        DiffLayout::SideBySide => append_side_by_side_diff(rows, diff, width, display_w, theme),
     }
 }
 
@@ -573,20 +918,37 @@ fn append_unified_diff(rows: &mut Vec<Row>, diff: &DiffContent, width: u16, them
                 ),
                 None => (gutter_style, mark_style, text_style, Style::default()),
             };
-            rows.push(Row::new(vec![
-                RowSpan::styled(format!(" {}  {} ", old_no, new_no), g),
-                RowSpan::styled(format!("{} ", prefix), m),
-                RowSpan::styled(content, t),
-                RowSpan::styled(" ".repeat(pad), p),
-            ]));
+            // Content width excludes the trailing pad (which fills out to
+            // `virtual_w` so diff bg spans the viewport). Uses the *original*
+            // line.content width — `content` above may have been trimmed by
+            // `max_text`, but we want clamp to converge to the real line.
+            // The gutter format below is " NNNNN  NNNNN  " = 15 cols, matching
+            // DIFF_GUTTER_WIDTH and the git tab's diff panel; an earlier off-by-one
+            // (14-col gutter via 1 trailing space) made content_width skew by 1
+            // and contributed to right-edge misalignment.
+            let line_content_w = DIFF_GUTTER_WIDTH
+                .saturating_add(2)
+                .saturating_add(UnicodeWidthStr::width(line.content.as_str()));
+            rows.push(
+                Row::new(vec![
+                    RowSpan::styled(format!(" {}  {}  ", old_no, new_no), g),
+                    RowSpan::styled(format!("{} ", prefix), m),
+                    RowSpan::styled(content, t),
+                    RowSpan::styled(" ".repeat(pad), p),
+                ])
+                .with_content_width(line_content_w),
+            );
         }
     }
 }
 
-fn append_side_by_side_diff(rows: &mut Vec<Row>, diff: &DiffContent, width: u16, theme: &Theme) {
-    let half = width.saturating_sub(1) / 2;
-    let right_w = width.saturating_sub(half + 1);
-
+fn append_side_by_side_diff(
+    rows: &mut Vec<Row>,
+    diff: &DiffContent,
+    _virtual_w: u16,
+    _display_w: u16,
+    theme: &Theme,
+) {
     for (i, hunk) in diff.hunks.iter().enumerate() {
         if i > 0 {
             rows.push(Row::new(vec![RowSpan::styled(
@@ -601,77 +963,49 @@ fn append_side_by_side_diff(rows: &mut Vec<Row>, diff: &DiffContent, width: u16,
                 .add_modifier(Modifier::DIM),
         )]));
 
-        for row in pair_hunk_lines(hunk) {
-            rows.push(render_sbs_row(&row, half, right_w, theme));
+        for parts in pair_hunk_lines(hunk) {
+            rows.push(build_sbs_row(parts, theme));
         }
     }
 }
 
-struct SbsRow {
-    left_tag: LineTag,
-    left_no: Option<u32>,
-    left_text: String,
-    right_tag: LineTag,
-    right_no: Option<u32>,
-    right_text: String,
-}
+/// Build an SBS row as a marker-plus-searchable-spans: `spans` holds a flat
+/// "left_gutter | left_text | │ | right_gutter | right_text" concatenation
+/// so `searchable_rows` keeps working and `content_width` reflects the
+/// flat text width (used by Unified-style clamp — which is inactive in
+/// SBS mode, but keeping the field sensible is cheaper than special-casing).
+/// The `sbs` field is the source of truth for rendering; the render
+/// function detects it and takes a per-half clip pipeline instead.
+fn build_sbs_row(parts: SbsParts, theme: &Theme) -> Row {
+    let (left_fg, left_bg) = side_style(parts.left_tag, theme);
+    let (right_fg, right_bg) = side_style(parts.right_tag, theme);
 
-fn render_sbs_row(row: &SbsRow, half_w: u16, right_w: u16, theme: &Theme) -> Row {
-    let mut spans: Vec<RowSpan> = Vec::new();
-    let (left_fg, left_bg) = side_style(row.left_tag, theme);
-    let (right_fg, right_bg) = side_style(row.right_tag, theme);
+    let left_gutter_style = style_with_bg(Style::default().fg(theme.fg_secondary), left_bg);
+    let left_body_style = style_with_bg(Style::default().fg(left_fg), left_bg);
+    let right_gutter_style = style_with_bg(Style::default().fg(theme.fg_secondary), right_bg);
+    let right_body_style = style_with_bg(Style::default().fg(right_fg), right_bg);
 
-    push_sbs_half(
-        &mut spans,
-        row.left_no,
-        &row.left_text,
-        left_fg,
-        left_bg,
-        half_w,
-        theme,
-    );
-    spans.push(RowSpan::styled(
-        "│".to_string(),
-        Style::default().fg(theme.fg_secondary),
-    ));
-    push_sbs_half(
-        &mut spans,
-        row.right_no,
-        &row.right_text,
-        right_fg,
-        right_bg,
-        right_w,
-        theme,
-    );
-    Row::new(spans)
-}
-
-fn push_sbs_half(
-    spans: &mut Vec<RowSpan>,
-    lineno: Option<u32>,
-    text: &str,
-    fg: Color,
-    bg: Option<Color>,
-    width: u16,
-    theme: &Theme,
-) {
-    let content_w = (width as usize).saturating_sub(SBS_GUTTER_WIDTH);
-    let trimmed = truncate_to_display_width(text, content_w);
-    let pad = content_w.saturating_sub(UnicodeWidthStr::width(trimmed));
-
-    let gutter_style = Style::default().fg(theme.fg_secondary);
-    let body_style = Style::default().fg(fg);
-    let (g, b, p) = match bg {
-        Some(bg) => (
-            gutter_style.bg(bg),
-            body_style.bg(bg),
-            Style::default().bg(bg),
+    let spans = vec![
+        RowSpan::styled(
+            format!(" {} ", fmt_diff_lineno(parts.left_no)),
+            left_gutter_style,
         ),
-        None => (gutter_style, body_style, Style::default()),
-    };
-    spans.push(RowSpan::styled(format!(" {} ", fmt_diff_lineno(lineno)), g));
-    spans.push(RowSpan::styled(trimmed.to_string(), b));
-    spans.push(RowSpan::styled(" ".repeat(pad), p));
+        RowSpan::styled(parts.left_text.clone(), left_body_style),
+        RowSpan::styled("│".to_string(), Style::default().fg(theme.fg_secondary)),
+        RowSpan::styled(
+            format!(" {} ", fmt_diff_lineno(parts.right_no)),
+            right_gutter_style,
+        ),
+        RowSpan::styled(parts.right_text.clone(), right_body_style),
+    ];
+    Row::new(spans).with_sbs(parts)
+}
+
+fn style_with_bg(style: Style, bg: Option<Color>) -> Style {
+    match bg {
+        Some(c) => style.bg(c),
+        None => style,
+    }
 }
 
 fn side_style(tag: LineTag, theme: &Theme) -> (Color, Option<Color>) {
@@ -682,7 +1016,7 @@ fn side_style(tag: LineTag, theme: &Theme) -> (Color, Option<Color>) {
     }
 }
 
-fn pair_hunk_lines(hunk: &crate::git::DiffHunk) -> Vec<SbsRow> {
+fn pair_hunk_lines(hunk: &crate::git::DiffHunk) -> Vec<SbsParts> {
     let mut rows = Vec::new();
     let mut pending_removed: Vec<(Option<u32>, String)> = Vec::new();
 
@@ -695,7 +1029,7 @@ fn pair_hunk_lines(hunk: &crate::git::DiffHunk) -> Vec<SbsRow> {
                 if let Some((old_no, old_text)) =
                     (!pending_removed.is_empty()).then(|| pending_removed.remove(0))
                 {
-                    rows.push(SbsRow {
+                    rows.push(SbsParts {
                         left_tag: LineTag::Removed,
                         left_no: old_no,
                         left_text: old_text,
@@ -704,7 +1038,7 @@ fn pair_hunk_lines(hunk: &crate::git::DiffHunk) -> Vec<SbsRow> {
                         right_text: line.content.clone(),
                     });
                 } else {
-                    rows.push(SbsRow {
+                    rows.push(SbsParts {
                         left_tag: LineTag::Context,
                         left_no: None,
                         left_text: String::new(),
@@ -716,7 +1050,7 @@ fn pair_hunk_lines(hunk: &crate::git::DiffHunk) -> Vec<SbsRow> {
             }
             LineTag::Context => {
                 for (old_no, old_text) in pending_removed.drain(..) {
-                    rows.push(SbsRow {
+                    rows.push(SbsParts {
                         left_tag: LineTag::Removed,
                         left_no: old_no,
                         left_text: old_text,
@@ -725,7 +1059,7 @@ fn pair_hunk_lines(hunk: &crate::git::DiffHunk) -> Vec<SbsRow> {
                         right_text: String::new(),
                     });
                 }
-                rows.push(SbsRow {
+                rows.push(SbsParts {
                     left_tag: LineTag::Context,
                     left_no: line.old_lineno,
                     left_text: line.content.clone(),
@@ -738,7 +1072,7 @@ fn pair_hunk_lines(hunk: &crate::git::DiffHunk) -> Vec<SbsRow> {
     }
 
     for (old_no, old_text) in pending_removed.drain(..) {
-        rows.push(SbsRow {
+        rows.push(SbsParts {
             left_tag: LineTag::Removed,
             left_no: old_no,
             left_text: old_text,
@@ -804,11 +1138,11 @@ fn format_timestamp(secs: i64) -> String {
 
 /// Flattens the panel's row stream into plain text — one string per rendered
 /// row. Used by `crate::search` so match row indices line up 1:1 with
-/// `commit_detail.scroll` and with what the panel draws. Width is passed as
-/// `u16::MAX` so row construction skips display-width truncation and the
-/// searchable text mirrors the underlying data.
+/// `commit_detail.scroll` and with what the panel draws. Both width params
+/// are passed as `u16::MAX` so row construction skips display-width
+/// truncation and the searchable text mirrors the underlying data.
 pub fn searchable_rows(app: &App) -> Vec<String> {
-    let rows = build_rows(app, u16::MAX, &app.theme);
+    let rows = build_rows(app, u16::MAX, u16::MAX, &app.theme);
     rows.into_iter()
         .map(|r| {
             r.spans
@@ -832,4 +1166,187 @@ fn days_to_ymd(days: i64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     let year = if m <= 2 { y + 1 } else { y };
     (year, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_new_sums_span_widths() {
+        let row = Row::new(vec![RowSpan::plain("hello"), RowSpan::plain(" world")]);
+        assert_eq!(row.content_width, 11);
+    }
+
+    #[test]
+    fn row_with_content_width_overrides_auto_value() {
+        // Auto-sum would be 5 + 100 = 105 because of the trailing pad.
+        // Mirrors how diff / SBS rows suppress pad from the h_scroll clamp.
+        let row = Row::new(vec![
+            RowSpan::plain("hello"),
+            RowSpan::plain(" ".repeat(100)),
+        ])
+        .with_content_width(5);
+        assert_eq!(row.content_width, 5);
+    }
+
+    /// Regression test for the h_scroll clamp that previously used
+    /// `sum(span widths)` per row: since `build_rows` pads diff/SBS lines
+    /// out to `virtual_w`, raw-sum clamp always yielded `max_h = h_input`,
+    /// letting the user scroll forever. With `content_width` the clamp
+    /// reflects the real longest line and converges.
+    #[test]
+    fn clamp_via_content_width_ignores_trailing_pad() {
+        let rows = [
+            Row::new(vec![RowSpan::plain("author: alice")]),
+            // Simulates a diff content row built at virtual_w=500:
+            // gutter(15) + prefix(2) + content(30) + pad(453).
+            // Raw-sum would be 500; content_width = 47.
+            Row::new(vec![
+                RowSpan::plain(" 12345  12345  "),
+                RowSpan::plain("+ "),
+                RowSpan::plain("x".repeat(30)),
+                RowSpan::plain(" ".repeat(453)),
+            ])
+            .with_content_width(DIFF_GUTTER_WIDTH + 2 + 30),
+        ];
+
+        let area_width: usize = 80;
+        let max_visible_w = rows.iter().map(|r| r.content_width).max().unwrap_or(0);
+        let max_h = max_visible_w.saturating_sub(area_width);
+
+        // Content (47 cols) fits in viewport (80 cols): no room to scroll.
+        // If the clamp regressed to raw-sum this would be 500 - 80 = 420.
+        assert_eq!(max_h, 0);
+    }
+
+    #[test]
+    fn diff_separator_row_has_zero_content_width() {
+        let theme = crate::ui::theme::Theme::dark();
+        let row = diff_separator_row(5000, &theme);
+        assert_eq!(
+            row.content_width, 0,
+            "decorative separator must not gate h_scroll clamp"
+        );
+    }
+
+    /// SBS rows carry the `sbs` marker so render dispatches to the per-half
+    /// clip pipeline (independent left & right h_scrolls), not the flat
+    /// clip_spans path.
+    #[test]
+    fn sbs_row_carries_sbs_marker() {
+        let theme = crate::ui::theme::Theme::dark();
+        let parts = SbsParts {
+            left_tag: LineTag::Context,
+            left_no: Some(1),
+            left_text: "old".to_string(),
+            right_tag: LineTag::Context,
+            right_no: Some(2),
+            right_text: "new".to_string(),
+        };
+        let row = build_sbs_row(parts.clone(), &theme);
+        let marker = row.sbs.as_ref().expect("SBS row must carry sbs marker");
+        assert_eq!(marker.left_text, "old");
+        assert_eq!(marker.right_text, "new");
+    }
+
+    /// SBS search highlight regression test: ranges in a flat row string
+    /// ("lg | left | │ | rg | right") must map to body-local ranges on
+    /// the correct side, and in-gutter / on-separator / straddling matches
+    /// must be dropped (the render pipeline has nothing to highlight there).
+    #[test]
+    fn sbs_ranges_split_maps_to_correct_half() {
+        // left_text.len() = 10, right_text.len() = 15.
+        // Byte layout:
+        //   [0, 7)  lg
+        //   [7, 17) left_text
+        //   [17, 20) │ (3 bytes)
+        //   [20, 27) rg
+        //   [27, 42) right_text
+        let left_start = 7;
+        let left_end = 17;
+        let right_start = 20 + 7; // 27
+        let right_end = right_start + 15; // 42
+
+        let match_in_left = 9..12; // inside left body
+        let match_in_right = 30..35; // inside right body
+        let match_in_gutter = 3..5; // inside left gutter → dropped
+        let match_on_sep = 17..18; // on separator → dropped
+        let match_straddle = 15..25; // crosses body/sep/gutter → dropped
+
+        let ranges = vec![
+            match_in_left.clone(),
+            match_in_right.clone(),
+            match_in_gutter,
+            match_on_sep,
+            match_straddle,
+        ];
+        let cur = Some(match_in_right.clone());
+
+        let split = split_sbs_ranges(
+            &ranges,
+            cur.as_ref(),
+            left_start,
+            left_end,
+            right_start,
+            right_end,
+        );
+
+        assert_eq!(split.left, vec![(9 - 7)..(12 - 7)]);
+        assert_eq!(split.right, vec![(30 - 27)..(35 - 27)]);
+        assert_eq!(split.right_cur, Some((30 - 27)..(35 - 27)));
+        assert!(split.left_cur.is_none());
+    }
+
+    /// Independent clamps: the left and right SBS h_scroll are computed from
+    /// their respective text widths — max_left_h depends on left_tw, max_right_h
+    /// depends on right_tw, and the two don't cross-contaminate.
+    #[test]
+    fn sbs_independent_clamp_per_half() {
+        // display_w=80 → half=39, right_w=40, left_body_w=32, right_body_w=33.
+        let left_body_w: usize = 32;
+        let right_body_w: usize = 33;
+        let parts = [
+            SbsParts {
+                left_tag: LineTag::Context,
+                left_no: Some(1),
+                left_text: "x".repeat(100), // long left
+                right_tag: LineTag::Context,
+                right_no: Some(1),
+                right_text: "y".repeat(50), // shorter right
+            },
+            SbsParts {
+                left_tag: LineTag::Context,
+                left_no: Some(2),
+                left_text: "z".repeat(10), // short left
+                right_tag: LineTag::Context,
+                right_no: Some(2),
+                right_text: "w".repeat(200), // very long right
+            },
+        ];
+
+        let (max_left_tw, max_right_tw) = parts.iter().fold((0usize, 0usize), |(l, r), p| {
+            (
+                l.max(UnicodeWidthStr::width(p.left_text.as_str())),
+                r.max(UnicodeWidthStr::width(p.right_text.as_str())),
+            )
+        });
+        let max_left_h = max_left_tw.saturating_sub(left_body_w);
+        let max_right_h = max_right_tw.saturating_sub(right_body_w);
+
+        assert_eq!(
+            max_left_h,
+            100 - left_body_w,
+            "left clamp uses only left_tw"
+        );
+        assert_eq!(
+            max_right_h,
+            200 - right_body_w,
+            "right clamp uses only right_tw"
+        );
+        assert_ne!(
+            max_left_h, max_right_h,
+            "left/right clamps must be independent"
+        );
+    }
 }

@@ -327,6 +327,8 @@ mod tests {
         FileEntry {
             path: path.to_string(),
             status,
+            additions: 0,
+            deletions: 0,
         }
     }
 

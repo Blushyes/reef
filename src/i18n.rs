@@ -88,6 +88,7 @@ pub enum Msg {
     Changes,
     StageAll,
     UnstageAll,
+    DiscardAll,
     NoFiles,
 
     // Diff panel
@@ -193,6 +194,7 @@ fn t_zh(m: Msg) -> &'static str {
         Changes => "更改",
         StageAll => "暂存全部",
         UnstageAll => "取消全部",
+        DiscardAll => "全部撤回",
         NoFiles => "  无文件",
         DiffEmpty => "选择一个文件查看 diff",
         PreviewEmpty => "选择一个文件预览内容",
@@ -281,6 +283,7 @@ fn t_en(m: Msg) -> &'static str {
         Changes => "Changes",
         StageAll => "Stage all",
         UnstageAll => "Unstage all",
+        DiscardAll => "Discard all",
         NoFiles => "  (no files)",
         DiffEmpty => "Select a file to view diff",
         PreviewEmpty => "Select a file to preview",
@@ -376,6 +379,39 @@ pub fn diverged_force_push(ahead: usize, behind: usize) -> String {
     match lang() {
         Lang::Zh => format!(" ⚠ 已分叉 ↑{ahead} ↓{behind} — 强制推送 "),
         Lang::En => format!(" ⚠ Diverged ↑{ahead} ↓{behind} — force push "),
+    }
+}
+
+/// Yellow prefix on the discard-folder confirm banner. Mirrors the
+/// `DiscardPromptPrefix` wording but signals that the target is a whole
+/// directory — staged / unstaged wording distinguishes "reset to HEAD"
+/// from "restore from index".
+pub fn discard_folder_prefix(is_staged: bool) -> String {
+    match (lang(), is_staged) {
+        (Lang::Zh, true) => "  ⚠ 撤回已暂存文件夹 ".to_string(),
+        (Lang::En, true) => "  ⚠ Discard staged folder ".to_string(),
+        (Lang::Zh, false) => "  ⚠ 撤回文件夹 ".to_string(),
+        (Lang::En, false) => "  ⚠ Discard folder ".to_string(),
+    }
+}
+
+/// Banner parts for the "全部撤回" confirmation — returns the yellow prefix
+/// and the white-bold count highlight separately. Keeping them split lets
+/// the panel bold the file count for emphasis. Chinese avoids the
+/// `（N 个文件）` bracketing because the following `？（不可撤销）` would
+/// otherwise render as an awkward `）？（` double-bracket.
+pub fn discard_section_prefix_and_count(is_staged: bool, count: usize) -> (String, String) {
+    match (lang(), is_staged) {
+        (Lang::Zh, true) => ("  ⚠ 撤回全部已暂存的 ".to_string(), format!("{count} 个文件")),
+        (Lang::Zh, false) => ("  ⚠ 撤回全部未暂存的 ".to_string(), format!("{count} 个文件")),
+        (Lang::En, true) => (
+            "  ⚠ Discard all staged changes ".to_string(),
+            format!("({count} files)"),
+        ),
+        (Lang::En, false) => (
+            "  ⚠ Discard all changes ".to_string(),
+            format!("({count} files)"),
+        ),
     }
 }
 

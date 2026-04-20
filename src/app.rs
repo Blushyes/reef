@@ -58,12 +58,24 @@ pub enum DiffMode {
     FullFile, // 显示整个文件
 }
 
+/// What the user is about to discard when the confirmation banner is up.
+/// `File` is the original single-file ↺ flow; `Folder` covers the tree-mode
+/// per-directory button; `Section` covers the header-level "discard all"
+/// button for the staged or unstaged list. Staged targets get reset to
+/// HEAD (unstage + restore); unstaged targets just restore from the index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscardTarget {
+    File(String),
+    Folder { is_staged: bool, path: String },
+    Section { is_staged: bool },
+}
+
 /// State for the inline Git status sidebar.
 #[derive(Debug, Default)]
 pub struct GitStatusState {
     pub tree_mode: bool,
     pub collapsed_dirs: HashSet<String>,
-    pub confirm_discard: Option<String>,
+    pub confirm_discard: Option<DiscardTarget>,
     pub confirm_push: bool,
     pub confirm_force_push: bool,
     /// Last `git push` failure surfaced as an in-panel banner. Cleared by a
@@ -1040,27 +1052,69 @@ impl App {
         self.load_diff();
     }
 
-    /// Restore the currently-confirmed unstaged file to its HEAD state.
-    /// Clears the confirmation banner and selection if the discarded file
-    /// was selected, then refreshes status + diff.
+    /// Apply the currently-pending discard target. Clears the confirmation
+    /// banner, drops the selection if the discarded path(s) include it,
+    /// then refreshes status + diff.
+    ///
+    /// Semantics by target:
+    /// * `File` — restore a single unstaged file to its HEAD state (existing
+    ///   ↺ behaviour).
+    /// * `Folder { is_staged }` — for every file currently listed under that
+    ///   directory prefix, do a section-flavoured revert (see `Section`).
+    /// * `Section { is_staged }` — for every file in the section: if staged,
+    ///   unstage then restore workdir to HEAD (full revert); if unstaged,
+    ///   restore workdir to index.
     pub fn confirm_discard(&mut self) {
-        let Some(path) = self.git_status.confirm_discard.take() else {
+        let Some(target) = self.git_status.confirm_discard.take() else {
             return;
         };
-        if let Some(ref repo) = self.repo {
-            let _ = repo.restore_file(&path);
-        }
-        if self
-            .selected_file
-            .as_ref()
-            .map(|s| s.path == path)
-            .unwrap_or(false)
-        {
-            self.selected_file = None;
-            self.diff_content = None;
+        let discarded_paths = self.apply_discard_target(&target);
+        if let Some(sel) = self.selected_file.as_ref() {
+            if discarded_paths.contains(&sel.path) {
+                self.selected_file = None;
+                self.diff_content = None;
+            }
         }
         self.refresh_status();
         self.load_diff();
+    }
+
+    fn apply_discard_target(&mut self, target: &DiscardTarget) -> HashSet<String> {
+        let mut touched: HashSet<String> = HashSet::new();
+        let Some(repo) = self.repo.as_ref() else {
+            return touched;
+        };
+        match target {
+            DiscardTarget::File(path) => {
+                let _ = repo.restore_file(path);
+                touched.insert(path.clone());
+            }
+            DiscardTarget::Folder { is_staged, path } => {
+                let source: Vec<String> = if *is_staged {
+                    self.staged_files.iter().map(|f| f.path.clone()).collect()
+                } else {
+                    self.unstaged_files.iter().map(|f| f.path.clone()).collect()
+                };
+                for p in source {
+                    if folder_contains(path, &p) {
+                        revert_path(repo, &p, *is_staged);
+                        touched.insert(p);
+                    }
+                }
+            }
+            DiscardTarget::Section { is_staged } => {
+                let source: Vec<String> = if *is_staged {
+                    self.staged_files.iter().map(|f| f.path.clone()).collect()
+                } else {
+                    self.unstaged_files.iter().map(|f| f.path.clone()).collect()
+                };
+                for p in source {
+                    revert_path(repo, &p, *is_staged);
+                    touched.insert(p);
+                }
+            }
+        }
+        touched
     }
 
     /// Rebuild the commit graph iff HEAD or any ref moved since the last build.
@@ -2127,6 +2181,28 @@ impl App {
     }
 }
 
+// ─── Discard helpers ──────────────────────────────────────────────────────────
+
+/// Revert a single workdir path under the rules used by the "discard all"
+/// and "discard folder" flows. Staged paths are reset to HEAD (unstage +
+/// restore workdir); unstaged paths keep the existing single-file semantics.
+fn revert_path(repo: &GitRepo, path: &str, is_staged: bool) {
+    if is_staged {
+        let _ = repo.unstage_file(path);
+    }
+    let _ = repo.restore_file(path);
+}
+
+/// True when `file_path` lives under the directory at `folder_path` (direct
+/// child or deeper). Tolerates a trailing slash on `folder_path` and handles
+/// the edge case where `file_path` *is* `folder_path` — that should never
+/// happen from UI-driven targets but keeps the Folder discard flow safe if
+/// a caller constructs one programmatically.
+fn folder_contains(folder_path: &str, file_path: &str) -> bool {
+    let prefix = format!("{}/", folder_path.trim_end_matches('/'));
+    file_path == folder_path || file_path.starts_with(&prefix)
+}
+
 // ─── Prefs persistence ────────────────────────────────────────────────────────
 
 /// Load the Git tab's diff layout + mode from the unified prefs file.
@@ -2161,4 +2237,54 @@ fn save_prefs(layout: DiffLayout, mode: DiffMode) {
             DiffMode::FullFile => "full_file",
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::folder_contains;
+
+    #[test]
+    fn folder_contains_direct_child() {
+        assert!(folder_contains("src/ui", "src/ui/a.rs"));
+    }
+
+    #[test]
+    fn folder_contains_nested_child() {
+        assert!(folder_contains("src", "src/ui/panels/git.rs"));
+    }
+
+    #[test]
+    fn folder_contains_does_not_eat_sibling_prefix() {
+        // The classic "src/ui" vs "src/ui-helper.rs" bug — naive prefix
+        // match without the trailing slash would misfire here.
+        assert!(!folder_contains("src/ui", "src/ui-helper.rs"));
+    }
+
+    #[test]
+    fn folder_contains_exact_path_match() {
+        // Defensive: DiscardTarget::Folder with a file path still reverts
+        // that one file instead of silently doing nothing.
+        assert!(folder_contains("src/main.rs", "src/main.rs"));
+    }
+
+    #[test]
+    fn folder_contains_rejects_unrelated_path() {
+        assert!(!folder_contains("src/ui", "tests/foo.rs"));
+    }
+
+    #[test]
+    fn folder_contains_tolerates_trailing_slash() {
+        assert!(folder_contains("src/ui/", "src/ui/a.rs"));
+    }
+
+    #[test]
+    fn folder_contains_empty_path_is_noop() {
+        // The sidebar never builds a `Folder { path: "" }` target — the
+        // tree walk always starts inside a named section — so we don't
+        // need empty-prefix semantics. Document the actual behavior:
+        // the synthetic "/" prefix won't match any normal file path,
+        // which makes an empty target a safe no-op rather than a
+        // "revert everything" footgun.
+        assert!(!folder_contains("", "anything.rs"));
+    }
 }

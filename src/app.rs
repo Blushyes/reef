@@ -109,6 +109,10 @@ pub struct CommitDetailState {
     /// offset covers the whole view — the commit detail is rendered as a
     /// single list rather than split scroll regions.
     pub scroll: usize,
+    /// Horizontal scroll in display columns. Shared across the header /
+    /// files list / diff rows — the panel renders as a single list, and
+    /// `clip_spans` applies this offset uniformly per row.
+    pub diff_h_scroll: usize,
 }
 
 impl Default for CommitDetailState {
@@ -121,6 +125,7 @@ impl Default for CommitDetailState {
             files_tree_mode: false,
             files_collapsed: HashSet::new(),
             scroll: 0,
+            diff_h_scroll: 0,
         }
     }
 }

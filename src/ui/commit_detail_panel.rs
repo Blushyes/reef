@@ -8,7 +8,7 @@ use crate::i18n::{Msg, t};
 use crate::search::SearchTarget;
 use crate::ui::git_graph_panel;
 use crate::ui::mouse::ClickAction;
-use crate::ui::text::overlay_match_highlight;
+use crate::ui::text::{clip_spans, overlay_match_highlight};
 use crate::ui::theme::Theme;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -26,7 +26,15 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
     let theme = app.theme;
     // Cache viewport so search-jump can center.
     app.last_commit_detail_view_h = area.height;
-    let rows = build_rows(app, area.width, &theme);
+
+    // Build rows at a virtual width = viewport + current h_scroll, so content
+    // and pad extend far enough right for `clip_spans` below to reveal rows
+    // past `area.width`. Mirrors the diff_panel / file_preview_panel strategy.
+    let h = app.commit_detail.diff_h_scroll;
+    let virtual_w = (area.width as usize)
+        .saturating_add(h)
+        .min(u16::MAX as usize) as u16;
+    let rows = build_rows(app, virtual_w, &theme);
     let total = rows.len();
 
     let max_scroll = total.saturating_sub(area.height as usize);
@@ -34,6 +42,28 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
         app.commit_detail.scroll = max_scroll;
     }
     let scroll = app.commit_detail.scroll;
+
+    // Clamp h_scroll against the widest row currently in view. `build_rows`
+    // emits pad/decoration out to `virtual_w`, so we sum raw span widths
+    // per row rather than using `virtual_w` itself (which would let the
+    // offset run off the right edge when the panel is mostly short lines).
+    let max_visible_w: usize = rows
+        .iter()
+        .skip(scroll)
+        .take(area.height as usize)
+        .map(|r| {
+            r.spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.text.as_str()))
+                .sum::<usize>()
+        })
+        .max()
+        .unwrap_or(0);
+    let max_h = max_visible_w.saturating_sub(area.width as usize);
+    if app.commit_detail.diff_h_scroll > max_h {
+        app.commit_detail.diff_h_scroll = max_h;
+    }
+    let h = app.commit_detail.diff_h_scroll;
 
     for (i, row) in rows
         .iter()
@@ -48,66 +78,70 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
             .search
             .ranges_on_row(SearchTarget::CommitDetail, row_idx);
 
-        let spans: Vec<Span<'static>> = if ranges.is_empty() {
-            row.spans
-                .iter()
-                .map(|s| {
-                    Span::styled(
-                        s.text.clone(),
-                        crate::ui::hover::apply(s.style, hover, app.theme.hover_bg),
-                    )
-                })
-                .collect()
+        let base: Vec<(Style, String)> = row
+            .spans
+            .iter()
+            .map(|s| (s.style, s.text.clone()))
+            .collect();
+        let overlaid = if ranges.is_empty() {
+            base
         } else {
-            let segments: Vec<(Style, String)> = row
-                .spans
-                .iter()
-                .map(|s| (s.style, s.text.clone()))
-                .collect();
-            let overlaid = overlay_match_highlight(
-                segments,
-                &ranges,
-                cur,
-                theme.search_match,
-                theme.search_current,
-            );
-            overlaid
-                .into_iter()
-                .map(|(style, text)| {
-                    Span::styled(
-                        text,
-                        crate::ui::hover::apply(style, hover, app.theme.hover_bg),
-                    )
-                })
-                .collect()
+            overlay_match_highlight(base, &ranges, cur, theme.search_match, theme.search_current)
         };
-        f.render_widget(Line::from(spans), Rect::new(area.x, y, area.width, 1));
+        let final_tokens: Vec<(Style, String)> = overlaid
+            .into_iter()
+            .map(|(style, text)| {
+                (
+                    crate::ui::hover::apply(style, hover, app.theme.hover_bg),
+                    text,
+                )
+            })
+            .collect();
+        let clipped = clip_spans(&final_tokens, h, area.width as usize);
+        f.render_widget(Line::from(clipped), Rect::new(area.x, y, area.width, 1));
 
-        let mut x = area.x;
+        // Hit registry must account for h_scroll: a span at logical x=200
+        // with h=150 renders at screen x=50, not x=200. Intersect each
+        // clickable span with [h, h + area.width) and register the clipped
+        // on-screen portion.
+        let mut x_logical: usize = 0;
         for span in &row.spans {
-            let w = UnicodeWidthStr::width(span.text.as_str()) as u16;
+            let w = UnicodeWidthStr::width(span.text.as_str());
             if w == 0 {
                 continue;
             }
+            let start = x_logical;
+            let end = x_logical + w;
+            x_logical = end;
+
             let (cmd, args) = match (&span.click, &row.row_click) {
                 (Some(c), _) => (Some(c.0.clone()), Some(c.1.clone())),
                 (None, Some(r)) => (Some(r.0.clone()), Some(r.1.clone())),
                 (None, None) => (None, None),
             };
-            if let Some(cmd) = cmd {
-                app.hit_registry.register_row(
-                    x,
-                    y,
-                    w,
-                    ClickAction::GitCommand {
-                        command: cmd,
-                        args: args.unwrap_or(Value::Null),
-                        dbl_command: None,
-                        dbl_args: None,
-                    },
-                );
+            let Some(cmd) = cmd else {
+                continue;
+            };
+
+            let vis_start = start.max(h);
+            let vis_end = end.min(h.saturating_add(area.width as usize));
+            if vis_start >= vis_end {
+                continue;
             }
-            x = x.saturating_add(w);
+            let screen_x = area.x.saturating_add((vis_start - h) as u16);
+            let screen_w = (vis_end - vis_start) as u16;
+
+            app.hit_registry.register_row(
+                screen_x,
+                y,
+                screen_w,
+                ClickAction::GitCommand {
+                    command: cmd,
+                    args: args.unwrap_or(Value::Null),
+                    dbl_command: None,
+                    dbl_args: None,
+                },
+            );
         }
     }
 }

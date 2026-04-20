@@ -1296,10 +1296,6 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
 /// and bare ← / → keys. Tab::Search is the only tab whose LEFT panel also
 /// h-scrolls (the results list) — other tabs' left panels are tree/list
 /// widgets with no long horizontal content.
-///
-/// Graph tab right side (commit detail) isn't wired yet — rows already
-/// truncate to width there; add `CommitDetailState.diff_h_scroll` if
-/// long-line viewing becomes a real need.
 fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: i32) {
     let split_x = total_width * app.split_percent / 100;
     let is_left = column < split_x;
@@ -1310,7 +1306,7 @@ fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: 
         (Tab::Files, false) => Some(&mut app.preview_h_scroll),
         (Tab::Git, false) => Some(&mut app.diff_h_scroll),
         (Tab::Search, false) => Some(&mut app.preview_h_scroll),
-        (Tab::Graph, false) => None,
+        (Tab::Graph, false) => Some(&mut app.commit_detail.diff_h_scroll),
     };
     let Some(target) = target else {
         return;

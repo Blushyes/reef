@@ -279,11 +279,23 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
                 search::begin(app, true);
                 return;
             }
-            KeyCode::Char('n') if app.search.can_step() && !has_pending_confirm(app) => {
+            // Require NO Control modifier so Ctrl+N stays available as
+            // a per-tab "down" nav alias rather than stepping the
+            // vim-style search. Bare N (Shift+n) keeps its step-back
+            // meaning.
+            KeyCode::Char('n')
+                if app.search.can_step()
+                    && !has_pending_confirm(app)
+                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 search::step(app, false);
                 return;
             }
-            KeyCode::Char('N') if app.search.can_step() && !has_pending_confirm(app) => {
+            KeyCode::Char('N')
+                if app.search.can_step()
+                    && !has_pending_confirm(app)
+                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 search::step(app, true);
                 return;
             }
@@ -619,14 +631,29 @@ fn handle_key_search_input_mode(key: KeyEvent, app: &mut App, ctrl: bool, alt: b
 
 fn handle_key_graph(key: KeyEvent, app: &mut App) {
     use ui::{commit_detail_panel, git_graph_panel};
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
-        KeyCode::Up | KeyCode::Char('k') => match app.active_panel {
+        KeyCode::Up | KeyCode::Char('k') if !ctrl => match app.active_panel {
             Panel::Files => {
                 git_graph_panel::handle_key(app, "k");
             }
             Panel::Diff => commit_detail_panel::scroll(app, -1),
         },
-        KeyCode::Down | KeyCode::Char('j') => match app.active_panel {
+        KeyCode::Down | KeyCode::Char('j') if !ctrl => match app.active_panel {
+            Panel::Files => {
+                git_graph_panel::handle_key(app, "j");
+            }
+            Panel::Diff => commit_detail_panel::scroll(app, 1),
+        },
+        // Readline-style nav aliases (parallel to what palettes and
+        // Files/Git tabs bind).
+        KeyCode::Char('p' | 'k') if ctrl => match app.active_panel {
+            Panel::Files => {
+                git_graph_panel::handle_key(app, "k");
+            }
+            Panel::Diff => commit_detail_panel::scroll(app, -1),
+        },
+        KeyCode::Char('n' | 'j') if ctrl => match app.active_panel {
             Panel::Files => {
                 git_graph_panel::handle_key(app, "j");
             }
@@ -668,14 +695,33 @@ fn handle_key_graph(key: KeyEvent, app: &mut App) {
 }
 
 fn handle_key_git(key: KeyEvent, app: &mut App) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
-        KeyCode::Up | KeyCode::Char('k') => match app.active_panel {
+        KeyCode::Up | KeyCode::Char('k') if !ctrl => match app.active_panel {
             Panel::Files => app.navigate_files(-1),
             Panel::Diff => {
                 app.diff_scroll = app.diff_scroll.saturating_sub(1);
             }
         },
-        KeyCode::Down | KeyCode::Char('j') => match app.active_panel {
+        KeyCode::Down | KeyCode::Char('j') if !ctrl => match app.active_panel {
+            Panel::Files => app.navigate_files(1),
+            Panel::Diff => {
+                app.diff_scroll += 1;
+            }
+        },
+        // Readline-style nav aliases. Must come BEFORE the bare
+        // `Char('n')` / `Char('d')` arms below, which would otherwise
+        // route Ctrl+N to the git-status "No" confirm. The bare
+        // letters (n/y/d for confirm / discard chord) stay on their
+        // own arms because they check `!ctrl` implicitly via being
+        // matched only if the Ctrl arm above didn't fire.
+        KeyCode::Char('p' | 'k') if ctrl => match app.active_panel {
+            Panel::Files => app.navigate_files(-1),
+            Panel::Diff => {
+                app.diff_scroll = app.diff_scroll.saturating_sub(1);
+            }
+        },
+        KeyCode::Char('n' | 'j') if ctrl => match app.active_panel {
             Panel::Files => app.navigate_files(1),
             Panel::Diff => {
                 app.diff_scroll += 1;
@@ -761,8 +807,9 @@ fn handle_key_git(key: KeyEvent, app: &mut App) {
 }
 
 fn handle_key_files(key: KeyEvent, app: &mut App) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
-        KeyCode::Up | KeyCode::Char('k') => match app.active_panel {
+        KeyCode::Up | KeyCode::Char('k') if !ctrl => match app.active_panel {
             Panel::Files => {
                 app.file_tree.navigate(-1);
                 app.load_preview();
@@ -771,7 +818,30 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 app.preview_scroll = app.preview_scroll.saturating_sub(1);
             }
         },
-        KeyCode::Down | KeyCode::Char('j') => match app.active_panel {
+        KeyCode::Down | KeyCode::Char('j') if !ctrl => match app.active_panel {
+            Panel::Files => {
+                app.file_tree.navigate(1);
+                app.load_preview();
+            }
+            Panel::Diff => {
+                app.preview_scroll += 1;
+            }
+        },
+        // Readline-style nav: Ctrl+P/K = up, Ctrl+N/J = down. Mirrors
+        // the palette bindings so a Vim+Emacs-era user gets the same
+        // keys on any list in the app. Guarded behind `ctrl` (the
+        // bare letter guards above check `!ctrl`) so pressing `j`
+        // without a modifier still navigates normally.
+        KeyCode::Char('p' | 'k') if ctrl => match app.active_panel {
+            Panel::Files => {
+                app.file_tree.navigate(-1);
+                app.load_preview();
+            }
+            Panel::Diff => {
+                app.preview_scroll = app.preview_scroll.saturating_sub(1);
+            }
+        },
+        KeyCode::Char('n' | 'j') if ctrl => match app.active_panel {
             Panel::Files => {
                 app.file_tree.navigate(1);
                 app.load_preview();

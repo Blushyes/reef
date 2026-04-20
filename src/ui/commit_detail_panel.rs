@@ -44,19 +44,15 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
     let scroll = app.commit_detail.scroll;
 
     // Clamp h_scroll against the widest row currently in view. `build_rows`
-    // emits pad/decoration out to `virtual_w`, so we sum raw span widths
-    // per row rather than using `virtual_w` itself (which would let the
-    // offset run off the right edge when the panel is mostly short lines).
+    // fills pad/decoration out to `virtual_w` so the diff bg spans the
+    // viewport — using raw span widths here would make max_h track
+    // virtual_w and the clamp never converge. `Row.content_width` is the
+    // per-row "useful width" that excludes trailing pad.
     let max_visible_w: usize = rows
         .iter()
         .skip(scroll)
         .take(area.height as usize)
-        .map(|r| {
-            r.spans
-                .iter()
-                .map(|s| UnicodeWidthStr::width(s.text.as_str()))
-                .sum::<usize>()
-        })
+        .map(|r| r.content_width)
         .max()
         .unwrap_or(0);
     let max_h = max_visible_w.saturating_sub(area.width as usize);
@@ -249,6 +245,12 @@ struct RowSpan {
 struct Row {
     spans: Vec<RowSpan>,
     row_click: Option<(String, Value)>,
+    /// Effective content width excluding trailing pad / decorative fill.
+    /// Defaults to the sum of span widths (correct for rows without pad);
+    /// rows that fill out to `virtual_w` (unified diff content, SBS halves,
+    /// the `─`-separator) override this via `with_content_width` so the
+    /// h_scroll clamp in `render` converges instead of tracking virtual_w.
+    content_width: usize,
 }
 
 impl RowSpan {
@@ -274,9 +276,14 @@ impl RowSpan {
 
 impl Row {
     fn new(spans: Vec<RowSpan>) -> Self {
+        let content_width = spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.text.as_str()))
+            .sum();
         Self {
             spans,
             row_click: None,
+            content_width,
         }
     }
     fn blank() -> Self {
@@ -284,6 +291,10 @@ impl Row {
     }
     fn on_click(mut self, cmd: &str, args: Value) -> Self {
         self.row_click = Some((cmd.to_string(), args));
+        self
+    }
+    fn with_content_width(mut self, w: usize) -> Self {
+        self.content_width = w;
         self
     }
 }
@@ -546,10 +557,14 @@ fn diff_header_row(
 }
 
 fn diff_separator_row(width: u16, theme: &Theme) -> Row {
+    // Purely decorative — fills to `width` so it always spans the viewport,
+    // but its "content" is zero. Excluding it from the h_scroll clamp keeps
+    // virtual_w from pinning max_h to itself.
     Row::new(vec![RowSpan::styled(
         "─".repeat(width as usize),
         Style::default().fg(theme.fg_secondary),
     )])
+    .with_content_width(0)
 }
 
 fn append_diff_rows(
@@ -607,12 +622,22 @@ fn append_unified_diff(rows: &mut Vec<Row>, diff: &DiffContent, width: u16, them
                 ),
                 None => (gutter_style, mark_style, text_style, Style::default()),
             };
-            rows.push(Row::new(vec![
-                RowSpan::styled(format!(" {}  {} ", old_no, new_no), g),
-                RowSpan::styled(format!("{} ", prefix), m),
-                RowSpan::styled(content, t),
-                RowSpan::styled(" ".repeat(pad), p),
-            ]));
+            // Content width excludes the trailing pad (which fills out to
+            // `virtual_w` so diff bg spans the viewport). Uses the *original*
+            // line.content width — `content` above may have been trimmed by
+            // `max_text`, but we want clamp to converge to the real line.
+            let line_content_w = DIFF_GUTTER_WIDTH
+                .saturating_add(2)
+                .saturating_add(UnicodeWidthStr::width(line.content.as_str()));
+            rows.push(
+                Row::new(vec![
+                    RowSpan::styled(format!(" {}  {} ", old_no, new_no), g),
+                    RowSpan::styled(format!("{} ", prefix), m),
+                    RowSpan::styled(content, t),
+                    RowSpan::styled(" ".repeat(pad), p),
+                ])
+                .with_content_width(line_content_w),
+            );
         }
     }
 }
@@ -677,7 +702,17 @@ fn render_sbs_row(row: &SbsRow, half_w: u16, right_w: u16, theme: &Theme) -> Row
         right_w,
         theme,
     );
-    Row::new(spans)
+    // Content width: both halves' gutters + their real text widths + the
+    // 1-col separator. Excludes the trailing pad in each half, so clamp
+    // converges on the real content instead of `virtual_w`.
+    let left_tw = UnicodeWidthStr::width(row.left_text.as_str());
+    let right_tw = UnicodeWidthStr::width(row.right_text.as_str());
+    let content_w = SBS_GUTTER_WIDTH
+        .saturating_add(left_tw)
+        .saturating_add(1)
+        .saturating_add(SBS_GUTTER_WIDTH)
+        .saturating_add(right_tw);
+    Row::new(spans).with_content_width(content_w)
 }
 
 fn push_sbs_half(
@@ -866,4 +901,67 @@ fn days_to_ymd(days: i64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     let year = if m <= 2 { y + 1 } else { y };
     (year, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_new_sums_span_widths() {
+        let row = Row::new(vec![RowSpan::plain("hello"), RowSpan::plain(" world")]);
+        assert_eq!(row.content_width, 11);
+    }
+
+    #[test]
+    fn row_with_content_width_overrides_auto_value() {
+        // Auto-sum would be 5 + 100 = 105 because of the trailing pad.
+        // Mirrors how diff / SBS rows suppress pad from the h_scroll clamp.
+        let row = Row::new(vec![
+            RowSpan::plain("hello"),
+            RowSpan::plain(" ".repeat(100)),
+        ])
+        .with_content_width(5);
+        assert_eq!(row.content_width, 5);
+    }
+
+    /// Regression test for the h_scroll clamp that previously used
+    /// `sum(span widths)` per row: since `build_rows` pads diff/SBS lines
+    /// out to `virtual_w`, raw-sum clamp always yielded `max_h = h_input`,
+    /// letting the user scroll forever. With `content_width` the clamp
+    /// reflects the real longest line and converges.
+    #[test]
+    fn clamp_via_content_width_ignores_trailing_pad() {
+        let rows = [
+            Row::new(vec![RowSpan::plain("author: alice")]),
+            // Simulates a diff content row built at virtual_w=500:
+            // gutter(15) + prefix(2) + content(30) + pad(453).
+            // Raw-sum would be 500; content_width = 47.
+            Row::new(vec![
+                RowSpan::plain(" 12345  12345  "),
+                RowSpan::plain("+ "),
+                RowSpan::plain("x".repeat(30)),
+                RowSpan::plain(" ".repeat(453)),
+            ])
+            .with_content_width(DIFF_GUTTER_WIDTH + 2 + 30),
+        ];
+
+        let area_width: usize = 80;
+        let max_visible_w = rows.iter().map(|r| r.content_width).max().unwrap_or(0);
+        let max_h = max_visible_w.saturating_sub(area_width);
+
+        // Content (47 cols) fits in viewport (80 cols): no room to scroll.
+        // If the clamp regressed to raw-sum this would be 500 - 80 = 420.
+        assert_eq!(max_h, 0);
+    }
+
+    #[test]
+    fn diff_separator_row_has_zero_content_width() {
+        let theme = crate::ui::theme::Theme::dark();
+        let row = diff_separator_row(5000, &theme);
+        assert_eq!(
+            row.content_width, 0,
+            "decorative separator must not gate h_scroll clamp"
+        );
+    }
 }

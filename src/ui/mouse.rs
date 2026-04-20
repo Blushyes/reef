@@ -46,6 +46,24 @@ pub enum ClickAction {
     /// border surrounding the whole file tree, or any tree-panel spot that
     /// isn't a folder row).
     PlaceModeRoot,
+    /// Click on one of the Files-tab tree toolbar buttons.
+    FileTreeToolbarNewFile,
+    FileTreeToolbarNewFolder,
+    FileTreeToolbarRefresh,
+    FileTreeToolbarCollapse,
+    /// Pick from an open right-click context menu. Dispatched when
+    /// the user left-clicks a menu row; keyboard picks go through
+    /// `App::dispatch_context_menu_item` directly from `input`.
+    TreeContextMenuItem(crate::tree_context_menu::ContextMenuItem),
+    /// Registered panel-wide underneath an open context menu — any
+    /// left-click that misses a menu row falls through to this and
+    /// just closes the menu.
+    TreeContextMenuClose,
+    /// Left-click on the Files-tab tree panel that missed every
+    /// entry row (i.e. clicked on the empty area below the last
+    /// entry). Clears the selection so a subsequent toolbar New
+    /// File / Folder creates at the project root — VSCode behaviour.
+    TreeClearSelection,
 }
 
 #[derive(Debug, Clone)]

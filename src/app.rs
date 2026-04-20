@@ -226,6 +226,21 @@ pub struct App {
     /// place-mode branches (see `crate::place_mode`).
     pub place_mode: crate::place_mode::PlaceModeState,
 
+    /// Inline editor for the Files-tab tree — VSCode-style new file /
+    /// new folder / rename prompt. While `tree_edit.active`, input
+    /// dispatch fully owns the keyboard (typing goes into the buffer,
+    /// Enter commits, Esc cancels).
+    pub tree_edit: crate::tree_edit::TreeEditState,
+
+    /// Right-click context menu for the Files tab tree. Also takes
+    /// full input ownership while visible.
+    pub tree_context_menu: crate::tree_context_menu::ContextMenuState,
+
+    /// Pending Move-to-Trash / Hard-Delete confirmation. The status
+    /// bar takes over with `⚠ Delete foo? (y / Esc)` while this is
+    /// `Some`. Cleared on confirm or cancel.
+    pub tree_delete_confirm: Option<TreeDeletePending>,
+
     /// Timestamp of the most recent bare-Space keystroke in the global
     /// keymap. `Some(t)` means a Space leader is primed and waiting for a
     /// follow-up key within `input::LEADER_TIMEOUT`. The palette-side
@@ -260,8 +275,31 @@ pub struct App {
     /// mode before a long directory copy finishes) and to show a "copying…"
     /// hint if the operation takes long enough to notice.
     pub file_copy_load: AsyncState,
+    /// Tracks any in-flight CreateFile / CreateFolder / Rename / Trash
+    /// / HardDelete. Used to drop stale generations and to prevent
+    /// rage-click / re-commit from stacking requests on the worker.
+    pub fs_mutation_load: AsyncState,
+    /// Path to auto-select after the next FsMutation completes. Set
+    /// by `commit_tree_edit` to the new file / folder / renamed path
+    /// so the tree rebuild after the mutation lands with the new
+    /// entry highlighted (matches VSCode: create/rename → new row is
+    /// selected). Consumed by `apply_worker_result::FsMutation`.
+    /// `None` for delete operations — selecting a just-trashed path
+    /// would be nonsense.
+    pub fs_mutation_select_on_done: Option<PathBuf>,
     next_git_revalidate_at: Instant,
     next_graph_revalidate_at: Instant,
+}
+
+/// What the user is about to delete once they confirm the status-bar
+/// prompt. `hard` distinguishes Shift+Delete (permanent) from the
+/// default Delete (Trash).
+#[derive(Debug, Clone)]
+pub struct TreeDeletePending {
+    pub path: PathBuf,
+    pub display_name: String,
+    pub is_dir: bool,
+    pub hard: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -373,6 +411,9 @@ impl App {
             global_search: crate::global_search::GlobalSearchState::default(),
             preview_highlight: None,
             place_mode: crate::place_mode::PlaceModeState::default(),
+            tree_edit: crate::tree_edit::TreeEditState::default(),
+            tree_context_menu: crate::tree_context_menu::ContextMenuState::default(),
+            tree_delete_confirm: None,
             space_leader_at: None,
             last_preview_view_h: 0,
             last_diff_view_h: 0,
@@ -387,6 +428,8 @@ impl App {
             commit_file_diff_load: AsyncState::default(),
             global_search_load: AsyncState::default(),
             file_copy_load: AsyncState::default(),
+            fs_mutation_load: AsyncState::default(),
+            fs_mutation_select_on_done: None,
             next_git_revalidate_at: now + Duration::from_millis(800),
             next_graph_revalidate_at: now + Duration::from_millis(1200),
         };
@@ -446,6 +489,13 @@ impl App {
             crate::search::exit_cancel(self);
         }
         self.show_help = false;
+        // Also drop any Files-tab tree modals — otherwise the user
+        // would be in place mode (render path switches) AND still
+        // carry a half-typed tree_edit buffer invisibly, or still
+        // have a pending delete confirm taking over the status bar.
+        self.tree_edit.clear();
+        self.tree_context_menu.close();
+        self.tree_delete_confirm = None;
         self.set_active_tab(Tab::Files);
         self.place_mode.active = true;
         self.place_mode.sources = sources;
@@ -478,6 +528,336 @@ impl App {
         }
         let generation = self.file_copy_load.begin();
         self.tasks.copy_files(generation, sources, dest_dir);
+    }
+
+    // ── Files-tab tree actions: New File / New Folder / Rename / Delete ──
+
+    /// Open the inline editor for a new file / new folder under
+    /// `parent_dir`, or a rename of `rename_target`. Closes any competing
+    /// modal first so place-mode / context-menu / delete-confirm don't
+    /// fight with the editor for input ownership.
+    ///
+    /// `anchor_idx` is the visible-row index the editable row will
+    /// render under (the parent folder for creates, the target entry
+    /// itself for rename). `None` means the edit row attaches to the
+    /// top of the tree — used when creating at project root.
+    pub fn begin_tree_edit(
+        &mut self,
+        mode: crate::tree_edit::TreeEditMode,
+        parent_dir: PathBuf,
+        rename_target: Option<PathBuf>,
+        anchor_idx: Option<usize>,
+    ) {
+        if self.fs_mutation_load.loading {
+            self.toasts
+                .push(Toast::warn(crate::i18n::tree_op_blocked_by_in_flight()));
+            return;
+        }
+        // Close competing modals so tree-edit owns the screen.
+        self.tree_context_menu.close();
+        self.tree_delete_confirm = None;
+        self.exit_place_mode();
+        self.set_active_tab(Tab::Files);
+
+        let buffer = match &rename_target {
+            Some(p) => p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(String::from)
+                .unwrap_or_default(),
+            None => String::new(),
+        };
+        let cursor = buffer.len();
+        self.tree_edit = crate::tree_edit::TreeEditState {
+            active: true,
+            mode: Some(mode),
+            parent_dir: Some(parent_dir),
+            rename_target,
+            buffer,
+            cursor,
+            anchor_idx,
+            error: None,
+        };
+    }
+
+    /// Validate `tree_edit.buffer` and kick off the matching worker
+    /// task. On validation failure we set `tree_edit.error` and stay
+    /// active so the user can fix the name.
+    pub fn commit_tree_edit(&mut self) {
+        // Critical race guard: a previous commit might still be
+        // in-flight (worker not done). Without this, a second Enter
+        // press would `fs_mutation_load.begin()` again → the older
+        // generation's result arrives, gen-mismatches, gets silently
+        // dropped — the earlier file DID get created on disk but the
+        // user sees no toast for it; the second CreateFile then fails
+        // with EEXIST and fires an error toast. Data integrity is
+        // fine, but the UX is outright wrong.
+        if self.fs_mutation_load.loading {
+            return;
+        }
+        let Some(mode) = self.tree_edit.mode else {
+            self.tree_edit.clear();
+            return;
+        };
+        let Some(parent_dir) = self.tree_edit.parent_dir.clone() else {
+            self.tree_edit.clear();
+            return;
+        };
+        let name = match crate::tree_edit::validate_basename(&self.tree_edit.buffer) {
+            Ok(n) => n,
+            Err(err) => {
+                self.tree_edit.error = Some(err);
+                return;
+            }
+        };
+        let target_path = parent_dir.join(&name);
+
+        // Collision check runs at commit (not render) because it needs
+        // a syscall — keeps typing cheap.
+        //
+        // Rename's "new == old" is fine (no-op, close the editor).
+        if let Some(old) = &self.tree_edit.rename_target {
+            if old == &target_path {
+                self.tree_edit.clear();
+                return;
+            }
+        }
+        if target_path.exists() {
+            self.tree_edit.error = Some(crate::tree_edit::TreeEditError::NameAlreadyExists(name));
+            return;
+        }
+
+        let generation = self.fs_mutation_load.begin();
+        // Remember where to land selection after the worker comes back.
+        // `refresh_file_tree_with_target` wants a workdir-relative path
+        // (that's the shape `TreeEntry::path` carries), so strip the
+        // absolute prefix here. Outside-of-workdir paths shouldn't be
+        // possible in practice, but if they slip through we just fall
+        // back to the existing selection at refresh time.
+        self.fs_mutation_select_on_done = target_path
+            .strip_prefix(&self.file_tree.root)
+            .ok()
+            .map(|p| p.to_path_buf());
+        match mode {
+            crate::tree_edit::TreeEditMode::NewFile => {
+                self.tasks.create_file(generation, target_path);
+            }
+            crate::tree_edit::TreeEditMode::NewFolder => {
+                self.tasks.create_folder(generation, target_path);
+            }
+            crate::tree_edit::TreeEditMode::Rename => {
+                let Some(old) = self.tree_edit.rename_target.clone() else {
+                    self.tree_edit.clear();
+                    self.fs_mutation_select_on_done = None;
+                    return;
+                };
+                self.tasks.rename_path(generation, old, target_path);
+            }
+        }
+        // Keep state until the worker result arrives — the render
+        // loop then sees `fs_mutation_load.loading` to disable the
+        // input briefly. `apply_worker_result` clears `tree_edit` on
+        // success.
+    }
+
+    pub fn cancel_tree_edit(&mut self) {
+        self.tree_edit.clear();
+    }
+
+    /// Right-click opened a context menu over `target_entry_idx`
+    /// (or None for a click that missed all rows). `anchor` is the
+    /// mouse column/row in screen cells; the renderer will clamp
+    /// to the viewport.
+    pub fn open_tree_context_menu(&mut self, target_entry_idx: Option<usize>, anchor: (u16, u16)) {
+        if self.place_mode.active || self.tree_edit.active {
+            return;
+        }
+        // NOTE: we deliberately do NOT move `file_tree.selected` to the
+        // right-clicked row. The menu carries its own `target_entry_idx`
+        // so Rename / Delete / etc. know what to operate on; leaving
+        // selection alone matches VSCode's Explorer (right-click never
+        // moves the selection highlight) and — critically — stops the
+        // underlying row's `selection_bg` from stretching across the
+        // full width and visually fighting with the popup.
+        self.tree_context_menu.open(anchor, target_entry_idx);
+    }
+
+    pub fn close_tree_context_menu(&mut self) {
+        self.tree_context_menu.close();
+    }
+
+    /// Translate a picked `ContextMenuItem` into the corresponding
+    /// App action. Called from `input` when the user clicks / keys
+    /// on a menu row.
+    pub fn dispatch_context_menu_item(&mut self, item: crate::tree_context_menu::ContextMenuItem) {
+        use crate::tree_context_menu::ContextMenuItem as I;
+        let target_idx = self.tree_context_menu.target_entry_idx;
+        self.tree_context_menu.close();
+        match item {
+            I::NewFile => {
+                let (parent, anchor) = self.resolve_create_anchor(target_idx);
+                self.begin_tree_edit(
+                    crate::tree_edit::TreeEditMode::NewFile,
+                    parent,
+                    None,
+                    anchor,
+                );
+            }
+            I::NewFolder => {
+                let (parent, anchor) = self.resolve_create_anchor(target_idx);
+                self.begin_tree_edit(
+                    crate::tree_edit::TreeEditMode::NewFolder,
+                    parent,
+                    None,
+                    anchor,
+                );
+            }
+            I::Rename => {
+                let Some(idx) = target_idx else { return };
+                let Some(entry) = self.file_tree.entries.get(idx).cloned() else {
+                    return;
+                };
+                let abs = self.file_tree.root.join(&entry.path);
+                let parent = abs
+                    .parent()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| self.file_tree.root.clone());
+                self.begin_tree_edit(
+                    crate::tree_edit::TreeEditMode::Rename,
+                    parent,
+                    Some(abs),
+                    Some(idx),
+                );
+            }
+            I::Delete => {
+                let Some(idx) = target_idx else { return };
+                let Some(entry) = self.file_tree.entries.get(idx).cloned() else {
+                    return;
+                };
+                let abs = self.file_tree.root.join(&entry.path);
+                self.prompt_tree_delete(abs, entry.is_dir, /*hard=*/ false);
+            }
+            I::RevealInFinder => {
+                let path = match target_idx {
+                    Some(idx) => self
+                        .file_tree
+                        .entries
+                        .get(idx)
+                        .map(|e| self.file_tree.root.join(&e.path))
+                        .unwrap_or_else(|| self.file_tree.root.clone()),
+                    None => self.file_tree.root.clone(),
+                };
+                if let Err(msg) = crate::reveal::reveal_in_finder(&path) {
+                    // Platforms we don't support get the unsupported toast
+                    // instead of the raw error — it's a cleaner UX hint.
+                    let text = if msg.contains("not supported") {
+                        crate::i18n::tree_reveal_unsupported_platform()
+                    } else {
+                        msg
+                    };
+                    self.toasts.push(Toast::error(text));
+                }
+            }
+        }
+    }
+
+    /// Given the entry the user clicked (or `None` for empty-space),
+    /// pick the parent directory the new file/folder should land in,
+    /// plus the visible row index the editable row anchors under.
+    ///
+    /// Rules:
+    /// - Clicked on a folder → create INSIDE that folder. Auto-expands
+    ///   the folder first if it's currently collapsed so the edit row
+    ///   is actually visible.
+    /// - Clicked on a file → create as a SIBLING (under the file's
+    ///   parent folder). Anchor at the file's own row — good enough;
+    ///   the render-side insertion logic handles this cleanly.
+    /// - Clicked on empty space / None → create at project root.
+    fn resolve_create_anchor(
+        &mut self,
+        target_entry_idx: Option<usize>,
+    ) -> (PathBuf, Option<usize>) {
+        let Some(idx) = target_entry_idx else {
+            return (self.file_tree.root.clone(), None);
+        };
+        let Some(entry) = self.file_tree.entries.get(idx).cloned() else {
+            return (self.file_tree.root.clone(), None);
+        };
+        if entry.is_dir {
+            let abs = self.file_tree.root.join(&entry.path);
+            // Auto-expand collapsed folder so the editable child row
+            // actually renders. The refresh is async; `anchor_idx` will
+            // remain valid in the meantime (the existing folder row
+            // doesn't move), and the edit row renders right after it
+            // regardless of expansion state because it's keyed on
+            // anchor_idx, not on the children's indices.
+            if !entry.is_expanded {
+                self.file_tree.toggle_expand(idx);
+                self.refresh_file_tree_with_target(self.file_tree.selected_path());
+            }
+            (abs, Some(idx))
+        } else {
+            // File → create next to it. The file's parent is the
+            // clicked entry's parent on disk.
+            let abs = self.file_tree.root.join(&entry.path);
+            let parent = abs
+                .parent()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| self.file_tree.root.clone());
+            (parent, Some(idx))
+        }
+    }
+
+    /// Pop the status-bar delete-confirm prompt. `hard` controls
+    /// Trash vs. `fs::remove_*`; the prompt text adjusts accordingly.
+    pub fn prompt_tree_delete(&mut self, path: PathBuf, is_dir: bool, hard: bool) {
+        let display_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(crate::tree_edit::sanitize_filename)
+            .unwrap_or_else(|| path.to_string_lossy().to_string());
+        self.tree_context_menu.close();
+        self.tree_delete_confirm = Some(TreeDeletePending {
+            path,
+            display_name,
+            is_dir,
+            hard,
+        });
+    }
+
+    /// User pressed Y on the delete confirm. Dispatches the matching
+    /// worker task and clears the prompt.
+    pub fn confirm_tree_delete(&mut self) {
+        // Same generation-bump race as commit_tree_edit: a previous
+        // trash/hard-delete might still be running. Keep the confirm
+        // in place (don't `.take()`) so the user's Y press isn't
+        // lost — they can retry when the prior op completes.
+        if self.fs_mutation_load.loading {
+            self.toasts
+                .push(Toast::warn(crate::i18n::tree_op_blocked_by_in_flight()));
+            return;
+        }
+        let Some(pending) = self.tree_delete_confirm.take() else {
+            return;
+        };
+        let generation = self.fs_mutation_load.begin();
+        if pending.hard {
+            self.tasks.hard_delete_paths(generation, vec![pending.path]);
+        } else {
+            self.tasks.trash_paths(generation, vec![pending.path]);
+        }
+    }
+
+    pub fn cancel_tree_delete(&mut self) {
+        self.tree_delete_confirm = None;
+    }
+
+    /// Collapse every expanded folder and async-refresh the tree so
+    /// the render path picks up the shorter row list.
+    pub fn collapse_all_tree_entries(&mut self) {
+        self.file_tree.collapse_all();
+        let selected_path = self.file_tree.selected_path();
+        self.refresh_file_tree_with_target(selected_path);
     }
 
     /// Rebuild the file tree from disk, applying git decorations when a repo is open.
@@ -854,6 +1234,38 @@ impl App {
                             .replace_entries(payload.entries, payload.selected_idx);
                         self.file_tree
                             .refresh_git_statuses(&self.staged_files, &self.unstaged_files);
+                        // Re-validate tree_edit's anchor against the
+                        // freshly-replaced entries. fs-watcher bounces
+                        // (an external save, git operation, etc.)
+                        // can reshape the tree while the user is
+                        // mid-edit; without this guard the edit row
+                        // either renders in the wrong spot or falls
+                        // off the end.
+                        if self.tree_edit.active {
+                            let len = self.file_tree.entries.len();
+                            if let Some(idx) = self.tree_edit.anchor_idx {
+                                if idx >= len {
+                                    match self.tree_edit.mode {
+                                        Some(crate::tree_edit::TreeEditMode::Rename) => {
+                                            // Can't synthesise a valid
+                                            // rename anchor if the target
+                                            // entry is gone. Cancel; the
+                                            // user can redo F2 after they
+                                            // orient.
+                                            self.tree_edit.clear();
+                                        }
+                                        _ => {
+                                            // Create: degrade to
+                                            // create-at-root so the typed
+                                            // buffer stays visible.
+                                            self.tree_edit.anchor_idx = None;
+                                            self.tree_edit.parent_dir =
+                                                Some(self.file_tree.root.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if before != self.file_tree.selected_path() {
                             self.load_preview();
                         }
@@ -1068,6 +1480,54 @@ impl App {
                     }
                 }
             },
+            WorkerResult::FsMutation {
+                generation,
+                kind,
+                result,
+            } => match result {
+                Ok(()) => {
+                    if self.fs_mutation_load.complete_ok(generation) {
+                        let toast = crate::i18n::fs_mutation_success_toast(&kind);
+                        self.toasts.push(Toast::info(toast));
+                        // Inline edit / delete confirm are no longer relevant
+                        // after a successful mutation — clean up before the
+                        // tree rebuild runs so the renderer doesn't briefly
+                        // show a stale cursor on a row that's about to move.
+                        self.tree_edit.clear();
+                        self.tree_delete_confirm = None;
+                        // Select the newly-created / renamed entry if we
+                        // stashed one on dispatch. Delete paths leave
+                        // `fs_mutation_select_on_done` as `None` so the
+                        // tree keeps its current selection.
+                        let target = self.fs_mutation_select_on_done.take();
+                        if target.is_some() {
+                            self.refresh_file_tree_with_target(target);
+                        } else {
+                            self.refresh_file_tree();
+                        }
+                    }
+                }
+                Err(error) => {
+                    if self
+                        .fs_mutation_load
+                        .complete_err(generation, error.clone())
+                    {
+                        let toast = crate::i18n::fs_mutation_error_toast(&kind, &error);
+                        self.toasts.push(Toast::error(toast));
+                        // Leave `tree_edit` alone on error so the user can
+                        // fix the buffer and retry. Same as the drag-drop
+                        // path: clear stale/error flags so activity_message
+                        // doesn't double-surface the toast after it fades.
+                        self.tree_delete_confirm = None;
+                        // Drop the pending auto-select — the target path
+                        // was never created / renamed, so trying to focus
+                        // it would be a stale lookup at best.
+                        self.fs_mutation_select_on_done = None;
+                        self.fs_mutation_load.stale = false;
+                        self.fs_mutation_load.error = None;
+                    }
+                }
+            },
         }
     }
 
@@ -1075,7 +1535,18 @@ impl App {
         if self.active_tab == tab {
             return;
         }
+        let was_files = self.active_tab == Tab::Files;
         self.active_tab = tab;
+        // Leaving the Files tab cancels any Files-tab-scoped modal —
+        // tree edit row, context menu, delete confirm. Those modals
+        // are invisible on other tabs, so leaving them armed would
+        // let a stray key or click fire them from a tab where the
+        // corresponding file tree isn't even being rendered.
+        if was_files {
+            self.tree_edit.clear();
+            self.tree_context_menu.close();
+            self.tree_delete_confirm = None;
+        }
         match tab {
             Tab::Git => self.git_status_load.mark_stale(),
             Tab::Graph => self.graph_load.mark_stale(),
@@ -1225,6 +1696,69 @@ impl App {
                 let dest_dir = self.file_tree.root.clone();
                 self.request_file_copy(sources, dest_dir);
             }
+            ClickAction::FileTreeToolbarNewFile => {
+                let target = self.toolbar_create_target();
+                let (parent, anchor) = self.resolve_create_anchor(target);
+                self.begin_tree_edit(
+                    crate::tree_edit::TreeEditMode::NewFile,
+                    parent,
+                    None,
+                    anchor,
+                );
+            }
+            ClickAction::FileTreeToolbarNewFolder => {
+                let target = self.toolbar_create_target();
+                let (parent, anchor) = self.resolve_create_anchor(target);
+                self.begin_tree_edit(
+                    crate::tree_edit::TreeEditMode::NewFolder,
+                    parent,
+                    None,
+                    anchor,
+                );
+            }
+            ClickAction::FileTreeToolbarRefresh => {
+                self.refresh_file_tree();
+                if self.repo.is_some() {
+                    self.refresh_status();
+                }
+            }
+            ClickAction::FileTreeToolbarCollapse => {
+                self.collapse_all_tree_entries();
+            }
+            ClickAction::TreeContextMenuItem(item) => {
+                self.dispatch_context_menu_item(item);
+            }
+            ClickAction::TreeContextMenuClose => {
+                self.close_tree_context_menu();
+            }
+            ClickAction::TreeClearSelection => {
+                // Left-click on empty tree space → drop the selection
+                // highlight. Next toolbar `+ File` / `+ Folder` lands
+                // at the project root. Any in-progress inline edit is
+                // also cancelled, matching VSCode's "click elsewhere
+                // discards the pending name" behaviour.
+                self.file_tree.clear_selection();
+                if self.tree_edit.active {
+                    self.tree_edit.clear();
+                }
+            }
+        }
+    }
+
+    /// Pick the "create anchor" target for a toolbar `+ File` / `+ Folder`
+    /// click. Uses the current tree selection; falls back to `None`
+    /// (= project root) when the user has explicitly cleared it or the
+    /// tree is empty.
+    ///
+    /// `resolve_create_anchor` then handles the folder-vs-file split —
+    /// selection on a folder creates INSIDE, selection on a file creates
+    /// as a sibling.
+    fn toolbar_create_target(&self) -> Option<usize> {
+        let sel = self.file_tree.selected;
+        if self.file_tree.entries.get(sel).is_some() {
+            Some(sel)
+        } else {
+            None
         }
     }
 

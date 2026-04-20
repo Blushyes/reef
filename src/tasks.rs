@@ -132,6 +132,35 @@ pub enum WorkerResult {
         generation: u64,
         result: Result<usize, String>,
     },
+    /// Result of a file-tree toolbar / context-menu mutation (Create,
+    /// Rename, Trash, HardDelete). `kind` is carried separately from
+    /// `result` so the merge site can pick the right toast phrasing
+    /// (created vs. renamed vs. deleted) without having to sniff the
+    /// worker task itself.
+    FsMutation {
+        generation: u64,
+        kind: FsMutationKind,
+        result: Result<(), String>,
+    },
+}
+
+/// What mutation a `FsMutation` corresponds to. The `created_name` /
+/// `old_name` / `new_name` fields feed the toast text — we could resolve
+/// them from the worker task by looking at the path, but carrying them
+/// on the result keeps the merge path from doing path arithmetic during
+/// render.
+#[derive(Debug, Clone)]
+pub enum FsMutationKind {
+    /// A new file was created. `name` is the final basename.
+    CreatedFile { name: String },
+    /// A new folder was created. `name` is the final basename.
+    CreatedFolder { name: String },
+    /// Rename completed. Display as "old → new".
+    Renamed { old_name: String, new_name: String },
+    /// Entry moved to the OS Trash. `name` is the basename.
+    Trashed { name: String },
+    /// Entry hard-deleted (Shift+Delete). `name` is the basename.
+    HardDeleted { name: String },
 }
 
 enum FilesTask {
@@ -157,6 +186,38 @@ enum FilesTask {
         generation: u64,
         sources: Vec<PathBuf>,
         dest_dir: PathBuf,
+    },
+    /// Create an empty file at `path`. Fails if the parent dir is
+    /// missing or the file already exists — the UI layer
+    /// (`App::commit_tree_edit`) has already validated + rejected
+    /// collisions before dispatch, but a race with an external
+    /// process is possible so we still surface the io::Error.
+    CreateFile { generation: u64, path: PathBuf },
+    /// `mkdir -p` on `path`. If the directory already exists we
+    /// treat that as success (the rare race window) to avoid a
+    /// surprising failure after the user explicitly asked for it.
+    CreateFolder { generation: u64, path: PathBuf },
+    /// `fs::rename(old, new)`. Caller guarantees `new` doesn't
+    /// already exist (checked in `App::commit_tree_edit`).
+    Rename {
+        generation: u64,
+        old_path: PathBuf,
+        new_path: PathBuf,
+    },
+    /// Move each path to the system Trash. Uses the `trash` crate
+    /// for cross-platform semantics (Finder Trash on macOS, XDG
+    /// Trash on Linux, Recycle Bin on Windows).
+    TrashPaths {
+        generation: u64,
+        paths: Vec<PathBuf>,
+    },
+    /// Permanent delete via `fs::remove_file` / `remove_dir_all`.
+    /// Reached via Shift+Delete after the confirm dialog. Files
+    /// and directories both supported; symlinks are removed by
+    /// `remove_file` without dereferencing (matches `rm` on Unix).
+    HardDeletePaths {
+        generation: u64,
+        paths: Vec<PathBuf>,
     },
 }
 
@@ -261,6 +322,38 @@ impl TaskCoordinator {
             sources,
             dest_dir,
         });
+    }
+
+    pub fn create_file(&self, generation: u64, path: PathBuf) {
+        let _ = self
+            .files_tx
+            .send(FilesTask::CreateFile { generation, path });
+    }
+
+    pub fn create_folder(&self, generation: u64, path: PathBuf) {
+        let _ = self
+            .files_tx
+            .send(FilesTask::CreateFolder { generation, path });
+    }
+
+    pub fn rename_path(&self, generation: u64, old_path: PathBuf, new_path: PathBuf) {
+        let _ = self.files_tx.send(FilesTask::Rename {
+            generation,
+            old_path,
+            new_path,
+        });
+    }
+
+    pub fn trash_paths(&self, generation: u64, paths: Vec<PathBuf>) {
+        let _ = self
+            .files_tx
+            .send(FilesTask::TrashPaths { generation, paths });
+    }
+
+    pub fn hard_delete_paths(&self, generation: u64, paths: Vec<PathBuf>) {
+        let _ = self
+            .files_tx
+            .send(FilesTask::HardDeletePaths { generation, paths });
     }
 
     pub fn refresh_status(&self, generation: u64, workdir: PathBuf) {
@@ -384,10 +477,135 @@ fn spawn_files_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Fil
                         let result = copy_sources(&sources, &dest_dir);
                         let _ = result_tx.send(WorkerResult::FileCopy { generation, result });
                     }
+                    FilesTask::CreateFile { generation, path } => {
+                        let (kind, result) = run_create_file(&path);
+                        let _ = result_tx.send(WorkerResult::FsMutation {
+                            generation,
+                            kind,
+                            result,
+                        });
+                    }
+                    FilesTask::CreateFolder { generation, path } => {
+                        let (kind, result) = run_create_folder(&path);
+                        let _ = result_tx.send(WorkerResult::FsMutation {
+                            generation,
+                            kind,
+                            result,
+                        });
+                    }
+                    FilesTask::Rename {
+                        generation,
+                        old_path,
+                        new_path,
+                    } => {
+                        let (kind, result) = run_rename(&old_path, &new_path);
+                        let _ = result_tx.send(WorkerResult::FsMutation {
+                            generation,
+                            kind,
+                            result,
+                        });
+                    }
+                    FilesTask::TrashPaths { generation, paths } => {
+                        let (kind, result) = run_trash(&paths);
+                        let _ = result_tx.send(WorkerResult::FsMutation {
+                            generation,
+                            kind,
+                            result,
+                        });
+                    }
+                    FilesTask::HardDeletePaths { generation, paths } => {
+                        let (kind, result) = run_hard_delete(&paths);
+                        let _ = result_tx.send(WorkerResult::FsMutation {
+                            generation,
+                            kind,
+                            result,
+                        });
+                    }
                 }
             }
         });
     tx
+}
+
+// ─── FS mutation helpers ─────────────────────────────────────────────────────
+
+fn basename_str(path: &Path) -> String {
+    // Filenames land in toast text and FsMutationKind display strings.
+    // macOS allows control chars (`\n`, `\t`, bell, …) in filenames,
+    // which would otherwise break single-line status-bar rendering or
+    // mis-align the toast. Replace them with `?` — the sanitised
+    // display form only; the actual filesystem path is never touched.
+    let raw = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(String::from)
+        .unwrap_or_else(|| path.to_string_lossy().to_string());
+    raw.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+fn run_create_file(path: &Path) -> (FsMutationKind, Result<(), String>) {
+    let name = basename_str(path);
+    let kind = FsMutationKind::CreatedFile { name: name.clone() };
+    // `OpenOptions::create_new` refuses to overwrite an existing file — a
+    // race with fs-watcher / an external editor creating the file between
+    // the UI-level collision check and this syscall surfaces as a clear
+    // error instead of silently clobbering.
+    let result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map(|_| ())
+        .map_err(|e| format!("create {name:?}: {e}"));
+    (kind, result)
+}
+
+fn run_create_folder(path: &Path) -> (FsMutationKind, Result<(), String>) {
+    let name = basename_str(path);
+    let kind = FsMutationKind::CreatedFolder { name: name.clone() };
+    // `create_dir_all` treats an existing directory as success; fine here
+    // because the UI has already checked for name collisions with files.
+    let result = std::fs::create_dir_all(path).map_err(|e| format!("mkdir {name:?}: {e}"));
+    (kind, result)
+}
+
+fn run_rename(old: &Path, new: &Path) -> (FsMutationKind, Result<(), String>) {
+    let old_name = basename_str(old);
+    let new_name = basename_str(new);
+    let kind = FsMutationKind::Renamed {
+        old_name: old_name.clone(),
+        new_name: new_name.clone(),
+    };
+    let result =
+        std::fs::rename(old, new).map_err(|e| format!("rename {old_name:?} → {new_name:?}: {e}"));
+    (kind, result)
+}
+
+fn run_trash(paths: &[PathBuf]) -> (FsMutationKind, Result<(), String>) {
+    // The kind string reports the first path's basename to keep the toast
+    // short; if the user trashed many at once (future: multi-select) the
+    // toast can reach into the worker task's list itself.
+    let name = paths.first().map(|p| basename_str(p)).unwrap_or_default();
+    let kind = FsMutationKind::Trashed { name: name.clone() };
+    let result = trash::delete_all(paths).map_err(|e| format!("trash {name:?}: {e}"));
+    (kind, result)
+}
+
+fn run_hard_delete(paths: &[PathBuf]) -> (FsMutationKind, Result<(), String>) {
+    let name = paths.first().map(|p| basename_str(p)).unwrap_or_default();
+    let kind = FsMutationKind::HardDeleted { name: name.clone() };
+    for p in paths {
+        let res = if p.is_dir() {
+            std::fs::remove_dir_all(p)
+        } else {
+            std::fs::remove_file(p)
+        };
+        if let Err(e) = res {
+            return (kind, Err(format!("delete {:?}: {e}", basename_str(p))));
+        }
+    }
+    (kind, Ok(()))
 }
 
 // ─── Drag-and-drop copy helpers ──────────────────────────────────────────────
@@ -1079,5 +1297,89 @@ mod copy_tests {
             fs::read_to_string(tmp.path().join("pkg (1)").join("a.txt")).unwrap(),
             "hello"
         );
+    }
+}
+
+#[cfg(test)]
+mod fs_mutation_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn create_file_writes_empty_file() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("hello.rs");
+        let (kind, result) = run_create_file(&target);
+        assert!(result.is_ok());
+        assert!(matches!(kind, FsMutationKind::CreatedFile { .. }));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "");
+    }
+
+    #[test]
+    fn create_file_refuses_to_overwrite() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("dup.txt");
+        fs::write(&target, "existing").unwrap();
+        let (_, result) = run_create_file(&target);
+        assert!(result.is_err());
+        // Original untouched.
+        assert_eq!(fs::read_to_string(&target).unwrap(), "existing");
+    }
+
+    #[test]
+    fn create_folder_makes_dir_and_parents() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("a").join("b").join("c");
+        let (kind, result) = run_create_folder(&target);
+        assert!(result.is_ok());
+        assert!(matches!(kind, FsMutationKind::CreatedFolder { .. }));
+        assert!(target.is_dir());
+    }
+
+    #[test]
+    fn rename_moves_path() {
+        let tmp = TempDir::new().unwrap();
+        let old = tmp.path().join("old.txt");
+        let new = tmp.path().join("new.txt");
+        fs::write(&old, "content").unwrap();
+        let (kind, result) = run_rename(&old, &new);
+        assert!(result.is_ok());
+        assert!(matches!(kind, FsMutationKind::Renamed { .. }));
+        assert!(!old.exists());
+        assert_eq!(fs::read_to_string(&new).unwrap(), "content");
+    }
+
+    #[test]
+    fn rename_fails_on_missing_source() {
+        let tmp = TempDir::new().unwrap();
+        let old = tmp.path().join("nope.txt");
+        let new = tmp.path().join("new.txt");
+        let (_, result) = run_rename(&old, &new);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn hard_delete_removes_file_and_dir() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("a.txt");
+        let dir = tmp.path().join("d");
+        fs::write(&file, "").unwrap();
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("nested.txt"), "").unwrap();
+
+        let (_, res) = run_hard_delete(&[file.clone(), dir.clone()]);
+        assert!(res.is_ok());
+        assert!(!file.exists());
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn hard_delete_propagates_first_error() {
+        // Missing path — `remove_file` returns ENOENT.
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("ghost.txt");
+        let (_, res) = run_hard_delete(std::slice::from_ref(&missing));
+        assert!(res.is_err());
     }
 }

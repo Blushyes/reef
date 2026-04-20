@@ -116,6 +116,33 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         return;
     }
 
+    // Inline tree editor (New File / New Folder / Rename): while
+    // `tree_edit.active`, every non-Ctrl-C keystroke goes into the
+    // editable buffer. Priority-wise this sits above place-mode and
+    // the context menu so a stray right-click or drop can't yank the
+    // cursor out from under a half-typed filename.
+    if app.tree_edit.active {
+        handle_key_tree_edit(key, app);
+        return;
+    }
+
+    // Right-click context menu: while visible it owns the keyboard —
+    // arrow keys navigate, Enter fires, Esc closes. Any other key
+    // closes the menu (VSCode behaviour — keeps the user from
+    // accidentally leaving a menu lingering).
+    if app.tree_context_menu.active {
+        handle_key_tree_context_menu(key, app);
+        return;
+    }
+
+    // Delete confirmation status-bar prompt: Y confirms, N / Esc
+    // cancels. Every other key is ignored so the user can't
+    // accidentally trigger something else while the confirm is up.
+    if app.tree_delete_confirm.is_some() {
+        handle_key_tree_delete_confirm(key, app);
+        return;
+    }
+
     // Place mode (drag-and-drop destination picker) is mouse-first —
     // most keystrokes are ignored so a stray keypress can't accidentally
     // commit a copy. Exceptions: Esc cancels the mode, and the two
@@ -819,6 +846,124 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 }
             }
         }
+        KeyCode::F(2) => {
+            // F2 = Rename — VSCode's default. Opens the inline rename
+            // editor on the selected entry. No-op on an empty tree.
+            let idx = app.file_tree.selected;
+            if let Some(entry) = app.file_tree.entries.get(idx).cloned() {
+                let abs = app.file_tree.root.join(&entry.path);
+                let parent = abs
+                    .parent()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| app.file_tree.root.clone());
+                app.begin_tree_edit(
+                    crate::tree_edit::TreeEditMode::Rename,
+                    parent,
+                    Some(abs),
+                    Some(idx),
+                );
+            }
+        }
+        KeyCode::Delete | KeyCode::Backspace => {
+            // Delete / Cmd+Backspace — default is "Move to Trash"
+            // (safer, reversible). Shift modifier escalates to the
+            // hard-delete path. Backspace aliases Delete so macOS
+            // users (who don't have a real Delete key on most
+            // keyboards) get the same action.
+            let hard = key.modifiers.contains(KeyModifiers::SHIFT);
+            let idx = app.file_tree.selected;
+            if let Some(entry) = app.file_tree.entries.get(idx).cloned() {
+                let abs = app.file_tree.root.join(&entry.path);
+                app.prompt_tree_delete(abs, entry.is_dir, hard);
+            }
+        }
+        _ => {}
+    }
+}
+
+// ─── Tree modal keyboard helpers ─────────────────────────────────────────────
+
+/// Tree-edit (inline New File / New Folder / Rename) keyboard owner.
+/// Drains every keystroke into the buffer until Enter / Esc / Ctrl+C
+/// exits — Tab / Up-Down are intentionally ignored so accidental
+/// keyboard navigation can't orphan a half-typed filename.
+fn handle_key_tree_edit(key: KeyEvent, app: &mut App) {
+    // Any keystroke clears a lingering validation banner — the user
+    // is typing, which means they're trying to fix the issue.
+    if app.tree_edit.error.is_some() {
+        app.tree_edit.error = None;
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => app.cancel_tree_edit(),
+        KeyCode::Char('c') if ctrl => app.cancel_tree_edit(),
+        KeyCode::Enter => app.commit_tree_edit(),
+        KeyCode::Backspace => {
+            if ctrl || key.modifiers.contains(KeyModifiers::ALT) {
+                crate::input_edit::delete_word_backward(
+                    &mut app.tree_edit.buffer,
+                    &mut app.tree_edit.cursor,
+                );
+            } else {
+                crate::input_edit::backspace(&mut app.tree_edit.buffer, &mut app.tree_edit.cursor);
+            }
+        }
+        KeyCode::Char('w') if ctrl => {
+            crate::input_edit::delete_word_backward(
+                &mut app.tree_edit.buffer,
+                &mut app.tree_edit.cursor,
+            );
+        }
+        KeyCode::Char('u') if ctrl => {
+            app.tree_edit.buffer.clear();
+            app.tree_edit.cursor = 0;
+        }
+        KeyCode::Left => {
+            crate::input_edit::move_cursor(&app.tree_edit.buffer, &mut app.tree_edit.cursor, -1);
+        }
+        KeyCode::Right => {
+            crate::input_edit::move_cursor(&app.tree_edit.buffer, &mut app.tree_edit.cursor, 1);
+        }
+        KeyCode::Home => {
+            app.tree_edit.cursor = 0;
+        }
+        KeyCode::End => {
+            app.tree_edit.cursor = app.tree_edit.buffer.len();
+        }
+        KeyCode::Char(c) if !ctrl => {
+            crate::input_edit::insert_char(&mut app.tree_edit.buffer, &mut app.tree_edit.cursor, c);
+        }
+        _ => {}
+    }
+}
+
+/// Keyboard navigation for the right-click context menu popup.
+fn handle_key_tree_context_menu(key: KeyEvent, app: &mut App) {
+    match key.code {
+        KeyCode::Esc => app.close_tree_context_menu(),
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.close_tree_context_menu();
+        }
+        KeyCode::Up | KeyCode::Char('k') => app.tree_context_menu.navigate(-1),
+        KeyCode::Down | KeyCode::Char('j') => app.tree_context_menu.navigate(1),
+        KeyCode::Enter => {
+            if let Some(item) = app.tree_context_menu.current() {
+                app.dispatch_context_menu_item(item);
+            }
+        }
+        // Any other key closes the menu (VSCode behaviour). Prevents
+        // the menu from lingering if the user mis-clicks into it.
+        _ => app.close_tree_context_menu(),
+    }
+}
+
+/// Y/Esc handler for the status-bar delete confirm.
+fn handle_key_tree_delete_confirm(key: KeyEvent, app: &mut App) {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_tree_delete(),
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('c') => {
+            app.cancel_tree_delete()
+        }
         _ => {}
     }
 }
@@ -842,6 +987,53 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
         handle_mouse_place_mode(mouse, app);
         return;
     }
+
+    // Mid-edit mouse-button press → cancel the inline editor. Then let
+    // the click fall through to normal handling so clicking another
+    // row still selects it, clicking a toolbar button still fires, etc.
+    // Keeping the edit active across clicks makes the row UI lie about
+    // what a subsequent Enter would commit (`parent_dir` is stale).
+    // Move events and scroll wheel pass through untouched so hover /
+    // scroll keep working while the user types.
+    if app.tree_edit.active && matches!(mouse.kind, MouseEventKind::Down(_)) {
+        app.cancel_tree_edit();
+    }
+
+    // Right-click on the Files tab's tree panel → open context menu.
+    // Gated on the hit_test result, not just `active_tab`: right-click
+    // on the preview panel, on the toolbar row, or on an empty area
+    // outside the tree must NOT open the menu. `TreeClick(idx)` means
+    // a row was hit; `TreeClearSelection` means the click landed in
+    // the empty space below rows (root-flavoured menu). Every other
+    // hit (toolbar buttons, preview content, no-op areas) bails out.
+    if let MouseEventKind::Down(MouseButton::Right) = mouse.kind {
+        if app.active_tab == Tab::Files
+            && !app.tree_edit.active
+            && app.tree_delete_confirm.is_none()
+        {
+            // Second right-click while the menu is already open
+            // dismisses it (Finder / VSCode behaviour).
+            if app.tree_context_menu.active {
+                app.close_tree_context_menu();
+                return;
+            }
+            let opens_menu = match app.hit_registry.hit_test(mouse.column, mouse.row) {
+                Some(ui::mouse::ClickAction::TreeClick(idx)) => Some(Some(idx)),
+                Some(ui::mouse::ClickAction::TreeClearSelection) => Some(None),
+                _ => None,
+            };
+            if let Some(target) = opens_menu {
+                app.open_tree_context_menu(target, (mouse.column, mouse.row));
+            }
+            return;
+        }
+    }
+
+    // Clicks while the context menu is open: left-click outside the
+    // menu closes it; hit_registry routing to `TreeContextMenuItem`
+    // happens through the normal path below.
+    // (The fallthrough-close region is registered by the menu renderer
+    // underneath the menu panel, so it goes through handle_action.)
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {

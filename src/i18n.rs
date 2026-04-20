@@ -118,6 +118,7 @@ pub enum Msg {
     HelpKeyAnyKey,
     HelpKeyMouseHScroll,
     HelpKeyDragDrop,
+    HelpKeyRightClick,
     // Help popup — descriptions
     HelpQuit,
     HelpSwitchTab,
@@ -142,6 +143,10 @@ pub enum Msg {
     HelpQuickOpen,
     HelpGlobalSearch,
     HelpDragDrop,
+    HelpRenameEntry,
+    HelpDeleteEntry,
+    HelpHardDeleteEntry,
+    HelpRightClickMenu,
     HelpAnyKey,
 }
 
@@ -208,6 +213,7 @@ fn t_zh(m: Msg) -> &'static str {
         HelpKeyAnyKey => "任意键",
         HelpKeyMouseHScroll => "Shift+滚轮 / 触控板横划",
         HelpKeyDragDrop => "拖文件进终端",
+        HelpKeyRightClick => "右键文件树行",
         HelpQuit => "退出",
         HelpSwitchTab => "切换顶部标签页（文件 ↔ Git ↔ 图表）",
         HelpSwitchPanel => "切换焦点面板（侧边栏 ↔ 编辑区）",
@@ -231,6 +237,10 @@ fn t_zh(m: Msg) -> &'static str {
         HelpQuickOpen => "打开 / 关闭快速打开浮层（全局模糊搜索）",
         HelpGlobalSearch => "打开全局内容搜索浮层",
         HelpDragDrop => "进入放置模式：点击文件夹复制到那里，Esc / 右键 取消",
+        HelpRenameEntry => "重命名选中项",
+        HelpDeleteEntry => "移动到废纸篓（带确认）",
+        HelpHardDeleteEntry => "永久删除（不可撤销）",
+        HelpRightClickMenu => "打开文件树右键菜单",
         HelpAnyKey => "关闭帮助",
     }
 }
@@ -291,6 +301,7 @@ fn t_en(m: Msg) -> &'static str {
         HelpKeyAnyKey => "any key",
         HelpKeyMouseHScroll => "Shift+Wheel / trackpad",
         HelpKeyDragDrop => "Drag file into terminal",
+        HelpKeyRightClick => "Right-click a tree row",
         HelpQuit => "Quit",
         HelpSwitchTab => "Cycle top tabs (Files ↔ Git ↔ Graph)",
         HelpSwitchPanel => "Switch focused panel (sidebar ↔ editor)",
@@ -316,6 +327,10 @@ fn t_en(m: Msg) -> &'static str {
         HelpDragDrop => {
             "Enter place mode: click a folder to copy there, Esc / right-click to cancel"
         }
+        HelpRenameEntry => "Rename the selected entry",
+        HelpDeleteEntry => "Move to Trash (with confirm)",
+        HelpHardDeleteEntry => "Delete permanently (cannot be undone)",
+        HelpRightClickMenu => "Open file-tree context menu",
         HelpAnyKey => "Close help",
     }
 }
@@ -478,6 +493,165 @@ pub fn place_mode_copying_banner() -> String {
     match lang() {
         Lang::Zh => " ⋯ 正在复制… ".to_string(),
         Lang::En => " ⋯ Copying… ".to_string(),
+    }
+}
+
+/// Toast text after a successful file-tree mutation (Create / Rename /
+/// Trash / HardDelete). The `kind` is carried on the `WorkerResult::FsMutation`
+/// so each branch can pick an appropriate verb without the merge site
+/// having to re-derive it from paths.
+pub fn fs_mutation_success_toast(kind: &crate::tasks::FsMutationKind) -> String {
+    use crate::tasks::FsMutationKind as K;
+    match (lang(), kind) {
+        (Lang::Zh, K::CreatedFile { name }) => format!("已创建文件 {name}"),
+        (Lang::En, K::CreatedFile { name }) => format!("Created {name}"),
+        (Lang::Zh, K::CreatedFolder { name }) => format!("已创建文件夹 {name}"),
+        (Lang::En, K::CreatedFolder { name }) => format!("Created folder {name}"),
+        (Lang::Zh, K::Renamed { old_name, new_name }) => {
+            format!("已重命名 {old_name} → {new_name}")
+        }
+        (Lang::En, K::Renamed { old_name, new_name }) => {
+            format!("Renamed {old_name} → {new_name}")
+        }
+        (Lang::Zh, K::Trashed { name }) => format!("已移动到废纸篓: {name}"),
+        (Lang::En, K::Trashed { name }) => format!("Moved to Trash: {name}"),
+        (Lang::Zh, K::HardDeleted { name }) => format!("已永久删除: {name}"),
+        (Lang::En, K::HardDeleted { name }) => format!("Deleted permanently: {name}"),
+    }
+}
+
+/// Toast text after a file-tree mutation fails. Carries the raw error
+/// string from the worker so permission / EEXIST / cross-device-link
+/// failures aren't silently swallowed.
+pub fn fs_mutation_error_toast(kind: &crate::tasks::FsMutationKind, error: &str) -> String {
+    use crate::tasks::FsMutationKind as K;
+    let verb = match (lang(), kind) {
+        (Lang::Zh, K::CreatedFile { .. }) => "创建文件失败",
+        (Lang::En, K::CreatedFile { .. }) => "Create file failed",
+        (Lang::Zh, K::CreatedFolder { .. }) => "创建文件夹失败",
+        (Lang::En, K::CreatedFolder { .. }) => "Create folder failed",
+        (Lang::Zh, K::Renamed { .. }) => "重命名失败",
+        (Lang::En, K::Renamed { .. }) => "Rename failed",
+        (Lang::Zh, K::Trashed { .. }) => "移动到废纸篓失败",
+        (Lang::En, K::Trashed { .. }) => "Move to Trash failed",
+        (Lang::Zh, K::HardDeleted { .. }) => "删除失败",
+        (Lang::En, K::HardDeleted { .. }) => "Delete failed",
+    };
+    format!("{verb}: {error}")
+}
+
+// ─── File-tree edit row / delete confirm / toolbar ──────────────────────────
+
+/// Placeholder shown in an empty editable row when the user hasn't
+/// typed yet. Differs by mode so the hint tells them what they're
+/// about to create.
+pub fn tree_edit_placeholder(mode: crate::tree_edit::TreeEditMode) -> &'static str {
+    use crate::tree_edit::TreeEditMode as M;
+    match (lang(), mode) {
+        (Lang::Zh, M::NewFile) => "新文件名…",
+        (Lang::En, M::NewFile) => "New file name…",
+        (Lang::Zh, M::NewFolder) => "新文件夹名…",
+        (Lang::En, M::NewFolder) => "New folder name…",
+        (Lang::Zh, M::Rename) => "新名字…",
+        (Lang::En, M::Rename) => "New name…",
+    }
+}
+
+/// Error line rendered directly under the editable row when commit is
+/// rejected. Uses the specific variant so the user knows whether to
+/// change the name or delete the conflicting file first.
+pub fn tree_edit_error(err: &crate::tree_edit::TreeEditError) -> String {
+    use crate::tree_edit::TreeEditError as E;
+    match (lang(), err) {
+        (Lang::Zh, E::InvalidName) => "名字不能为空或是 `.` / `..`".to_string(),
+        (Lang::En, E::InvalidName) => "Name cannot be empty or `.` / `..`".to_string(),
+        (Lang::Zh, E::IllegalChars) => "名字不能包含 `/`、`\\` 或控制字符".to_string(),
+        (Lang::En, E::IllegalChars) => {
+            "Name cannot contain `/`, `\\`, or control chars".to_string()
+        }
+        (Lang::Zh, E::NameAlreadyExists(name)) => format!("`{name}` 已存在"),
+        (Lang::En, E::NameAlreadyExists(name)) => format!("`{name}` already exists"),
+    }
+}
+
+/// Status-bar takeover while a delete is pending confirmation. `hard`
+/// switches the wording so the user sees that Shift+Delete is
+/// permanent, not just trash.
+pub fn tree_delete_confirm_prompt(name: &str, is_dir: bool, hard: bool) -> String {
+    let kind_zh = if is_dir { "文件夹" } else { "文件" };
+    let kind_en = if is_dir { "folder" } else { "file" };
+    match (lang(), hard) {
+        (Lang::Zh, true) => format!("  ⚠ 永久删除{kind_zh} `{name}`？(不可恢复) (y / Esc)  "),
+        (Lang::En, true) => {
+            format!("  ⚠ Permanently delete {kind_en} `{name}`? (cannot be undone) (y / Esc)  ")
+        }
+        (Lang::Zh, false) => format!("  ⚠ 把{kind_zh} `{name}` 移到废纸篓？(y / Esc)  "),
+        (Lang::En, false) => format!("  ⚠ Move {kind_en} `{name}` to Trash? (y / Esc)  "),
+    }
+}
+
+/// Warning toast when the user tries to start / confirm another
+/// tree mutation while one is still in flight. Prevents the
+/// generation-bump race where an earlier worker result would be
+/// silently dropped.
+pub fn tree_op_blocked_by_in_flight() -> String {
+    match lang() {
+        Lang::Zh => "上次文件操作还在进行中，稍等再试".to_string(),
+        Lang::En => "A file operation is still running — please wait".to_string(),
+    }
+}
+
+/// Toast when "Reveal in Finder" fires on a platform we haven't wired
+/// up yet.
+pub fn tree_reveal_unsupported_platform() -> String {
+    match lang() {
+        Lang::Zh => "Reveal in Finder 目前只支持 macOS / Windows".to_string(),
+        Lang::En => "Reveal in Finder is only supported on macOS / Windows yet".to_string(),
+    }
+}
+
+/// Right-click context-menu item labels. Kept parallel with
+/// `ContextMenuItem` so the render loop can map 1:1.
+pub fn tree_context_menu_label(item: &crate::tree_context_menu::ContextMenuItem) -> &'static str {
+    use crate::tree_context_menu::ContextMenuItem as I;
+    match (lang(), item) {
+        (Lang::Zh, I::NewFile) => "新建文件",
+        (Lang::En, I::NewFile) => "New File",
+        (Lang::Zh, I::NewFolder) => "新建文件夹",
+        (Lang::En, I::NewFolder) => "New Folder",
+        (Lang::Zh, I::Rename) => "重命名",
+        (Lang::En, I::Rename) => "Rename",
+        (Lang::Zh, I::Delete) => "删除",
+        (Lang::En, I::Delete) => "Delete",
+        (Lang::Zh, I::RevealInFinder) => "在 Finder 中显示",
+        (Lang::En, I::RevealInFinder) => "Reveal in Finder",
+    }
+}
+
+/// Toolbar button tooltips — rendered inline next to the icon when the
+/// panel is wide enough. Narrow panels render icons only.
+pub fn tree_toolbar_new_file() -> &'static str {
+    match lang() {
+        Lang::Zh => "新建文件",
+        Lang::En => "New File",
+    }
+}
+pub fn tree_toolbar_new_folder() -> &'static str {
+    match lang() {
+        Lang::Zh => "新建文件夹",
+        Lang::En => "New Folder",
+    }
+}
+pub fn tree_toolbar_refresh() -> &'static str {
+    match lang() {
+        Lang::Zh => "刷新",
+        Lang::En => "Refresh",
+    }
+}
+pub fn tree_toolbar_collapse_all() -> &'static str {
+    match lang() {
+        Lang::Zh => "全部折叠",
+        Lang::En => "Collapse All",
     }
 }
 

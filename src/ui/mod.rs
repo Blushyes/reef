@@ -449,7 +449,6 @@ fn render_search_prompt(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let prompt_text = format!("{}{}", prefix, query);
-    let prompt_width = UnicodeWidthStr::width(prompt_text.as_str()) as u16;
     let right_width = UnicodeWidthStr::width(right.as_str()) as u16;
 
     // Draw background fill for the whole row first.
@@ -479,9 +478,13 @@ fn render_search_prompt(f: &mut Frame, app: &App, area: Rect) {
         );
     }
 
-    // Blinking terminal cursor at the tail of the query — lets the user see
-    // their insertion point without a static `█` glyph.
-    let cursor_x = area.x + prompt_width.min(area.width.saturating_sub(1));
+    // Blinking terminal cursor at the current insertion point — lets the user
+    // see where new chars will land without a static `█` glyph.
+    let prefix_w = 1u16; // '/' and '?' are always narrow.
+    let cursor_w =
+        UnicodeWidthStr::width(&app.search.query[..app.search.cursor.min(app.search.query.len())])
+            as u16;
+    let cursor_x = area.x + (prefix_w + cursor_w).min(area.width.saturating_sub(1));
     f.set_cursor_position((cursor_x, area.y));
 }
 

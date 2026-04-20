@@ -76,6 +76,13 @@ fn render_unified(f: &mut Frame, app: &mut App, area: Rect, diff: &DiffContent) 
     // Remember viewport height for search-jump centering.
     app.last_diff_view_h = visible_rows as u16;
 
+    // Clamp vertical scroll so we can't scroll past the last displayable row.
+    // Must come before the horizontal max-width calc below, which itself
+    // uses `skip(app.diff_scroll)` and would see an empty slice if we let
+    // the offset run past the end.
+    let max_scroll = all_lines.len().saturating_sub(visible_rows);
+    app.diff_scroll = app.diff_scroll.min(max_scroll);
+
     // Clamp horizontal scroll against the widest Content line currently in view.
     let max_visible_w: usize = all_lines
         .iter()
@@ -333,6 +340,10 @@ fn render_side_by_side(f: &mut Frame, app: &mut App, area: Rect, diff: &DiffCont
     let right_content_w = (right_w as usize).saturating_sub(gutter);
     let visible_rows = max_y.saturating_sub(y) as usize;
     app.last_diff_view_h = visible_rows as u16;
+
+    // Clamp vertical scroll so we can't scroll past the last displayable row.
+    let max_scroll = all_lines.len().saturating_sub(visible_rows);
+    app.diff_scroll = app.diff_scroll.min(max_scroll);
 
     // Clamp horizontal scroll against the widest text column in view (either side).
     let max_visible_w: usize = all_lines

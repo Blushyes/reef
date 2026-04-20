@@ -1306,7 +1306,25 @@ fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: 
         (Tab::Files, false) => Some(&mut app.preview_h_scroll),
         (Tab::Git, false) => Some(&mut app.diff_h_scroll),
         (Tab::Search, false) => Some(&mut app.preview_h_scroll),
-        (Tab::Graph, false) => Some(&mut app.commit_detail.diff_h_scroll),
+        (Tab::Graph, false) => {
+            // Graph's right panel is the commit detail. SBS layout splits
+            // that panel in half visually, and each half scrolls
+            // independently (old vs new version). Unified layout has one
+            // scroll for the whole panel.
+            match app.commit_detail.diff_layout {
+                crate::app::DiffLayout::Unified => Some(&mut app.commit_detail.diff_h_scroll),
+                crate::app::DiffLayout::SideBySide => {
+                    let panel_start = split_x;
+                    let panel_w = total_width.saturating_sub(panel_start);
+                    let panel_mid = panel_start.saturating_add(panel_w / 2);
+                    if column < panel_mid {
+                        Some(&mut app.commit_detail.sbs_left_h_scroll)
+                    } else {
+                        Some(&mut app.commit_detail.sbs_right_h_scroll)
+                    }
+                }
+            }
+        }
     };
     let Some(target) = target else {
         return;

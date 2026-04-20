@@ -109,10 +109,17 @@ pub struct CommitDetailState {
     /// offset covers the whole view — the commit detail is rendered as a
     /// single list rather than split scroll regions.
     pub scroll: usize,
-    /// Horizontal scroll in display columns. Shared across the header /
+    /// Horizontal scroll for Unified layout. Shared across the header /
     /// files list / diff rows — the panel renders as a single list, and
-    /// `clip_spans` applies this offset uniformly per row.
+    /// `clip_spans` applies this offset uniformly per row. SBS uses the
+    /// two fields below instead (each half scrolls independently).
     pub diff_h_scroll: usize,
+    /// Horizontal scroll for the SBS left half (old version). Independent
+    /// of the right half and of `diff_h_scroll` — switching diff layouts
+    /// preserves all three.
+    pub sbs_left_h_scroll: usize,
+    /// Horizontal scroll for the SBS right half (new version).
+    pub sbs_right_h_scroll: usize,
 }
 
 impl Default for CommitDetailState {
@@ -126,6 +133,8 @@ impl Default for CommitDetailState {
             files_collapsed: HashSet::new(),
             scroll: 0,
             diff_h_scroll: 0,
+            sbs_left_h_scroll: 0,
+            sbs_right_h_scroll: 0,
         }
     }
 }

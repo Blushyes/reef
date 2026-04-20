@@ -1,4 +1,5 @@
 pub mod commit_detail_panel;
+pub mod context_menu_panel;
 pub mod diff_panel;
 pub mod file_preview_panel;
 pub mod file_tree_panel;
@@ -101,6 +102,17 @@ pub fn render(f: &mut Frame, app: &mut App) {
     }
     if app.global_search.active {
         global_search_panel::render(f, app, size);
+    }
+    // Context menu overlay renders last so it sits above the help
+    // popup and any other in-panel chrome. The menu itself is scoped
+    // to the Files tab but we don't gate on `active_tab` here: the
+    // menu can only be opened from a right-click while the Files tab
+    // is active, and `tree_edit.active` implicitly prevents concurrent
+    // opens. Once shown, the menu should stay visible even if the
+    // user tab-switches (unlikely — input is gated) so the render
+    // check only looks at `tree_context_menu.active`.
+    if app.tree_context_menu.active {
+        context_menu_panel::render(f, app, size);
     }
 }
 
@@ -349,6 +361,45 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    // Tree delete-confirm: status bar becomes a red ⚠ prompt. Mirrors
+    // the select/place mode takeover pattern. Confirm key routing
+    // lives in `input::handle_key_tree_delete_confirm` — here we
+    // just draw.
+    if let Some(pending) = app.tree_delete_confirm.as_ref() {
+        let prompt = crate::i18n::tree_delete_confirm_prompt(
+            &pending.display_name,
+            pending.is_dir,
+            pending.hard,
+        );
+        let badge = if pending.hard {
+            " ⚠ DELETE "
+        } else {
+            " 🗑 TRASH "
+        };
+        let hint = Line::from(vec![
+            Span::styled(
+                badge,
+                Style::default()
+                    .fg(Color::White)
+                    .bg(th.error_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                prompt,
+                Style::default()
+                    .fg(th.fg_primary)
+                    .bg(th.chrome_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " ".repeat(area.width.saturating_sub(80) as usize),
+                Style::default().bg(th.chrome_bg),
+            ),
+        ]);
+        f.render_widget(hint, area);
+        return;
+    }
+
     // Show the most recent toast (push success/failure etc.) inline.
     let (notif, notif_color) = match app.toasts.last() {
         Some(t) => (
@@ -466,8 +517,8 @@ fn render_help(f: &mut Frame, app: &App, screen: Rect) {
         ("Tab", t(Msg::HelpSwitchTab)),
         ("Shift+Tab", t(Msg::HelpSwitchPanel)),
         ("1 … 9", t(Msg::HelpJumpTab)),
-        ("↑ / k", t(Msg::HelpNavUp)),
-        ("↓ / j", t(Msg::HelpNavDown)),
+        ("↑ / k / Ctrl+P", t(Msg::HelpNavUp)),
+        ("↓ / j / Ctrl+N", t(Msg::HelpNavDown)),
         ("PageUp", t(Msg::HelpPageUp)),
         ("PageDown", t(Msg::HelpPageDown)),
         ("← / →", t(Msg::HelpHScroll)),
@@ -485,6 +536,10 @@ fn render_help(f: &mut Frame, app: &App, screen: Rect) {
         ("Space p", t(Msg::HelpQuickOpen)),
         ("Space f", t(Msg::HelpGlobalSearch)),
         (t(Msg::HelpKeyDragDrop), t(Msg::HelpDragDrop)),
+        ("F2", t(Msg::HelpRenameEntry)),
+        ("d / Del / ⌫", t(Msg::HelpDeleteEntry)),
+        ("Shift+D / Shift+Del", t(Msg::HelpHardDeleteEntry)),
+        (t(Msg::HelpKeyRightClick), t(Msg::HelpRightClickMenu)),
         (t(Msg::HelpKeyAnyKey), t(Msg::HelpAnyKey)),
     ];
 

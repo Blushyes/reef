@@ -67,15 +67,57 @@ impl FileTree {
         }
     }
 
+    /// Collapse every currently-expanded directory. The `expanded` set is
+    /// cleared rather than toggling each entry so the next rebuild emits
+    /// only the top-level rows. Selection clamps to index 0 so the viewport
+    /// doesn't end up pointing past the shortened entry list.
+    ///
+    /// Does not rebuild by itself — callers drive the async refresh path
+    /// (`App::refresh_file_tree_with_target`) so the file worker gets a
+    /// chance to also re-read git decorations atomically with the reshape.
+    pub fn collapse_all(&mut self) {
+        self.expanded.clear();
+        self.selected = 0;
+    }
+
     pub fn navigate(&mut self, delta: i32) {
         if self.entries.is_empty() {
             return;
         }
+        let last = self.entries.len() - 1;
+        // Cleared-selection sentinel (`selected >= entries.len()`): treat
+        // the first arrow key as "land on an edge" — Down → first row,
+        // Up → last row, matching VSCode's Explorer when nothing is
+        // selected. Without this, `selected + 1` on the sentinel would
+        // arithmetic-overflow.
+        if self.selected > last {
+            self.selected = if delta > 0 { 0 } else { last };
+            return;
+        }
         if delta > 0 {
-            self.selected = (self.selected + delta as usize).min(self.entries.len() - 1);
+            self.selected = (self.selected + delta as usize).min(last);
         } else {
             self.selected = self.selected.saturating_sub((-delta) as usize);
         }
+    }
+
+    /// VSCode-style "nothing selected" state. `clear_selection` drops the
+    /// highlight so a subsequent toolbar `+ File` / `+ Folder` creates at
+    /// the project root, and right-click menu / F2 / Del no-op until the
+    /// user picks a row again.
+    ///
+    /// Implementation: sets `selected` to `entries.len()`, a value that's
+    /// always out of range so `selected_entry()` returns `None` and
+    /// `is_selected == global_idx` never matches in render. Avoids the
+    /// invasive refactor to `Option<usize>` all callers would need.
+    pub fn clear_selection(&mut self) {
+        self.selected = self.entries.len();
+    }
+
+    /// Whether `selected` currently points past the last entry (i.e. the
+    /// "cleared" sentinel state).
+    pub fn selected_cleared(&self) -> bool {
+        self.selected >= self.entries.len()
     }
 
     pub fn selected_entry(&self) -> Option<&TreeEntry> {

@@ -2,18 +2,18 @@
 source: tests/ui_snapshots.rs
 expression: output
 ---
- reef  [TMPDIR]  ⎇ (detached)
+ reef  [TMPDIR]  ⎇ master
  📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph           1:Files 2:Search 3:Git 4:Graph
  +   📁    ↻   ⊟        │
- (empty)               │
-                       │
-                       │
-                       │
-                       │
-                       │
-                       │
-                       │                  Select a file to preview
-                       │
+ ▸ src ●               │
+   README.md           │
+    ┌────────────────────┐
+    │  New File          │
+    │  New Folder        │
+    │  Rename            │
+    │  Delete            │
+    │  Reveal in Finder  │                Select a file to preview
+    └────────────────────┘
                        │
                        │
                        │

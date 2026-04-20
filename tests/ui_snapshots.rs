@@ -179,6 +179,84 @@ fn snapshot_place_mode_renders_banner_and_border() {
 }
 
 #[test]
+fn snapshot_tree_edit_row_new_file() {
+    // Locks in the VSCode-style inline editor visuals: the toolbar row,
+    // the editable row injected after the anchor folder, the cursor
+    // block on the first empty cell, and the placeholder text. If this
+    // regresses, the user's typing would either render to the wrong
+    // row or the cursor would go invisible.
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "README.md", "# hi\n", "init");
+    std::fs::create_dir(tmp.path().join("src")).unwrap();
+    write_file(&raw, "src/main.rs", "fn main() {}\n");
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark());
+    app.refresh_file_tree();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        app.tick();
+        if !app.file_tree_load.loading && !app.file_tree.entries.is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Kick off a NewFile edit anchored on the first top-level folder so
+    // the editable row renders indented one deeper than the folder.
+    let parent_dir = tmp.path().join("src");
+    app.begin_tree_edit(
+        reef::tree_edit::TreeEditMode::NewFile,
+        parent_dir,
+        None,
+        Some(0),
+    );
+
+    let output = render_app(&mut app, 80, 20);
+    with_filters(|| insta::assert_snapshot!("tree_edit_row_new_file", output));
+}
+
+#[test]
+fn snapshot_tree_context_menu() {
+    // Locks in the right-click context-menu popup visuals. If the menu
+    // regresses the user would lose access to Rename / Delete / Reveal
+    // on a pure mouse workflow.
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "README.md", "# hi\n", "init");
+    std::fs::create_dir(tmp.path().join("src")).unwrap();
+    write_file(&raw, "src/main.rs", "fn main() {}\n");
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark());
+    app.refresh_file_tree();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        app.tick();
+        if !app.file_tree_load.loading && !app.file_tree.entries.is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Open menu anchored at column 4, row 5 — arbitrary coords that
+    // leave room for the popup to render inline without getting
+    // clamped by the right edge. target_entry_idx=0 hits the first
+    // file-tree row so the full ALL_FOR_ENTRY menu is offered.
+    app.open_tree_context_menu(Some(0), (4, 5));
+
+    let output = render_app(&mut app, 80, 20);
+    with_filters(|| insta::assert_snapshot!("tree_context_menu", output));
+}
+
+#[test]
 fn snapshot_with_staged_and_unstaged_light_theme() {
     // Locks in the light-theme wiring: a dark-vs-light snapshot diff must exist
     // somewhere, otherwise the Theme plumbing could silently regress to dark.

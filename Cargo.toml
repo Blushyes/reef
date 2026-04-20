@@ -27,6 +27,11 @@ grep-regex    = "0.1.14"
 grep-matcher  = "0.1.8"
 serde_json    = { workspace = true }
 terminal-colorsaurus = "1.0.3"
+# Cross-platform "Move to Trash" for the file-tree delete action.
+# macOS: NSWorkspace recycleURLs; Linux: XDG freedesktop spec; Windows:
+# SHFileOperationW. Safer default than `std::fs::remove_*` — hard delete
+# stays behind Shift+Delete.
+trash         = "5"
 
 [dev-dependencies]
 tempfile     = "3"

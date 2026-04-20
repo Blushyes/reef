@@ -364,12 +364,21 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     rows.push(Row::blank());
 
     for raw in detail.message.lines() {
+        // content_width uses the *raw* line width (pre-truncation) so clamp
+        // converges to the real end of the message; otherwise content_width
+        // would equal virtual_w while the line is truncated, and max_h
+        // would track the user's h_scroll indefinitely — then snap back
+        // when the line finally fits (the "jitter" you see at the right edge).
+        let raw_w = UnicodeWidthStr::width(raw);
         let mut msg = raw.to_string();
         truncate_in_place(&mut msg, max_msg);
-        rows.push(Row::new(vec![
-            RowSpan::plain("    "),
-            RowSpan::styled(msg, Style::default().fg(theme.fg_primary)),
-        ]));
+        rows.push(
+            Row::new(vec![
+                RowSpan::plain("    "),
+                RowSpan::styled(msg, Style::default().fg(theme.fg_primary)),
+            ])
+            .with_content_width(4 + raw_w),
+        );
     }
 
     rows.push(Row::blank());
@@ -449,6 +458,10 @@ fn commit_file_row(
         FileStatus::Renamed => Color::Cyan,
         FileStatus::Untracked => Color::Green,
     };
+    // content_width uses the raw (pre-truncation) path width so clamp
+    // converges on the full path instead of chasing virtual_w.
+    let indent_w = UnicodeWidthStr::width(indent);
+    let full_display_w = UnicodeWidthStr::width(display_path);
     let mut display = display_path.to_string();
     truncate_in_place(&mut display, ctx.max_path);
 
@@ -464,10 +477,12 @@ fn commit_file_row(
         RowSpan::styled(display, apply_bg(Style::default().fg(ctx.fg), base_bg)),
     ];
 
-    Row::new(spans).on_click(
-        "git.selectCommitFile",
-        serde_json::json!({ "oid": ctx.commit_oid, "path": file.path }),
-    )
+    Row::new(spans)
+        .on_click(
+            "git.selectCommitFile",
+            serde_json::json!({ "oid": ctx.commit_oid, "path": file.path }),
+        )
+        .with_content_width(indent_w + 2 + full_display_w)
 }
 
 fn render_commit_file_tree(
@@ -544,6 +559,9 @@ fn diff_header_row(
     let tag_w = UnicodeWidthStr::width(tag_str.as_str());
     let path_max = (width as usize).saturating_sub(tag_w);
     let path_display = truncate_to_display_width(path, path_max).to_string();
+    // content_width uses the full path width so clamp converges independent
+    // of virtual_w (see commit message row for the full rationale).
+    let full_path_w = UnicodeWidthStr::width(path);
 
     Row::new(vec![
         RowSpan::styled(
@@ -554,6 +572,7 @@ fn diff_header_row(
         ),
         RowSpan::styled(tag_str, Style::default().fg(theme.fg_secondary)),
     ])
+    .with_content_width(full_path_w + tag_w)
 }
 
 fn diff_separator_row(width: u16, theme: &Theme) -> Row {
@@ -626,12 +645,16 @@ fn append_unified_diff(rows: &mut Vec<Row>, diff: &DiffContent, width: u16, them
             // `virtual_w` so diff bg spans the viewport). Uses the *original*
             // line.content width — `content` above may have been trimmed by
             // `max_text`, but we want clamp to converge to the real line.
+            // The gutter format below is " NNNNN  NNNNN  " = 15 cols, matching
+            // DIFF_GUTTER_WIDTH and the git tab's diff panel; an earlier off-by-one
+            // (14-col gutter via 1 trailing space) made content_width skew by 1
+            // and contributed to right-edge misalignment.
             let line_content_w = DIFF_GUTTER_WIDTH
                 .saturating_add(2)
                 .saturating_add(UnicodeWidthStr::width(line.content.as_str()));
             rows.push(
                 Row::new(vec![
-                    RowSpan::styled(format!(" {}  {} ", old_no, new_no), g),
+                    RowSpan::styled(format!(" {}  {}  ", old_no, new_no), g),
                     RowSpan::styled(format!("{} ", prefix), m),
                     RowSpan::styled(content, t),
                     RowSpan::styled(" ".repeat(pad), p),

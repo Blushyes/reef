@@ -1244,14 +1244,38 @@ impl App {
                         if self.tree_edit.active {
                             let len = self.file_tree.entries.len();
                             if let Some(idx) = self.tree_edit.anchor_idx {
-                                if idx >= len {
+                                // Rename needs a stricter check than
+                                // Create: a tree shift that keeps the
+                                // idx in-range but swaps the entry
+                                // underneath it leaves the edit row
+                                // visually attached to the wrong file.
+                                // Commit would then try to rename a
+                                // still-existing `rename_target` path
+                                // that the user can no longer see, and
+                                // fail with ENOENT if the original was
+                                // also renamed externally. Detect the
+                                // mismatch by comparing the row's
+                                // current absolute path against
+                                // `rename_target`.
+                                let stale = match self.tree_edit.mode {
+                                    Some(crate::tree_edit::TreeEditMode::Rename) => {
+                                        let current = self
+                                            .file_tree
+                                            .entries
+                                            .get(idx)
+                                            .map(|e| self.file_tree.root.join(&e.path));
+                                        current.as_ref() != self.tree_edit.rename_target.as_ref()
+                                    }
+                                    _ => idx >= len,
+                                };
+                                if stale {
                                     match self.tree_edit.mode {
                                         Some(crate::tree_edit::TreeEditMode::Rename) => {
                                             // Can't synthesise a valid
                                             // rename anchor if the target
-                                            // entry is gone. Cancel; the
-                                            // user can redo F2 after they
-                                            // orient.
+                                            // entry moved or is gone.
+                                            // Cancel; the user can redo
+                                            // F2 after they orient.
                                             self.tree_edit.clear();
                                         }
                                         _ => {

@@ -1105,6 +1105,48 @@ impl App {
         self.load_diff();
     }
 
+    pub fn stage_folder(&mut self, folder_path: &str) {
+        let paths: Vec<String> = self
+            .unstaged_files
+            .iter()
+            .filter(|f| folder_contains(folder_path, &f.path))
+            .map(|f| f.path.clone())
+            .collect();
+        for p in &paths {
+            if let Some(ref repo) = self.repo {
+                let _ = repo.stage_file(p);
+            }
+        }
+        if let Some(ref mut sel) = self.selected_file {
+            if paths.iter().any(|p| p == &sel.path) {
+                sel.is_staged = true;
+            }
+        }
+        self.refresh_status();
+        self.load_diff();
+    }
+
+    pub fn unstage_folder(&mut self, folder_path: &str) {
+        let paths: Vec<String> = self
+            .staged_files
+            .iter()
+            .filter(|f| folder_contains(folder_path, &f.path))
+            .map(|f| f.path.clone())
+            .collect();
+        for p in &paths {
+            if let Some(ref repo) = self.repo {
+                let _ = repo.unstage_file(p);
+            }
+        }
+        if let Some(ref mut sel) = self.selected_file {
+            if paths.iter().any(|p| p == &sel.path) {
+                sel.is_staged = false;
+            }
+        }
+        self.refresh_status();
+        self.load_diff();
+    }
+
     /// Apply the currently-pending discard target. Clears the confirmation
     /// banner, drops the selection if the discarded path(s) include it,
     /// then refreshes status + diff.

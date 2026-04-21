@@ -1,8 +1,9 @@
-use crate::app::{App, DiffLayout};
+use crate::app::{App, DiffHighlighted, DiffLayout, LineTokens};
 use crate::git::{DiffContent, DiffHunk, LineTag};
 use crate::i18n::{Msg, t};
 use crate::search::SearchTarget;
-use crate::ui::text::{clip_spans, overlay_match_highlight, skip_n_columns, truncate_to_width};
+use crate::ui::highlight::StyledToken;
+use crate::ui::text::{clip_spans, overlay_match_highlight, truncate_to_width};
 use crate::ui::theme::Theme;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -21,12 +22,16 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         None => {
             render_empty(f, app, inner);
         }
-        Some(diff) => {
+        Some(d) => {
             match app.diff_layout {
-                DiffLayout::Unified => render_unified(f, app, inner, &diff),
-                DiffLayout::SideBySide => render_side_by_side(f, app, inner, &diff),
+                DiffLayout::Unified => {
+                    render_unified(f, app, inner, &d.diff, d.highlighted.as_ref())
+                }
+                DiffLayout::SideBySide => {
+                    render_side_by_side(f, app, inner, &d.diff, d.highlighted.as_ref())
+                }
             }
-            app.diff_content = Some(diff);
+            app.diff_content = Some(d);
         }
     }
 }
@@ -46,26 +51,36 @@ fn render_empty(f: &mut Frame, app: &App, area: Rect) {
 
 // ─── Unified view ────────────────────────────────────────────────────────────
 
-fn render_unified(f: &mut Frame, app: &mut App, area: Rect, diff: &DiffContent) {
+fn render_unified(
+    f: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    diff: &DiffContent,
+    highlighted: Option<&DiffHighlighted>,
+) {
     let mut y = area.y;
     let max_y = area.y + area.height;
     let theme = app.theme;
 
     render_file_header(f, app, area, diff, &mut y, max_y);
 
-    // Build all display lines
+    // Build all display lines. Content rows pick up per-line syntect tokens
+    // when available so the render path can emit syntax-colored spans
+    // instead of a single plain-fg span.
     let mut all_lines: Vec<UnifiedLine> = Vec::new();
-    for (i, hunk) in diff.hunks.iter().enumerate() {
-        if i > 0 {
+    for (hi, hunk) in diff.hunks.iter().enumerate() {
+        if hi > 0 {
             all_lines.push(UnifiedLine::Separator);
         }
         all_lines.push(UnifiedLine::HunkHeader(hunk.header.clone()));
-        for line in &hunk.lines {
+        let hunk_tokens = highlighted.and_then(|h| h.get(hi));
+        for (li, line) in hunk.lines.iter().enumerate() {
             all_lines.push(UnifiedLine::Content {
                 tag: line.tag,
                 old_lineno: line.old_lineno,
                 new_lineno: line.new_lineno,
                 text: line.content.clone(),
+                tokens: hunk_tokens.and_then(|t| t.get(li)).cloned(),
             });
         }
     }
@@ -163,6 +178,7 @@ fn render_unified_line(
             old_lineno,
             new_lineno,
             text,
+            tokens: syntax_tokens,
         } => {
             let (prefix, fg, bg) = line_style(*tag, theme);
             let old_num = fmt_lineno(*old_lineno);
@@ -175,7 +191,13 @@ fn render_unified_line(
             // onto unshifted text. `clip_spans` then handles h_scroll without
             // caring that the token stream was split.
             let body_style = Style::default().fg(fg).bg(bg);
-            let base_tokens = vec![(body_style, text.clone())];
+            let base_tokens: Vec<StyledToken> = match syntax_tokens {
+                Some(toks) if !toks.is_empty() => toks
+                    .iter()
+                    .map(|(s, t)| (s.bg(bg), t.clone()))
+                    .collect(),
+                _ => vec![(body_style, text.clone())],
+            };
             let tokens = if match_ranges.is_empty() {
                 base_tokens
             } else {
@@ -220,6 +242,11 @@ enum UnifiedLine {
         old_lineno: Option<u32>,
         new_lineno: Option<u32>,
         text: String,
+        /// Syntect-colored tokens for this line (when a syntax resolved).
+        /// Concatenating token texts yields `text`; render path overlays
+        /// the row's bg on each token. `Arc` so per-hunk `tokens_for` pass
+        /// is O(1) per line.
+        tokens: Option<LineTokens>,
     },
 }
 
@@ -229,9 +256,14 @@ struct SbsRow {
     left_tag: LineTag,
     left_no: Option<u32>,
     left_text: String,
+    /// Syntect tokens for `left_text` (when a syntax resolved); concatenating
+    /// token texts yields `left_text`. `None` falls back to a single plain-fg
+    /// span at render time. `Arc` so pairing / render clones are O(1).
+    left_tokens: Option<LineTokens>,
     right_tag: LineTag,
     right_no: Option<u32>,
     right_text: String,
+    right_tokens: Option<LineTokens>,
 }
 
 enum SbsDisplayLine {
@@ -240,27 +272,39 @@ enum SbsDisplayLine {
     Row(SbsRow),
 }
 
-fn build_sbs_lines(hunk: &DiffHunk) -> Vec<SbsDisplayLine> {
+fn build_sbs_lines(
+    hunk: &DiffHunk,
+    hunk_tokens: Option<&Vec<LineTokens>>,
+) -> Vec<SbsDisplayLine> {
     let mut rows: Vec<SbsDisplayLine> = Vec::new();
-    let mut pending_removed: Vec<(Option<u32>, String)> = Vec::new();
+    // Carry tokens alongside each pending removal so a later Added pairing
+    // keeps the left half's syntax highlighting.
+    let mut pending_removed: Vec<(Option<u32>, String, Option<LineTokens>)> =
+        Vec::new();
+    let tokens_for = |li: usize| -> Option<LineTokens> {
+        hunk_tokens.and_then(|t| t.get(li)).cloned()
+    };
 
     rows.push(SbsDisplayLine::HunkHeader(hunk.header.clone()));
 
-    for line in &hunk.lines {
+    for (li, line) in hunk.lines.iter().enumerate() {
         match line.tag {
             LineTag::Removed => {
-                pending_removed.push((line.old_lineno, line.content.clone()));
+                pending_removed.push((line.old_lineno, line.content.clone(), tokens_for(li)));
             }
             LineTag::Added => {
-                if let Some((old_no, old_text)) = pending_removed.first().cloned() {
+                let added_tokens = tokens_for(li);
+                if let Some((old_no, old_text, old_tokens)) = pending_removed.first().cloned() {
                     pending_removed.remove(0);
                     rows.push(SbsDisplayLine::Row(SbsRow {
                         left_tag: LineTag::Removed,
                         left_no: old_no,
                         left_text: old_text,
+                        left_tokens: old_tokens,
                         right_tag: LineTag::Added,
                         right_no: line.new_lineno,
                         right_text: line.content.clone(),
+                        right_tokens: added_tokens,
                     }));
                 } else {
                     // Added with no paired removal
@@ -268,53 +312,68 @@ fn build_sbs_lines(hunk: &DiffHunk) -> Vec<SbsDisplayLine> {
                         left_tag: LineTag::Context,
                         left_no: None,
                         left_text: String::new(),
+                        left_tokens: None,
                         right_tag: LineTag::Added,
                         right_no: line.new_lineno,
                         right_text: line.content.clone(),
+                        right_tokens: added_tokens,
                     }));
                 }
             }
             LineTag::Context => {
                 // Flush pending removed (no matching additions)
-                for (old_no, old_text) in pending_removed.drain(..) {
+                for (old_no, old_text, old_tokens) in pending_removed.drain(..) {
                     rows.push(SbsDisplayLine::Row(SbsRow {
                         left_tag: LineTag::Removed,
                         left_no: old_no,
                         left_text: old_text,
+                        left_tokens: old_tokens,
                         right_tag: LineTag::Context,
                         right_no: None,
                         right_text: String::new(),
+                        right_tokens: None,
                     }));
                 }
                 // Context appears on both sides
+                let ctx_tokens = tokens_for(li);
                 rows.push(SbsDisplayLine::Row(SbsRow {
                     left_tag: LineTag::Context,
                     left_no: line.old_lineno,
                     left_text: line.content.clone(),
+                    left_tokens: ctx_tokens.clone(),
                     right_tag: LineTag::Context,
                     right_no: line.new_lineno,
                     right_text: line.content.clone(),
+                    right_tokens: ctx_tokens,
                 }));
             }
         }
     }
 
     // Flush any remaining pending removed
-    for (old_no, old_text) in pending_removed.drain(..) {
+    for (old_no, old_text, old_tokens) in pending_removed.drain(..) {
         rows.push(SbsDisplayLine::Row(SbsRow {
             left_tag: LineTag::Removed,
             left_no: old_no,
             left_text: old_text,
+            left_tokens: old_tokens,
             right_tag: LineTag::Context,
             right_no: None,
             right_text: String::new(),
+            right_tokens: None,
         }));
     }
 
     rows
 }
 
-fn render_side_by_side(f: &mut Frame, app: &mut App, area: Rect, diff: &DiffContent) {
+fn render_side_by_side(
+    f: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    diff: &DiffContent,
+    highlighted: Option<&DiffHighlighted>,
+) {
     let mut y = area.y;
     let max_y = area.y + area.height;
     let theme = app.theme;
@@ -323,11 +382,12 @@ fn render_side_by_side(f: &mut Frame, app: &mut App, area: Rect, diff: &DiffCont
 
     // Build all display lines
     let mut all_lines: Vec<SbsDisplayLine> = Vec::new();
-    for (i, hunk) in diff.hunks.iter().enumerate() {
-        if i > 0 {
+    for (hi, hunk) in diff.hunks.iter().enumerate() {
+        if hi > 0 {
             all_lines.push(SbsDisplayLine::Separator);
         }
-        all_lines.extend(build_sbs_lines(hunk));
+        let hunk_tokens = highlighted.and_then(|h| h.get(hi));
+        all_lines.extend(build_sbs_lines(hunk, hunk_tokens));
     }
 
     // Half width: leave 1 col for center divider
@@ -416,22 +476,21 @@ fn render_sbs_row(
     let left_content_w = (half_w as usize).saturating_sub(gutter);
     let (_, left_fg, left_bg) = line_style(row.left_tag, theme);
     let left_no = fmt_lineno(row.left_no);
-    let left_shifted = skip_n_columns(&row.left_text, h_scroll);
-    let left_text = truncate_to_width(left_shifted, left_content_w);
-    let left_pad = left_content_w.saturating_sub(UnicodeWidthStr::width(left_text));
+    let left_body = build_sbs_body_tokens(&row.left_text, row.left_tokens.as_ref(), left_fg, left_bg);
+    let left_spans = clip_spans(&left_body, h_scroll, left_content_w);
+    let left_used: usize = left_spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
+    let left_pad = left_content_w.saturating_sub(left_used);
 
-    let left_line = Line::from(vec![
-        Span::styled(
-            format!(" {} ", left_no),
-            Style::default().fg(theme.fg_secondary).bg(left_bg),
-        ),
-        Span::styled(
-            left_text.to_string(),
-            Style::default().fg(left_fg).bg(left_bg),
-        ),
-        Span::styled(" ".repeat(left_pad), Style::default().bg(left_bg)),
-    ]);
-    f.render_widget(left_line, Rect::new(area.x, y, half_w, 1));
+    let mut left_line_spans = vec![Span::styled(
+        format!(" {} ", left_no),
+        Style::default().fg(theme.fg_secondary).bg(left_bg),
+    )];
+    left_line_spans.extend(left_spans);
+    left_line_spans.push(Span::styled(" ".repeat(left_pad), Style::default().bg(left_bg)));
+    f.render_widget(Line::from(left_line_spans), Rect::new(area.x, y, half_w, 1));
 
     // ── Divider ──
     let div_x = area.x + half_w;
@@ -442,22 +501,43 @@ fn render_sbs_row(
     let right_content_w = (right_w as usize).saturating_sub(gutter);
     let (_, right_fg, right_bg) = line_style(row.right_tag, theme);
     let right_no = fmt_lineno(row.right_no);
-    let right_shifted = skip_n_columns(&row.right_text, h_scroll);
-    let right_text = truncate_to_width(right_shifted, right_content_w);
-    let right_pad = right_content_w.saturating_sub(UnicodeWidthStr::width(right_text));
+    let right_body =
+        build_sbs_body_tokens(&row.right_text, row.right_tokens.as_ref(), right_fg, right_bg);
+    let right_spans = clip_spans(&right_body, h_scroll, right_content_w);
+    let right_used: usize = right_spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
+    let right_pad = right_content_w.saturating_sub(right_used);
 
-    let right_line = Line::from(vec![
-        Span::styled(
-            format!(" {} ", right_no),
-            Style::default().fg(theme.fg_secondary).bg(right_bg),
-        ),
-        Span::styled(
-            right_text.to_string(),
-            Style::default().fg(right_fg).bg(right_bg),
-        ),
-        Span::styled(" ".repeat(right_pad), Style::default().bg(right_bg)),
-    ]);
-    f.render_widget(right_line, Rect::new(div_x + 1, y, right_w, 1));
+    let mut right_line_spans = vec![Span::styled(
+        format!(" {} ", right_no),
+        Style::default().fg(theme.fg_secondary).bg(right_bg),
+    )];
+    right_line_spans.extend(right_spans);
+    right_line_spans.push(Span::styled(
+        " ".repeat(right_pad),
+        Style::default().bg(right_bg),
+    ));
+    f.render_widget(
+        Line::from(right_line_spans),
+        Rect::new(div_x + 1, y, right_w, 1),
+    );
+}
+
+/// Pick the token stream for one SBS body: syntect tokens (bg overlaid per-token)
+/// when available, else a single plain-fg span with bg. `Arc` lets the caller
+/// pass a per-line handle it got cheaply from the hunk token table.
+fn build_sbs_body_tokens(
+    text: &str,
+    tokens: Option<&LineTokens>,
+    fg: Color,
+    bg: Color,
+) -> Vec<StyledToken> {
+    match tokens {
+        Some(toks) if !toks.is_empty() => toks.iter().map(|(s, t)| (s.bg(bg), t.clone())).collect(),
+        _ => vec![(Style::default().fg(fg).bg(bg), text.to_string())],
+    }
 }
 
 // ─── Shared helpers ──────────────────────────────────────────────────────────
@@ -530,6 +610,7 @@ fn fmt_lineno(n: Option<u32>) -> String {
 mod tests {
     use super::*;
     use crate::git::{DiffHunk, DiffLine, LineTag};
+    use std::sync::Arc;
 
     fn make_line(
         tag: LineTag,
@@ -618,7 +699,7 @@ mod tests {
     #[test]
     fn build_sbs_lines_starts_with_hunk_header() {
         let hunk = make_hunk("@@ -1,2 +1,2 @@", vec![]);
-        let lines = build_sbs_lines(&hunk);
+        let lines = build_sbs_lines(&hunk, None);
         assert!(matches!(lines.first(), Some(SbsDisplayLine::HunkHeader(_))));
     }
 
@@ -628,7 +709,7 @@ mod tests {
             "@@ @@",
             vec![make_line(LineTag::Context, "same", Some(1), Some(1))],
         );
-        let lines = build_sbs_lines(&hunk);
+        let lines = build_sbs_lines(&hunk, None);
         let rows = get_rows(&lines);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].left_tag, LineTag::Context);
@@ -643,7 +724,7 @@ mod tests {
             "@@ @@",
             vec![make_line(LineTag::Added, "new line", None, Some(1))],
         );
-        let lines = build_sbs_lines(&hunk);
+        let lines = build_sbs_lines(&hunk, None);
         let rows = get_rows(&lines);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].left_tag, LineTag::Context);
@@ -658,7 +739,7 @@ mod tests {
             "@@ @@",
             vec![make_line(LineTag::Removed, "old line", Some(1), None)],
         );
-        let lines = build_sbs_lines(&hunk);
+        let lines = build_sbs_lines(&hunk, None);
         let rows = get_rows(&lines);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].left_tag, LineTag::Removed);
@@ -676,7 +757,7 @@ mod tests {
                 make_line(LineTag::Added, "new", None, Some(1)),
             ],
         );
-        let lines = build_sbs_lines(&hunk);
+        let lines = build_sbs_lines(&hunk, None);
         let rows = get_rows(&lines);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].left_text, "old");
@@ -692,6 +773,63 @@ mod tests {
                 make_line(LineTag::Context, "line2", Some(2), Some(2)),
             ],
         );
-        assert_eq!(count_rows(&build_sbs_lines(&hunk)), 2);
+        assert_eq!(count_rows(&build_sbs_lines(&hunk, None)), 2);
+    }
+
+    /// Paired Remove/Add with tokens must surface them on both halves.
+    /// Uses `Arc::ptr_eq` to verify the pairing didn't clone the inner Vec —
+    /// clones should just bump the refcount.
+    #[test]
+    fn build_sbs_lines_paired_threads_tokens() {
+        let hunk = make_hunk(
+            "@@ @@",
+            vec![
+                make_line(LineTag::Removed, "old", Some(1), None),
+                make_line(LineTag::Added, "new", None, Some(1)),
+            ],
+        );
+        let tok_removed = Arc::new(vec![(Style::default().fg(Color::Red), "old".to_string())]);
+        let tok_added = Arc::new(vec![(Style::default().fg(Color::Green), "new".to_string())]);
+        let hunk_tokens = vec![tok_removed.clone(), tok_added.clone()];
+        let lines = build_sbs_lines(&hunk, Some(&hunk_tokens));
+        let rows = get_rows(&lines);
+        assert_eq!(rows.len(), 1);
+        assert!(Arc::ptr_eq(rows[0].left_tokens.as_ref().unwrap(), &tok_removed));
+        assert!(Arc::ptr_eq(rows[0].right_tokens.as_ref().unwrap(), &tok_added));
+    }
+
+    /// End-of-hunk flush (a hunk ending in `-` lines with no trailing Context
+    /// or Added) must still carry the removed line's tokens to the left half.
+    /// Regression guard for the final `pending_removed.drain(..)` loop.
+    #[test]
+    fn build_sbs_lines_end_of_hunk_flush_preserves_tokens() {
+        let hunk = make_hunk(
+            "@@ @@",
+            vec![make_line(LineTag::Removed, "gone", Some(1), None)],
+        );
+        let tok = Arc::new(vec![(Style::default().fg(Color::Red), "gone".to_string())]);
+        let hunk_tokens = vec![tok.clone()];
+        let lines = build_sbs_lines(&hunk, Some(&hunk_tokens));
+        let rows = get_rows(&lines);
+        assert_eq!(rows.len(), 1);
+        assert!(Arc::ptr_eq(rows[0].left_tokens.as_ref().unwrap(), &tok));
+        assert!(rows[0].right_tokens.is_none());
+    }
+
+    /// Context rows clone the token Arc into both halves — they share the
+    /// same inner Vec (both identity-equal to the original).
+    #[test]
+    fn build_sbs_lines_context_shares_tokens_across_halves() {
+        let hunk = make_hunk(
+            "@@ @@",
+            vec![make_line(LineTag::Context, "same", Some(1), Some(1))],
+        );
+        let tok = Arc::new(vec![(Style::default(), "same".to_string())]);
+        let hunk_tokens = vec![tok.clone()];
+        let lines = build_sbs_lines(&hunk, Some(&hunk_tokens));
+        let rows = get_rows(&lines);
+        assert_eq!(rows.len(), 1);
+        assert!(Arc::ptr_eq(rows[0].left_tokens.as_ref().unwrap(), &tok));
+        assert!(Arc::ptr_eq(rows[0].right_tokens.as_ref().unwrap(), &tok));
     }
 }

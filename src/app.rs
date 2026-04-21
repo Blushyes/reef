@@ -3,12 +3,13 @@ use crate::fs_watcher;
 use crate::git::graph::GraphRow;
 use crate::git::{CommitDetail, DiffContent, FileEntry, GitRepo, RefLabel};
 use crate::tasks::{AsyncState, TaskCoordinator, WorkerResult};
+use crate::ui::highlight::StyledToken;
 use crate::ui::mouse::{ClickAction, HitTestRegistry};
 use crate::ui::theme::Theme;
 use crate::ui::toast::Toast;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,11 +95,42 @@ pub struct GitGraphState {
     pub last_rendered_selected: Option<usize>,
 }
 
+/// Syntect tokens for one line of a diff. `Arc` so the render pipeline can
+/// pass them through `tokens_for` / pairing state without per-frame deep
+/// clones (commit_detail's `build_rows` rebuilds every frame; on 10k-line
+/// diffs this was 10k vec-of-String clones per keystroke).
+pub type LineTokens = Arc<Vec<StyledToken>>;
+
+/// Highlighted diff tokens: `out[hunk][line]` holds the syntect-colored
+/// tokens for the line at that position in `DiffContent.hunks[h].lines[l]`.
+/// `None` means the file's extension / name didn't resolve a syntax; rendering
+/// falls back to plain per-tag colors.
+pub type DiffHighlighted = Vec<Vec<LineTokens>>;
+
+/// A diff plus its optional syntax-highlighted tokens. Used for the Git-tab
+/// working/staged diff (no path needed — the selected file is tracked
+/// elsewhere) where `CommitFileDiff` would be overkill.
+#[derive(Debug, Clone)]
+pub struct HighlightedDiff {
+    pub diff: DiffContent,
+    pub highlighted: Option<DiffHighlighted>,
+}
+
+/// A loaded commit-file diff plus its optional syntax-highlighted tokens.
+/// Kept at the app/UI layer (not in `src/git`) so the git module stays free
+/// of ratatui types (the SBS/Unified renderers own all styling).
+#[derive(Debug, Clone)]
+pub struct CommitFileDiff {
+    pub path: String,
+    pub diff: DiffContent,
+    pub highlighted: Option<DiffHighlighted>,
+}
+
 /// State for the inline commit-detail editor panel (Tab::Graph right side).
 #[derive(Debug)]
 pub struct CommitDetailState {
     pub detail: Option<CommitDetail>,
-    pub file_diff: Option<(String, DiffContent)>,
+    pub file_diff: Option<CommitFileDiff>,
     /// Intentionally independent of `App.diff_layout` — the Git tab and the
     /// Graph tab track their diff layout separately (see plan pitfall #1).
     pub diff_layout: DiffLayout,
@@ -152,7 +184,7 @@ pub struct App {
     pub staged_files: Vec<FileEntry>,
     pub unstaged_files: Vec<FileEntry>,
     pub selected_file: Option<SelectedFile>,
-    pub diff_content: Option<DiffContent>,
+    pub diff_content: Option<HighlightedDiff>,
     pub diff_layout: DiffLayout,
     pub diff_mode: DiffMode,
     pub staged_collapsed: bool,
@@ -949,6 +981,7 @@ impl App {
             sel.path,
             sel.is_staged,
             context,
+            self.theme.is_dark,
         );
     }
 
@@ -1122,7 +1155,7 @@ impl App {
             .commit_detail
             .file_diff
             .as_ref()
-            .map(|(p, _)| p.as_str() != path)
+            .map(|d| d.path.as_str() != path)
             .unwrap_or(true);
         if is_new_file {
             self.commit_detail.diff_h_scroll = 0;
@@ -1136,6 +1169,7 @@ impl App {
             oid,
             path.to_string(),
             context,
+            self.theme.is_dark,
         );
     }
 
@@ -1146,7 +1180,7 @@ impl App {
             .commit_detail
             .file_diff
             .as_ref()
-            .map(|(p, _)| p.clone());
+            .map(|d| d.path.clone());
         if let Some(path) = path {
             self.load_commit_file_diff(&path);
         }

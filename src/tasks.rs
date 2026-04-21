@@ -4,10 +4,12 @@
 //! the filesystem, diff generation, or syntax highlighting is routed through
 //! these workers and merged back into `App` from `tick()`.
 
+use crate::app::{CommitFileDiff, DiffHighlighted, HighlightedDiff};
 use crate::file_tree::{self, PreviewContent, TreeEntry};
 use crate::git::graph::GraphRow;
 use crate::git::{CommitDetail, DiffContent, FileEntry, GitRepo, RefLabel};
 use crate::global_search::MatchHit;
+use crate::ui::highlight;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -99,7 +101,7 @@ pub enum WorkerResult {
     },
     Diff {
         generation: u64,
-        result: Result<Option<DiffContent>, String>,
+        result: Result<Option<HighlightedDiff>, String>,
     },
     Graph {
         generation: u64,
@@ -111,7 +113,7 @@ pub enum WorkerResult {
     },
     CommitFileDiff {
         generation: u64,
-        result: Result<Option<(String, DiffContent)>, String>,
+        result: Result<Option<CommitFileDiff>, String>,
     },
     /// A batch of global-search hits. Streamed from the worker so the UI
     /// stays responsive on big workdirs; can fire multiple times per search
@@ -232,6 +234,9 @@ enum GitTask {
         path: String,
         staged: bool,
         context_lines: u32,
+        /// Picks the syntect theme (dark vs light) — same role as
+        /// `LoadCommitFileDiff.dark` / `LoadPreview.dark`.
+        dark: bool,
     },
 }
 
@@ -261,6 +266,9 @@ enum GraphTask {
         oid: String,
         path: String,
         context_lines: u32,
+        /// Picks the syntect theme (dark vs light) so highlighted tokens
+        /// read correctly against the active UI theme — same as `load_preview`.
+        dark: bool,
     },
 }
 
@@ -370,6 +378,7 @@ impl TaskCoordinator {
         path: String,
         staged: bool,
         context_lines: u32,
+        dark: bool,
     ) {
         let _ = self.git_tx.send(GitTask::LoadDiff {
             generation,
@@ -377,6 +386,7 @@ impl TaskCoordinator {
             path,
             staged,
             context_lines,
+            dark,
         });
     }
 
@@ -403,6 +413,7 @@ impl TaskCoordinator {
         oid: String,
         path: String,
         context_lines: u32,
+        dark: bool,
     ) {
         let _ = self.graph_tx.send(GraphTask::LoadCommitFileDiff {
             generation,
@@ -410,6 +421,7 @@ impl TaskCoordinator {
             oid,
             path,
             context_lines,
+            dark,
         });
     }
 
@@ -775,9 +787,12 @@ fn spawn_git_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<GitTa
                         path,
                         staged,
                         context_lines,
+                        dark,
                     } => {
-                        let result = open_repo(&workdir)
-                            .map(|repo| repo.get_diff(&path, staged, context_lines));
+                        let result = open_repo(&workdir).map(|repo| {
+                            repo.get_diff(&path, staged, context_lines)
+                                .map(|diff| build_highlighted_diff(&path, diff, dark))
+                        });
                         let _ = result_tx.send(WorkerResult::Diff { generation, result });
                     }
                 }
@@ -826,10 +841,11 @@ fn spawn_graph_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Gra
                         oid,
                         path,
                         context_lines,
+                        dark,
                     } => {
                         let result = open_repo(&workdir).map(|repo| {
                             repo.get_commit_file_diff(&oid, &path, context_lines)
-                                .map(|diff| (path, diff))
+                                .map(|diff| build_commit_file_diff(path, diff, dark))
                         });
                         let _ = result_tx.send(WorkerResult::CommitFileDiff { generation, result });
                     }
@@ -837,6 +853,57 @@ fn spawn_graph_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Gra
             }
         });
     tx
+}
+
+/// Run syntect over the diff's content lines once per file and split the
+/// flat result into per-hunk slices so the renderer can index by
+/// `(hunk, line)`. Runs in worker threads — keeps the UI smooth on large
+/// diffs (a 10k-line diff takes ~50ms). Lines are fed through a single
+/// `HighlightLines` instance so state (e.g. open block comments) persists
+/// across hunks; this matches delta/bat's pragmatic approach of treating
+/// the hunk stream as a pseudo-file when the full file isn't available.
+/// Added/removed/context lines are mixed together — accepted imprecision
+/// for the 90% case. Returns `None` when no syntax resolves (unknown
+/// extension, binary, etc.), letting the renderer fall back to plain
+/// per-tag colors.
+fn highlight_diff(path: &str, diff: &DiffContent, dark: bool) -> Option<DiffHighlighted> {
+    let mut flat: Vec<String> = Vec::new();
+    let mut hunk_lens: Vec<usize> = Vec::with_capacity(diff.hunks.len());
+    for hunk in &diff.hunks {
+        hunk_lens.push(hunk.lines.len());
+        for line in &hunk.lines {
+            flat.push(line.content.clone());
+        }
+    }
+    highlight::highlight_file(path, &flat, dark).map(|flat_tokens| {
+        // Wrap each line's tokens in `Arc` so downstream `tokens_for(li)`
+        // clones are O(1). The iterator-based split hands each Arc to its
+        // owning hunk without re-bumping refcounts.
+        let mut per_line = flat_tokens.into_iter().map(Arc::new);
+        let mut out = Vec::with_capacity(hunk_lens.len());
+        for &n in &hunk_lens {
+            let mut hunk = Vec::with_capacity(n);
+            for _ in 0..n {
+                hunk.push(per_line.next().expect("line count matches highlight_file output"));
+            }
+            out.push(hunk);
+        }
+        out
+    })
+}
+
+fn build_commit_file_diff(path: String, diff: DiffContent, dark: bool) -> CommitFileDiff {
+    let highlighted = highlight_diff(&path, &diff, dark);
+    CommitFileDiff {
+        path,
+        diff,
+        highlighted,
+    }
+}
+
+fn build_highlighted_diff(path: &str, diff: DiffContent, dark: bool) -> HighlightedDiff {
+    let highlighted = highlight_diff(path, &diff, dark);
+    HighlightedDiff { diff, highlighted }
 }
 
 fn build_file_tree_payload(

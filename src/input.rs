@@ -9,13 +9,20 @@
 //! just add indirection.
 
 use crate::app::{App, Panel, Tab};
+use crate::clipboard;
 use crate::global_search;
+use crate::i18n::{Msg, t};
 use crate::quick_open;
 use crate::search;
 use crate::ui;
+use crate::ui::selection::{
+    PreviewSelection, col_to_byte_offset, collect_selected_text, word_at_byte,
+};
+use crate::ui::toast::Toast;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
+use ratatui::layout::Rect;
 use std::time::{Duration, Instant};
 
 pub const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
@@ -1125,6 +1132,17 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
     // (The fallthrough-close region is registered by the menu renderer
     // underneath the menu panel, so it goes through handle_action.)
 
+    // Preview drag-selection fast-path. Owns Down/Drag/Up(Left) when the
+    // gesture starts inside the preview panel. Scroll wheel, right-click,
+    // and Down outside the panel fall through to the normal match below.
+    //
+    // Once a drag has begun, subsequent Drag and Up events are captured
+    // unconditionally (even if the cursor leaves the panel) — otherwise
+    // selection would silently drop whenever the user pulls past the edge.
+    if handle_preview_selection(&mouse, app) {
+        return;
+    }
+
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             let now = Instant::now();
@@ -1289,6 +1307,161 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
         }
         _ => {}
     }
+}
+
+/// Drive in-panel text selection on the preview panel. Returns `true` when
+/// the mouse event was consumed so the caller stops further dispatch.
+///
+/// Click levels (same position within `DOUBLE_CLICK_WINDOW`):
+/// - 1× (single drag) → anchor-to-cursor drag selection
+/// - 2× (double-click) → select word under cursor
+/// - 3× (triple-click) → select entire line
+///
+/// For levels 2 and 3 the initial selection is committed immediately on
+/// `Down`, but `dragging = true` so the `Up` handler still triggers the
+/// clipboard copy. A `Drag` after a double/triple click extends the active
+/// endpoint normally (VS Code-style word-range extension).
+fn handle_preview_selection(mouse: &MouseEvent, app: &mut App) -> bool {
+    let content_origin = app.last_preview_content_origin;
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some(rect) = app.last_preview_rect else {
+                return false;
+            };
+            if !point_in_rect(rect, mouse.column, mouse.row) {
+                return false;
+            }
+            let Some(origin) = content_origin else {
+                return false;
+            };
+            let Some((file_line, byte_offset)) =
+                mouse_to_file_coord(app, mouse.column, mouse.row, origin)
+            else {
+                return false;
+            };
+
+            // Advance (or reset) the click counter.
+            let now = Instant::now();
+            let click_count = if let Some((t, c, r, n)) = app.preview_click_state {
+                if c == mouse.column
+                    && r == mouse.row
+                    && now.duration_since(t) < DOUBLE_CLICK_WINDOW
+                {
+                    (n + 1).min(3)
+                } else {
+                    1
+                }
+            } else {
+                1
+            };
+            app.preview_click_state = Some((now, mouse.column, mouse.row, click_count));
+
+            let preview_lines = app
+                .preview_content
+                .as_ref()
+                .map(|p| p.lines.as_slice())
+                .unwrap_or_default();
+            let line_len = preview_lines.get(file_line).map(|l| l.len()).unwrap_or(0);
+
+            let sel = match click_count {
+                2 => {
+                    // Double-click → select word
+                    let word = preview_lines
+                        .get(file_line)
+                        .map(|l| word_at_byte(l, byte_offset))
+                        .unwrap_or(byte_offset..byte_offset);
+                    PreviewSelection {
+                        anchor: (file_line, word.start),
+                        active: (file_line, word.end),
+                        dragging: true,
+                    }
+                }
+                3 => {
+                    // Triple-click → select entire line
+                    PreviewSelection {
+                        anchor: (file_line, 0),
+                        active: (file_line, line_len),
+                        dragging: true,
+                    }
+                }
+                _ => PreviewSelection::new((file_line, byte_offset)),
+            };
+            app.preview_selection = Some(sel);
+            true
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let dragging = app.preview_selection.is_some_and(|s| s.dragging);
+            if !dragging {
+                return false;
+            }
+            let Some(origin) = content_origin else {
+                return true; // swallow even without update — the drag is ours
+            };
+            if let Some(pos) = mouse_to_file_coord(app, mouse.column, mouse.row, origin) {
+                if let Some(s) = app.preview_selection.as_mut() {
+                    s.active = pos;
+                }
+            }
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let Some(sel) = app.preview_selection.as_mut() else {
+                return false;
+            };
+            if !sel.dragging {
+                return false;
+            }
+            sel.dragging = false;
+            let sel_snapshot = *sel;
+            if !sel_snapshot.is_empty() {
+                if let Some(preview) = app.preview_content.as_ref() {
+                    let text = collect_selected_text(&preview.lines, &sel_snapshot);
+                    if !text.is_empty() {
+                        match clipboard::copy_to_clipboard(&text) {
+                            Ok(()) => app.toasts.push(Toast::info(t(Msg::ClipboardCopied))),
+                            Err(_) => app.toasts.push(Toast::error(t(Msg::ClipboardCopyFailed))),
+                        }
+                    }
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn point_in_rect(rect: Rect, col: u16, row: u16) -> bool {
+    col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+}
+
+/// Translate a terminal `(column, row)` hit into `(file_line_index,
+/// byte_offset_in_line)` using the cached content-area origin + current
+/// scroll state. Returns `None` when the preview is empty / unloaded.
+///
+/// Columns left of the gutter collapse to byte 0; rows above the content area
+/// collapse to file line `preview_scroll` (first visible line). Rows past the
+/// last line clamp to the last line's terminator (so "drag past end" selects
+/// through the final line cleanly).
+fn mouse_to_file_coord(
+    app: &App,
+    col: u16,
+    row: u16,
+    origin: (u16, u16, u16),
+) -> Option<(usize, usize)> {
+    let preview = app.preview_content.as_ref()?;
+    if preview.lines.is_empty() {
+        return None;
+    }
+    let (content_x, content_y, _) = origin;
+
+    let visible_row = row.saturating_sub(content_y) as usize;
+    let file_line = (app.preview_scroll + visible_row).min(preview.lines.len() - 1);
+    let line = &preview.lines[file_line];
+
+    let visible_col = (col.saturating_sub(content_x) as usize) + app.preview_h_scroll;
+    let byte_offset = col_to_byte_offset(line, visible_col);
+
+    Some((file_line, byte_offset))
 }
 
 /// Apply a horizontal-scroll delta (in display columns) to whichever panel

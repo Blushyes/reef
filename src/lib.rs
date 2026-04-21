@@ -3,6 +3,7 @@
 //! (src/main.rs) is a thin wrapper that consumes this library.
 
 pub mod app;
+pub mod clipboard;
 pub mod editor;
 pub mod file_tree;
 pub mod fs_watcher;

@@ -217,6 +217,22 @@ pub struct App {
     pub preview_scroll: usize,
     pub preview_h_scroll: usize,
 
+    /// 应用级文字选中状态(preview 面板)。Some = 正在拖 / 刚松开但仍要
+    /// 显示高亮;None = 无选中。坐标在文件空间(line_index, byte_offset),
+    /// 与滚动无关。
+    pub preview_selection: Option<crate::ui::selection::PreviewSelection>,
+    /// 上一帧 preview 面板(含头部与分隔线)的整体 Rect,mouse handler 用于
+    /// hit test 判断鼠标是否在 preview 区域内。None = 尚未渲染过或者不在
+    /// 当前 tab。
+    pub last_preview_rect: Option<ratatui::layout::Rect>,
+    /// 上一帧 preview 内容行的起点(content_x, content_y)与 gutter 宽度。
+    /// mouse handler 据此把终端列行坐标映射回文件行/列。
+    pub last_preview_content_origin: Option<(u16, u16, u16)>,
+    /// 连击计数器:记录上一次 preview 区 Down(Left) 的时间/位置/次数,用于
+    /// 检测双击(选词)和三击(选行)。与全局 `last_click` 独立,不干扰
+    /// hit_registry 的 double-click 逻辑。
+    pub preview_click_state: Option<(Instant, u16, u16, u8)>,
+
     // Layout
     pub split_percent: u16,
     pub dragging_split: bool,
@@ -432,6 +448,10 @@ impl App {
             last_rendered_tree_selected: None,
             preview_scroll: 0,
             preview_h_scroll: 0,
+            preview_selection: None,
+            last_preview_rect: None,
+            last_preview_content_origin: None,
+            preview_click_state: None,
             split_percent: 30,
             dragging_split: false,
             hit_registry: HitTestRegistry::new(),
@@ -1432,6 +1452,8 @@ impl App {
                         if !same_file {
                             self.preview_scroll = 0;
                             self.preview_h_scroll = 0;
+                            self.preview_selection = None;
+                            self.preview_click_state = None;
                         }
                         // If `global_search::accept` stashed a highlight for
                         // this file, re-center once the preview actually
@@ -1693,6 +1715,11 @@ impl App {
             self.tree_context_menu.close();
             self.tree_delete_confirm = None;
         }
+        // Preview selection is scoped to the Files/Search tabs that render
+        // the preview panel. Switching away clears it so no stale highlight
+        // appears on return and the click-count resets cleanly.
+        self.preview_selection = None;
+        self.preview_click_state = None;
         match tab {
             Tab::Git => self.git_status_load.mark_stale(),
             Tab::Graph => self.graph_load.mark_stale(),

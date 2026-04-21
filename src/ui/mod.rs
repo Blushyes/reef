@@ -11,6 +11,7 @@ pub mod hover;
 pub mod mouse;
 pub mod quick_open_panel;
 pub mod search_tab;
+pub mod selection;
 pub mod text;
 pub mod theme;
 pub mod toast;
@@ -30,6 +31,13 @@ use unicode_width::UnicodeWidthStr;
 pub fn render(f: &mut Frame, app: &mut App) {
     let size = f.area();
     app.hit_registry.clear();
+    // Clear the preview hit cache each frame; the preview panel's own
+    // `render` will repopulate it when the active tab renders the preview.
+    // Without this, switching away from a preview-bearing tab would leave
+    // `last_preview_rect` pointing at a now-hidden region and the mouse
+    // handler would treat clicks on other panels as selection gestures.
+    app.last_preview_rect = None;
+    app.last_preview_content_origin = None;
 
     let main_layout = Layout::default()
         .direction(Direction::Vertical)

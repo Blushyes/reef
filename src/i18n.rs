@@ -67,6 +67,8 @@ pub enum Msg {
     PushSuccess,
     ForcePushSuccess,
     PushThreadCrashed,
+    ClipboardCopied,
+    ClipboardCopyFailed,
 
     // Git status panel
     PushingHint,
@@ -175,6 +177,8 @@ fn t_zh(m: Msg) -> &'static str {
         PushSuccess => "推送成功",
         ForcePushSuccess => "强制推送成功",
         PushThreadCrashed => "推送线程异常退出，请重试",
+        ClipboardCopied => "已复制到剪贴板",
+        ClipboardCopyFailed => "复制到剪贴板失败",
         PushingHint => "  ⋯ 推送中…",
         PushFailedPrefix => "  ✖ 推送失败: ",
         DismissClose => "  [关闭]",
@@ -264,6 +268,8 @@ fn t_en(m: Msg) -> &'static str {
         PushSuccess => "Push succeeded",
         ForcePushSuccess => "Force push succeeded",
         PushThreadCrashed => "Push worker crashed, please retry",
+        ClipboardCopied => "Copied to clipboard",
+        ClipboardCopyFailed => "Clipboard copy failed",
         PushingHint => "  ⋯ Pushing…",
         PushFailedPrefix => "  ✖ Push failed: ",
         DismissClose => "  [dismiss]",

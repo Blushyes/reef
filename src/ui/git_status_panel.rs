@@ -320,6 +320,20 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             }
             true
         }
+        "git.stageFolder" => {
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            if !path.is_empty() {
+                app.stage_folder(path);
+            }
+            true
+        }
+        "git.unstageFolder" => {
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            if !path.is_empty() {
+                app.unstage_folder(path);
+            }
+            true
+        }
         "git.discardAllPrompt" => {
             let is_staged = args
                 .get("staged")
@@ -857,6 +871,11 @@ fn dir_row(
     theme: &Theme,
 ) -> Row {
     let arrow = if is_collapsed { "›" } else { "⌄" };
+    let (stage_btn, stage_color, stage_cmd) = if is_staged {
+        ("−", Color::Red, "git.unstageFolder")
+    } else {
+        ("+", Color::Green, "git.stageFolder")
+    };
     let spans = vec![
         RowSpan::plain("  ".repeat(depth)),
         RowSpan::styled(
@@ -869,6 +888,17 @@ fn dir_row(
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ),
+        // Per-folder stage/unstage button. Mirrors the file-row `+`/`−`
+        // semantics, scoped to every file under this directory prefix.
+        RowSpan::plain(" "),
+        RowSpan {
+            text: stage_btn.into(),
+            style: Style::default()
+                .fg(stage_color)
+                .add_modifier(Modifier::BOLD),
+            click: Some((stage_cmd.into(), serde_json::json!({ "path": path }))),
+            dbl: None,
+        },
         // Per-folder revert button. Clicking this stages a Folder discard
         // target; the root-row click (below) still toggles expand/collapse.
         RowSpan::plain(" "),

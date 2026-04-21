@@ -884,7 +884,11 @@ fn highlight_diff(path: &str, diff: &DiffContent, dark: bool) -> Option<DiffHigh
         for &n in &hunk_lens {
             let mut hunk = Vec::with_capacity(n);
             for _ in 0..n {
-                hunk.push(per_line.next().expect("line count matches highlight_file output"));
+                hunk.push(
+                    per_line
+                        .next()
+                        .expect("line count matches highlight_file output"),
+                );
             }
             out.push(hunk);
         }

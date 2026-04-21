@@ -949,19 +949,19 @@ fn append_unified_diff(
             let gutter_style = Style::default().fg(theme.fg_secondary);
             let mark_style = Style::default().fg(fg);
             let (g, m, pad_style) = match bg {
-                Some(bg) => (gutter_style.bg(bg), mark_style.bg(bg), Style::default().bg(bg)),
+                Some(bg) => (
+                    gutter_style.bg(bg),
+                    mark_style.bg(bg),
+                    Style::default().bg(bg),
+                ),
                 None => (gutter_style, mark_style, Style::default()),
             };
 
             // Content tokens: syntect-colored when available, else a single
             // plain-fg token. `bg` is applied per-token so added/removed bg
             // spans the full line. Pad at end fills out to virtual_w.
-            let content_tokens = content_tokens_for_line(
-                &line.content,
-                hunk_tokens.and_then(|t| t.get(li)),
-                fg,
-                bg,
-            );
+            let content_tokens =
+                content_tokens_for_line(&line.content, hunk_tokens.and_then(|t| t.get(li)), fg, bg);
             let clipped = clip_spans(&content_tokens, 0, max_text);
             let used: usize = clipped
                 .iter()
@@ -1101,11 +1101,9 @@ fn pair_hunk_lines(
     let mut rows = Vec::new();
     // Pending removed entries carry their per-line tokens so the left half
     // keeps its syntax highlighting when paired with a later Added line.
-    let mut pending_removed: Vec<(Option<u32>, String, Option<LineTokens>)> =
-        Vec::new();
-    let tokens_for = |li: usize| -> Option<LineTokens> {
-        hunk_tokens.and_then(|t| t.get(li)).cloned()
-    };
+    let mut pending_removed: Vec<(Option<u32>, String, Option<LineTokens>)> = Vec::new();
+    let tokens_for =
+        |li: usize| -> Option<LineTokens> { hunk_tokens.and_then(|t| t.get(li)).cloned() };
 
     for (li, line) in hunk.lines.iter().enumerate() {
         match line.tag {
@@ -1294,12 +1292,8 @@ mod tests {
             (syntax_a, "let ".to_string()),
             (syntax_b, "x".to_string()),
         ]);
-        let out = content_tokens_for_line(
-            "let x",
-            Some(&line_tokens),
-            Color::Red,
-            Some(Color::Yellow),
-        );
+        let out =
+            content_tokens_for_line("let x", Some(&line_tokens), Color::Red, Some(Color::Yellow));
         // Tokens preserved, bg overlaid on each.
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].1, "let ");

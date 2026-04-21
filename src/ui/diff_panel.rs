@@ -192,10 +192,9 @@ fn render_unified_line(
             // caring that the token stream was split.
             let body_style = Style::default().fg(fg).bg(bg);
             let base_tokens: Vec<StyledToken> = match syntax_tokens {
-                Some(toks) if !toks.is_empty() => toks
-                    .iter()
-                    .map(|(s, t)| (s.bg(bg), t.clone()))
-                    .collect(),
+                Some(toks) if !toks.is_empty() => {
+                    toks.iter().map(|(s, t)| (s.bg(bg), t.clone())).collect()
+                }
                 _ => vec![(body_style, text.clone())],
             };
             let tokens = if match_ranges.is_empty() {
@@ -272,18 +271,13 @@ enum SbsDisplayLine {
     Row(SbsRow),
 }
 
-fn build_sbs_lines(
-    hunk: &DiffHunk,
-    hunk_tokens: Option<&Vec<LineTokens>>,
-) -> Vec<SbsDisplayLine> {
+fn build_sbs_lines(hunk: &DiffHunk, hunk_tokens: Option<&Vec<LineTokens>>) -> Vec<SbsDisplayLine> {
     let mut rows: Vec<SbsDisplayLine> = Vec::new();
     // Carry tokens alongside each pending removal so a later Added pairing
     // keeps the left half's syntax highlighting.
-    let mut pending_removed: Vec<(Option<u32>, String, Option<LineTokens>)> =
-        Vec::new();
-    let tokens_for = |li: usize| -> Option<LineTokens> {
-        hunk_tokens.and_then(|t| t.get(li)).cloned()
-    };
+    let mut pending_removed: Vec<(Option<u32>, String, Option<LineTokens>)> = Vec::new();
+    let tokens_for =
+        |li: usize| -> Option<LineTokens> { hunk_tokens.and_then(|t| t.get(li)).cloned() };
 
     rows.push(SbsDisplayLine::HunkHeader(hunk.header.clone()));
 
@@ -476,7 +470,8 @@ fn render_sbs_row(
     let left_content_w = (half_w as usize).saturating_sub(gutter);
     let (_, left_fg, left_bg) = line_style(row.left_tag, theme);
     let left_no = fmt_lineno(row.left_no);
-    let left_body = build_sbs_body_tokens(&row.left_text, row.left_tokens.as_ref(), left_fg, left_bg);
+    let left_body =
+        build_sbs_body_tokens(&row.left_text, row.left_tokens.as_ref(), left_fg, left_bg);
     let left_spans = clip_spans(&left_body, h_scroll, left_content_w);
     let left_used: usize = left_spans
         .iter()
@@ -489,7 +484,10 @@ fn render_sbs_row(
         Style::default().fg(theme.fg_secondary).bg(left_bg),
     )];
     left_line_spans.extend(left_spans);
-    left_line_spans.push(Span::styled(" ".repeat(left_pad), Style::default().bg(left_bg)));
+    left_line_spans.push(Span::styled(
+        " ".repeat(left_pad),
+        Style::default().bg(left_bg),
+    ));
     f.render_widget(Line::from(left_line_spans), Rect::new(area.x, y, half_w, 1));
 
     // ── Divider ──
@@ -501,8 +499,12 @@ fn render_sbs_row(
     let right_content_w = (right_w as usize).saturating_sub(gutter);
     let (_, right_fg, right_bg) = line_style(row.right_tag, theme);
     let right_no = fmt_lineno(row.right_no);
-    let right_body =
-        build_sbs_body_tokens(&row.right_text, row.right_tokens.as_ref(), right_fg, right_bg);
+    let right_body = build_sbs_body_tokens(
+        &row.right_text,
+        row.right_tokens.as_ref(),
+        right_fg,
+        right_bg,
+    );
     let right_spans = clip_spans(&right_body, h_scroll, right_content_w);
     let right_used: usize = right_spans
         .iter()
@@ -794,8 +796,14 @@ mod tests {
         let lines = build_sbs_lines(&hunk, Some(&hunk_tokens));
         let rows = get_rows(&lines);
         assert_eq!(rows.len(), 1);
-        assert!(Arc::ptr_eq(rows[0].left_tokens.as_ref().unwrap(), &tok_removed));
-        assert!(Arc::ptr_eq(rows[0].right_tokens.as_ref().unwrap(), &tok_added));
+        assert!(Arc::ptr_eq(
+            rows[0].left_tokens.as_ref().unwrap(),
+            &tok_removed
+        ));
+        assert!(Arc::ptr_eq(
+            rows[0].right_tokens.as_ref().unwrap(),
+            &tok_added
+        ));
     }
 
     /// End-of-hunk flush (a hunk ending in `-` lines with no trailing Context

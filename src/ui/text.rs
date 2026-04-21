@@ -17,28 +17,10 @@ pub fn truncate_to_width(s: &str, max_width: usize) -> &str {
     s
 }
 
-/// 从字符串头部跳过 `skip_cols` 个显示列，返回剩余切片。
-///
-/// 跨越宽字符（CJK / emoji）边界时，整个宽字符会被跳过 —— 宁可多跳一列也
-/// 不切半个字符。这与 [`truncate_to_width`] 的保守策略一致。
-pub fn skip_n_columns(s: &str, skip_cols: usize) -> &str {
-    if skip_cols == 0 {
-        return s;
-    }
-    let mut skipped = 0usize;
-    for (i, c) in s.char_indices() {
-        if skipped >= skip_cols {
-            return &s[i..];
-        }
-        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
-        skipped += cw;
-    }
-    ""
-}
-
 /// 对 styled token 流先跳 `skip_cols` 显示列、再保留至多 `max_width` 显示
-/// 列。在跨越 skip 边界的宽字符会被整体丢弃（保持与 [`skip_n_columns`] 行为
-/// 一致）；在右端超出 `max_width` 的字符直接截断。
+/// 列。在跨越 skip 边界的宽字符会被整体丢弃（宁可多跳一列也不切半个字符，
+/// 与 [`truncate_to_width`] 的保守策略一致）；在右端超出 `max_width` 的
+/// 字符直接截断。
 pub fn clip_spans<'a>(
     tokens: &'a [(Style, String)],
     skip_cols: usize,
@@ -239,52 +221,6 @@ mod tests {
     fn truncate_to_width_cjk_cuts_before_wide_char() {
         // 3 列放不下第二个"好"，保留"你"
         assert_eq!(truncate_to_width("你好", 3), "你");
-    }
-
-    // ── skip_n_columns ───────────────────────────────────────────────────────
-
-    #[test]
-    fn skip_n_columns_zero_returns_original() {
-        assert_eq!(skip_n_columns("hello", 0), "hello");
-    }
-
-    #[test]
-    fn skip_n_columns_ascii_within() {
-        assert_eq!(skip_n_columns("hello world", 6), "world");
-    }
-
-    #[test]
-    fn skip_n_columns_ascii_exact_end() {
-        assert_eq!(skip_n_columns("hello", 5), "");
-    }
-
-    #[test]
-    fn skip_n_columns_ascii_over_end() {
-        assert_eq!(skip_n_columns("hello", 100), "");
-    }
-
-    #[test]
-    fn skip_n_columns_cjk_exact_boundary() {
-        // "你" 占 2 列，skip=2 正好跨过它
-        assert_eq!(skip_n_columns("你好", 2), "好");
-    }
-
-    #[test]
-    fn skip_n_columns_cjk_inside_wide_char_skips_entire_char() {
-        // skip=1 落在"你"中间 → 整体跳过"你"
-        assert_eq!(skip_n_columns("你好", 1), "好");
-    }
-
-    #[test]
-    fn skip_n_columns_cjk_inside_second_wide_char() {
-        // skip=3 落在"好"中间 → 整体跳过"好"，返回空
-        assert_eq!(skip_n_columns("你好", 3), "");
-    }
-
-    #[test]
-    fn skip_n_columns_mixed_ascii_cjk() {
-        // "a你bc" — a=1, 你=2, b=1, c=1（总 5 列）
-        assert_eq!(skip_n_columns("a你bc", 3), "bc");
     }
 
     // ── clip_spans ───────────────────────────────────────────────────────────

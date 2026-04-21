@@ -359,7 +359,7 @@ fn collect_rows(app: &App, target: SearchTarget) -> Vec<String> {
             // separator rows between hunks, then hunk header + per-line rows.
             // `diff_scroll` is an offset into that vec, so our row index is
             // directly usable as a scroll target.
-            Some(d) => unified_display_rows(d),
+            Some(d) => unified_display_rows(&d.diff),
             None => Vec::new(),
         },
         SearchTarget::CommitDetail => {

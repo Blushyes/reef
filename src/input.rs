@@ -1356,10 +1356,13 @@ fn handle_preview_selection(mouse: &MouseEvent, app: &mut App) -> bool {
             };
             app.preview_click_state = Some((now, mouse.column, mouse.row, click_count));
 
-            let preview_lines = app
+            let preview_lines: &[String] = app
                 .preview_content
                 .as_ref()
-                .map(|p| p.lines.as_slice())
+                .and_then(|p| match &p.body {
+                    crate::file_tree::PreviewBody::Text { lines, .. } => Some(lines.as_slice()),
+                    _ => None,
+                })
                 .unwrap_or_default();
             let line_len = preview_lines.get(file_line).map(|l| l.len()).unwrap_or(0);
 
@@ -1415,11 +1418,17 @@ fn handle_preview_selection(mouse: &MouseEvent, app: &mut App) -> bool {
             let sel_snapshot = *sel;
             if !sel_snapshot.is_empty() {
                 if let Some(preview) = app.preview_content.as_ref() {
-                    let text = collect_selected_text(&preview.lines, &sel_snapshot);
-                    if !text.is_empty() {
-                        match clipboard::copy_to_clipboard(&text) {
-                            Ok(()) => app.toasts.push(Toast::info(t(Msg::ClipboardCopied))),
-                            Err(_) => app.toasts.push(Toast::error(t(Msg::ClipboardCopyFailed))),
+                    // Only text bodies have selectable lines — image/binary
+                    // previews have no `lines` vector.
+                    if let crate::file_tree::PreviewBody::Text { lines, .. } = &preview.body {
+                        let text = collect_selected_text(lines, &sel_snapshot);
+                        if !text.is_empty() {
+                            match clipboard::copy_to_clipboard(&text) {
+                                Ok(()) => app.toasts.push(Toast::info(t(Msg::ClipboardCopied))),
+                                Err(_) => {
+                                    app.toasts.push(Toast::error(t(Msg::ClipboardCopyFailed)))
+                                }
+                            }
                         }
                     }
                 }
@@ -1449,14 +1458,20 @@ fn mouse_to_file_coord(
     origin: (u16, u16, u16),
 ) -> Option<(usize, usize)> {
     let preview = app.preview_content.as_ref()?;
-    if preview.lines.is_empty() {
+    let lines = match &preview.body {
+        crate::file_tree::PreviewBody::Text { lines, .. } => lines,
+        // Image / binary cards don't have per-line content, so
+        // drag-select is a no-op over them.
+        _ => return None,
+    };
+    if lines.is_empty() {
         return None;
     }
     let (content_x, content_y, _) = origin;
 
     let visible_row = row.saturating_sub(content_y) as usize;
-    let file_line = (app.preview_scroll + visible_row).min(preview.lines.len() - 1);
-    let line = &preview.lines[file_line];
+    let file_line = (app.preview_scroll + visible_row).min(lines.len() - 1);
+    let line = &lines[file_line];
 
     let visible_col = (col.saturating_sub(content_x) as usize) + app.preview_h_scroll;
     let byte_offset = col_to_byte_offset(line, visible_col);

@@ -9,13 +9,14 @@
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
+use ratatui_image::picker::Picker;
 use reef::app::App;
 use reef::ui;
 use reef::ui::theme::Theme;
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
-use test_support::{HomeGuard, commit_file, tempdir_repo, write_file};
+use test_support::{HomeGuard, commit_file, tempdir_repo, write_file, write_striped_png};
 
 static CWD_LOCK: Mutex<()> = Mutex::new(());
 
@@ -108,7 +109,7 @@ fn snapshot_empty_repo() {
     let _h = HomeGuard::enter(home.path());
     let _g = CwdGuard::enter(tmp.path());
 
-    let mut app = App::new(Theme::dark());
+    let mut app = App::new(Theme::dark(), None);
     let output = render_app(&mut app, 80, 20);
     with_filters(|| insta::assert_snapshot!("empty_repo", output));
 }
@@ -125,7 +126,7 @@ fn snapshot_with_staged_and_unstaged() {
     let _h = HomeGuard::enter(home.path());
     let _g = CwdGuard::enter(tmp.path());
 
-    let mut app = App::new(Theme::dark());
+    let mut app = App::new(Theme::dark(), None);
     // Switch to Git tab to show staged/unstaged sections
     app.set_active_tab(reef::app::Tab::Git);
     app.refresh_status();
@@ -153,7 +154,7 @@ fn snapshot_place_mode_renders_banner_and_border() {
     let _h = HomeGuard::enter(home.path());
     let _g = CwdGuard::enter(tmp.path());
 
-    let mut app = App::new(Theme::dark());
+    let mut app = App::new(Theme::dark(), None);
     // Force a tree rebuild so `src/` and `README.md` show up before the
     // snapshot draw (the async load fires from `App::new` via tick).
     app.refresh_file_tree();
@@ -195,7 +196,7 @@ fn snapshot_tree_edit_row_new_file() {
     let _h = HomeGuard::enter(home.path());
     let _g = CwdGuard::enter(tmp.path());
 
-    let mut app = App::new(Theme::dark());
+    let mut app = App::new(Theme::dark(), None);
     app.refresh_file_tree();
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
@@ -235,7 +236,7 @@ fn snapshot_tree_context_menu() {
     let _h = HomeGuard::enter(home.path());
     let _g = CwdGuard::enter(tmp.path());
 
-    let mut app = App::new(Theme::dark());
+    let mut app = App::new(Theme::dark(), None);
     app.refresh_file_tree();
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
@@ -273,10 +274,119 @@ fn snapshot_with_staged_and_unstaged_light_theme() {
     let _h = HomeGuard::enter(tmp.path());
     let _g = CwdGuard::enter(tmp.path());
 
-    let mut app = App::new(Theme::light());
+    let mut app = App::new(Theme::light(), None);
     app.set_active_tab(reef::app::Tab::Git);
     app.refresh_status();
     wait_for_git_status(&mut app);
     let output = render_app(&mut app, 80, 20);
     with_filters(|| insta::assert_snapshot!("with_staged_and_unstaged_light", output));
+}
+
+/// Wait until the preview worker delivers a result (either text, image,
+/// or binary). Used by image-preview snapshot tests to avoid racing
+/// against the background file worker.
+fn wait_for_preview(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        app.tick();
+        if !app.preview_load.loading && app.preview_content.is_some() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for preview worker");
+}
+
+#[test]
+fn snapshot_image_preview_halfblocks() {
+    // Locks in the image-preview layout: header + separator + metadata
+    // line ("4×4 · PNG · N B") + blank row + halfblocks body. The
+    // Halfblocks protocol is the only ratatui-image backend that writes
+    // into the ratatui Buffer (the others emit escape sequences straight
+    // to stdout, invisible to TestBackend), so we force it via
+    // `Picker::halfblocks()` to keep the snapshot deterministic.
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
+    let (tmp, _raw) = tempdir_repo();
+    // Striped red/green PNG — halfblocks' `pick_side` collapses cells
+    // whose upper and lower pixel halves match to a literal space, so
+    // uniform solid-colour PNGs produce no visible text in the snapshot
+    // dump even though their colors are set on the cells. Striped rows
+    // guarantee top≠bottom at each cell so the `▀` glyph renders and
+    // the snapshot actually asserts something.
+    write_striped_png(tmp.path(), "striped.png", 40, 40, [255, 0, 0], [0, 255, 0]);
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), Some(Picker::halfblocks()));
+    // Populate the tree, then drive selection to the PNG so the worker
+    // queues a preview load. `navigate_files` also fires the preview
+    // request internally.
+    app.refresh_file_tree();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        app.tick();
+        if !app.file_tree_load.loading && !app.file_tree.entries.is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    // Seed `selected_file` on whichever row is "striped.png".
+    let idx = app
+        .file_tree
+        .entries
+        .iter()
+        .position(|e| e.name == "striped.png")
+        .expect("striped.png in tree");
+    app.file_tree.selected = idx;
+    app.load_preview();
+    wait_for_preview(&mut app);
+
+    // `StatefulImage` is lazy: the first render call hands the protocol
+    // the cell area, and the widget encodes against that size on the
+    // next frame. Draw twice so the snapshot captures pixels, not a
+    // placeholder. A real user never notices (frame 1→2 is 16 ms) but
+    // TestBackend stops at whatever frame we ask it to.
+    let _warmup = render_app(&mut app, 80, 20);
+    let output = render_app(&mut app, 80, 20);
+    with_filters(|| insta::assert_snapshot!("image_preview_halfblocks", output));
+}
+
+#[test]
+fn snapshot_binary_info_pdf() {
+    // Non-image binary card: header + separator + "application/pdf · N B"
+    // + centred "binary file" line. Regression guard for the friendly
+    // metadata branch — if it breaks, users selecting a PDF would see
+    // "(binary file)" again with no size/MIME context.
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
+    let (tmp, _raw) = tempdir_repo();
+    std::fs::write(tmp.path().join("doc.pdf"), b"%PDF-1.4\n%...\n").unwrap();
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    app.refresh_file_tree();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        app.tick();
+        if !app.file_tree_load.loading && !app.file_tree.entries.is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let idx = app
+        .file_tree
+        .entries
+        .iter()
+        .position(|e| e.name == "doc.pdf")
+        .expect("doc.pdf in tree");
+    app.file_tree.selected = idx;
+    app.load_preview();
+    wait_for_preview(&mut app);
+
+    let output = render_app(&mut app, 80, 20);
+    with_filters(|| insta::assert_snapshot!("binary_info_pdf", output));
 }

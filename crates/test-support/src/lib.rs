@@ -112,3 +112,61 @@ pub fn write_file(repo: &Repository, path: &str, content: &str) {
     }
     fs::write(&full, content).unwrap();
 }
+
+/// Write a small solid-colour PNG at `<dir>/<name>`. Used by image-preview
+/// tests — keeping the fixture generated at runtime means the repo stays
+/// free of binary blobs (which are a pain to review and diff).
+///
+/// The returned buffer is the same bytes written to disk, so tests that
+/// want to sniff magic bytes without hitting the filesystem can use it
+/// directly.
+pub fn write_png(dir: &Path, name: &str, width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
+    use image::{ImageBuffer, Rgb};
+    let img = ImageBuffer::from_pixel(width, height, Rgb(rgb));
+    let full = dir.join(name);
+    if let Some(parent) = full.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    img.save_with_format(&full, image::ImageFormat::Png)
+        .expect("write PNG fixture");
+    fs::read(&full).expect("read back PNG fixture")
+}
+
+/// In-memory PNG bytes for tests that want to feed buffers to a parser
+/// without touching disk (MIME sniffing, magic-byte detection).
+pub fn png_bytes(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
+    use image::{ImageBuffer, ImageFormat, Rgb};
+    use std::io::Cursor;
+    let img = ImageBuffer::from_pixel(width, height, Rgb(rgb));
+    let mut buf = Vec::new();
+    image::DynamicImage::ImageRgb8(img)
+        .write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+        .expect("encode PNG");
+    buf
+}
+
+/// Write a striped PNG (alternating horizontal rows of `rgb_a` and `rgb_b`)
+/// at `<dir>/<name>`. Stripes are required for halfblocks snapshot tests:
+/// the halfblocks encoder collapses cells whose upper and lower halves
+/// share a color to a literal space, so a uniform solid-colour PNG
+/// produces no visible characters in a text dump. Alternating rows force
+/// different upper/lower cells and light up the `▀` glyph.
+pub fn write_striped_png(
+    dir: &Path,
+    name: &str,
+    width: u32,
+    height: u32,
+    rgb_a: [u8; 3],
+    rgb_b: [u8; 3],
+) {
+    use image::{ImageBuffer, Rgb};
+    let img = ImageBuffer::from_fn(width, height, |_, y| {
+        if y % 2 == 0 { Rgb(rgb_a) } else { Rgb(rgb_b) }
+    });
+    let full = dir.join(name);
+    if let Some(parent) = full.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    img.save_with_format(&full, image::ImageFormat::Png)
+        .expect("write striped PNG fixture");
+}

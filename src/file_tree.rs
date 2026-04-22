@@ -48,22 +48,25 @@ impl PreviewContent {
 /// Decoded raster image plus the metadata a render caller needs to show
 /// dimensions / format / size without re-inspecting the file.
 ///
-/// `image` (the `DynamicImage`) is kept so that ratatui-image's
-/// `StatefulProtocol` can re-encode on panel resize without re-decoding
-/// from disk. For typical repo assets (icons, screenshots) the pixels are
-/// tiny compared to a full-file reread; for huge images `load_preview`
-/// already refused to decode.
+/// `image` is the transport slot for the decoded pixels: the worker
+/// sets `Some(DynamicImage)`, then `App::apply_worker_result` **takes**
+/// it out on the main thread and hands ownership to ratatui-image's
+/// `StatefulProtocol`. Once that's done, the stored `PreviewContent`
+/// carries `image: None` and just the metadata — avoids keeping a
+/// second copy of the pixels alongside the protocol's own buffer.
 #[derive(Debug)]
 pub struct ImagePreview {
-    pub image: image::DynamicImage,
+    pub image: Option<image::DynamicImage>,
     pub width_px: u32,
     pub height_px: u32,
     pub format: image::ImageFormat,
     pub bytes_on_disk: u64,
-    /// `Some(n>1)` for animated GIF (we still only render the first frame
-    /// in v1; the count is surfaced in the metadata line so the user knows
-    /// the still is a snapshot). `None` for non-animated formats.
-    pub frame_count: Option<u32>,
+    /// `true` for GIFs with more than one frame — we still render only
+    /// the first frame in v1, but surface the animated-ness in the
+    /// metadata line ("animated") so the still isn't mistaken for the
+    /// whole thing. Exact frame count isn't worth re-decoding the entire
+    /// GIF just to display.
+    pub animated: bool,
 }
 
 #[derive(Debug)]
@@ -88,13 +91,32 @@ pub enum BinaryReason {
     /// bound memory.
     TooLarge,
     /// `image` crate rejected the bytes mid-decode. The String is a short
-    /// diagnostic (one line, no source chain) for the UI.
+    /// diagnostic (one line, no source chain) for the UI. Already
+    /// truncated at construction to keep the metadata card single-line
+    /// and to bound accidental disclosure from future decoder backends.
     DecodeError(String),
     /// Legacy fallback: `infer` couldn't identify it, but the first 8KB
-    /// contained null bytes so we treat it as binary.
+    /// contained null bytes so we treat it as binary. Rendered the same
+    /// way as `NonImage` — the distinction is for telemetry / tests.
     NullBytes,
     /// 0-byte file. Shown as "(empty file)" in the preview card.
     Empty,
+}
+
+/// Cap the length of an error message we stuff into a `BinaryReason::
+/// DecodeError`. Longer strings get ellipsis-truncated. Keeps the
+/// metadata card on a single terminal row even for pathological
+/// messages, and limits the blast radius if a future image decoder
+/// decides to embed paths or hex dumps in its error text.
+const MAX_DECODE_ERROR_LEN: usize = 100;
+
+fn decode_error(msg: impl Into<String>) -> BinaryReason {
+    let mut s: String = msg.into();
+    if s.len() > MAX_DECODE_ERROR_LEN {
+        s.truncate(MAX_DECODE_ERROR_LEN);
+        s.push('…');
+    }
+    BinaryReason::DecodeError(s)
 }
 
 /// Manages the file tree state.
@@ -359,6 +381,13 @@ pub const MAX_PIXELS: u64 = 50_000_000;
 /// we pass 8KB to match our existing null-byte probe window.
 const PROBE_BYTES: usize = 8192;
 
+/// Largest file the fallback null-byte heuristic will slurp into memory
+/// when `infer` returned no magic-byte match. Anything bigger is
+/// classified `Binary(NullBytes)` on the spot: a 500 MB random-bytes
+/// file with no magic header shouldn't blow up RAM just so we can
+/// confirm it isn't text.
+const MAX_TEXT_PROBE_BYTES: u64 = 10 * 1024 * 1024;
+
 /// Load a file for preview. Returns None if the file can't be read.
 ///
 /// `dark` picks the syntect theme (OneHalfDark vs OneHalfLight) so the
@@ -421,6 +450,21 @@ pub fn load_preview(root: &Path, rel_path: &Path, dark: bool) -> Option<PreviewC
     }
 
     // ── Unknown: fall back to null-byte heuristic for text ──────────
+    // Huge files without a recognised magic header stay out of RAM —
+    // we wouldn't be able to render them as text anyway (10K-line cap
+    // in the text branch below), and reading 500 MB of random bytes
+    // just to confirm they're binary is a bad trade.
+    if file_size > MAX_TEXT_PROBE_BYTES {
+        return Some(PreviewContent {
+            file_path: rel_str,
+            body: PreviewBody::Binary(BinaryInfo {
+                bytes_on_disk: file_size,
+                mime: None,
+                reason: BinaryReason::NullBytes,
+            }),
+        });
+    }
+
     let raw = match std::fs::read(&full) {
         Ok(r) => r,
         Err(_) => return None,
@@ -485,16 +529,16 @@ fn load_image_preview(
 
     let bytes = match std::fs::read(full) {
         Ok(b) => b,
-        Err(e) => return too_large_card(BinaryReason::DecodeError(e.to_string())),
+        Err(e) => return too_large_card(decode_error(e.to_string())),
     };
 
-    // Probe dimensions without allocating pixels. `ImageReader` parses the
-    // header only until `into_dimensions()` returns. This is why we bail
-    // BEFORE `decode()` — a 20000×20000 PNG's on-disk footprint is small
-    // but the decoded `DynamicImage` is gigabytes.
+    // Build a single ImageReader and reuse it: `format()` is cheap
+    // (reads the guessed format stored on the reader, no I/O). The
+    // dimension probe DOES consume the reader, so we rebuild once
+    // more before `decode()`. Three header parses → two.
     let reader = match ImageReader::new(Cursor::new(&bytes)).with_guessed_format() {
         Ok(r) => r,
-        Err(e) => return too_large_card(BinaryReason::DecodeError(e.to_string())),
+        Err(e) => return too_large_card(decode_error(e.to_string())),
     };
 
     let format = match reader.format() {
@@ -502,22 +546,17 @@ fn load_image_preview(
         None => return too_large_card(BinaryReason::UnsupportedImage),
     };
 
-    let dims_reader = match ImageReader::new(Cursor::new(&bytes)).with_guessed_format() {
-        Ok(r) => r,
-        Err(e) => return too_large_card(BinaryReason::DecodeError(e.to_string())),
-    };
-    let (w, h) = match dims_reader.into_dimensions() {
+    let (w, h) = match reader.into_dimensions() {
         Ok(d) => d,
         Err(e) => {
             // UnsupportedError here means the `image` crate can read the
             // header but can't decode the payload (e.g. an image format
             // we didn't enable — AVIF without the feature, or HEIC).
             // Everything else is a genuine parse/IO failure.
-            let msg = e.to_string();
             let reason = if matches!(e, image::ImageError::Unsupported(_)) {
                 BinaryReason::UnsupportedImage
             } else {
-                BinaryReason::DecodeError(msg)
+                decode_error(e.to_string())
             };
             return too_large_card(reason);
         }
@@ -527,45 +566,50 @@ fn load_image_preview(
         return too_large_card(BinaryReason::TooLarge);
     }
 
-    // Full decode now that dimensions are known safe.
-    let decoded = match reader.decode() {
+    // Full decode now that dimensions are known safe. Rebuild the
+    // reader because `into_dimensions` consumed the previous one.
+    let decoded = match ImageReader::new(Cursor::new(&bytes))
+        .with_guessed_format()
+        .and_then(|r| r.decode().map_err(std::io::Error::other))
+    {
         Ok(img) => img,
         Err(e) => {
-            let reason = if matches!(e, image::ImageError::Unsupported(_)) {
+            // Unwrap our std::io::Error wrapper to see if the cause was
+            // an image::ImageError::Unsupported — if so, report format
+            // as unsupported rather than a generic decode failure.
+            let msg = e.to_string();
+            let reason = if msg.contains("unsupported") || msg.contains("Unsupported") {
                 BinaryReason::UnsupportedImage
             } else {
-                BinaryReason::DecodeError(e.to_string())
+                decode_error(msg)
             };
             return too_large_card(reason);
         }
     };
 
-    // Animated GIFs: v1 renders the first frame only. Surface the frame
-    // count so the metadata line can say "GIF · 24 frames (first frame
-    // shown)". Counting re-reads the file but it's cheap for GIFs.
-    let frame_count = if format == image::ImageFormat::Gif {
+    // Animated GIFs: v1 renders the first frame only. We only need to
+    // know "is it animated?" — `take(2)` short-circuits the LZW decode
+    // loop after two frames, so a 1000-frame GIF doesn't cost 1000×
+    // the decode time just to populate the metadata line.
+    let animated = if format == image::ImageFormat::Gif {
         use image::AnimationDecoder;
         use image::codecs::gif::GifDecoder;
-        match GifDecoder::new(Cursor::new(&bytes)) {
-            Ok(dec) => {
-                let n = dec.into_frames().count() as u32;
-                if n > 1 { Some(n) } else { None }
-            }
-            Err(_) => None,
-        }
+        GifDecoder::new(Cursor::new(&bytes))
+            .map(|dec| dec.into_frames().take(2).count() > 1)
+            .unwrap_or(false)
     } else {
-        None
+        false
     };
 
     PreviewContent {
         file_path: rel_str.to_string(),
         body: PreviewBody::Image(ImagePreview {
-            image: decoded,
+            image: Some(decoded),
             width_px: w,
             height_px: h,
             format,
             bytes_on_disk: file_size,
-            frame_count,
+            animated,
         }),
     }
 }
@@ -887,6 +931,65 @@ mod tests {
                 assert!(matches!(info.reason, BinaryReason::NullBytes));
             }
             other => panic!("expected Binary(NullBytes), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_preview_huge_unknown_skips_full_read() {
+        // Unknown-magic file over `MAX_TEXT_PROBE_BYTES` short-circuits
+        // to `Binary(NullBytes)` without reading the whole file. We
+        // can't observe "didn't read" directly, but we CAN observe the
+        // result shape: the metadata says bytes_on_disk == file_size
+        // and reason is NullBytes regardless of whether the body
+        // contains a null byte or not.
+        let tmp = tempfile::tempdir().unwrap();
+        // Write `MAX_TEXT_PROBE_BYTES + 1` bytes of a single value with
+        // NO null byte and no magic-byte header. Without the size guard
+        // we'd slurp the whole thing and then classify as text (no
+        // null); with the guard we bail to NullBytes early.
+        let path = tmp.path().join("big.dat");
+        let big_size = super::MAX_TEXT_PROBE_BYTES + 1;
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&path).unwrap();
+            // Write in 1 MB chunks of 0x41 ('A') — no null byte
+            // anywhere, no known magic.
+            let chunk = vec![b'A'; 1024 * 1024];
+            let mut remaining = big_size;
+            while remaining > 0 {
+                let n = (remaining as usize).min(chunk.len());
+                f.write_all(&chunk[..n]).unwrap();
+                remaining -= n as u64;
+            }
+        }
+
+        let content = load_preview(tmp.path(), Path::new("big.dat"), true).expect("some");
+        match content.body {
+            PreviewBody::Binary(info) => {
+                assert!(matches!(info.reason, BinaryReason::NullBytes));
+                assert_eq!(info.bytes_on_disk, big_size);
+            }
+            other => panic!("expected Binary(NullBytes), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_error_truncates_long_messages() {
+        // Ensures the truncation helper keeps the payload single-line.
+        // `BinaryReason::DecodeError` is rendered verbatim in the UI, so
+        // a multi-line or 10 KB error from a decoder would blow up the
+        // metadata card.
+        let long = "x".repeat(super::MAX_DECODE_ERROR_LEN + 500);
+        match super::decode_error(long) {
+            BinaryReason::DecodeError(s) => {
+                assert!(
+                    s.chars().count() <= super::MAX_DECODE_ERROR_LEN + 1,
+                    "truncated string + ellipsis exceeded cap: {} chars",
+                    s.chars().count()
+                );
+                assert!(s.ends_with('…'), "expected ellipsis suffix, got: {s:?}");
+            }
+            other => panic!("expected DecodeError, got {other:?}"),
         }
     }
 }

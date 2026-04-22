@@ -100,6 +100,70 @@ fn selecting_png_decodes_and_builds_protocol() {
         app.preview_image_protocol.is_some(),
         "expected StatefulProtocol wired up when image body + picker both present"
     );
+    // The decoded `DynamicImage` was moved into the protocol, so the
+    // ImagePreview we're holding shouldn't still be carrying a copy
+    // (that would double the memory footprint per selection).
+    if let PreviewBody::Image(img) = &app.preview_content.as_ref().unwrap().body {
+        assert!(
+            img.image.is_none(),
+            "pixels must be moved into the protocol, not duplicated on PreviewContent"
+        );
+    }
+}
+
+#[test]
+fn re_selecting_same_image_reuses_protocol() {
+    // Two consecutive load_preview calls on the same file must not
+    // rebuild the StatefulProtocol — that would trigger a re-encode
+    // and visibly flicker the preview when fs-watcher or the user
+    // re-enters the selection. `preview_image_protocol_builds` is a
+    // monotonic counter; it's the observable signal for "we built a
+    // fresh protocol." Address-based identity doesn't work because the
+    // `Option<StatefulProtocol>` slot lives at a fixed offset inside
+    // `App`, so an in-place replace looks identical to no change.
+    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, _raw) = tempdir_repo();
+    write_striped_png(tmp.path(), "img.png", 16, 16, [255, 0, 0], [0, 0, 255]);
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), Some(Picker::halfblocks()));
+    app.refresh_file_tree();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        app.tick();
+        if !app.file_tree_load.loading && !app.file_tree.entries.is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let idx = app
+        .file_tree
+        .entries
+        .iter()
+        .position(|e| e.name == "img.png")
+        .expect("img.png in tree");
+    app.file_tree.selected = idx;
+    app.load_preview();
+    wait_for_preview(&mut app);
+    assert!(app.preview_image_protocol.is_some());
+    assert_eq!(
+        app.preview_image_protocol_builds, 1,
+        "first load should build exactly one protocol"
+    );
+
+    // Re-load without changing the file. The worker re-decodes (we
+    // don't cache at the worker layer in v1) but the main-thread
+    // merge should detect bytes_on_disk + w + h + format match and
+    // keep the existing protocol.
+    app.load_preview();
+    wait_for_preview(&mut app);
+    assert!(app.preview_image_protocol.is_some());
+    assert_eq!(
+        app.preview_image_protocol_builds, 1,
+        "same-file reload should not rebuild the protocol"
+    );
 }
 
 #[test]

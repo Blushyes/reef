@@ -11,6 +11,12 @@ use ratatui::widgets::{Block, Padding};
 use ratatui_image::StatefulImage;
 use unicode_width::UnicodeWidthStr;
 
+/// Below this panel height we drop the metadata line (dimensions/format/
+/// size) and the blank spacer so the image body gets more rows. Chosen
+/// so header (1) + separator (1) + meta (1) + blank (1) + at-least-1
+/// image row still fits.
+const MIN_META_HEIGHT: u16 = 5;
+
 pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default().padding(Padding::new(1, 1, 0, 0));
     let inner = block.inner(area);
@@ -88,7 +94,7 @@ fn render_image(f: &mut Frame, app: &mut App, area: Rect, path: &str, img: &Imag
 
     // Metadata line. Skipped when the panel is too short — in that case
     // we'd rather reclaim the row for actual pixels than spend it on text.
-    let wants_meta = area.height >= 5;
+    let wants_meta = area.height >= MIN_META_HEIGHT;
     if wants_meta && y < max_y {
         let meta = image_meta_text(img);
         f.render_widget(
@@ -136,12 +142,13 @@ fn render_image(f: &mut Frame, app: &mut App, area: Rect, path: &str, img: &Imag
 fn image_meta_text(img: &ImagePreview) -> String {
     let fmt = format_name(img.format);
     let size = format_size(img.bytes_on_disk);
-    match img.frame_count {
-        Some(n) if n > 1 => format!(
-            "{}×{} · {} · {} · {} frames (first frame shown)",
-            img.width_px, img.height_px, fmt, size, n
-        ),
-        _ => format!("{}×{} · {} · {}", img.width_px, img.height_px, fmt, size),
+    if img.animated {
+        format!(
+            "{}×{} · {} · {} · animated (first frame shown)",
+            img.width_px, img.height_px, fmt, size
+        )
+    } else {
+        format!("{}×{} · {} · {}", img.width_px, img.height_px, fmt, size)
     }
 }
 
@@ -244,13 +251,17 @@ fn render_binary_info(f: &mut Frame, app: &App, area: Rect, path: &str, info: &B
 
 fn binary_reason_text(info: &BinaryInfo) -> String {
     match &info.reason {
-        BinaryReason::NonImage => t(Msg::PreviewBinaryNonImage).to_string(),
+        // NonImage and NullBytes both render as a generic "binary file"
+        // line — the distinction matters only for classification
+        // (NonImage has a MIME, NullBytes doesn't) and telemetry/tests.
+        BinaryReason::NonImage | BinaryReason::NullBytes => {
+            t(Msg::PreviewBinaryNonImage).to_string()
+        }
         BinaryReason::UnsupportedImage => t(Msg::PreviewBinaryUnsupportedImage).to_string(),
         BinaryReason::TooLarge => t(Msg::PreviewBinaryTooLarge).to_string(),
         BinaryReason::DecodeError(msg) => {
             format!("{}: {}", t(Msg::PreviewBinaryDecodeError), msg)
         }
-        BinaryReason::NullBytes => t(Msg::PreviewBinaryGeneric).to_string(),
         BinaryReason::Empty => t(Msg::PreviewBinaryEmpty).to_string(),
     }
 }

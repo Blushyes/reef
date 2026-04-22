@@ -222,6 +222,12 @@ pub struct App {
     /// this to be `&mut` across frames so it can cache the encoded output
     /// keyed by target cell area and only re-encode on panel resize.
     pub preview_image_protocol: Option<ratatui_image::protocol::StatefulProtocol>,
+    /// Monotonic counter incremented every time `apply_worker_result`
+    /// constructs a fresh `StatefulProtocol`. Tests observe this to tell
+    /// "reused existing protocol" from "rebuilt" — address-based identity
+    /// doesn't work because the Option slot lives at a fixed offset. Not
+    /// used in any production codepath.
+    pub preview_image_protocol_builds: u64,
     pub tree_scroll: usize,
     /// The `file_tree.selected` value we observed on the previous render.
     /// Used by the Files-tab tree panel to distinguish "selection just changed
@@ -460,6 +466,7 @@ impl App {
             preview_content: None,
             image_picker,
             preview_image_protocol: None,
+            preview_image_protocol_builds: 0,
             tree_scroll: 0,
             last_rendered_tree_selected: None,
             preview_scroll: 0,
@@ -1500,28 +1507,65 @@ impl App {
                 }
             },
             WorkerResult::Preview { generation, result } => match result {
-                Ok(content) => {
+                Ok(mut content) => {
                     if self.preview_load.complete_ok(generation) {
                         let same_file = matches!(
                             (self.preview_content.as_ref(), content.as_ref()),
                             (Some(old), Some(new)) if old.file_path == new.file_path
                         );
-                        // Build or tear down the ratatui-image protocol to
-                        // match the new body. The protocol holds non-Send
-                        // encoder state tied to the `Picker`, so this MUST
-                        // run on the main thread (the worker handed us a
-                        // plain `DynamicImage`). Done once per preview
-                        // load — resizing re-encodes inside the widget
-                        // without rebuilding.
-                        self.preview_image_protocol = match (
-                            self.image_picker.as_mut(),
-                            content.as_ref().map(|c| &c.body),
-                        ) {
-                            (Some(picker), Some(crate::file_tree::PreviewBody::Image(img))) => {
-                                Some(picker.new_resize_protocol(img.image.clone()))
+                        // Decide the protocol fate in three buckets:
+                        //
+                        // 1. Same-file re-load where old and new are both
+                        //    images with identical (bytes_on_disk, w, h,
+                        //    format) — a conservative "pixels probably
+                        //    didn't change" heuristic that covers
+                        //    re-selecting the same file. Keep the existing
+                        //    protocol so ratatui-image doesn't re-encode
+                        //    and the UI doesn't flicker.
+                        // 2. Other Image bodies — build a fresh protocol
+                        //    by moving the decoded `DynamicImage` out of
+                        //    the worker payload (so we don't keep two
+                        //    copies of the pixels alive).
+                        // 3. Non-image bodies or no picker — drop any
+                        //    stale protocol so we don't keep a previous
+                        //    image lingering.
+                        let reuse_protocol = same_file
+                            && self.preview_image_protocol.is_some()
+                            && matches!(
+                                (
+                                    self.preview_content.as_ref().map(|c| &c.body),
+                                    content.as_ref().map(|c| &c.body),
+                                ),
+                                (
+                                    Some(crate::file_tree::PreviewBody::Image(old)),
+                                    Some(crate::file_tree::PreviewBody::Image(new)),
+                                ) if old.bytes_on_disk == new.bytes_on_disk
+                                    && old.width_px == new.width_px
+                                    && old.height_px == new.height_px
+                                    && old.format == new.format
+                            );
+                        if !reuse_protocol {
+                            self.preview_image_protocol = match (
+                                self.image_picker.as_mut(),
+                                content.as_mut().map(|c| &mut c.body),
+                            ) {
+                                (Some(picker), Some(crate::file_tree::PreviewBody::Image(img))) => {
+                                    img.image
+                                        .take()
+                                        .map(|dyn_img| picker.new_resize_protocol(dyn_img))
+                                }
+                                _ => None,
+                            };
+                            if self.preview_image_protocol.is_some() {
+                                self.preview_image_protocol_builds += 1;
                             }
-                            _ => None,
-                        };
+                        } else if let Some(crate::file_tree::PreviewBody::Image(img)) =
+                            content.as_mut().map(|c| &mut c.body)
+                        {
+                            // Drop the new DynamicImage — the kept
+                            // protocol already has its own copy.
+                            img.image = None;
+                        }
                         self.preview_content = content;
                         if !same_file {
                             self.preview_scroll = 0;

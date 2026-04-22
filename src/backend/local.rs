@@ -1,0 +1,704 @@
+//! Local backend — wraps the existing `GitRepo`, `file_tree`, `fs_watcher`
+//! and `editor` helpers. Phase 0 is additive: this impl forwards to the
+//! current code unchanged so TUI behaviour stays byte-identical with main.
+//!
+//! Every git operation re-opens `git2::Repository::discover(workdir)` rather
+//! than caching a handle — matches what the background workers in
+//! `src/tasks.rs` already do and keeps `LocalBackend` `Send + Sync` without
+//! any `Mutex` dance around `Repository` (which is non-Send).
+
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
+use std::sync::mpsc;
+
+use super::{
+    Backend, BackendError, ContentMatchHit, ContentSearchCompleted, ContentSearchRequest,
+    EditorLaunchSpec, SearchChunkSink, StatusSnapshot, TrashOutcome, WalkOpts, WalkResponse,
+};
+use crate::file_tree::{self, PreviewContent, TreeEntry};
+use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, GitRepo, RefLabel};
+use std::ops::ControlFlow;
+
+/// Local filesystem + libgit2 backend.
+pub struct LocalBackend {
+    workdir: PathBuf,
+}
+
+impl LocalBackend {
+    /// Open a backend rooted at the current working directory. Unlike
+    /// `GitRepo::open`, this always succeeds — we need a backend even when
+    /// the cwd is not a git repo (the Files tab still works).
+    pub fn open_cwd() -> std::io::Result<Self> {
+        let workdir = std::env::current_dir()?;
+        Ok(Self { workdir })
+    }
+
+    /// Open at an explicit workdir. Used by `reef-agent --workdir`.
+    pub fn open_at(workdir: PathBuf) -> Self {
+        Self { workdir }
+    }
+
+    pub fn workdir(&self) -> &Path {
+        &self.workdir
+    }
+
+    fn repo(&self) -> Result<GitRepo, BackendError> {
+        GitRepo::open_at(&self.workdir).map_err(|e| BackendError::Git(e.message().to_string()))
+    }
+
+    /// Join a workdir-relative path to the backend's workdir root, rejecting
+    /// absolute paths (workdir is the security boundary) and parent-dir
+    /// traversal. Accepts the root itself (`""` or `.`).
+    fn resolve_rel(&self, rel: &Path) -> Result<PathBuf, BackendError> {
+        resolve_rel_within(&self.workdir, rel)
+    }
+}
+
+/// Workdir-relative path resolver. Broken out of `LocalBackend::resolve_rel`
+/// so the search / walk helpers can reuse it without needing a backend
+/// handle.
+pub fn resolve_rel_within(root: &Path, rel: &Path) -> Result<PathBuf, BackendError> {
+    if rel.is_absolute() {
+        return Err(BackendError::PathEscape(format!(
+            "absolute path not allowed: {}",
+            rel.display()
+        )));
+    }
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(BackendError::PathEscape(format!(
+                    "parent-dir traversal not allowed: {}",
+                    rel.display()
+                )));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(BackendError::PathEscape(format!(
+                    "rooted path not allowed: {}",
+                    rel.display()
+                )));
+            }
+        }
+    }
+    Ok(root.join(rel))
+}
+
+impl Backend for LocalBackend {
+    fn workdir_path(&self) -> PathBuf {
+        self.workdir.clone()
+    }
+
+    fn workdir_name(&self) -> String {
+        // Prefer the git workdir basename when a repo is present; otherwise
+        // fall back to the cwd basename, matching the pre-Backend
+        // behaviour in `App::new`.
+        if let Ok(repo) = self.repo() {
+            return repo.workdir_name();
+        }
+        self.workdir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(String::from)
+            .unwrap_or_else(|| "repo".to_string())
+    }
+
+    fn branch_name(&self) -> String {
+        self.repo()
+            .map(|r| r.branch_name())
+            .unwrap_or_else(|_| String::new())
+    }
+
+    fn has_repo(&self) -> bool {
+        self.repo().is_ok()
+    }
+
+    fn build_file_tree(
+        &self,
+        expanded: &HashSet<PathBuf>,
+        git_statuses: &HashMap<String, char>,
+    ) -> Result<Vec<TreeEntry>, String> {
+        Ok(file_tree::build_entries(
+            &self.workdir,
+            expanded,
+            git_statuses,
+        ))
+    }
+
+    fn load_preview(&self, rel_path: &Path, dark: bool) -> Option<PreviewContent> {
+        file_tree::load_preview(&self.workdir, rel_path, dark)
+    }
+
+    fn read_file(&self, rel_path: &Path, max_bytes: u64) -> Result<Vec<u8>, BackendError> {
+        // Route through `resolve_rel` so the workdir is a hard boundary
+        // even on read paths — every other op honours this; without it a
+        // malicious or buggy client could `ReadFile { path: "../etc/passwd" }`.
+        let full = self.resolve_rel(rel_path)?;
+        if !full.is_file() {
+            return Err(BackendError::NotFound);
+        }
+        let bytes = std::fs::read(&full).map_err(|e| BackendError::Io(e.to_string()))?;
+        let capped = if (bytes.len() as u64) > max_bytes {
+            bytes[..max_bytes as usize].to_vec()
+        } else {
+            bytes
+        };
+        Ok(capped)
+    }
+
+    fn git_status(&self) -> Result<StatusSnapshot, BackendError> {
+        let repo = self.repo()?;
+        let (staged, unstaged) = repo.get_status();
+        Ok(StatusSnapshot {
+            staged,
+            unstaged,
+            branch_name: repo.branch_name(),
+            ahead_behind: repo.ahead_behind(),
+        })
+    }
+
+    fn staged_diff(
+        &self,
+        path: &str,
+        context_lines: u32,
+    ) -> Result<Option<DiffContent>, BackendError> {
+        Ok(self.repo()?.get_diff(path, true, context_lines))
+    }
+
+    fn unstaged_diff(
+        &self,
+        path: &str,
+        context_lines: u32,
+    ) -> Result<Option<DiffContent>, BackendError> {
+        Ok(self.repo()?.get_diff(path, false, context_lines))
+    }
+
+    fn untracked_diff(&self, path: &str) -> Result<Option<DiffContent>, BackendError> {
+        // `get_diff(staged=false)` already dispatches to untracked-diff when
+        // the path is new — so we route through the same entry point and
+        // keep the UNtracked-only API available for explicit use.
+        Ok(self.repo()?.get_diff(path, false, 3))
+    }
+
+    fn stage(&self, path: &str) -> Result<(), BackendError> {
+        self.repo()?
+            .stage_file(path)
+            .map_err(|e| BackendError::Git(e.message().to_string()))
+    }
+
+    fn unstage(&self, path: &str) -> Result<(), BackendError> {
+        self.repo()?
+            .unstage_file(path)
+            .map_err(|e| BackendError::Git(e.message().to_string()))
+    }
+
+    fn restore(&self, path: &str) -> Result<(), BackendError> {
+        self.repo()?
+            .restore_file(path)
+            .map_err(|e| BackendError::Git(e.message().to_string()))
+    }
+
+    fn revert_path(&self, path: &str, is_staged: bool) -> Result<(), BackendError> {
+        // Staged-path revert = unstage → restore-workdir. Unstaged-path
+        // revert = just restore-workdir. Mirrors the free `revert_path`
+        // helper in `app.rs` (removed in M4 Track A-0.1) — errors on
+        // either side are swallowed the same way the UI did before,
+        // except we surface the *last* error so the backend contract
+        // stays `Result<(), _>`.
+        let repo = self.repo()?;
+        if is_staged {
+            let _ = repo.unstage_file(path);
+        }
+        repo.restore_file(path)
+            .map_err(|e| BackendError::Git(e.message().to_string()))
+    }
+
+    fn push(&self, force: bool) -> Result<(), BackendError> {
+        // Reuse the free function so we don't need a GitRepo handle — it
+        // shells out to `git push` and is the same thing the foreground
+        // App::run_push() uses on its worker thread.
+        crate::git::push_at(&self.workdir, force).map_err(BackendError::Git)
+    }
+
+    fn list_commits(&self, limit: usize) -> Result<Vec<CommitInfo>, BackendError> {
+        Ok(self.repo()?.list_commits(limit))
+    }
+
+    fn list_refs(&self) -> Result<HashMap<String, Vec<RefLabel>>, BackendError> {
+        Ok(self.repo()?.list_refs())
+    }
+
+    fn head_oid(&self) -> Result<Option<String>, BackendError> {
+        Ok(self.repo()?.head_oid())
+    }
+
+    fn commit_detail(&self, oid: &str) -> Result<Option<CommitDetail>, BackendError> {
+        Ok(self.repo()?.get_commit(oid))
+    }
+
+    fn commit_file_diff(
+        &self,
+        oid: &str,
+        path: &str,
+        context_lines: u32,
+    ) -> Result<Option<DiffContent>, BackendError> {
+        Ok(self.repo()?.get_commit_file_diff(oid, path, context_lines))
+    }
+
+    fn range_files(
+        &self,
+        oldest_oid: &str,
+        newest_oid: &str,
+    ) -> Result<Vec<FileEntry>, BackendError> {
+        Ok(self.repo()?.get_range_files(oldest_oid, newest_oid))
+    }
+
+    fn range_file_diff(
+        &self,
+        oldest_oid: &str,
+        newest_oid: &str,
+        path: &str,
+        context_lines: u32,
+    ) -> Result<Option<DiffContent>, BackendError> {
+        Ok(self
+            .repo()?
+            .get_range_file_diff(oldest_oid, newest_oid, path, context_lines))
+    }
+
+    fn subscribe_fs_events(&self) -> mpsc::Receiver<()> {
+        crate::fs_watcher::spawn(self.workdir.clone())
+    }
+
+    fn launch_editor(&self, _rel_path: &Path) -> Result<(), BackendError> {
+        // The host loop in `main.rs` owns the terminal and still calls
+        // `editor::launch` directly against the shared `Terminal<B>` so it
+        // can tear down / restore raw-mode around the spawn. This hook is
+        // kept to round out the trait surface — LocalBackend returns Ok(())
+        // so callers that route through the backend get a no-op, and
+        // remote's implementation can return Unimplemented until Phase 6.
+        Ok(())
+    }
+
+    fn editor_launch_spec(&self, rel_path: &Path) -> Result<EditorLaunchSpec, BackendError> {
+        use std::ffi::OsString;
+        let abs = if rel_path.is_absolute() {
+            // Callers historically pass an already-absolute path (see
+            // `input.rs`). Accept it as long as it lives under the workdir;
+            // otherwise the editor happily opens a sibling file, which is
+            // fine behaviour we don't want to surprise local users by
+            // regressing.
+            rel_path.to_path_buf()
+        } else {
+            self.resolve_rel(rel_path)?
+        };
+        let (program, extra_args) = crate::editor::resolve_editor()
+            .ok_or_else(|| BackendError::Io("no editor set (VISUAL / EDITOR)".to_string()))?;
+        let mut args: Vec<OsString> = extra_args.into_iter().map(OsString::from).collect();
+        args.push(abs.into_os_string());
+        Ok(EditorLaunchSpec {
+            program: OsString::from(program),
+            args,
+            inherit_tty: true,
+        })
+    }
+
+    fn create_file(&self, rel_path: &Path) -> Result<(), BackendError> {
+        let abs = self.resolve_rel(rel_path)?;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&abs)
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(BackendError::PathExists(abs.display().to_string()))
+            }
+            Err(e) => Err(BackendError::Io(e.to_string())),
+        }
+    }
+
+    fn create_dir_all(&self, rel_path: &Path) -> Result<(), BackendError> {
+        let abs = self.resolve_rel(rel_path)?;
+        std::fs::create_dir_all(&abs).map_err(|e| BackendError::Io(e.to_string()))
+    }
+
+    fn rename(&self, from_rel: &Path, to_rel: &Path) -> Result<(), BackendError> {
+        let from = self.resolve_rel(from_rel)?;
+        let to = self.resolve_rel(to_rel)?;
+        std::fs::rename(&from, &to).map_err(|e| BackendError::Io(e.to_string()))
+    }
+
+    fn copy_file(&self, from_rel: &Path, to_rel: &Path) -> Result<(), BackendError> {
+        let from = self.resolve_rel(from_rel)?;
+        let to = self.resolve_rel(to_rel)?;
+        std::fs::copy(&from, &to)
+            .map(|_| ())
+            .map_err(|e| BackendError::Io(e.to_string()))
+    }
+
+    fn copy_dir_recursive(&self, from_rel: &Path, to_rel: &Path) -> Result<(), BackendError> {
+        let from = self.resolve_rel(from_rel)?;
+        let to = self.resolve_rel(to_rel)?;
+        copy_dir_recursive_inner(&from, &to).map_err(|e| BackendError::Io(e.to_string()))
+    }
+
+    fn upload_from_local(
+        &self,
+        local_src: &Path,
+        remote_dst_rel: &Path,
+    ) -> Result<(), BackendError> {
+        // For LocalBackend the "remote" is just the workdir, so upload
+        // degenerates to a plain copy. Keeping the shape identical to the
+        // remote implementation means `tasks::copy_sources` can call the
+        // same method on either backend and forget about the split.
+        let to = self.resolve_rel(remote_dst_rel)?;
+        if local_src.is_dir() {
+            copy_dir_recursive_inner(local_src, &to).map_err(|e| BackendError::Io(e.to_string()))
+        } else {
+            std::fs::copy(local_src, &to)
+                .map(|_| ())
+                .map_err(|e| BackendError::Io(e.to_string()))
+        }
+    }
+
+    fn remove_file(&self, rel_path: &Path) -> Result<(), BackendError> {
+        let abs = self.resolve_rel(rel_path)?;
+        std::fs::remove_file(&abs).map_err(|e| BackendError::Io(e.to_string()))
+    }
+
+    fn remove_dir_all(&self, rel_path: &Path) -> Result<(), BackendError> {
+        let abs = self.resolve_rel(rel_path)?;
+        std::fs::remove_dir_all(&abs).map_err(|e| BackendError::Io(e.to_string()))
+    }
+
+    fn trash(&self, rel_paths: &[PathBuf]) -> Result<TrashOutcome, BackendError> {
+        // Resolve every path first so a `PathEscape` fails atomically
+        // before any side-effects.
+        let abs: Vec<PathBuf> = rel_paths
+            .iter()
+            .map(|r| self.resolve_rel(r))
+            .collect::<Result<_, _>>()?;
+        trash::delete_all(&abs)
+            .map(|_| TrashOutcome { used_trash: true })
+            .map_err(|e| BackendError::Io(format!("trash: {e}")))
+    }
+
+    fn hard_delete(&self, rel_paths: &[PathBuf]) -> Result<(), BackendError> {
+        for r in rel_paths {
+            let abs = self.resolve_rel(r)?;
+            let res = if abs.is_dir() {
+                std::fs::remove_dir_all(&abs)
+            } else {
+                std::fs::remove_file(&abs)
+            };
+            res.map_err(|e| BackendError::Io(format!("delete {}: {}", abs.display(), e)))?;
+        }
+        Ok(())
+    }
+
+    fn walk_repo_paths(&self, opts: &WalkOpts) -> Result<WalkResponse, BackendError> {
+        Ok(walk_paths(&self.workdir, opts))
+    }
+
+    fn search_content(
+        &self,
+        request: &ContentSearchRequest,
+        on_chunk: &mut SearchChunkSink<'_>,
+    ) -> Result<ContentSearchCompleted, BackendError> {
+        Ok(search_content_local(&self.workdir, request, on_chunk))
+    }
+}
+
+/// Recursive directory copy, DFS walk. Mirrors the legacy helper in
+/// `tasks.rs` — skips symlinks to avoid cycles / dangling-target
+/// surprises. `src` must already exist and be a directory.
+pub(crate) fn copy_dir_recursive_inner(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let sub_src = entry.path();
+        let sub_dst = dst.join(entry.file_name());
+        if file_type.is_symlink() {
+            continue;
+        } else if file_type.is_dir() {
+            copy_dir_recursive_inner(&sub_src, &sub_dst)?;
+        } else if file_type.is_file() {
+            std::fs::copy(&sub_src, &sub_dst)?;
+        }
+    }
+    Ok(())
+}
+
+/// Walk the workdir with an `ignore::WalkBuilder`, returning sorted
+/// workdir-relative file paths (no directories) with an optional cap.
+///
+/// `MAX_WALK_PATHS` is the hard ceiling — exceeding it sets
+/// `truncated=true` and the remainder of the walk is discarded.
+pub(crate) fn walk_paths(root: &Path, opts: &WalkOpts) -> WalkResponse {
+    use ignore::WalkBuilder;
+    let hard_cap: u64 = reef_proto::MAX_WALK_PATHS;
+    let cap = match opts.max_files {
+        Some(n) => n.min(hard_cap),
+        None => hard_cap,
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    let mut truncated = false;
+
+    let walker = WalkBuilder::new(root)
+        .hidden(!opts.include_hidden)
+        .git_ignore(opts.respect_gitignore)
+        .git_exclude(opts.respect_gitignore)
+        .git_global(opts.respect_gitignore)
+        .filter_entry(|dent| dent.file_name() != ".git")
+        .build();
+
+    for result in walker {
+        let Ok(entry) = result else { continue };
+        let is_file = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false);
+        if !is_file {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        let display = rel.to_string_lossy().to_string();
+        if display.is_empty() {
+            continue;
+        }
+        if (out.len() as u64) >= cap {
+            truncated = true;
+            break;
+        }
+        out.push(display);
+    }
+    out.sort();
+    WalkResponse {
+        paths: out,
+        truncated,
+    }
+}
+
+/// Run `grep_searcher` with a smart-case matcher over `root`, streaming
+/// matches out through `on_chunk` in batches of up to
+/// [`reef_proto::CHUNK_TARGET_HITS`]. Stops after `min(max_results,
+/// MAX_SEARCH_HITS)` cumulative hits and reports `truncated=true`.
+///
+/// Streaming means the walker order (BFS-ish, by filename) is what the
+/// caller observes — no global sort. Callers that want the hits
+/// grouped by file can rely on the walker returning all matches from a
+/// given file contiguously (one `search_path` call per file produces
+/// hits in line order, and the outer walk processes each file exactly
+/// once).
+pub(crate) fn search_content_local(
+    root: &Path,
+    request: &ContentSearchRequest,
+    on_chunk: &mut SearchChunkSink<'_>,
+) -> ContentSearchCompleted {
+    use grep_matcher::Matcher;
+    use grep_regex::RegexMatcherBuilder;
+    use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, SinkMatch};
+    use ignore::WalkBuilder;
+
+    if request.pattern.is_empty() {
+        return ContentSearchCompleted::default();
+    }
+    let hard_cap: u32 = reef_proto::MAX_SEARCH_HITS;
+    let cap: usize = request.max_results.min(hard_cap) as usize;
+    if cap == 0 {
+        return ContentSearchCompleted::default();
+    }
+
+    let mut builder = RegexMatcherBuilder::new();
+    match request.case_sensitive {
+        Some(true) => {
+            builder.case_insensitive(false).case_smart(false);
+        }
+        Some(false) => {
+            builder.case_insensitive(true).case_smart(false);
+        }
+        None => {
+            builder.case_smart(true);
+        }
+    }
+    builder.fixed_strings(request.fixed_strings);
+    let matcher = match builder.build(&request.pattern) {
+        Ok(m) => m,
+        Err(_) => return ContentSearchCompleted::default(),
+    };
+
+    let walker = WalkBuilder::new(root)
+        .hidden(false)
+        .filter_entry(|dent| dent.file_name() != ".git")
+        .build();
+
+    let mut searcher: Searcher = SearcherBuilder::new()
+        .binary_detection(BinaryDetection::quit(0))
+        .build();
+    // Accumulator for the current in-flight chunk. The `Collector` sink
+    // pushes into this buffer; once it crosses `CHUNK_TARGET_HITS` the
+    // outer loop flushes via `on_chunk`. We flush at file boundaries
+    // rather than from inside the sink to keep the sink `Send`-free and
+    // avoid reborrow gymnastics through grep-searcher's Sink trait.
+    let mut buffer: Vec<ContentMatchHit> = Vec::with_capacity(reef_proto::CHUNK_TARGET_HITS);
+    let mut total_emitted: usize = 0;
+    let mut truncated = false;
+    let mut aborted = false;
+    let max_line_chars = request.max_line_chars as usize;
+    let chunk_target = reef_proto::CHUNK_TARGET_HITS;
+
+    struct Collector<'a> {
+        rel: PathBuf,
+        display: String,
+        buffer: &'a mut Vec<ContentMatchHit>,
+        total_emitted: &'a mut usize,
+        cap: usize,
+        truncated: &'a mut bool,
+        max_line_chars: usize,
+        matcher: &'a grep_regex::RegexMatcher,
+    }
+    impl grep_searcher::Sink for Collector<'_> {
+        type Error = std::io::Error;
+        fn matched(
+            &mut self,
+            _s: &grep_searcher::Searcher,
+            mat: &SinkMatch<'_>,
+        ) -> Result<bool, Self::Error> {
+            if *self.total_emitted + self.buffer.len() >= self.cap {
+                *self.truncated = true;
+                return Ok(false);
+            }
+            let raw = strip_trailing_newline(mat.bytes());
+            let line_text_full = match std::str::from_utf8(raw) {
+                Ok(s) => s,
+                Err(_) => return Ok(true),
+            };
+            let line_text = truncate_to_chars(line_text_full, self.max_line_chars);
+            let line_text_len = line_text.len();
+            let byte_range = self
+                .matcher
+                .find(raw)
+                .ok()
+                .flatten()
+                .and_then(|m| clip_range(m.start()..m.end(), line_text_len))
+                .unwrap_or(0..0);
+            self.buffer.push(ContentMatchHit {
+                path: self.rel.clone(),
+                display: self.display.clone(),
+                line: mat.line_number().unwrap_or(1).saturating_sub(1) as usize,
+                line_text: line_text.into_owned(),
+                byte_range,
+            });
+            Ok(true)
+        }
+    }
+
+    'walk: for result in walker {
+        let Ok(entry) = result else { continue };
+        let is_file = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false);
+        if !is_file {
+            continue;
+        }
+        let abs = entry.path();
+        let Ok(rel) = abs.strip_prefix(root) else {
+            continue;
+        };
+        let display = rel.to_string_lossy().to_string();
+        if display.is_empty() {
+            continue;
+        }
+
+        let mut sink = Collector {
+            rel: rel.to_path_buf(),
+            display: display.clone(),
+            buffer: &mut buffer,
+            total_emitted: &mut total_emitted,
+            cap,
+            truncated: &mut truncated,
+            max_line_chars,
+            matcher: &matcher,
+        };
+        let _ = searcher.search_path(&matcher, abs, &mut sink);
+
+        // Flush any accumulated chunks. We flush once per file as long as
+        // the buffer is non-empty — small buffers still get forwarded
+        // promptly because the *next* file is the gate, not some timer
+        // we'd otherwise have to wire up. If the buffer is bigger than
+        // `chunk_target` we may slice into multiple chunks so each frame
+        // stays bounded.
+        while buffer.len() >= chunk_target {
+            let chunk: Vec<ContentMatchHit> = buffer.drain(..chunk_target).collect();
+            total_emitted += chunk.len();
+            match on_chunk(chunk) {
+                ControlFlow::Continue(()) => {}
+                ControlFlow::Break(()) => {
+                    aborted = true;
+                    break 'walk;
+                }
+            }
+        }
+        if !buffer.is_empty() {
+            let chunk = std::mem::take(&mut buffer);
+            total_emitted += chunk.len();
+            match on_chunk(chunk) {
+                ControlFlow::Continue(()) => {}
+                ControlFlow::Break(()) => {
+                    aborted = true;
+                    break 'walk;
+                }
+            }
+        }
+
+        if truncated {
+            break 'walk;
+        }
+    }
+
+    // Flush a tail buffer if we bailed without a final file-boundary
+    // flush. Under truncation the sink returned `false` after pushing
+    // the very last hit so the tail is still in `buffer`.
+    if !aborted && !buffer.is_empty() {
+        let chunk = std::mem::take(&mut buffer);
+        let _ = on_chunk(chunk);
+    }
+
+    ContentSearchCompleted { truncated }
+}
+
+fn strip_trailing_newline(bytes: &[u8]) -> &[u8] {
+    let mut end = bytes.len();
+    if end > 0 && bytes[end - 1] == b'\n' {
+        end -= 1;
+    }
+    if end > 0 && bytes[end - 1] == b'\r' {
+        end -= 1;
+    }
+    &bytes[..end]
+}
+
+fn truncate_to_chars(text: &str, max_chars: usize) -> Cow<'_, str> {
+    let mut chars_seen = 0usize;
+    let mut byte_end = 0usize;
+    for (bi, c) in text.char_indices() {
+        if chars_seen >= max_chars {
+            break;
+        }
+        byte_end = bi + c.len_utf8();
+        chars_seen += 1;
+    }
+    if byte_end >= text.len() {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(text[..byte_end].to_string())
+    }
+}
+
+fn clip_range(range: std::ops::Range<usize>, max_end: usize) -> Option<std::ops::Range<usize>> {
+    if range.start >= max_end {
+        return None;
+    }
+    let end = range.end.min(max_end);
+    Some(range.start..end)
+}

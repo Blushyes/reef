@@ -398,6 +398,16 @@ pub fn edit_open_failed(e: &str) -> String {
     }
 }
 
+/// Toast surfaced when `--ssh` / hosts-picker session swap fails to
+/// connect. Goes through the toast queue so the user actually sees it
+/// — `eprintln!` while the alt-screen is up is silently swallowed.
+pub fn ssh_connect_failed(target: &str, e: &str) -> String {
+    match lang() {
+        Lang::Zh => format!("连接 {target} 失败: {e}"),
+        Lang::En => format!("Failed to connect to {target}: {e}"),
+    }
+}
+
 pub fn push_failed_toast(e: &str) -> String {
     match lang() {
         Lang::Zh => format!("推送失败: {e}"),

@@ -5,8 +5,48 @@
 use git2::{Repository, Signature};
 use std::ffi::OsString;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+/// Locate the `reef-agent` binary across all the target-dir layouts CI runs
+/// our tests under:
+///
+/// - default: `<workspace>/target/{debug,release}/reef-agent`
+/// - `cargo llvm-cov`: `<workspace>/target/llvm-cov-target/{debug,release}/reef-agent`
+/// - `CARGO_TARGET_DIR=...`: `<dir>/{debug,release}/reef-agent`
+///
+/// Panics with the searched paths so a missing binary is easy to triage.
+/// Used by every `tests/backend_*_loopback.rs` helper that spawns the agent
+/// as a subprocess.
+pub fn agent_bin() -> PathBuf {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+
+    let mut target_dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(d) = std::env::var("CARGO_TARGET_DIR") {
+        target_dirs.push(PathBuf::from(d));
+    }
+    target_dirs.push(workspace_root.join("target").join("llvm-cov-target"));
+    target_dirs.push(workspace_root.join("target"));
+
+    let mut tried = Vec::new();
+    for target in &target_dirs {
+        for profile in ["debug", "release"] {
+            let candidate = target.join(profile).join("reef-agent");
+            if candidate.exists() {
+                return candidate;
+            }
+            tried.push(candidate.display().to_string());
+        }
+    }
+    panic!(
+        "reef-agent binary not found; tried:\n  - {}",
+        tried.join("\n  - ")
+    );
+}
 
 /// Redirect `$HOME` to a path for the lifetime of the guard, then restore
 /// whatever value was there before (or remove it if HOME was unset).

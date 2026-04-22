@@ -71,12 +71,21 @@ fn wait_for_git_status(app: &mut App) {
     panic!("timed out waiting for background git status");
 }
 
+fn wait_for_file_tree(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        app.tick();
+        if !app.file_tree_load.loading {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for background file tree");
+}
+
 /// Apply the shared TMPDIR masks plus any per-test `extra` filters, then
 /// run `body` under the resulting insta settings. `extra` is a slice of
 /// `(regex, replacement)` pairs — pass `&[]` when no extras are needed.
-/// Keeps the two TMPDIR regex defaults in exactly one place so tests that
-/// need to mask additional nondeterministic tokens (e.g. short OIDs for the
-/// graph-range snapshot) don't drift out of sync.
 fn with_filters<F: FnOnce()>(extra: &[(&str, &str)], body: F) {
     let mut settings = insta::Settings::clone_current();
     // TempDir names are `.tmpXXXXXX` on most platforms.
@@ -100,6 +109,7 @@ fn snapshot_empty_repo() {
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new(Theme::dark(), None);
+    wait_for_file_tree(&mut app);
     let output = render_app(&mut app, 80, 20);
     with_filters(&[], || insta::assert_snapshot!("empty_repo", output));
 }
@@ -315,6 +325,106 @@ fn snapshot_graph_range_mode() {
     // snapshot captures layout/text, not the non-deterministic SHAs.
     with_filters(&[(r"\b[0-9a-f]{7}\b", "[OID]")], || {
         insta::assert_snapshot!("graph_range_mode", output)
+    });
+}
+
+/// Hosts picker snapshot — empty state (no `~/.ssh/config` parseable, no
+/// recent connections). Verifies the overlay renders an input row, a
+/// separator, the "no matches" placeholder, and the footer help line.
+#[test]
+fn snapshot_hosts_picker_empty() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
+    let (tmp, _raw) = tempdir_repo();
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    wait_for_file_tree(&mut app);
+    app.hosts_picker.open(vec![], vec![]);
+    let output = render_app(&mut app, 80, 20);
+    with_filters(&[], || {
+        insta::assert_snapshot!("hosts_picker_empty", output)
+    });
+}
+
+/// Hosts picker snapshot — populated list (three hosts from `~/.ssh/config`
+/// + one recent connection).
+///
+/// Locks in the recent→config row ordering, selection highlighting,
+/// and the two-column alias/hostname layout.
+#[test]
+fn snapshot_hosts_picker_populated() {
+    use reef::hosts::HostEntry;
+    use reef::hosts_picker::SshTarget;
+
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
+    let (tmp, _raw) = tempdir_repo();
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    let hosts = vec![
+        HostEntry {
+            alias: "hongxuan".into(),
+            hostname: Some("47.101.167.85".into()),
+            user: Some("root".into()),
+        },
+        HostEntry {
+            alias: "dev-box".into(),
+            hostname: Some("dev.internal".into()),
+            user: Some("pan".into()),
+        },
+        HostEntry {
+            alias: "ci".into(),
+            hostname: None,
+            user: None,
+        },
+    ];
+    let recent = vec![SshTarget {
+        host: "root@47.101.167.85".into(),
+        path: "/srv/app".into(),
+    }];
+    wait_for_file_tree(&mut app);
+    app.hosts_picker.open(hosts, recent);
+    let output = render_app(&mut app, 80, 20);
+    with_filters(&[], || {
+        insta::assert_snapshot!("hosts_picker_populated", output)
+    });
+}
+
+/// Hosts picker snapshot — path-input mode. After pressing Ctrl+P (or
+/// Enter on a selected row) the overlay title flips to `Connect to ·
+/// [user@]host[:path]` and the prompt glyph changes `›` → `➜`.
+#[test]
+fn snapshot_hosts_picker_path_mode() {
+    use reef::hosts::HostEntry;
+
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
+    let (tmp, _raw) = tempdir_repo();
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    app.hosts_picker.open(
+        vec![HostEntry {
+            alias: "hongxuan".into(),
+            hostname: Some("47.101.167.85".into()),
+            user: Some("root".into()),
+        }],
+        vec![],
+    );
+    wait_for_file_tree(&mut app);
+    app.hosts_picker.enter_path_mode();
+    app.hosts_picker.path_buffer = "root@47.101.167.85:/tmp/work".into();
+    let output = render_app(&mut app, 80, 20);
+    with_filters(&[], || {
+        insta::assert_snapshot!("hosts_picker_path_mode", output)
     });
 }
 

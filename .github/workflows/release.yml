@@ -58,6 +58,19 @@ jobs:
         if: matrix.use_cross
         run: cargo install cross --locked --git https://github.com/cross-rs/cross
 
+      # The agent is built before reef itself so reef's `build.rs` can
+      # embed the freshly-built `reef-agent` binary as the upload fallback
+      # blob (see `src/agent_deploy/upload.rs`).
+      - name: Build reef-agent (cargo)
+        if: '!matrix.use_cross'
+        run: cargo build --release --locked --target ${{ matrix.target }} -p reef-agent
+        shell: bash
+
+      - name: Build reef-agent (cross)
+        if: matrix.use_cross
+        run: cross build --release --locked --target ${{ matrix.target }} -p reef-agent
+        shell: bash
+
       - name: Build (cargo)
         if: '!matrix.use_cross'
         run: cargo build --release --locked --target ${{ matrix.target }} -p reef
@@ -68,17 +81,32 @@ jobs:
         run: cross build --release --locked --target ${{ matrix.target }} -p reef
         shell: bash
 
-      - name: Stage binary
+      - name: Stage binaries
         shell: bash
         run: |
-          mkdir -p staged
-          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "staged/${{ matrix.bin }}"
+          mkdir -p staged-reef staged-agent
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "staged-reef/${{ matrix.bin }}"
+          # On Windows the agent binary has a `.exe` suffix; everywhere else
+          # it's a plain ELF/Mach-O. Compute once and stage.
+          if [[ "${{ matrix.platform }}" == win32-* ]]; then
+            cp "target/${{ matrix.target }}/release/reef-agent.exe" "staged-agent/reef-agent.exe"
+          else
+            cp "target/${{ matrix.target }}/release/reef-agent" "staged-agent/reef-agent"
+          fi
 
-      - name: Upload binary artifact
+      - name: Upload reef artifact
         uses: actions/upload-artifact@v4
         with:
           name: reef-${{ matrix.platform }}
-          path: staged/${{ matrix.bin }}
+          path: staged-reef/${{ matrix.bin }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload reef-agent artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reef-agent-${{ matrix.platform }}
+          path: staged-agent/*
           if-no-files-found: error
           retention-days: 7
 

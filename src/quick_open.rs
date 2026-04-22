@@ -20,15 +20,15 @@
 //!   characters in real-world paths are exotic enough to be worth the edge.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ignore::WalkBuilder;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32String};
 use ratatui::layout::Rect;
 use std::collections::{HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::app::{App, Tab};
+use crate::backend::{Backend, WalkOpts};
 use crate::input::DOUBLE_CLICK_WINDOW;
 use crate::input_edit;
 use crate::prefs;
@@ -124,9 +124,8 @@ impl QuickOpenState {
 /// saw changes since the last build). Preserves `query` across close/reopen
 /// so the user can Esc to peek at something and come back.
 pub fn begin(app: &mut App) {
-    let root = app.file_tree.root.clone();
     if app.quick_open.index_stale || app.quick_open.index.is_empty() {
-        app.quick_open.index = rebuild_index(&root);
+        app.quick_open.index = rebuild_index_via_backend(app.backend.as_ref());
         app.quick_open.index_stale = false;
     }
     app.quick_open.active = true;
@@ -458,22 +457,43 @@ pub fn mark_stale(state: &mut QuickOpenState) {
 
 // ─── Index construction ──────────────────────────────────────────────────────
 
-fn rebuild_index(root: &Path) -> Vec<Candidate> {
-    let mut out: Vec<Candidate> = Vec::new();
+/// Ask the backend to walk the workdir and build the palette candidate
+/// list. For `LocalBackend` this is `ignore::WalkBuilder` over the cwd
+/// (identical to the pre-M3 behaviour). For `RemoteBackend` this ships a
+/// `WalkRepoPaths` RPC so the agent walks its own workdir and the reef
+/// client never touches the remote filesystem directly.
+fn rebuild_index_via_backend(backend: &dyn Backend) -> Vec<Candidate> {
+    let opts = WalkOpts::default();
+    let resp = match backend.walk_repo_paths(&opts) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<Candidate> = Vec::with_capacity(resp.paths.len());
+    for display in resp.paths {
+        if display.is_empty() {
+            continue;
+        }
+        let utf32 = Utf32String::from(display.as_str());
+        out.push(Candidate {
+            rel_path: PathBuf::from(&display),
+            display,
+            utf32,
+        });
+    }
+    out
+}
 
-    // `hidden(false)` so dotfiles (`.gitignore`, `.vimrc`, …) surface, which
-    // matches VSCode's Ctrl+P. We still need to prune `.git` itself — that's
-    // version-control metadata, not source you'd ever want to open through
-    // this palette. `filter_entry` prunes the whole subtree at the matching
-    // directory, so the walker never descends into it.
+/// Legacy direct-walk path kept only for the `rebuild_index_respects_gitignore`
+/// regression test — production code routes through
+/// `rebuild_index_via_backend`.
+#[cfg(test)]
+fn rebuild_index(root: &std::path::Path) -> Vec<Candidate> {
+    use ignore::WalkBuilder;
+    let mut out: Vec<Candidate> = Vec::new();
     let walker = WalkBuilder::new(root)
         .hidden(false)
-        .filter_entry(|dent| {
-            let name = dent.file_name();
-            name != ".git"
-        })
+        .filter_entry(|dent| dent.file_name() != ".git")
         .build();
-
     for result in walker {
         let Ok(entry) = result else { continue };
         let is_file = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false);
@@ -494,7 +514,6 @@ fn rebuild_index(root: &Path) -> Vec<Candidate> {
             utf32,
         });
     }
-
     out.sort_by(|a, b| a.display.cmp(&b.display));
     out
 }

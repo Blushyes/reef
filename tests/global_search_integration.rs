@@ -5,6 +5,7 @@
 //! The worker runs in a background thread so each test polls `try_recv`
 //! with a timeout rather than busy-waiting.
 
+use reef::backend::{Backend, LocalBackend};
 use reef::global_search::{MAX_RESULTS, MatchHit};
 use reef::tasks::{TaskCoordinator, WorkerResult};
 use std::path::Path;
@@ -13,6 +14,10 @@ use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+
+fn local_backend(root: &Path) -> Arc<dyn Backend> {
+    Arc::new(LocalBackend::open_at(root.to_path_buf()))
+}
 
 /// Drain chunks + Done from the coordinator into a flat Vec, returning
 /// (hits, truncated). Bails after `deadline` with whatever it has seen.
@@ -65,7 +70,7 @@ fn literal_match_with_smart_case_finds_hits() {
 
     let coord = TaskCoordinator::new();
     let cancel = Arc::new(AtomicBool::new(false));
-    coord.search_all(1, cancel, root.to_path_buf(), "foo".into());
+    coord.search_all(1, cancel, local_backend(root), "foo".into());
 
     let (hits, truncated) = collect(&coord, 1, Duration::from_secs(5));
     assert!(!truncated);
@@ -101,7 +106,7 @@ fn smart_case_becomes_case_sensitive_with_uppercase_in_query() {
     let coord = TaskCoordinator::new();
     let cancel = Arc::new(AtomicBool::new(false));
     // Capital letter → case-sensitive. Only "Foo" should match.
-    coord.search_all(1, cancel, root.to_path_buf(), "Foo".into());
+    coord.search_all(1, cancel, local_backend(root), "Foo".into());
     let (hits, _) = collect(&coord, 1, Duration::from_secs(5));
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].byte_range, 0..3);
@@ -123,7 +128,7 @@ fn respects_gitignore() {
 
     let coord = TaskCoordinator::new();
     let cancel = Arc::new(AtomicBool::new(false));
-    coord.search_all(1, cancel, root.to_path_buf(), "fn".into());
+    coord.search_all(1, cancel, local_backend(root), "fn".into());
     let (hits, _) = collect(&coord, 1, Duration::from_secs(5));
     assert!(hits.iter().any(|h| h.display.contains("public.rs")));
     assert!(
@@ -146,7 +151,7 @@ fn binary_files_are_skipped() {
 
     let coord = TaskCoordinator::new();
     let cancel = Arc::new(AtomicBool::new(false));
-    coord.search_all(1, cancel, root.to_path_buf(), "foo".into());
+    coord.search_all(1, cancel, local_backend(root), "foo".into());
     let (hits, _) = collect(&coord, 1, Duration::from_secs(5));
     assert!(hits.iter().any(|h| h.display.contains("plain.txt")));
     assert!(
@@ -163,7 +168,7 @@ fn empty_query_returns_nothing_and_done_arrives() {
 
     let coord = TaskCoordinator::new();
     let cancel = Arc::new(AtomicBool::new(false));
-    coord.search_all(7, cancel, root.to_path_buf(), String::new());
+    coord.search_all(7, cancel, local_backend(root), String::new());
     let (hits, truncated) = collect(&coord, 7, Duration::from_secs(5));
     assert!(hits.is_empty());
     assert!(!truncated);
@@ -187,7 +192,7 @@ fn truncates_at_max_results() {
 
     let coord = TaskCoordinator::new();
     let cancel = Arc::new(AtomicBool::new(false));
-    coord.search_all(2, cancel, root.to_path_buf(), "needle".into());
+    coord.search_all(2, cancel, local_backend(root), "needle".into());
     let (hits, truncated) = collect(&coord, 2, Duration::from_secs(10));
     assert!(
         truncated,
@@ -215,7 +220,7 @@ fn cancel_flag_bails_mid_walk() {
 
     let coord = TaskCoordinator::new();
     let cancel = Arc::new(AtomicBool::new(false));
-    coord.search_all(3, cancel.clone(), root.to_path_buf(), "needle".into());
+    coord.search_all(3, cancel.clone(), local_backend(root), "needle".into());
 
     // Flip cancel right away. Depending on scheduler the worker might have
     // already started pumping chunks — we don't assert *no* hits, just that
@@ -240,8 +245,8 @@ fn superseded_generation_is_dropped() {
     let coord = TaskCoordinator::new();
     let c1 = Arc::new(AtomicBool::new(false));
     let c2 = Arc::new(AtomicBool::new(false));
-    coord.search_all(10, c1, root.to_path_buf(), "alpha".into());
-    coord.search_all(11, c2, root.to_path_buf(), "bravo".into());
+    coord.search_all(10, c1, local_backend(root), "alpha".into());
+    coord.search_all(11, c2, local_backend(root), "bravo".into());
 
     let (g10_hits, _) = collect(&coord, 10, Duration::from_secs(5));
     let (g11_hits, _) = collect(&coord, 11, Duration::from_secs(5));

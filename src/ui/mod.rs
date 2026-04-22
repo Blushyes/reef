@@ -7,6 +7,7 @@ pub mod git_graph_panel;
 pub mod git_status_panel;
 pub mod global_search_panel;
 pub mod highlight;
+pub mod hosts_picker_panel;
 pub mod hover;
 pub mod mouse;
 pub mod quick_open_panel;
@@ -72,7 +73,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     match app.active_tab {
         Tab::Git => {
-            if app.repo.is_none() {
+            if !app.backend.has_repo() {
                 render_no_repo(f, app, body_layout[0]);
             } else {
                 render_git_sidebar(f, app, body_layout[0]);
@@ -110,6 +111,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     }
     if app.global_search.active {
         global_search_panel::render(f, app, size);
+    }
+    if app.hosts_picker.active {
+        hosts_picker_panel::render(f, app, size);
     }
     // Context menu overlay renders last so it sits above the help
     // popup and any other in-panel chrome. The menu itself is scoped
@@ -257,7 +261,7 @@ fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_title_bar(f: &mut Frame, app: &App, area: Rect) {
     let th = app.theme;
-    let repo_name = if app.repo.is_some() {
+    let repo_name = if app.backend.has_repo() {
         app.workdir_name.as_str()
     } else {
         "—"

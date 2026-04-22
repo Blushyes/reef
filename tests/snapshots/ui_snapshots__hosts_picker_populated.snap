@@ -1,0 +1,25 @@
+---
+source: tests/ui_snapshots.rs
+assertion_line: 316
+expression: output
+---
+ reef  [TMPDIR]  ⎇ (detached)
+ 📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph           1:Files 2:Search 3:Git 4:Graph
+ +   📁  Connect to · filter ─────────────────────────────────────────────┐
+ (empt│ ›                                                                │
+      │ ──────────────────────────────────────────────────────────────── │
+      │  root@47.101.167.85:/srv/app  recent                             │
+      │  hongxuan  root@47.101.167.85                                    │
+      │  dev-box  pan@dev.internal                                       │
+      │  ci                                                              │
+      │                                                                  │
+      │                                                                  │
+      │                                                                  │
+      │                                                                  │
+      │                                                                  │
+      │                                                                  │
+      │                                                                  │
+      │   Enter connect · Ctrl+P path mode · Esc cancel                  │
+      └──────────────────────────────────────────────────────────────────┘
+                       │
+                     q:quit Tab:switch s:stage u:unstage r:refresh h:help

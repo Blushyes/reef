@@ -2266,6 +2266,8 @@ dependencies = [
  "proptest",
  "ratatui",
  "ratatui-image",
+ "reef-proto",
+ "serde",
  "serde_json",
  "similar 3.1.0",
  "syntect",
@@ -2275,6 +2277,26 @@ dependencies = [
  "trash",
  "two-face",
  "unicode-width",
+]
+
+[[package]]
+name = "reef-agent"
+version = "0.1.0"
+dependencies = [
+ "reef",
+ "reef-proto",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "test-support",
+]
+
+[[package]]
+name = "reef-proto"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

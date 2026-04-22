@@ -22,6 +22,8 @@ use std::io;
 use std::path::Path;
 use std::process::Command;
 
+use crate::backend::EditorLaunchSpec;
+
 /// Parse an `$EDITOR`-style string into (program, extra_args).
 ///
 /// Returns None if the string is empty or whitespace-only. Extra args are
@@ -35,7 +37,7 @@ pub fn parse_editor_command(s: &str) -> Option<(String, Vec<String>)> {
 }
 
 /// Resolve `$VISUAL`, then `$EDITOR`, then a platform fallback.
-fn resolve_editor() -> Option<(String, Vec<String>)> {
+pub(crate) fn resolve_editor() -> Option<(String, Vec<String>)> {
     for var in ["VISUAL", "EDITOR"] {
         if let Ok(s) = std::env::var(var) {
             if let Some(cmd) = parse_editor_command(&s) {
@@ -56,6 +58,7 @@ fn resolve_editor() -> Option<(String, Vec<String>)> {
 /// `mouse_capture_was_on` tells us whether to re-enable mouse capture on
 /// resume — the caller tracks this because `v` (select mode) may have
 /// disabled it before the user triggered the edit.
+#[allow(dead_code)]
 pub fn launch<B: Backend>(
     terminal: &mut Terminal<B>,
     path: &Path,
@@ -93,6 +96,44 @@ pub fn launch<B: Backend>(
     })();
 
     // Surface whichever failure came first.
+    match (run_result, restore) {
+        (Err(e), _) => Err(e),
+        (_, Err(e)) => Err(e),
+        (Ok(_), Ok(())) => Ok(()),
+    }
+}
+
+/// Same as `launch`, but sourced from a `Backend::editor_launch_spec` —
+/// so the program + args are whatever the backend decided. Local
+/// backend produces `$EDITOR <abs>`; remote backend produces
+/// `ssh -t <ssh_args> host "cd <workdir> && $editor <rel>"`.
+///
+/// Keeps the TUI teardown/restore dance identical to `launch()` so the
+/// terminal always ends up back in alt-screen + raw mode even when the
+/// child editor / ssh returns non-zero.
+pub fn launch_spec<B: Backend>(
+    terminal: &mut Terminal<B>,
+    spec: &EditorLaunchSpec,
+    mouse_capture_was_on: bool,
+) -> io::Result<()> {
+    disable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, LeaveAlternateScreen, DisableMouseCapture)?;
+
+    let run_result = Command::new(&spec.program).args(&spec.args).status();
+
+    let restore = (|| -> io::Result<()> {
+        enable_raw_mode()?;
+        execute!(stdout, EnterAlternateScreen)?;
+        if mouse_capture_was_on {
+            execute!(stdout, EnableMouseCapture)?;
+        }
+        terminal
+            .clear()
+            .map_err(|e| io::Error::other(format!("{e:?}")))?;
+        Ok(())
+    })();
+
     match (run_result, restore) {
         (Err(e), _) => Err(e),
         (_, Err(e)) => Err(e),

@@ -25,8 +25,10 @@ nucleo-matcher = "0.3"
 grep-searcher = "0.1.16"
 grep-regex    = "0.1.14"
 grep-matcher  = "0.1.8"
+serde         = { workspace = true }
 serde_json    = { workspace = true }
 terminal-colorsaurus = "1.0.3"
+reef-proto    = { path = "crates/reef-proto" }
 # Cross-platform "Move to Trash" for the file-tree delete action.
 # macOS: NSWorkspace recycleURLs; Linux: XDG freedesktop spec; Windows:
 # SHFileOperationW. Safer default than `std::fs::remove_*` — hard delete
@@ -61,10 +63,11 @@ harness = false
 # lib used by this crate's integration tests. `fuzz/` is excluded and runs as
 # its own workspace (see fuzz/Cargo.toml).
 [workspace]
-members = ["crates/test-support"]
+members = ["crates/test-support", "crates/reef-proto", "crates/reef-agent"]
 resolver = "2"
 
 [workspace.dependencies]
+serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # ─── Lint policy ───────────────────────────────────────────────────────────

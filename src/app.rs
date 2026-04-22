@@ -1,5 +1,5 @@
+use crate::backend::{Backend, LocalBackend};
 use crate::file_tree::{FileTree, PreviewContent};
-use crate::fs_watcher;
 use crate::git::graph::GraphRow;
 use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, GitRepo, RefLabel};
 use crate::tasks::{AsyncState, TaskCoordinator, WorkerResult};
@@ -245,6 +245,15 @@ impl Default for CommitDetailState {
 }
 
 pub struct App {
+    /// The active backend — LocalBackend for `reef` invoked normally, or
+    /// RemoteBackend when `main.rs` passes `--agent-exec`. Kept behind
+    /// `Arc<dyn Backend>` so workers can cheaply clone a handle.
+    pub backend: Arc<dyn Backend>,
+    /// Legacy cached `GitRepo` handle — used by the synchronous
+    /// stage/unstage/restore/push paths in `App` that predate the backend
+    /// trait. `None` when cwd is not a git repo or when the active backend
+    /// is remote (no local `git2` handle available). New code should go
+    /// through `self.backend` instead.
     pub repo: Option<GitRepo>,
     pub workdir_name: String,
     pub branch_name: String,
@@ -369,6 +378,23 @@ pub struct App {
     /// input is routed exclusively to `crate::global_search::handle_key`.
     pub global_search: crate::global_search::GlobalSearchState,
 
+    /// Ctrl+O hosts picker overlay. Driven by the outer `'session:` loop
+    /// in `main.rs` — picking a host populates `pending_ssh_target` and
+    /// sets `should_quit_session`, the main loop then tears down the
+    /// current App and rebuilds it with the new backend.
+    pub hosts_picker: crate::hosts_picker::HostsPickerState,
+
+    /// Populated by the hosts picker on confirm. `main.rs` inspects this
+    /// after `should_quit_session` fires and uses it to build the next
+    /// `RemoteBackend`. Cleared once consumed.
+    pub pending_ssh_target: Option<crate::hosts_picker::SshTarget>,
+
+    /// Set by the hosts picker (via `request_session_swap`) to ask
+    /// `main.rs` to exit the current loop body and start a new one with
+    /// a fresh backend. Distinct from `should_quit` so the outer loop
+    /// can tell "quit reef" from "switch connection".
+    pub should_quit_session: bool,
+
     /// Row-scoped highlight to apply in the Files-tab file preview — set by
     /// `global_search::accept` right before it kicks off an async preview
     /// load, consumed when that preview arrives (for scroll centering) and
@@ -475,7 +501,22 @@ pub struct PreviewHighlight {
 }
 
 impl App {
+    /// Local-backend entry point. Threads `image_picker` straight through
+    /// to `new_with_backend`. Tests construct via `new(Theme::dark(), None)`;
+    /// `main.rs` constructs via `new_with_backend` so it can pick the
+    /// backend (Local vs Remote) up front.
     pub fn new(theme: Theme, image_picker: Option<ratatui_image::picker::Picker>) -> Self {
+        let backend = Arc::new(
+            LocalBackend::open_cwd().unwrap_or_else(|_| LocalBackend::open_at(PathBuf::from("."))),
+        );
+        Self::new_with_backend(theme, backend, image_picker)
+    }
+
+    pub fn new_with_backend(
+        theme: Theme,
+        backend: Arc<dyn Backend>,
+        image_picker: Option<ratatui_image::picker::Picker>,
+    ) -> Self {
         // Fold pre-1.0 unprefixed keys (`layout=`, `mode=`) and the retired
         // `~/.config/reef/git.prefs` into the current prefixed namespace
         // BEFORE any `prefs::get` runs. Order matters: `load_prefs` below
@@ -485,28 +526,22 @@ impl App {
         // legacy install.
         crate::prefs::migrate_legacy_prefs();
 
-        let repo = GitRepo::open().ok();
-        let workdir = repo
-            .as_ref()
-            .and_then(|r| r.workdir_path())
-            .unwrap_or_else(|| PathBuf::from("."));
-        let workdir_name = repo
-            .as_ref()
-            .map(|r| r.workdir_name())
-            .or_else(|| {
-                workdir
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(String::from)
-            })
-            .unwrap_or_else(|| "repo".to_string());
-        let branch_name = repo.as_ref().map(|r| r.branch_name()).unwrap_or_default();
+        // `repo` is kept for the legacy stage/unstage/restore/push paths in
+        // `App` (and for back-compat with existing tests that assert
+        // `app.repo.is_none()`). It mirrors the backend's repo view — when
+        // the backend is local it reflects cwd; when it's remote we have
+        // no local git handle at all.
+        let workdir = backend.workdir_path();
+        let repo = GitRepo::open_at(&workdir).ok();
+        let workdir_name = backend.workdir_name();
+        let branch_name = backend.branch_name();
         let file_tree = FileTree::new(&workdir);
-        let fs_watcher_rx = Some(fs_watcher::spawn(workdir.clone()));
+        let fs_watcher_rx = Some(backend.subscribe_fs_events());
         let (saved_layout, saved_mode) = load_prefs();
         let tasks = TaskCoordinator::new();
         let now = Instant::now();
         let mut app = Self {
+            backend,
             repo,
             workdir_name,
             branch_name,
@@ -571,6 +606,9 @@ impl App {
             search: crate::search::SearchState::default(),
             quick_open: crate::quick_open::QuickOpenState::from_prefs(),
             global_search: crate::global_search::GlobalSearchState::default(),
+            hosts_picker: crate::hosts_picker::HostsPickerState::default(),
+            pending_ssh_target: None,
+            should_quit_session: false,
             preview_highlight: None,
             place_mode: crate::place_mode::PlaceModeState::default(),
             tree_edit: crate::tree_edit::TreeEditState::default(),
@@ -596,16 +634,17 @@ impl App {
             next_graph_revalidate_at: now + Duration::from_millis(1200),
         };
         app.refresh_status();
+        app.refresh_file_tree();
         app
     }
 
     pub fn refresh_status(&mut self) {
-        if self.repo.is_none() {
+        if !self.backend.has_repo() {
             return;
         };
         let generation = self.git_status_load.begin();
         self.tasks
-            .refresh_status(generation, self.file_tree.root.clone());
+            .refresh_status(generation, Arc::clone(&self.backend));
     }
 
     /// Enter the drag-and-drop destination picker. Switches to the Files
@@ -688,8 +727,14 @@ impl App {
             ));
             return;
         }
+        // External drag-drop onto a remote workdir is handled by
+        // `backend.upload_from_local` (scp under the hood) inside the
+        // worker — no UI guard needed. Intra-tree copies (sources all
+        // under the workdir) go through `backend.copy_file` /
+        // `copy_dir_recursive` on the agent side.
         let generation = self.file_copy_load.begin();
-        self.tasks.copy_files(generation, sources, dest_dir);
+        self.tasks
+            .copy_files(generation, Arc::clone(&self.backend), sources, dest_dir);
     }
 
     // ── Files-tab tree actions: New File / New Folder / Rename / Delete ──
@@ -800,12 +845,28 @@ impl App {
             .strip_prefix(&self.file_tree.root)
             .ok()
             .map(|p| p.to_path_buf());
+        // `Backend` write methods take workdir-relative paths (that's the
+        // same shape the wire protocol uses, so a remote backend can ship
+        // the call over the socket without re-encoding). Fall back to the
+        // absolute path on the rare "outside workdir" case so the local
+        // backend still does the right thing.
+        let new_rel = target_path
+            .strip_prefix(&self.file_tree.root)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| target_path.clone());
+        let display_new = name.clone();
         match mode {
             crate::tree_edit::TreeEditMode::NewFile => {
-                self.tasks.create_file(generation, target_path);
+                self.tasks
+                    .create_file(generation, Arc::clone(&self.backend), new_rel, display_new);
             }
             crate::tree_edit::TreeEditMode::NewFolder => {
-                self.tasks.create_folder(generation, target_path);
+                self.tasks.create_folder(
+                    generation,
+                    Arc::clone(&self.backend),
+                    new_rel,
+                    display_new,
+                );
             }
             crate::tree_edit::TreeEditMode::Rename => {
                 let Some(old) = self.tree_edit.rename_target.clone() else {
@@ -813,7 +874,23 @@ impl App {
                     self.fs_mutation_select_on_done = None;
                     return;
                 };
-                self.tasks.rename_path(generation, old, target_path);
+                let old_rel = old
+                    .strip_prefix(&self.file_tree.root)
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|_| old.clone());
+                let old_name = old
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| old.to_string_lossy().to_string());
+                self.tasks.rename_path(
+                    generation,
+                    Arc::clone(&self.backend),
+                    old_rel,
+                    new_rel,
+                    old_name,
+                    display_new,
+                );
             }
         }
         // Keep state until the worker result arrives — the render
@@ -900,6 +977,17 @@ impl App {
                 self.prompt_tree_delete(abs, entry.is_dir, /*hard=*/ false);
             }
             I::RevealInFinder => {
+                // Reveal-in-Finder opens the LOCAL file manager; over ssh
+                // the target path doesn't exist on this machine, so the
+                // action is always wrong. Guard at the caller layer so
+                // the user gets a clear "not supported" toast instead of
+                // "file not found" from the platform command.
+                if self.backend.is_remote() {
+                    self.toasts.push(Toast::warn(
+                        "Reveal in Finder is not supported on remote workdirs",
+                    ));
+                    return;
+                }
                 let path = match target_idx {
                     Some(idx) => self
                         .file_tree
@@ -1003,15 +1091,68 @@ impl App {
             return;
         };
         let generation = self.fs_mutation_load.begin();
+        // Convert the (absolute) selection path to a workdir-relative
+        // PathBuf for the Backend call. The UI still stores `abs` because
+        // it came from `file_tree.root.join(entry.path)` — the display
+        // name is derived before we lose the absolute form.
+        let first_name = pending.display_name.clone();
+        let rel = pending
+            .path
+            .strip_prefix(&self.file_tree.root)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| pending.path.clone());
         if pending.hard {
-            self.tasks.hard_delete_paths(generation, vec![pending.path]);
+            self.tasks.hard_delete_paths(
+                generation,
+                Arc::clone(&self.backend),
+                vec![rel],
+                first_name,
+            );
         } else {
-            self.tasks.trash_paths(generation, vec![pending.path]);
+            self.tasks
+                .trash_paths(generation, Arc::clone(&self.backend), vec![rel], first_name);
         }
     }
 
     pub fn cancel_tree_delete(&mut self) {
         self.tree_delete_confirm = None;
+    }
+
+    // ── Hosts picker (Ctrl+O) ────────────────────────────────────────────
+
+    /// Open the hosts picker overlay, seeding it from the current user's
+    /// `~/.ssh/config` plus the persisted recent-targets list. Errors
+    /// reading the config aren't fatal — we show an empty picker so the
+    /// user can still switch via the path-input mode.
+    pub fn open_hosts_picker(&mut self) {
+        let parsed = crate::hosts::parse_ssh_config().unwrap_or_default();
+        let recent = crate::hosts_picker::load_recent();
+        self.hosts_picker.open(parsed, recent);
+    }
+
+    /// Close the picker without connecting.
+    pub fn close_hosts_picker(&mut self) {
+        self.hosts_picker.close();
+    }
+
+    /// Commit the picker's current selection. On success, stash the
+    /// target for `main.rs` to consume and flip the session-swap flag —
+    /// we don't build the new backend here because the outer loop owns
+    /// the terminal teardown/setup dance around the connect.
+    pub fn confirm_hosts_picker(&mut self) {
+        let Some(target) = self.hosts_picker.confirm() else {
+            return;
+        };
+        // Persist the chosen target to the recents list before handing
+        // control back to `main.rs` — even if the subsequent connect
+        // fails, the user probably still wants it surfaced next time.
+        let mut current = crate::hosts_picker::load_recent();
+        current = crate::hosts_picker::bump_recent(current, target.clone());
+        crate::hosts_picker::save_recent(&current);
+
+        self.hosts_picker.close();
+        self.pending_ssh_target = Some(target);
+        self.should_quit_session = true;
     }
 
     /// Collapse every expanded folder and async-refresh the tree so
@@ -1032,7 +1173,7 @@ impl App {
         let generation = self.file_tree_load.begin();
         self.tasks.rebuild_tree(
             generation,
-            self.file_tree.root.clone(),
+            Arc::clone(&self.backend),
             self.file_tree.expanded_paths(),
             self.file_tree.git_statuses(),
             selected_path,
@@ -1061,7 +1202,7 @@ impl App {
         let generation = self.preview_load.begin();
         self.tasks.load_preview(
             generation,
-            self.file_tree.root.clone(),
+            Arc::clone(&self.backend),
             rel_path,
             self.theme.is_dark,
         );
@@ -1082,7 +1223,7 @@ impl App {
             self.diff_content = None;
             return;
         };
-        if self.repo.is_none() {
+        if !self.backend.has_repo() {
             self.diff_content = None;
             return;
         }
@@ -1093,7 +1234,7 @@ impl App {
         let generation = self.diff_load.begin();
         self.tasks.load_diff(
             generation,
-            self.file_tree.root.clone(),
+            Arc::clone(&self.backend),
             sel.path,
             sel.is_staged,
             context,
@@ -1123,11 +1264,7 @@ impl App {
     }
 
     pub fn stage_file(&mut self, path: &str) {
-        let ok = self
-            .repo
-            .as_ref()
-            .map(|r| r.stage_file(path).is_ok())
-            .unwrap_or(false);
+        let ok = self.backend.stage(path).is_ok();
         if ok {
             // If we were viewing this file, update selection
             if let Some(ref mut sel) = self.selected_file {
@@ -1141,11 +1278,7 @@ impl App {
     }
 
     pub fn unstage_file(&mut self, path: &str) {
-        let ok = self
-            .repo
-            .as_ref()
-            .map(|r| r.unstage_file(path).is_ok())
-            .unwrap_or(false);
+        let ok = self.backend.unstage(path).is_ok();
         if ok {
             if let Some(ref mut sel) = self.selected_file {
                 if sel.path == path && sel.is_staged {
@@ -1160,9 +1293,7 @@ impl App {
     pub fn stage_all(&mut self) {
         let paths: Vec<String> = self.unstaged_files.iter().map(|f| f.path.clone()).collect();
         for p in &paths {
-            if let Some(ref repo) = self.repo {
-                let _ = repo.stage_file(p);
-            }
+            let _ = self.backend.stage(p);
         }
         if let Some(ref mut sel) = self.selected_file {
             if paths.iter().any(|p| p == &sel.path) {
@@ -1176,9 +1307,7 @@ impl App {
     pub fn unstage_all(&mut self) {
         let paths: Vec<String> = self.staged_files.iter().map(|f| f.path.clone()).collect();
         for p in &paths {
-            if let Some(ref repo) = self.repo {
-                let _ = repo.unstage_file(p);
-            }
+            let _ = self.backend.unstage(p);
         }
         if let Some(ref mut sel) = self.selected_file {
             if paths.iter().any(|p| p == &sel.path) {
@@ -1260,12 +1389,15 @@ impl App {
 
     fn apply_discard_target(&mut self, target: &DiscardTarget) -> HashSet<String> {
         let mut touched: HashSet<String> = HashSet::new();
-        let Some(repo) = self.repo.as_ref() else {
-            return touched;
-        };
+        // Post-M4: discard goes through `backend.revert_path` so
+        // RemoteBackend gets the same folder/section semantics as local.
+        // We ignore errors (matches the pre-M4 `let _ = repo.…` pattern):
+        // the refresh_status + load_diff that follow will reflect whatever
+        // actually landed on disk, and a partial failure on one path in a
+        // folder discard shouldn't block the rest.
         match target {
             DiscardTarget::File(path) => {
-                let _ = repo.restore_file(path);
+                let _ = self.backend.revert_path(path, /*is_staged=*/ false);
                 touched.insert(path.clone());
             }
             DiscardTarget::Folder { is_staged, path } => {
@@ -1276,7 +1408,7 @@ impl App {
                 };
                 for p in source {
                     if folder_contains(path, &p) {
-                        revert_path(repo, &p, *is_staged);
+                        let _ = self.backend.revert_path(&p, *is_staged);
                         touched.insert(p);
                     }
                 }
@@ -1288,7 +1420,7 @@ impl App {
                     self.unstaged_files.iter().map(|f| f.path.clone()).collect()
                 };
                 for p in source {
-                    revert_path(repo, &p, *is_staged);
+                    let _ = self.backend.revert_path(&p, *is_staged);
                     touched.insert(p);
                 }
             }
@@ -1300,7 +1432,7 @@ impl App {
     /// Working-tree fs events do NOT invalidate the cache — see plan pitfall #2.
     pub fn refresh_graph(&mut self) {
         const GRAPH_COMMIT_LIMIT: usize = 500;
-        if self.repo.is_none() {
+        if !self.backend.has_repo() {
             self.git_graph.rows.clear();
             self.git_graph.ref_map.clear();
             self.git_graph.cache_key = None;
@@ -1308,7 +1440,7 @@ impl App {
         };
         let generation = self.graph_load.begin();
         self.tasks
-            .refresh_graph(generation, self.file_tree.root.clone(), GRAPH_COMMIT_LIMIT);
+            .refresh_graph(generation, Arc::clone(&self.backend), GRAPH_COMMIT_LIMIT);
     }
 
     /// (Re)load commit detail for the currently-selected commit. Clears detail
@@ -1325,13 +1457,13 @@ impl App {
             self.commit_detail.detail = None;
             return;
         };
-        if self.repo.is_none() {
+        if !self.backend.has_repo() {
             self.commit_detail.detail = None;
             return;
         }
         let generation = self.commit_detail_load.begin();
         self.tasks
-            .load_commit_detail(generation, self.file_tree.root.clone(), oid);
+            .load_commit_detail(generation, Arc::clone(&self.backend), oid);
     }
 
     /// (Re)load the range-mode payload for the current Shift-extended
@@ -1376,13 +1508,13 @@ impl App {
             commits,
             files: Vec::new(),
         });
-        if self.repo.is_none() {
+        if !self.backend.has_repo() {
             return;
         }
         let generation = self.commit_detail_load.begin();
         self.tasks.load_commit_range_detail(
             generation,
-            self.file_tree.root.clone(),
+            Arc::clone(&self.backend),
             oldest_oid,
             newest_oid,
         );
@@ -1411,7 +1543,7 @@ impl App {
             DiffMode::Compact => 3,
             DiffMode::FullFile => 9999,
         };
-        if self.repo.is_none() {
+        if !self.backend.has_repo() {
             self.commit_detail.file_diff = None;
             return;
         }
@@ -1438,7 +1570,7 @@ impl App {
             let generation = self.commit_file_diff_load.begin();
             self.tasks.load_range_file_diff(
                 generation,
-                self.file_tree.root.clone(),
+                Arc::clone(&self.backend),
                 oldest,
                 newest,
                 path.to_string(),
@@ -1454,7 +1586,7 @@ impl App {
         let generation = self.commit_file_diff_load.begin();
         self.tasks.load_commit_file_diff(
             generation,
-            self.file_tree.root.clone(),
+            Arc::clone(&self.backend),
             oid,
             path.to_string(),
             context,
@@ -1551,14 +1683,15 @@ impl App {
         if self.push_in_flight {
             return;
         }
-        let Some(workdir) = self.repo.as_ref().and_then(|r| r.workdir_path()) else {
+        if !self.backend.has_repo() {
             return;
-        };
+        }
+        let backend = Arc::clone(&self.backend);
         let (tx, rx) = mpsc::channel();
         self.push_rx = Some(rx);
         self.push_in_flight = true;
         std::thread::spawn(move || {
-            let result = crate::git::push_at(&workdir, force);
+            let result = backend.push(force).map_err(|e| e.to_string());
             // Recv side may have been dropped by the time we finish (e.g.
             // user quit mid-push); ignore the send error.
             let _ = tx.send((force, result));
@@ -2268,9 +2401,7 @@ impl App {
             }
             ClickAction::FileTreeToolbarRefresh => {
                 self.refresh_file_tree();
-                if self.repo.is_some() {
-                    self.refresh_status();
-                }
+                self.refresh_status();
             }
             ClickAction::FileTreeToolbarCollapse => {
                 self.collapse_all_tree_entries();
@@ -2280,6 +2411,19 @@ impl App {
             }
             ClickAction::TreeContextMenuClose => {
                 self.close_tree_context_menu();
+            }
+            ClickAction::HostsPickerSelect(idx) => {
+                // Mouse click on a hosts-picker row: move selection to
+                // that row and (for paths that already have a target)
+                // commit. The picker's own keyboard path goes through a
+                // different method, so here we just re-use `move_selection`
+                // by computing the delta.
+                let current = self.hosts_picker.selected_idx;
+                let delta = idx as i32 - current as i32;
+                self.hosts_picker.move_selection(delta);
+                // Enter path-mode immediately so user can type /path and
+                // hit Enter — matches the overlay's keyboard UX.
+                self.hosts_picker.enter_path_mode();
             }
             ClickAction::TreeClearSelection => {
                 // Left-click on empty tree space → drop the selection
@@ -2507,7 +2651,7 @@ impl App {
         self.tasks.search_all(
             new_gen,
             new_cancel,
-            self.file_tree.root.clone(),
+            Arc::clone(&self.backend),
             self.global_search.query.clone(),
         );
     }
@@ -2563,7 +2707,8 @@ impl App {
                 }
             }
             Tab::Git => {
-                let should_poll_git = self.repo.is_some() && now >= self.next_git_revalidate_at;
+                let has_repo = self.backend.has_repo();
+                let should_poll_git = has_repo && now >= self.next_git_revalidate_at;
                 if self.git_status_load.should_request()
                     || (should_poll_git && !self.git_status_load.loading)
                 {
@@ -2575,11 +2720,10 @@ impl App {
                 }
             }
             Tab::Graph => {
-                let should_poll_graph = self.repo.is_some() && now >= self.next_graph_revalidate_at;
+                let has_repo = self.backend.has_repo();
+                let should_poll_graph = has_repo && now >= self.next_graph_revalidate_at;
                 if self.graph_load.should_request()
-                    || (self.repo.is_some()
-                        && self.git_graph.rows.is_empty()
-                        && !self.graph_load.loading)
+                    || (has_repo && self.git_graph.rows.is_empty() && !self.graph_load.loading)
                     || (should_poll_graph && !self.graph_load.loading)
                 {
                     self.refresh_graph();
@@ -2620,16 +2764,6 @@ impl App {
 }
 
 // ─── Discard helpers ──────────────────────────────────────────────────────────
-
-/// Revert a single workdir path under the rules used by the "discard all"
-/// and "discard folder" flows. Staged paths are reset to HEAD (unstage +
-/// restore workdir); unstaged paths keep the existing single-file semantics.
-fn revert_path(repo: &GitRepo, path: &str, is_staged: bool) {
-    if is_staged {
-        let _ = repo.unstage_file(path);
-    }
-    let _ = repo.restore_file(path);
-}
 
 /// True when `file_path` lives under the directory at `folder_path` (direct
 /// child or deeper). Tolerates a trailing slash on `folder_path` and handles

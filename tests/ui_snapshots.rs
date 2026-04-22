@@ -287,7 +287,7 @@ fn snapshot_graph_range_mode() {
     let _h = HomeGuard::enter(home.path());
     let _g = CwdGuard::enter(tmp.path());
 
-    let mut app = App::new(Theme::dark());
+    let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(reef::app::Tab::Graph);
     wait_for_graph_ready(&mut app);
     // Extend by 2 → range of 3 (newest + 2 older). `rows` is newest-first,
@@ -413,7 +413,9 @@ fn snapshot_image_preview_halfblocks() {
     // TestBackend stops at whatever frame we ask it to.
     let _warmup = render_app(&mut app, 80, 20);
     let output = render_app(&mut app, 80, 20);
-    with_filters(|| insta::assert_snapshot!("image_preview_halfblocks", output));
+    with_filters(&[], || {
+        insta::assert_snapshot!("image_preview_halfblocks", output)
+    });
 }
 
 #[test]
@@ -451,5 +453,5 @@ fn snapshot_binary_info_pdf() {
     wait_for_preview(&mut app);
 
     let output = render_app(&mut app, 80, 20);
-    with_filters(|| insta::assert_snapshot!("binary_info_pdf", output));
+    with_filters(&[], || insta::assert_snapshot!("binary_info_pdf", output));
 }

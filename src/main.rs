@@ -9,16 +9,104 @@ use crossterm::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use reef::agent_deploy::{self, InstallPath, SshSession};
 use reef::app::App;
+use reef::backend::{Backend, LocalBackend, RemoteBackend};
 use reef::i18n;
 use reef::ui::theme::Theme;
 use reef::ui::toast::Toast;
 use reef::{editor, input, ui};
 use std::io;
 use std::panic;
+use std::sync::Arc;
 use std::time::Duration;
 
+/// Minimal argv parsing. Flags recognised:
+///   --agent-exec <COMMAND>    Spawn the given shell-split command as a
+///                             reef-agent subprocess and drive the UI through
+///                             it. Typical value: `ssh host reef-agent --stdio`.
+///                             This is the power-user / test hook.
+///   --ssh <TARGET>            High-level shortcut. `TARGET` is
+///                             `[user@]host[:remote_path]` — reef will:
+///                             (a) establish an ssh ControlMaster session,
+///                             (b) run the install script to ensure
+///                                 `reef-agent` matching this reef's
+///                                 version lives on the remote, and
+///                             (c) connect to it.
+///   --help / -h               Print usage and exit.
+fn parse_args() -> Result<AppArgs, String> {
+    let mut args = std::env::args().skip(1);
+    let mut agent_exec: Option<String> = None;
+    let mut ssh_target: Option<String> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            "--agent-exec" => {
+                agent_exec = Some(
+                    args.next()
+                        .ok_or_else(|| "--agent-exec requires a value".to_string())?,
+                );
+            }
+            "--ssh" => {
+                ssh_target = Some(
+                    args.next()
+                        .ok_or_else(|| "--ssh requires a [user@]host[:path] value".to_string())?,
+                );
+            }
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    if agent_exec.is_some() && ssh_target.is_some() {
+        return Err("--agent-exec and --ssh are mutually exclusive".into());
+    }
+    Ok(AppArgs {
+        agent_exec,
+        ssh_target,
+    })
+}
+
+fn print_usage() {
+    eprintln!("reef — terminal UI for git");
+    eprintln!();
+    eprintln!("USAGE:");
+    eprintln!("    reef                            # open cwd with local backend");
+    eprintln!(
+        "    reef --ssh user@host            # open remote HOME on host (agent auto-installed)"
+    );
+    eprintln!("    reef --ssh user@host:/path      # open /path on host");
+    eprintln!(
+        "    reef --agent-exec \"CMD...\"      # advanced: drive reef through a custom agent pipe"
+    );
+    eprintln!();
+    eprintln!("The --agent-exec value is whitespace-split into argv. Typical remote:");
+    eprintln!("    reef --agent-exec \"ssh user@host reef-agent --stdio --workdir /path\"");
+}
+
+struct AppArgs {
+    agent_exec: Option<String>,
+    ssh_target: Option<String>,
+}
+
+/// Split a `[user@]host[:path]` target. Returns `(host_with_user, path)`;
+/// `path` defaults to `"."` so the agent opens the remote `$HOME`.
+///
+/// We keep it simple: split on the *first* `:` because `user@host` itself
+/// never contains a colon, and `:` in remote paths is legal but unusual —
+/// users with weird paths can always fall through to `--agent-exec`.
+fn split_ssh_target(target: &str) -> (String, String) {
+    match target.split_once(':') {
+        Some((host, "")) => (host.to_string(), ".".to_string()),
+        Some((host, path)) => (host.to_string(), path.to_string()),
+        None => (target.to_string(), ".".to_string()),
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let parsed = parse_args()?;
+
     // Set up panic hook to restore terminal
     let original_hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {
@@ -41,6 +129,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // reply doesn't fragment onto the TUI. `Theme::resolve` also honours the
     // `ui.theme` pref override and a non-TTY fallback.
     let theme = Theme::resolve();
+
+    // Build the backend before terminal setup so any spawn failure surfaces
+    // as a normal error (stderr) rather than painting half-initialised on
+    // the alt-screen.
+    let mut backend: Arc<dyn Backend> = if let Some(target) = parsed.ssh_target.as_deref() {
+        Arc::new(build_ssh_backend(target)?)
+    } else if let Some(spec) = parsed.agent_exec.as_deref() {
+        let argv: Vec<String> = spec.split_whitespace().map(|s| s.to_string()).collect();
+        if argv.is_empty() {
+            return Err("--agent-exec value is empty".into());
+        }
+        Arc::new(RemoteBackend::spawn(&argv)?)
+    } else {
+        Arc::new(LocalBackend::open_cwd()?)
+    };
 
     // Terminal setup
     enable_raw_mode()?;
@@ -65,112 +168,180 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     )
     .is_ok();
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    // Rename the crossterm backend binding to avoid shadowing the
+    // `Arc<dyn Backend>` data-backend constructed above.
+    let backend_term = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend_term)?;
 
-    // App init
-    let mut app = App::new(theme);
+    // Outer session loop: the Ctrl+O hosts picker can flip
+    // `should_quit_session` + `pending_ssh_target` to ask for a fresh
+    // backend. Each iteration owns one `App` + one backend; the terminal
+    // setup/teardown lives outside so the new session inherits the
+    // existing alt-screen/mouse-capture state instead of flashing.
+    'session: loop {
+        // App init
+        let mut app = App::new_with_backend(theme, Arc::clone(&backend));
 
-    // Main loop
-    loop {
-        app.tick();
-        terminal.draw(|f| ui::render(f, &mut app))?;
-
-        // Block until at least one event arrives (or 16ms timeout for ~60fps)
-        if !event::poll(Duration::from_millis(16))? {
-            continue;
+        // First-run heuristic: if the user launched reef without `--ssh`
+        // and the cwd isn't a repo, auto-open the hosts picker so they
+        // have a visible path to an ssh connection instead of staring at
+        // the "Not a git repository" placeholder. Skipped on the subsequent
+        // session swaps — those always have a backend picked already.
+        if parsed.ssh_target.is_none()
+            && parsed.agent_exec.is_none()
+            && !app.backend.has_repo()
+            && app.hosts_picker.all_hosts.is_empty()
+        {
+            app.open_hosts_picker();
         }
 
-        // Snapshot selection before processing events
-        let sel_before = app
-            .selected_file
-            .as_ref()
-            .map(|s| (s.path.clone(), s.is_staged));
-
-        // Drain ALL pending events so rapid key repeats coalesce — only one
-        // render + diff-load runs per frame, regardless of how many events fired.
+        // Main loop
         loop {
-            match event::read()? {
-                Event::Key(key) => {
-                    // Crossterm emits Press + Release (and Repeat on hold) for every
-                    // physical keystroke on Windows Terminal, in terminals that enable
-                    // the kitty keyboard protocol, and on some macOS configurations.
-                    // Without this filter each keypress runs handle_key twice, so j/k
-                    // navigate 2 rows instead of 1 (and 3+ when held).
-                    if key.kind != KeyEventKind::Press {
-                        continue;
-                    }
+            app.tick();
+            terminal.draw(|f| ui::render(f, &mut app))?;
 
-                    // `v` toggles select mode, which flips crossterm's mouse capture
-                    // so the terminal's native text-selection works. Kept inline
-                    // because it's the only input that needs to poke the terminal
-                    // backend mid-loop.
-                    //
-                    // When any palette (quick-open or global-search) is active
-                    // it owns every key unconditionally — 'v' must land as a
-                    // literal in the query, and 'any key' must not dismiss
-                    // help — so route to handle_key first and let it delegate
-                    // to the palette.
-                    if app.quick_open.active || app.global_search.active {
-                        input::handle_key(key, &mut app);
-                    } else if key.code == KeyCode::Char('v') && key.modifiers.is_empty() {
-                        app.select_mode = !app.select_mode;
-                        if app.select_mode {
-                            execute!(terminal.backend_mut(), DisableMouseCapture)?;
-                        } else {
-                            execute!(terminal.backend_mut(), EnableMouseCapture)?;
+            // Block until at least one event arrives (or 16ms timeout for ~60fps)
+            if !event::poll(Duration::from_millis(16))? {
+                continue;
+            }
+
+            // Snapshot selection before processing events
+            let sel_before = app
+                .selected_file
+                .as_ref()
+                .map(|s| (s.path.clone(), s.is_staged));
+
+            // Drain ALL pending events so rapid key repeats coalesce — only one
+            // render + diff-load runs per frame, regardless of how many events fired.
+            loop {
+                match event::read()? {
+                    Event::Key(key) => {
+                        // Crossterm emits Press + Release (and Repeat on hold) for every
+                        // physical keystroke on Windows Terminal, in terminals that enable
+                        // the kitty keyboard protocol, and on some macOS configurations.
+                        // Without this filter each keypress runs handle_key twice, so j/k
+                        // navigate 2 rows instead of 1 (and 3+ when held).
+                        if key.kind != KeyEventKind::Press {
+                            continue;
                         }
-                    } else if app.show_help {
-                        app.show_help = false;
-                    } else {
-                        input::handle_key(key, &mut app);
+
+                        // `v` toggles select mode, which flips crossterm's mouse capture
+                        // so the terminal's native text-selection works. Kept inline
+                        // because it's the only input that needs to poke the terminal
+                        // backend mid-loop.
+                        //
+                        // When any palette (quick-open or global-search) is active
+                        // it owns every key unconditionally — 'v' must land as a
+                        // literal in the query, and 'any key' must not dismiss
+                        // help — so route to handle_key first and let it delegate
+                        // to the palette.
+                        if app.quick_open.active
+                            || app.global_search.active
+                            || app.hosts_picker.active
+                        {
+                            input::handle_key(key, &mut app);
+                        } else if key.code == KeyCode::Char('v') && key.modifiers.is_empty() {
+                            app.select_mode = !app.select_mode;
+                            if app.select_mode {
+                                execute!(terminal.backend_mut(), DisableMouseCapture)?;
+                            } else {
+                                execute!(terminal.backend_mut(), EnableMouseCapture)?;
+                            }
+                        } else if app.show_help {
+                            app.show_help = false;
+                        } else {
+                            input::handle_key(key, &mut app);
+                        }
+                    }
+                    Event::Mouse(mouse) => {
+                        if !app.select_mode {
+                            input::handle_mouse(mouse, &mut app, &terminal);
+                        }
+                    }
+                    Event::Paste(s) => {
+                        input::handle_paste(s, &mut app);
+                    }
+                    Event::Resize(_, _) => {}
+                    _ => {}
+                }
+                // Stop draining if no more events are immediately available
+                if !event::poll(Duration::from_millis(0))? {
+                    break;
+                }
+            }
+
+            // After draining, sync selection state
+            let sel_after = app
+                .selected_file
+                .as_ref()
+                .map(|s| (s.path.clone(), s.is_staged));
+            if sel_after != sel_before {
+                app.load_diff();
+            }
+
+            // Handle an edit request *after* event drain so the terminal is
+            // idle. Suspends the TUI, runs `$EDITOR` (or `ssh -t host
+            // $EDITOR rel` for remote), resumes. Mouse capture tracks
+            // `select_mode` — off in select mode, on otherwise.
+            if let Some(path) = app.pending_edit.take() {
+                let mouse_was_on = !app.select_mode;
+                // Convert an absolute path (input.rs synthesises
+                // `file_tree.root.join(entry.path)`) back to a workdir-
+                // relative form so the backend's remote variant can ship the
+                // path across the ssh boundary verbatim. LocalBackend accepts
+                // either shape.
+                let workdir = app.backend.workdir_path();
+                let rel_for_spec = path
+                    .strip_prefix(&workdir)
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|_| path.clone());
+                match app.backend.editor_launch_spec(&rel_for_spec) {
+                    Ok(spec) => {
+                        if let Err(e) = editor::launch_spec(&mut terminal, &spec, mouse_was_on) {
+                            app.toasts
+                                .push(Toast::error(i18n::edit_open_failed(&e.to_string())));
+                        }
+                    }
+                    Err(e) => {
+                        app.toasts
+                            .push(Toast::error(i18n::edit_open_failed(&e.to_string())));
                     }
                 }
-                Event::Mouse(mouse) => {
-                    if !app.select_mode {
-                        input::handle_mouse(mouse, &mut app, &terminal);
-                    }
+                // Pick up on-disk changes immediately rather than waiting for
+                // the fs-watcher debounce.
+                app.refresh_file_tree();
+                app.load_preview();
+            }
+
+            if app.should_quit {
+                break 'session;
+            }
+            if app.should_quit_session {
+                break; // inner loop only — outer 'session handles the swap
+            }
+        }
+
+        // Session swap: pick up the pending target, build the new backend
+        // (still inside raw-mode; the connect failure path below restores
+        // it if anything went wrong), then restart the inner loop with a
+        // fresh App. Errors here return to the picker state by falling
+        // through to a `continue 'session` with the old backend retained.
+        if let Some(target) = app.pending_ssh_target.take() {
+            let target_arg = target.to_arg();
+            match build_ssh_backend(&target_arg) {
+                Ok(new_backend) => {
+                    backend = Arc::new(new_backend);
+                    continue 'session;
                 }
-                Event::Paste(s) => {
-                    input::handle_paste(s, &mut app);
+                Err(e) => {
+                    eprintln!("reef: failed to connect to {target_arg}: {e}");
+                    // Keep the previous backend and let the user try again.
+                    continue 'session;
                 }
-                Event::Resize(_, _) => {}
-                _ => {}
-            }
-            // Stop draining if no more events are immediately available
-            if !event::poll(Duration::from_millis(0))? {
-                break;
             }
         }
-
-        // After draining, sync selection state
-        let sel_after = app
-            .selected_file
-            .as_ref()
-            .map(|s| (s.path.clone(), s.is_staged));
-        if sel_after != sel_before {
-            app.load_diff();
-        }
-
-        // Handle an edit request *after* event drain so the terminal is
-        // idle. Suspends the TUI, runs `$EDITOR`, resumes. Mouse capture
-        // tracks `select_mode` — off in select mode, on otherwise.
-        if let Some(path) = app.pending_edit.take() {
-            let mouse_was_on = !app.select_mode;
-            if let Err(e) = editor::launch(&mut terminal, &path, mouse_was_on) {
-                app.toasts
-                    .push(Toast::error(i18n::edit_open_failed(&e.to_string())));
-            }
-            // Pick up on-disk changes immediately rather than waiting for
-            // the fs-watcher debounce.
-            app.refresh_file_tree();
-            app.load_preview();
-        }
-
-        if app.should_quit {
-            break;
-        }
-    }
+        break 'session;
+    } // end 'session
 
     // Restore terminal. Pop the keyboard enhancement flags only if the
     // push succeeded earlier — popping on a terminal that never received
@@ -188,4 +359,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     terminal.show_cursor()?;
 
     Ok(())
+}
+
+/// End-to-end `--ssh <target>` flow:
+///   1. Resolve host + remote workdir
+///   2. Build a ControlMaster-enabled `SshSession`
+///   3. Run the install-script probe to ensure the agent is on disk
+///   4. Connect to the agent and return the RemoteBackend
+fn build_ssh_backend(target: &str) -> Result<RemoteBackend, Box<dyn std::error::Error>> {
+    let (host, remote_workdir) = split_ssh_target(target);
+    if host.is_empty() {
+        return Err("--ssh value is missing a host".into());
+    }
+    eprintln!(
+        "reef: connecting to {host}{}",
+        remote_path_suffix(&remote_workdir)
+    );
+
+    let session = SshSession::for_host(&host)?;
+    let location = agent_deploy::ensure_agent_with_session(
+        &session,
+        env!("CARGO_PKG_VERSION"),
+        agent_deploy::DEFAULT_DOWNLOAD_URL_TEMPLATE,
+    )?;
+
+    let via = match location.via {
+        InstallPath::AlreadyInstalled => "already installed",
+        InstallPath::Downloaded => "downloaded from release",
+        InstallPath::Uploaded => "uploaded from local build",
+    };
+    eprintln!(
+        "reef: remote agent ready ({via}) at {}:{}",
+        location.host, location.remote_path
+    );
+
+    let backend = RemoteBackend::connect_ssh(
+        &session,
+        &remote_workdir,
+        &location.remote_path,
+        location.remote_os,
+    )?;
+    Ok(backend)
+}
+
+fn remote_path_suffix(path: &str) -> String {
+    if path == "." {
+        String::new()
+    } else {
+        format!(":{path}")
+    }
 }

@@ -686,9 +686,19 @@ pub fn push_at(workdir: &Path, force: bool) -> Result<(), String> {
     if force {
         cmd.arg("--force-with-lease");
     }
-    let output = cmd
-        .output()
-        .map_err(|e| format!("failed to run git: {e}"))?;
+    let output = cmd.output().map_err(|e| {
+        // On POSIX `Command::spawn` returns `NotFound` ("No such file or
+        // directory"); on Windows it's the same `ErrorKind`. Detect and
+        // return a user-actionable message — relevant for remote agents
+        // running on minimal container images without `git` installed.
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "git executable not found on PATH — push requires a `git` binary \
+             on the host running the backend (install git on the remote to enable push)"
+                .to_string()
+        } else {
+            format!("failed to run git: {e}")
+        }
+    })?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if err.is_empty() {

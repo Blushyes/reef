@@ -5,9 +5,10 @@
 //! these workers and merged back into `App` from `tick()`.
 
 use crate::app::{CommitFileDiff, DiffHighlighted, HighlightedDiff};
-use crate::file_tree::{self, PreviewContent, TreeEntry};
+use crate::backend::Backend;
+use crate::file_tree::{PreviewContent, TreeEntry};
 use crate::git::graph::GraphRow;
-use crate::git::{CommitDetail, DiffContent, FileEntry, GitRepo, RefLabel};
+use crate::git::{CommitDetail, DiffContent, FileEntry, RefLabel};
 use crate::global_search::MatchHit;
 use crate::ui::highlight;
 use std::collections::HashMap;
@@ -168,7 +169,7 @@ pub enum FsMutationKind {
 enum FilesTask {
     RebuildTree {
         generation: u64,
-        root: PathBuf,
+        backend: Arc<dyn Backend>,
         expanded: Vec<PathBuf>,
         git_statuses: HashMap<String, char>,
         selected_path: Option<PathBuf>,
@@ -176,7 +177,7 @@ enum FilesTask {
     },
     LoadPreview {
         generation: u64,
-        root: PathBuf,
+        backend: Arc<dyn Backend>,
         rel_path: PathBuf,
         dark: bool,
     },
@@ -184,53 +185,77 @@ enum FilesTask {
     /// collision auto-renames VSCode-style (`foo.txt` → `foo (1).txt`).
     /// Directory sources are copied recursively; symlinks are skipped
     /// (documented in `copy_sources`).
+    ///
+    /// Paths here are still absolute because copy sources can be external
+    /// (drag-drop from Finder) or inside the workdir; the `App` layer
+    /// guards external drag-drop on remote backends.
     CopyFiles {
         generation: u64,
+        backend: Arc<dyn Backend>,
         sources: Vec<PathBuf>,
         dest_dir: PathBuf,
     },
-    /// Create an empty file at `path`. Fails if the parent dir is
+    /// Create an empty file at `rel`. Fails if the parent dir is
     /// missing or the file already exists — the UI layer
     /// (`App::commit_tree_edit`) has already validated + rejected
     /// collisions before dispatch, but a race with an external
-    /// process is possible so we still surface the io::Error.
-    CreateFile { generation: u64, path: PathBuf },
-    /// `mkdir -p` on `path`. If the directory already exists we
+    /// process is possible so we still surface the error.
+    CreateFile {
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        rel: PathBuf,
+        /// Basename for the toast (worker shouldn't redo `file_name`
+        /// arithmetic on a workdir-relative path — preserves the old
+        /// behaviour where rootless paths still rendered cleanly).
+        display_name: String,
+    },
+    /// `mkdir -p` on `rel`. If the directory already exists we
     /// treat that as success (the rare race window) to avoid a
     /// surprising failure after the user explicitly asked for it.
-    CreateFolder { generation: u64, path: PathBuf },
-    /// `fs::rename(old, new)`. Caller guarantees `new` doesn't
-    /// already exist (checked in `App::commit_tree_edit`).
+    CreateFolder {
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        rel: PathBuf,
+        display_name: String,
+    },
+    /// `backend.rename(old_rel, new_rel)`. Caller guarantees `new_rel`
+    /// doesn't already exist (checked in `App::commit_tree_edit`).
     Rename {
         generation: u64,
-        old_path: PathBuf,
-        new_path: PathBuf,
+        backend: Arc<dyn Backend>,
+        old_rel: PathBuf,
+        new_rel: PathBuf,
+        old_name: String,
+        new_name: String,
     },
-    /// Move each path to the system Trash. Uses the `trash` crate
-    /// for cross-platform semantics (Finder Trash on macOS, XDG
-    /// Trash on Linux, Recycle Bin on Windows).
+    /// Move each path to the system Trash. Uses `backend.trash`, which
+    /// is cross-platform on LocalBackend (via the `trash` crate) and
+    /// falls through to `gio trash` / permanent delete on RemoteBackend.
     TrashPaths {
         generation: u64,
-        paths: Vec<PathBuf>,
+        backend: Arc<dyn Backend>,
+        rels: Vec<PathBuf>,
+        first_name: String,
     },
-    /// Permanent delete via `fs::remove_file` / `remove_dir_all`.
-    /// Reached via Shift+Delete after the confirm dialog. Files
-    /// and directories both supported; symlinks are removed by
-    /// `remove_file` without dereferencing (matches `rm` on Unix).
+    /// Permanent delete via `backend.hard_delete`. Reached via
+    /// Shift+Delete after the confirm dialog. Files and directories
+    /// both supported.
     HardDeletePaths {
         generation: u64,
-        paths: Vec<PathBuf>,
+        backend: Arc<dyn Backend>,
+        rels: Vec<PathBuf>,
+        first_name: String,
     },
 }
 
 enum GitTask {
     RefreshStatus {
         generation: u64,
-        workdir: PathBuf,
+        backend: Arc<dyn Backend>,
     },
     LoadDiff {
         generation: u64,
-        workdir: PathBuf,
+        backend: Arc<dyn Backend>,
         path: String,
         staged: bool,
         context_lines: u32,
@@ -244,7 +269,7 @@ enum GlobalSearchTask {
     Run {
         generation: u64,
         cancel: Arc<AtomicBool>,
-        root: PathBuf,
+        backend: Arc<dyn Backend>,
         query: String,
     },
 }
@@ -252,17 +277,17 @@ enum GlobalSearchTask {
 enum GraphTask {
     RefreshGraph {
         generation: u64,
-        workdir: PathBuf,
+        backend: Arc<dyn Backend>,
         limit: usize,
     },
     LoadCommitDetail {
         generation: u64,
-        workdir: PathBuf,
+        backend: Arc<dyn Backend>,
         oid: String,
     },
     LoadCommitFileDiff {
         generation: u64,
-        workdir: PathBuf,
+        backend: Arc<dyn Backend>,
         oid: String,
         path: String,
         context_lines: u32,
@@ -299,7 +324,7 @@ impl TaskCoordinator {
     pub fn rebuild_tree(
         &self,
         generation: u64,
-        root: PathBuf,
+        backend: Arc<dyn Backend>,
         expanded: Vec<PathBuf>,
         git_statuses: HashMap<String, char>,
         selected_path: Option<PathBuf>,
@@ -307,7 +332,7 @@ impl TaskCoordinator {
     ) {
         let _ = self.files_tx.send(FilesTask::RebuildTree {
             generation,
-            root,
+            backend,
             expanded,
             git_statuses,
             selected_path,
@@ -315,66 +340,126 @@ impl TaskCoordinator {
         });
     }
 
-    pub fn load_preview(&self, generation: u64, root: PathBuf, rel_path: PathBuf, dark: bool) {
+    pub fn load_preview(
+        &self,
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        rel_path: PathBuf,
+        dark: bool,
+    ) {
         let _ = self.files_tx.send(FilesTask::LoadPreview {
             generation,
-            root,
+            backend,
             rel_path,
             dark,
         });
     }
 
-    pub fn copy_files(&self, generation: u64, sources: Vec<PathBuf>, dest_dir: PathBuf) {
+    pub fn copy_files(
+        &self,
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        sources: Vec<PathBuf>,
+        dest_dir: PathBuf,
+    ) {
         let _ = self.files_tx.send(FilesTask::CopyFiles {
             generation,
+            backend,
             sources,
             dest_dir,
         });
     }
 
-    pub fn create_file(&self, generation: u64, path: PathBuf) {
-        let _ = self
-            .files_tx
-            .send(FilesTask::CreateFile { generation, path });
-    }
-
-    pub fn create_folder(&self, generation: u64, path: PathBuf) {
-        let _ = self
-            .files_tx
-            .send(FilesTask::CreateFolder { generation, path });
-    }
-
-    pub fn rename_path(&self, generation: u64, old_path: PathBuf, new_path: PathBuf) {
-        let _ = self.files_tx.send(FilesTask::Rename {
+    pub fn create_file(
+        &self,
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        rel: PathBuf,
+        display_name: String,
+    ) {
+        let _ = self.files_tx.send(FilesTask::CreateFile {
             generation,
-            old_path,
-            new_path,
+            backend,
+            rel,
+            display_name,
         });
     }
 
-    pub fn trash_paths(&self, generation: u64, paths: Vec<PathBuf>) {
-        let _ = self
-            .files_tx
-            .send(FilesTask::TrashPaths { generation, paths });
+    pub fn create_folder(
+        &self,
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        rel: PathBuf,
+        display_name: String,
+    ) {
+        let _ = self.files_tx.send(FilesTask::CreateFolder {
+            generation,
+            backend,
+            rel,
+            display_name,
+        });
     }
 
-    pub fn hard_delete_paths(&self, generation: u64, paths: Vec<PathBuf>) {
-        let _ = self
-            .files_tx
-            .send(FilesTask::HardDeletePaths { generation, paths });
+    pub fn rename_path(
+        &self,
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        old_rel: PathBuf,
+        new_rel: PathBuf,
+        old_name: String,
+        new_name: String,
+    ) {
+        let _ = self.files_tx.send(FilesTask::Rename {
+            generation,
+            backend,
+            old_rel,
+            new_rel,
+            old_name,
+            new_name,
+        });
     }
 
-    pub fn refresh_status(&self, generation: u64, workdir: PathBuf) {
+    pub fn trash_paths(
+        &self,
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        rels: Vec<PathBuf>,
+        first_name: String,
+    ) {
+        let _ = self.files_tx.send(FilesTask::TrashPaths {
+            generation,
+            backend,
+            rels,
+            first_name,
+        });
+    }
+
+    pub fn hard_delete_paths(
+        &self,
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        rels: Vec<PathBuf>,
+        first_name: String,
+    ) {
+        let _ = self.files_tx.send(FilesTask::HardDeletePaths {
+            generation,
+            backend,
+            rels,
+            first_name,
+        });
+    }
+
+    pub fn refresh_status(&self, generation: u64, backend: Arc<dyn Backend>) {
         let _ = self.git_tx.send(GitTask::RefreshStatus {
             generation,
-            workdir,
+            backend,
         });
     }
 
     pub fn load_diff(
         &self,
         generation: u64,
-        workdir: PathBuf,
+        backend: Arc<dyn Backend>,
         path: String,
         staged: bool,
         context_lines: u32,
@@ -382,7 +467,7 @@ impl TaskCoordinator {
     ) {
         let _ = self.git_tx.send(GitTask::LoadDiff {
             generation,
-            workdir,
+            backend,
             path,
             staged,
             context_lines,
@@ -390,18 +475,18 @@ impl TaskCoordinator {
         });
     }
 
-    pub fn refresh_graph(&self, generation: u64, workdir: PathBuf, limit: usize) {
+    pub fn refresh_graph(&self, generation: u64, backend: Arc<dyn Backend>, limit: usize) {
         let _ = self.graph_tx.send(GraphTask::RefreshGraph {
             generation,
-            workdir,
+            backend,
             limit,
         });
     }
 
-    pub fn load_commit_detail(&self, generation: u64, workdir: PathBuf, oid: String) {
+    pub fn load_commit_detail(&self, generation: u64, backend: Arc<dyn Backend>, oid: String) {
         let _ = self.graph_tx.send(GraphTask::LoadCommitDetail {
             generation,
-            workdir,
+            backend,
             oid,
         });
     }
@@ -409,7 +494,7 @@ impl TaskCoordinator {
     pub fn load_commit_file_diff(
         &self,
         generation: u64,
-        workdir: PathBuf,
+        backend: Arc<dyn Backend>,
         oid: String,
         path: String,
         context_lines: u32,
@@ -417,7 +502,7 @@ impl TaskCoordinator {
     ) {
         let _ = self.graph_tx.send(GraphTask::LoadCommitFileDiff {
             generation,
-            workdir,
+            backend,
             oid,
             path,
             context_lines,
@@ -436,13 +521,13 @@ impl TaskCoordinator {
         &self,
         generation: u64,
         cancel: Arc<AtomicBool>,
-        root: PathBuf,
+        backend: Arc<dyn Backend>,
         query: String,
     ) {
         let _ = self.global_search_tx.send(GlobalSearchTask::Run {
             generation,
             cancel,
-            root,
+            backend,
             query,
         });
     }
@@ -457,48 +542,69 @@ fn spawn_files_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Fil
                 match task {
                     FilesTask::RebuildTree {
                         generation,
-                        root,
+                        backend,
                         expanded,
                         git_statuses,
                         selected_path,
                         fallback_selected,
                     } => {
-                        let result = Ok(build_file_tree_payload(
-                            root,
+                        let result = build_file_tree_payload(
+                            backend.as_ref(),
                             expanded,
                             git_statuses,
                             selected_path,
                             fallback_selected,
-                        ));
+                        );
                         let _ = result_tx.send(WorkerResult::FileTree { generation, result });
                     }
                     FilesTask::LoadPreview {
                         generation,
-                        root,
+                        backend,
                         rel_path,
                         dark,
                     } => {
-                        let result = Ok(file_tree::load_preview(&root, &rel_path, dark));
+                        let result = Ok(backend.load_preview(&rel_path, dark));
                         let _ = result_tx.send(WorkerResult::Preview { generation, result });
                     }
                     FilesTask::CopyFiles {
                         generation,
+                        backend,
                         sources,
                         dest_dir,
                     } => {
-                        let result = copy_sources(&sources, &dest_dir);
+                        let result = copy_sources(backend.as_ref(), &sources, &dest_dir);
                         let _ = result_tx.send(WorkerResult::FileCopy { generation, result });
                     }
-                    FilesTask::CreateFile { generation, path } => {
-                        let (kind, result) = run_create_file(&path);
+                    FilesTask::CreateFile {
+                        generation,
+                        backend,
+                        rel,
+                        display_name,
+                    } => {
+                        let kind = FsMutationKind::CreatedFile {
+                            name: display_name.clone(),
+                        };
+                        let result = backend
+                            .create_file(&rel)
+                            .map_err(|e| format!("create {display_name:?}: {e}"));
                         let _ = result_tx.send(WorkerResult::FsMutation {
                             generation,
                             kind,
                             result,
                         });
                     }
-                    FilesTask::CreateFolder { generation, path } => {
-                        let (kind, result) = run_create_folder(&path);
+                    FilesTask::CreateFolder {
+                        generation,
+                        backend,
+                        rel,
+                        display_name,
+                    } => {
+                        let kind = FsMutationKind::CreatedFolder {
+                            name: display_name.clone(),
+                        };
+                        let result = backend
+                            .create_dir_all(&rel)
+                            .map_err(|e| format!("mkdir {display_name:?}: {e}"));
                         let _ = result_tx.send(WorkerResult::FsMutation {
                             generation,
                             kind,
@@ -507,26 +613,56 @@ fn spawn_files_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Fil
                     }
                     FilesTask::Rename {
                         generation,
-                        old_path,
-                        new_path,
+                        backend,
+                        old_rel,
+                        new_rel,
+                        old_name,
+                        new_name,
                     } => {
-                        let (kind, result) = run_rename(&old_path, &new_path);
+                        let kind = FsMutationKind::Renamed {
+                            old_name: old_name.clone(),
+                            new_name: new_name.clone(),
+                        };
+                        let result = backend
+                            .rename(&old_rel, &new_rel)
+                            .map_err(|e| format!("rename {old_name:?} → {new_name:?}: {e}"));
                         let _ = result_tx.send(WorkerResult::FsMutation {
                             generation,
                             kind,
                             result,
                         });
                     }
-                    FilesTask::TrashPaths { generation, paths } => {
-                        let (kind, result) = run_trash(&paths);
+                    FilesTask::TrashPaths {
+                        generation,
+                        backend,
+                        rels,
+                        first_name,
+                    } => {
+                        let kind = FsMutationKind::Trashed {
+                            name: first_name.clone(),
+                        };
+                        let result = backend
+                            .trash(&rels)
+                            .map(|_| ())
+                            .map_err(|e| format!("trash {first_name:?}: {e}"));
                         let _ = result_tx.send(WorkerResult::FsMutation {
                             generation,
                             kind,
                             result,
                         });
                     }
-                    FilesTask::HardDeletePaths { generation, paths } => {
-                        let (kind, result) = run_hard_delete(&paths);
+                    FilesTask::HardDeletePaths {
+                        generation,
+                        backend,
+                        rels,
+                        first_name,
+                    } => {
+                        let kind = FsMutationKind::HardDeleted {
+                            name: first_name.clone(),
+                        };
+                        let result = backend
+                            .hard_delete(&rels)
+                            .map_err(|e| format!("delete {first_name:?}: {e}"));
                         let _ = result_tx.send(WorkerResult::FsMutation {
                             generation,
                             kind,
@@ -540,7 +676,14 @@ fn spawn_files_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Fil
 }
 
 // ─── FS mutation helpers ─────────────────────────────────────────────────────
+//
+// These direct-fs helpers used to live on the worker path; M3 routed the
+// workers through `Backend` so the local/remote implementations stay byte-
+// equivalent. The helpers remain because the unit tests in
+// `fs_mutation_tests` still exercise them as a regression guard for the
+// original `std::fs::*` semantics.
 
+#[cfg(test)]
 fn basename_str(path: &Path) -> String {
     // Filenames land in toast text and FsMutationKind display strings.
     // macOS allows control chars (`\n`, `\t`, bell, …) in filenames,
@@ -557,6 +700,7 @@ fn basename_str(path: &Path) -> String {
         .collect()
 }
 
+#[cfg(test)]
 fn run_create_file(path: &Path) -> (FsMutationKind, Result<(), String>) {
     let name = basename_str(path);
     let kind = FsMutationKind::CreatedFile { name: name.clone() };
@@ -573,6 +717,7 @@ fn run_create_file(path: &Path) -> (FsMutationKind, Result<(), String>) {
     (kind, result)
 }
 
+#[cfg(test)]
 fn run_create_folder(path: &Path) -> (FsMutationKind, Result<(), String>) {
     let name = basename_str(path);
     let kind = FsMutationKind::CreatedFolder { name: name.clone() };
@@ -582,6 +727,7 @@ fn run_create_folder(path: &Path) -> (FsMutationKind, Result<(), String>) {
     (kind, result)
 }
 
+#[cfg(test)]
 fn run_rename(old: &Path, new: &Path) -> (FsMutationKind, Result<(), String>) {
     let old_name = basename_str(old);
     let new_name = basename_str(new);
@@ -594,6 +740,8 @@ fn run_rename(old: &Path, new: &Path) -> (FsMutationKind, Result<(), String>) {
     (kind, result)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn run_trash(paths: &[PathBuf]) -> (FsMutationKind, Result<(), String>) {
     // The kind string reports the first path's basename to keep the toast
     // short; if the user trashed many at once (future: multi-select) the
@@ -604,6 +752,7 @@ fn run_trash(paths: &[PathBuf]) -> (FsMutationKind, Result<(), String>) {
     (kind, result)
 }
 
+#[cfg(test)]
 fn run_hard_delete(paths: &[PathBuf]) -> (FsMutationKind, Result<(), String>) {
     let name = paths.first().map(|p| basename_str(p)).unwrap_or_default();
     let kind = FsMutationKind::HardDeleted { name: name.clone() };
@@ -636,37 +785,56 @@ fn run_hard_delete(paths: &[PathBuf]) -> (FsMutationKind, Result<(), String>) {
 /// error encountered. We fail fast on the first error rather than
 /// best-effort so a partial copy doesn't silently miss a file and leave
 /// the user thinking everything succeeded.
-fn copy_sources(sources: &[PathBuf], dest_dir: &Path) -> Result<usize, String> {
-    if !dest_dir.is_dir() {
-        return Err(format!("destination is not a directory: {:?}", dest_dir));
-    }
-    // Canonicalise dest_dir once up front so the self-reference check below
-    // works even when `dest_dir` was passed in as a relative or symlinked
-    // path. `canonicalize` resolves symlinks to their real targets, which
-    // is exactly what we want — a symlinked dest pointing INTO a source
-    // is just as dangerous as a direct path.
-    let canon_dest = dest_dir
-        .canonicalize()
-        .map_err(|e| format!("cannot canonicalize destination {:?}: {}", dest_dir, e))?;
+fn copy_sources(
+    backend: &dyn Backend,
+    sources: &[PathBuf],
+    dest_dir: &Path,
+) -> Result<usize, String> {
+    let workdir = backend.workdir_path();
+    let dest_rel = dest_dir
+        .strip_prefix(&workdir)
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    let is_remote = backend.is_remote();
+
+    // On remote, `dest_dir` is an absolute path on the REMOTE host (the
+    // workdir passed to `--ssh`). It doesn't exist on this machine, so
+    // the local-filesystem probes below (`canonicalize`, `.is_dir()`)
+    // would fail. We defer all existence checks to the backend for
+    // remote and only run the name-conflict arithmetic off the
+    // workdir-relative shape.
+    let canon_dest = if is_remote {
+        None
+    } else {
+        if !dest_dir.is_dir() {
+            return Err(format!("destination is not a directory: {:?}", dest_dir));
+        }
+        // Canonicalise dest_dir once up front so the self-reference
+        // check below works even when `dest_dir` was passed in as a
+        // relative or symlinked path.
+        Some(
+            dest_dir
+                .canonicalize()
+                .map_err(|e| format!("cannot canonicalize destination {:?}: {}", dest_dir, e))?,
+        )
+    };
+
     let mut count = 0;
     for source in sources {
         let basename = source
             .file_name()
             .ok_or_else(|| format!("source has no basename: {:?}", source))?;
 
-        // P0 safety: block copying a directory INTO itself or any of its
-        // descendants. Without this, `copy_dir_recursive` walks the
-        // source tree while the destination (which we just created under
-        // it) keeps appearing as a new subdirectory — producing an
-        // infinite nest of folders until the filesystem rejects the
-        // path length. Seen concretely when a user drags a project's
-        // `src/` folder out of Finder and drops it back onto `src/` in
-        // the file tree.
-        if source.is_dir() {
+        // P0 safety for local copies: block copying a directory INTO
+        // itself or any of its descendants. Remote uploads can't hit
+        // this case — the source is on the client and the dest is on
+        // the server.
+        if !is_remote && source.is_dir() {
             let canon_src = source
                 .canonicalize()
                 .map_err(|e| format!("cannot canonicalize source {:?}: {}", source, e))?;
-            if canon_dest == canon_src || canon_dest.starts_with(&canon_src) {
+            let canon_dest = canon_dest.as_ref().unwrap();
+            if canon_dest == &canon_src || canon_dest.starts_with(&canon_src) {
                 return Err(format!(
                     "cannot copy {:?} into itself or a descendant {:?}",
                     source, dest_dir
@@ -674,13 +842,54 @@ fn copy_sources(sources: &[PathBuf], dest_dir: &Path) -> Result<usize, String> {
             }
         }
 
-        let final_dest = resolve_name_conflict(dest_dir, basename);
-        if source.is_dir() {
-            copy_dir_recursive(source, &final_dest)
-                .map_err(|e| format!("copy {:?} → {:?}: {}", source, final_dest, e))?;
+        // `resolve_name_conflict` probes the local disk with `.exists()`.
+        // On remote we don't have access to the tree, so we skip auto-
+        // rename and let the agent reject a collision via
+        // `BackendError::PathExists`. Dropping a duplicate name twice on
+        // a remote tree is an error rather than an auto-rename; that's a
+        // step down from local behaviour but matches the protocol:
+        // `CreateFile`/`CopyFile` use `create_new` semantics.
+        let final_dest: PathBuf = if is_remote {
+            dest_dir.join(basename)
         } else {
-            std::fs::copy(source, &final_dest)
-                .map_err(|e| format!("copy {:?} → {:?}: {}", source, final_dest, e))?;
+            resolve_name_conflict(dest_dir, basename)
+        };
+
+        let src_rel = source.strip_prefix(&workdir).ok();
+        let final_rel = final_dest
+            .strip_prefix(&workdir)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| {
+                // For remote external uploads, `final_dest` starts with
+                // the remote workdir string so strip_prefix succeeds;
+                // for local out-of-tree paths we fall back to the
+                // basename relative to `dest_rel`.
+                dest_rel.join(basename)
+            });
+
+        if source.is_dir() {
+            match src_rel {
+                Some(s) => backend
+                    .copy_dir_recursive(s, &final_rel)
+                    .map_err(|e| format!("copy {:?} → {:?}: {}", source, final_dest, e))?,
+                None => {
+                    // External (host-local) source → needs the upload
+                    // hook so remote backends can scp and local
+                    // backends can still do a plain recursive copy.
+                    backend
+                        .upload_from_local(source, &final_rel)
+                        .map_err(|e| format!("upload {:?} → {:?}: {}", source, final_dest, e))?;
+                }
+            }
+        } else {
+            match src_rel {
+                Some(s) => backend
+                    .copy_file(s, &final_rel)
+                    .map_err(|e| format!("copy {:?} → {:?}: {}", source, final_dest, e))?,
+                None => backend
+                    .upload_from_local(source, &final_rel)
+                    .map_err(|e| format!("upload {:?} → {:?}: {}", source, final_dest, e))?,
+            }
         }
         count += 1;
     }
@@ -738,27 +947,6 @@ fn split_stem_ext(name: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Recursive directory copy using a plain DFS walk. Mirrors the source
-/// tree under `dst`, creating intermediate directories as needed.
-/// Symlinks are intentionally skipped (see `copy_sources` doc comment).
-fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let sub_src = entry.path();
-        let sub_dst = dst.join(entry.file_name());
-        if file_type.is_symlink() {
-            continue;
-        } else if file_type.is_dir() {
-            copy_dir_recursive(&sub_src, &sub_dst)?;
-        } else if file_type.is_file() {
-            std::fs::copy(&sub_src, &sub_dst)?;
-        }
-    }
-    Ok(())
-}
-
 fn spawn_git_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<GitTask> {
     let (tx, rx) = mpsc::channel();
     let _ = thread::Builder::new()
@@ -768,31 +956,37 @@ fn spawn_git_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<GitTa
                 match task {
                     GitTask::RefreshStatus {
                         generation,
-                        workdir,
+                        backend,
                     } => {
-                        let result = open_repo(&workdir).map(|repo| {
-                            let (staged, unstaged) = repo.get_status();
-                            GitStatusPayload {
-                                staged,
-                                unstaged,
-                                ahead_behind: repo.ahead_behind(),
-                                branch_name: repo.branch_name(),
-                            }
-                        });
+                        let result = backend
+                            .git_status()
+                            .map(|snap| GitStatusPayload {
+                                staged: snap.staged,
+                                unstaged: snap.unstaged,
+                                ahead_behind: snap.ahead_behind,
+                                branch_name: snap.branch_name,
+                            })
+                            .map_err(|e| e.to_string());
                         let _ = result_tx.send(WorkerResult::GitStatus { generation, result });
                     }
                     GitTask::LoadDiff {
                         generation,
-                        workdir,
+                        backend,
                         path,
                         staged,
                         context_lines,
                         dark,
                     } => {
-                        let result = open_repo(&workdir).map(|repo| {
-                            repo.get_diff(&path, staged, context_lines)
-                                .map(|diff| build_highlighted_diff(&path, diff, dark))
-                        });
+                        // Merge: diff data via backend (remote-aware),
+                        // then apply v0.14.0's syntect highlighting on
+                        // the client side.
+                        let result = if staged {
+                            backend.staged_diff(&path, context_lines)
+                        } else {
+                            backend.unstaged_diff(&path, context_lines)
+                        }
+                        .map_err(|e| e.to_string())
+                        .map(|opt| opt.map(|diff| build_highlighted_diff(&path, diff, dark)));
                         let _ = result_tx.send(WorkerResult::Diff { generation, result });
                     }
                 }
@@ -810,43 +1004,46 @@ fn spawn_graph_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Gra
                 match task {
                     GraphTask::RefreshGraph {
                         generation,
-                        workdir,
+                        backend,
                         limit,
                     } => {
-                        let result = open_repo(&workdir).map(|repo| {
-                            let head = repo.head_oid().unwrap_or_default();
-                            let ref_map = repo.list_refs();
+                        let result = (|| -> Result<GraphPayload, String> {
+                            let head = backend
+                                .head_oid()
+                                .map_err(|e| e.to_string())?
+                                .unwrap_or_default();
+                            let ref_map = backend.list_refs().map_err(|e| e.to_string())?;
                             let refs_hash = hash_ref_map(&ref_map);
-                            let commits = repo.list_commits(limit);
+                            let commits = backend.list_commits(limit).map_err(|e| e.to_string())?;
                             let rows = crate::git::graph::build_graph(&commits);
-                            GraphPayload {
+                            Ok(GraphPayload {
                                 rows,
                                 ref_map,
                                 cache_key: (head, refs_hash),
-                            }
-                        });
+                            })
+                        })();
                         let _ = result_tx.send(WorkerResult::Graph { generation, result });
                     }
                     GraphTask::LoadCommitDetail {
                         generation,
-                        workdir,
+                        backend,
                         oid,
                     } => {
-                        let result = open_repo(&workdir).map(|repo| repo.get_commit(&oid));
+                        let result = backend.commit_detail(&oid).map_err(|e| e.to_string());
                         let _ = result_tx.send(WorkerResult::CommitDetail { generation, result });
                     }
                     GraphTask::LoadCommitFileDiff {
                         generation,
-                        workdir,
+                        backend,
                         oid,
                         path,
                         context_lines,
                         dark,
                     } => {
-                        let result = open_repo(&workdir).map(|repo| {
-                            repo.get_commit_file_diff(&oid, &path, context_lines)
-                                .map(|diff| build_commit_file_diff(path, diff, dark))
-                        });
+                        let result = backend
+                            .commit_file_diff(&oid, &path, context_lines)
+                            .map_err(|e| e.to_string())
+                            .map(|opt| opt.map(|diff| build_commit_file_diff(path, diff, dark)));
                         let _ = result_tx.send(WorkerResult::CommitFileDiff { generation, result });
                     }
                 }
@@ -911,26 +1108,22 @@ fn build_highlighted_diff(path: &str, diff: DiffContent, dark: bool) -> Highligh
 }
 
 fn build_file_tree_payload(
-    root: PathBuf,
+    backend: &dyn Backend,
     expanded: Vec<PathBuf>,
     git_statuses: HashMap<String, char>,
     selected_path: Option<PathBuf>,
     fallback_selected: usize,
-) -> FileTreePayload {
+) -> Result<FileTreePayload, String> {
     let expanded: std::collections::HashSet<PathBuf> = expanded.into_iter().collect();
-    let entries = file_tree::build_entries(&root, &expanded, &git_statuses);
+    let entries = backend.build_file_tree(&expanded, &git_statuses)?;
     let selected_idx = selected_path
         .as_ref()
         .and_then(|path| entries.iter().position(|entry| &entry.path == path))
         .unwrap_or_else(|| fallback_selected.min(entries.len().saturating_sub(1)));
-    FileTreePayload {
+    Ok(FileTreePayload {
         entries,
         selected_idx,
-    }
-}
-
-fn open_repo(workdir: &Path) -> Result<GitRepo, String> {
-    GitRepo::open_at(workdir).map_err(|e| e.message().to_string())
+    })
 }
 
 fn hash_ref_map(map: &HashMap<String, Vec<RefLabel>>) -> u64 {
@@ -979,11 +1172,16 @@ fn spawn_global_search_worker(
                     GlobalSearchTask::Run {
                         generation,
                         cancel,
-                        root,
+                        backend,
                         query,
                     } => {
-                        let truncated =
-                            run_global_search(generation, cancel, &root, &query, &result_tx);
+                        let truncated = run_global_search_via_backend(
+                            generation,
+                            cancel,
+                            backend.as_ref(),
+                            &query,
+                            &result_tx,
+                        );
                         // If the search was cancelled mid-walk we still send
                         // Done so the UI can flip in_flight=false; the UI side
                         // will drop late chunks via generation mismatch anyway.
@@ -998,216 +1196,86 @@ fn spawn_global_search_worker(
     tx
 }
 
-/// Run one global search, streaming chunks into `result_tx`. Returns
-/// `truncated` = true iff we hit [`crate::global_search::MAX_RESULTS`]
-/// before the walker finished.
+/// Run one global search via `backend.search_content`, forwarding each
+/// backend-emitted chunk as a `WorkerResult::GlobalSearchChunk` so the
+/// UI sees partial results within ~one chunk of walker output instead
+/// of waiting for the whole walk. Returns `truncated = true` iff the
+/// backend reported hitting the hit cap.
 ///
-/// Error handling: any per-file IO / decode error is silently skipped — the
-/// user sees fewer hits, which is strictly better than the whole search
-/// falling over on a single weird file. A malformed query is also absorbed:
-/// `RegexMatcherBuilder::fixed_strings(true)` means we'd only fail on some
-/// extremely pathological input, in which case we return early with
-/// truncated=false and no results.
-fn run_global_search(
+/// Cancellation: the sink returns `ControlFlow::Break(())` once `cancel`
+/// flips. The Local backend honours this at the next file boundary; the
+/// Remote backend stops forwarding to the UI but lets the agent finish
+/// the walk naturally (we don't have a "cancel this request" wire op
+/// yet — adding one would be the obvious follow-up if mis-typing a
+/// pattern on a huge remote monorepo proves costly).
+fn run_global_search_via_backend(
     generation: u64,
     cancel: Arc<AtomicBool>,
-    root: &Path,
+    backend: &dyn Backend,
     query: &str,
     result_tx: &mpsc::Sender<WorkerResult>,
 ) -> bool {
-    use grep_regex::RegexMatcherBuilder;
-    use grep_searcher::{BinaryDetection, SearcherBuilder};
-
     if query.is_empty() {
         return false;
     }
-
-    let matcher = match RegexMatcherBuilder::new()
-        .case_smart(true)
-        .fixed_strings(true)
-        .build(query)
-    {
-        Ok(m) => m,
-        Err(_) => return false,
+    let request = crate::backend::ContentSearchRequest {
+        pattern: query.to_string(),
+        fixed_strings: true,
+        case_sensitive: None,
+        max_results: crate::global_search::MAX_RESULTS as u32,
+        max_line_chars: crate::global_search::MAX_LINE_CHARS as u32,
     };
 
-    let walker = ignore::WalkBuilder::new(root)
-        .hidden(false)
-        .filter_entry(|dent| dent.file_name() != ".git")
-        .build();
-
-    // BinaryDetection::quit(0) skips any file whose first 8 KiB contains a
-    // NUL byte (matches ripgrep's default). Default `Searcher::new()` is
-    // `none` which would happily return hits from inside binaries.
-    let mut searcher = SearcherBuilder::new()
-        .binary_detection(BinaryDetection::quit(0))
-        .build();
-    let mut total: usize = 0;
-    let mut pending: Vec<MatchHit> = Vec::with_capacity(CHUNK_SIZE);
-    let mut truncated = false;
-
-    'walk: for result in walker {
-        // Poll cancel at every file boundary. Cheap (relaxed atomic load)
-        // and lets a superseded search bail within a handful of files.
+    let mut on_chunk = |hits: Vec<crate::backend::ContentMatchHit>| -> std::ops::ControlFlow<()> {
         if cancel.load(Ordering::Relaxed) {
-            break 'walk;
+            return std::ops::ControlFlow::Break(());
         }
-
-        let Ok(entry) = result else { continue };
-        let is_file = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false);
-        if !is_file {
-            continue;
+        if hits.is_empty() {
+            return std::ops::ControlFlow::Continue(());
         }
-        let abs = entry.path();
-        let Ok(rel) = abs.strip_prefix(root) else {
-            continue;
-        };
-        let display = rel.to_string_lossy().to_string();
-        if display.is_empty() {
-            continue;
-        }
-
-        let mut sink = ChunkSink {
-            rel_path: rel.to_path_buf(),
-            display: display.clone(),
-            pending: &mut pending,
-            total: &mut total,
-            cap: crate::global_search::MAX_RESULTS,
-            truncated: &mut truncated,
-            generation,
-            result_tx,
-            matcher: &matcher,
-        };
-        // search_path internally handles binary detection (NUL byte) and
-        // UTF-8 decoding; errors are per-file and we just skip them.
-        let _ = searcher.search_path(&matcher, abs, &mut sink);
-
-        // Flush any buffered hits at each file boundary — keeps the UI
-        // updating steadily on big workdirs even if a particular file
-        // contributes few matches.
-        if !pending.is_empty() {
-            let chunk = std::mem::replace(&mut pending, Vec::with_capacity(CHUNK_SIZE));
-            let _ = result_tx.send(WorkerResult::GlobalSearchChunk {
+        let ui_hits: Vec<MatchHit> = hits
+            .into_iter()
+            .map(|h| MatchHit {
+                path: h.path,
+                display: h.display,
+                line: h.line,
+                line_text: h.line_text,
+                byte_range: h.byte_range,
+            })
+            .collect();
+        // If the result channel is gone the App has torn down; stop
+        // trying to push chunks but let the backend tidy up on its
+        // own schedule.
+        if result_tx
+            .send(WorkerResult::GlobalSearchChunk {
                 generation,
-                hits: chunk,
-            });
+                hits: ui_hits,
+            })
+            .is_err()
+        {
+            return std::ops::ControlFlow::Break(());
         }
+        std::ops::ControlFlow::Continue(())
+    };
 
-        if truncated {
-            break;
-        }
+    match backend.search_content(&request, &mut on_chunk) {
+        Ok(completed) => completed.truncated,
+        Err(_) => false,
     }
-
-    // Flush trailing buffer (only reached on cancel between a file's sink
-    // finishing and the per-file flush — in practice rare, but defensive).
-    if !pending.is_empty() {
-        let _ = result_tx.send(WorkerResult::GlobalSearchChunk {
-            generation,
-            hits: pending,
-        });
-    }
-
-    truncated
-}
-
-const CHUNK_SIZE: usize = 50;
-
-/// Implements `grep_searcher::Sink`. Accumulates matches into `pending`,
-/// checks total against `cap`, sets `truncated` when hit. Doesn't send
-/// chunks itself — `run_global_search` flushes on file boundaries to keep
-/// the streaming cadence tied to a natural unit (per-file) rather than an
-/// arbitrary in-file batch size that breaks on single-file-heavy workdirs.
-struct ChunkSink<'a> {
-    rel_path: PathBuf,
-    display: String,
-    pending: &'a mut Vec<MatchHit>,
-    total: &'a mut usize,
-    cap: usize,
-    truncated: &'a mut bool,
-    generation: u64,
-    result_tx: &'a mpsc::Sender<WorkerResult>,
-    /// Borrowed so we can re-run `Matcher::find` on the line bytes to
-    /// recover the in-line byte range for the highlight overlay. The
-    /// `Searcher` already has this info but `SinkMatch` doesn't surface
-    /// it — one extra `find` per hit is cheap for fixed-strings.
-    matcher: &'a grep_regex::RegexMatcher,
-}
-
-impl<'a> grep_searcher::Sink for ChunkSink<'a> {
-    type Error = std::io::Error;
-
-    fn matched(
-        &mut self,
-        _searcher: &grep_searcher::Searcher,
-        mat: &grep_searcher::SinkMatch<'_>,
-    ) -> Result<bool, Self::Error> {
-        use grep_matcher::Matcher;
-
-        if *self.total >= self.cap {
-            *self.truncated = true;
-            return Ok(false);
-        }
-
-        // SinkMatch.bytes() contains the full matched line (including the
-        // trailing newline); trim it. line_number() is 1-indexed per ripgrep
-        // convention — convert to 0-indexed to match our MatchLoc scheme.
-        let raw = mat.bytes();
-        let raw = strip_trailing_newline(raw);
-        let line_text_full = match std::str::from_utf8(raw) {
-            Ok(s) => s,
-            Err(_) => return Ok(true), // non-UTF-8 line: skip, continue file
-        };
-        let line_text = crate::global_search::truncate_line(line_text_full);
-
-        // Recover in-line match byte range. `fixed_strings + case_smart`
-        // can't match a newline, so a single `find` on the line's bytes
-        // suffices. Clip to the truncated line length so the renderer
-        // doesn't slice past its end.
-        let byte_range = self
-            .matcher
-            .find(raw)
-            .ok()
-            .flatten()
-            .and_then(|m| crate::global_search::clip_range(m.start()..m.end(), line_text.len()))
-            .unwrap_or(0..0);
-
-        let hit = MatchHit {
-            path: self.rel_path.clone(),
-            display: self.display.clone(),
-            line: mat.line_number().unwrap_or(1).saturating_sub(1) as usize,
-            line_text,
-            byte_range,
-        };
-        self.pending.push(hit);
-        *self.total += 1;
-
-        if self.pending.len() >= CHUNK_SIZE {
-            let chunk = std::mem::replace(self.pending, Vec::with_capacity(CHUNK_SIZE));
-            let _ = self.result_tx.send(WorkerResult::GlobalSearchChunk {
-                generation: self.generation,
-                hits: chunk,
-            });
-        }
-        Ok(true)
-    }
-}
-
-fn strip_trailing_newline(bytes: &[u8]) -> &[u8] {
-    let mut end = bytes.len();
-    if end > 0 && bytes[end - 1] == b'\n' {
-        end -= 1;
-    }
-    if end > 0 && bytes[end - 1] == b'\r' {
-        end -= 1;
-    }
-    &bytes[..end]
 }
 
 #[cfg(test)]
 mod copy_tests {
     use super::*;
+    use crate::backend::LocalBackend;
     use std::fs;
     use tempfile::TempDir;
+
+    /// Build a `LocalBackend` rooted at `root`. The backend is wrapped in
+    /// `Arc<dyn Backend>` because `copy_sources` now takes a `&dyn Backend`.
+    fn test_backend(root: &std::path::Path) -> LocalBackend {
+        LocalBackend::open_at(root.to_path_buf())
+    }
 
     #[test]
     fn split_stem_ext_basic() {
@@ -1258,7 +1326,8 @@ mod copy_tests {
         let src = src_tmp.path().join("alpha.txt");
         fs::write(&src, "hello").unwrap();
 
-        let count = copy_sources(&[src], dst_tmp.path()).unwrap();
+        let b = test_backend(dst_tmp.path());
+        let count = copy_sources(&b, &[src], dst_tmp.path()).unwrap();
         assert_eq!(count, 1);
         assert_eq!(
             fs::read_to_string(dst_tmp.path().join("alpha.txt")).unwrap(),
@@ -1277,7 +1346,8 @@ mod copy_tests {
         fs::create_dir(pkg.join("nested")).unwrap();
         fs::write(pkg.join("nested").join("two.txt"), "2").unwrap();
 
-        let count = copy_sources(std::slice::from_ref(&pkg), dst_tmp.path()).unwrap();
+        let b = test_backend(dst_tmp.path());
+        let count = copy_sources(&b, std::slice::from_ref(&pkg), dst_tmp.path()).unwrap();
         assert_eq!(count, 1);
         assert_eq!(
             fs::read_to_string(dst_tmp.path().join("pkg").join("one.txt")).unwrap(),
@@ -1299,7 +1369,8 @@ mod copy_tests {
         // Pre-populate dest with the same basename.
         fs::write(dst_tmp.path().join("dup.txt"), "old").unwrap();
 
-        copy_sources(&[src], dst_tmp.path()).unwrap();
+        let b = test_backend(dst_tmp.path());
+        copy_sources(&b, &[src], dst_tmp.path()).unwrap();
         // Original untouched.
         assert_eq!(
             fs::read_to_string(dst_tmp.path().join("dup.txt")).unwrap(),
@@ -1320,7 +1391,8 @@ mod copy_tests {
         let src_tmp = TempDir::new().unwrap();
         let src = src_tmp.path().join("x");
         fs::write(&src, "").unwrap();
-        assert!(copy_sources(&[src], &not_a_dir).is_err());
+        let b = test_backend(dst_tmp.path());
+        assert!(copy_sources(&b, &[src], &not_a_dir).is_err());
     }
 
     #[test]
@@ -1334,7 +1406,8 @@ mod copy_tests {
         let pkg = tmp.path().join("pkg");
         fs::create_dir(&pkg).unwrap();
         fs::write(pkg.join("a.txt"), "").unwrap();
-        let err = copy_sources(std::slice::from_ref(&pkg), &pkg).unwrap_err();
+        let b = test_backend(tmp.path());
+        let err = copy_sources(&b, std::slice::from_ref(&pkg), &pkg).unwrap_err();
         assert!(
             err.contains("into itself") || err.contains("descendant"),
             "expected self-copy rejection, got: {err}"
@@ -1349,7 +1422,8 @@ mod copy_tests {
         let pkg = tmp.path().join("pkg");
         let nested = pkg.join("nested");
         fs::create_dir_all(&nested).unwrap();
-        let err = copy_sources(std::slice::from_ref(&pkg), &nested).unwrap_err();
+        let b = test_backend(tmp.path());
+        let err = copy_sources(&b, std::slice::from_ref(&pkg), &nested).unwrap_err();
         assert!(err.contains("into itself") || err.contains("descendant"));
     }
 
@@ -1362,7 +1436,8 @@ mod copy_tests {
         let pkg = tmp.path().join("pkg");
         fs::create_dir(&pkg).unwrap();
         fs::write(pkg.join("a.txt"), "hello").unwrap();
-        let count = copy_sources(std::slice::from_ref(&pkg), tmp.path()).unwrap();
+        let b = test_backend(tmp.path());
+        let count = copy_sources(&b, std::slice::from_ref(&pkg), tmp.path()).unwrap();
         assert_eq!(count, 1);
         assert_eq!(
             fs::read_to_string(tmp.path().join("pkg (1)").join("a.txt")).unwrap(),

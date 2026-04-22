@@ -2,12 +2,16 @@
 //! integration tests under `tests/` can exercise them. The `reef` binary
 //! (src/main.rs) is a thin wrapper that consumes this library.
 
+pub mod agent_deploy;
 pub mod app;
+pub mod backend;
 pub mod editor;
 pub mod file_tree;
 pub mod fs_watcher;
 pub mod git;
 pub mod global_search;
+pub mod hosts;
+pub mod hosts_picker;
 pub mod i18n;
 pub mod input;
 pub mod input_edit;

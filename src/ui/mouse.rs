@@ -26,6 +26,10 @@ pub enum ClickAction {
     /// dispatched inside `global_search::handle_mouse` (not via
     /// `App::handle_action`) so the palette keeps exclusive mouse ownership.
     GlobalSearchSelect(usize),
+    /// Click on a row in the hosts picker (Ctrl+O). The `usize` indexes
+    /// into `HostsPickerState::visible_rows()`. Handled in
+    /// `input::handle_mouse` while the picker owns mouse input.
+    HostsPickerSelect(usize),
     /// Click on the input row of the Search tab's left panel while in
     /// list mode. Flips `tab_input_focused` so the user can mouse-drive
     /// the mode switch instead of hunting for `/` or `i`. Only registered

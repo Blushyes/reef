@@ -1,0 +1,22 @@
+[package]
+name = "reef-agent"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "reef-agent"
+path = "src/main.rs"
+
+[dependencies]
+reef        = { path = "../.." }
+reef-proto  = { path = "../reef-proto" }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+
+[dev-dependencies]
+test-support = { path = "../test-support" }
+tempfile     = "3"

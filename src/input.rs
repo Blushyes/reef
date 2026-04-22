@@ -96,6 +96,13 @@ pub fn leader_decision(
 // ─── Keyboard ────────────────────────────────────────────────────────────────
 
 pub fn handle_key(key: KeyEvent, app: &mut App) {
+    // Hosts picker (Ctrl+O) — fully owns input while active, same contract
+    // as the other overlays.
+    if app.hosts_picker.active {
+        handle_key_hosts_picker(key, app);
+        return;
+    }
+
     // Global-search palette — fully owns input while active.
     if app.global_search.active {
         global_search::handle_key(key, app);
@@ -216,6 +223,13 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.should_quit = true;
+            return;
+        }
+        // Ctrl+O opens the hosts picker (session switcher). Shares the
+        // overlay priority with quick-open / global-search: any key
+        // handled there returns early before reaching this match.
+        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.open_hosts_picker();
             return;
         }
         KeyCode::Tab => {
@@ -796,10 +810,9 @@ fn handle_key_git(key: KeyEvent, app: &mut App) {
             // selected (empty status) or the repo's gone. A Deleted-status
             // file will be recreated by the editor if the user writes — same
             // behaviour you'd get running `$EDITOR path/to/deleted` in a shell.
-            if let (Some(repo), Some(sel)) = (&app.repo, &app.selected_file) {
-                if let Some(workdir) = repo.workdir_path() {
-                    app.pending_edit = Some(workdir.join(&sel.path));
-                }
+            if let Some(sel) = &app.selected_file {
+                let workdir = app.backend.workdir_path();
+                app.pending_edit = Some(workdir.join(&sel.path));
             }
         }
         _ => {}
@@ -1047,6 +1060,60 @@ fn handle_key_tree_context_menu(key: KeyEvent, app: &mut App) {
     }
 }
 
+/// Keyboard handler for the Ctrl+O hosts picker overlay. Mirrors the
+/// quick-open contract: Esc / Ctrl+C close, Enter commits, arrows
+/// navigate, printable chars append to the active input (filter or
+/// path). Ctrl+P toggles between the two input modes so the user can
+/// swap from "filter my config" to "type a target literally".
+fn handle_key_hosts_picker(key: KeyEvent, app: &mut App) {
+    use crate::hosts_picker::InputMode;
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => {
+            if app.hosts_picker.input_mode == InputMode::Path {
+                // Esc in path mode drops back to the filter view rather
+                // than closing outright — gives the user a way out of
+                // the path buffer without losing the picker state.
+                app.hosts_picker.input_mode = InputMode::Search;
+                app.hosts_picker.path_buffer.clear();
+            } else {
+                app.close_hosts_picker();
+            }
+        }
+        KeyCode::Char('c') if ctrl => {
+            app.close_hosts_picker();
+            app.should_quit = true;
+        }
+        KeyCode::Char('p') if ctrl => {
+            app.hosts_picker.enter_path_mode();
+        }
+        KeyCode::Enter => app.confirm_hosts_picker(),
+        KeyCode::Up => app.hosts_picker.move_selection(-1),
+        KeyCode::Down => app.hosts_picker.move_selection(1),
+        KeyCode::Char('k') if ctrl => app.hosts_picker.move_selection(-1),
+        KeyCode::Char('j') if ctrl => app.hosts_picker.move_selection(1),
+        KeyCode::Backspace => match app.hosts_picker.input_mode {
+            InputMode::Search => {
+                app.hosts_picker.filter.pop();
+                app.hosts_picker.selected_idx = 0;
+            }
+            InputMode::Path => {
+                app.hosts_picker.path_buffer.pop();
+            }
+        },
+        KeyCode::Char(c) if !ctrl => match app.hosts_picker.input_mode {
+            InputMode::Search => {
+                app.hosts_picker.filter.push(c);
+                app.hosts_picker.selected_idx = 0;
+            }
+            InputMode::Path => {
+                app.hosts_picker.path_buffer.push(c);
+            }
+        },
+        _ => {}
+    }
+}
+
 /// Y/Esc handler for the status-bar delete confirm.
 fn handle_key_tree_delete_confirm(key: KeyEvent, app: &mut App) {
     match key.code {
@@ -1064,6 +1131,10 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
     // Palettes fully own mouse input while active (global-search first,
     // then quick-open): clicks must not leak through to hidden panels,
     // and scroll wheels inside the popup should move the selection.
+    if app.hosts_picker.active {
+        handle_mouse_hosts_picker(mouse, app);
+        return;
+    }
     if app.global_search.active {
         global_search::handle_mouse(mouse, app);
         return;
@@ -1334,6 +1405,62 @@ fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: 
     } else {
         target.saturating_add(delta as usize)
     };
+}
+
+// ─── Hosts picker overlay ────────────────────────────────────────────────────
+
+/// Mouse dispatch for the Ctrl+O hosts picker. Clicks inside the popup
+/// select a row (and double-click commits); clicks outside dismiss the
+/// overlay, matching the quick-open / global-search click-away behaviour.
+fn handle_mouse_hosts_picker(mouse: MouseEvent, app: &mut App) {
+    let popup = match app.hosts_picker.last_popup_area {
+        Some(r) => r,
+        None => return,
+    };
+    let inside = mouse.column >= popup.x
+        && mouse.column < popup.x + popup.width
+        && mouse.row >= popup.y
+        && mouse.row < popup.y + popup.height;
+
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if !inside {
+                app.close_hosts_picker();
+                app.last_click = None;
+                return;
+            }
+            let now = Instant::now();
+            let is_double = matches!(
+                app.last_click,
+                Some((t, c, r))
+                    if c == mouse.column
+                        && r == mouse.row
+                        && now.duration_since(t) < DOUBLE_CLICK_WINDOW
+            );
+            if let Some(ui::mouse::ClickAction::HostsPickerSelect(idx)) =
+                app.hit_registry.hit_test(mouse.column, mouse.row)
+            {
+                app.hosts_picker.selected_idx = idx;
+                if is_double {
+                    app.confirm_hosts_picker();
+                    app.last_click = None;
+                    return;
+                }
+            }
+            app.last_click = if is_double {
+                None
+            } else {
+                Some((now, mouse.column, mouse.row))
+            };
+        }
+        MouseEventKind::ScrollUp if inside => {
+            app.hosts_picker.move_selection(-3);
+        }
+        MouseEventKind::ScrollDown if inside => {
+            app.hosts_picker.move_selection(3);
+        }
+        _ => {}
+    }
 }
 
 // ─── Place mode (drag-and-drop destination picker) ───────────────────────────

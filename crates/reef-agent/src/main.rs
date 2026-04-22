@@ -325,15 +325,15 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
                 for (k, v) in map.into_iter() {
                     out.insert(k, v.into_iter().map(ref_label_to_dto).collect::<Vec<_>>());
                 }
-                serde_json::to_value(out)
-                    .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}")))
+                serde_json::to_value(out).map_err(|e| (ErrorCode::Protocol, format!("encode: {e}")))
             }
             Err(e) => Err(backend_err(e)),
         },
 
         Request::HeadOid => match backend.head_oid() {
-            Ok(opt) => serde_json::to_value(opt)
-                .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
+            Ok(opt) => {
+                serde_json::to_value(opt).map_err(|e| (ErrorCode::Protocol, format!("encode: {e}")))
+            }
             Err(e) => Err(backend_err(e)),
         },
 

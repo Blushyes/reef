@@ -119,7 +119,11 @@ impl Backend for LocalBackend {
         expanded: &HashSet<PathBuf>,
         git_statuses: &HashMap<String, char>,
     ) -> Result<Vec<TreeEntry>, String> {
-        Ok(file_tree::build_entries(&self.workdir, expanded, git_statuses))
+        Ok(file_tree::build_entries(
+            &self.workdir,
+            expanded,
+            git_statuses,
+        ))
     }
 
     fn load_preview(&self, rel_path: &Path, dark: bool) -> Option<PreviewContent> {
@@ -254,7 +258,9 @@ impl Backend for LocalBackend {
         path: &str,
         context_lines: u32,
     ) -> Result<Option<DiffContent>, BackendError> {
-        Ok(self.repo()?.get_range_file_diff(oldest_oid, newest_oid, path, context_lines))
+        Ok(self
+            .repo()?
+            .get_range_file_diff(oldest_oid, newest_oid, path, context_lines))
     }
 
     fn subscribe_fs_events(&self) -> mpsc::Receiver<()> {

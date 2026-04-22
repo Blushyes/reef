@@ -626,7 +626,10 @@ impl Backend for RemoteBackend {
     }
 
     fn editor_launch_spec(&self, rel_path: &Path) -> Result<EditorLaunchSpec, BackendError> {
-        use crate::agent_deploy::{RemoteOs, ssh::{powershell_escape, shell_escape}};
+        use crate::agent_deploy::{
+            RemoteOs,
+            ssh::{powershell_escape, shell_escape},
+        };
         use std::ffi::OsString;
 
         let launch = self.ssh_launch.as_ref().ok_or_else(|| {
@@ -973,7 +976,9 @@ fn walk_remote(
 ) -> Result<(), String> {
     let dir_str = dir.to_string_lossy().to_string();
     let entries: Vec<DirEntryDto> = backend
-        .request(Request::ReadDir { path: dir_str.clone() })
+        .request(Request::ReadDir {
+            path: dir_str.clone(),
+        })
         .map_err(|e| format!("ReadDir {dir_str:?}: {e}"))?;
     let mut entries: Vec<DirEntryDto> = entries.into_iter().filter(|e| e.name != ".git").collect();
     entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {

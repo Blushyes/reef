@@ -361,7 +361,9 @@ fn snapshot_hosts_picker_empty() {
     wait_for_file_tree(&mut app);
     app.hosts_picker.open(vec![], vec![]);
     let output = render_app(&mut app, 80, 20);
-    with_filters(&[], || insta::assert_snapshot!("hosts_picker_empty", output));
+    with_filters(&[], || {
+        insta::assert_snapshot!("hosts_picker_empty", output)
+    });
 }
 
 /// Hosts picker snapshot — populated list (three hosts from `~/.ssh/config`
@@ -406,7 +408,9 @@ fn snapshot_hosts_picker_populated() {
     wait_for_file_tree(&mut app);
     app.hosts_picker.open(hosts, recent);
     let output = render_app(&mut app, 80, 20);
-    with_filters(&[], || insta::assert_snapshot!("hosts_picker_populated", output));
+    with_filters(&[], || {
+        insta::assert_snapshot!("hosts_picker_populated", output)
+    });
 }
 
 /// Hosts picker snapshot — path-input mode. After pressing Ctrl+P (or
@@ -436,7 +440,9 @@ fn snapshot_hosts_picker_path_mode() {
     app.hosts_picker.enter_path_mode();
     app.hosts_picker.path_buffer = "root@47.101.167.85:/tmp/work".into();
     let output = render_app(&mut app, 80, 20);
-    with_filters(&[], || insta::assert_snapshot!("hosts_picker_path_mode", output));
+    with_filters(&[], || {
+        insta::assert_snapshot!("hosts_picker_path_mode", output)
+    });
 }
 
 #[test]

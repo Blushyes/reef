@@ -439,12 +439,11 @@ impl Backend for RemoteBackend {
     }
 
     fn load_preview(&self, rel_path: &Path, dark: bool) -> Option<PreviewContent> {
-        // Fetch bytes over RPC and rebuild a `PreviewContent`. The new
-        // `PreviewBody::Image` variant on this enum holds a decoded
-        // `DynamicImage` that isn't trivially shipped over the wire — for
-        // M1 we surface every binary (image or otherwise) as a `Binary`
-        // metadata card. Real image rendering over SSH would need raw
-        // bytes + client-side decode; tracked separately.
+        // Fetch bytes over RPC and rebuild a `PreviewContent`. `PreviewBody`'s
+        // `Image` variant carries a decoded `DynamicImage` that isn't serde-
+        // shippable, so for now we surface every binary (image or otherwise)
+        // as the generic Binary metadata card. Image rendering over SSH would
+        // need raw bytes + client-side decode; tracked in issue #31.
         use crate::file_tree::{BinaryInfo, BinaryReason, PreviewBody};
         let rel_str = rel_path.to_string_lossy().to_string();
         let resp: ReadFileResponse = self
@@ -459,6 +458,13 @@ impl Backend for RemoteBackend {
         let raw = resp.bytes;
         let bytes_on_disk = resp.size;
 
+        if raw.is_empty() {
+            return Some(PreviewContent {
+                file_path: rel_str,
+                body: PreviewBody::Binary(BinaryInfo::new(0, None, BinaryReason::Empty)),
+            });
+        }
+
         let check_len = raw.len().min(8192);
         if raw[..check_len].contains(&0) {
             return Some(PreviewContent {
@@ -466,7 +472,7 @@ impl Backend for RemoteBackend {
                 body: PreviewBody::Binary(BinaryInfo::new(
                     bytes_on_disk,
                     None,
-                    BinaryReason::NonImage,
+                    BinaryReason::NullBytes,
                 )),
             });
         }

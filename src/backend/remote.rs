@@ -101,6 +101,11 @@ pub struct RemoteBackend {
     /// by the `--agent-exec` route) leaves this `None` and
     /// `editor_launch_spec` returns `Unimplemented` for that path.
     ssh_launch: Option<SshLaunchInfo>,
+    /// Installed by `connect_ssh`: owns the `~/.reef/sessions/<pid>/`
+    /// anchor dir + OSC 7 emission. Dropping this field (in any drop
+    /// order) restores OSC 7 to the original cwd and removes the dir.
+    /// `spawn()` and HOME-less environments leave this `None`.
+    shell_session: Option<crate::shell_integration::Session>,
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +160,14 @@ impl RemoteBackend {
             remote_os,
         };
         let mut backend = Self::spawn(&argv)?;
+
+        // Best-effort auto-SSH-split setup. Write the anchor dir, emit
+        // OSC 7, and stash the RAII handle on the backend so Drop tears
+        // it all down. Failures are swallowed — the SSH session itself
+        // is already live and the user can still work without the
+        // split-shell convenience.
+        backend.shell_session = install_shell_session(session, remote_workdir);
+
         backend.ssh_launch = Some(launch);
         Ok(backend)
     }
@@ -219,6 +232,7 @@ impl RemoteBackend {
             _stderr_reader: stderr_reader,
             child: Mutex::new(child),
             ssh_launch: None,
+            shell_session: None,
         };
 
         // Handshake: ask the agent for its workdir and name once so the UI
@@ -324,6 +338,31 @@ impl Drop for RemoteBackend {
                     _ => break,
                 }
             }
+        }
+    }
+}
+
+/// Try to install the anchor dir + OSC 7 emission for the given SSH
+/// session. Returns `None` when any precondition fails (no ControlPath
+/// in args, `$HOME` unset, fs error) — all failure modes are
+/// non-fatal for the SSH session itself, so we log to stderr (visible
+/// pre-alt-screen) and move on.
+fn install_shell_session(
+    session: &crate::agent_deploy::SshSession,
+    remote_workdir: &str,
+) -> Option<crate::shell_integration::Session> {
+    use crate::shell_integration::{self, SshInfo};
+    let control_path = shell_integration::extract_control_path(session.ssh_args())?;
+    let info = SshInfo {
+        host: session.host(),
+        workdir: remote_workdir,
+        control_path: &control_path,
+    };
+    match shell_integration::Session::install(&info)? {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("reef: shell-integration setup skipped: {e}");
+            None
         }
     }
 }

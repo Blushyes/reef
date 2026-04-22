@@ -5,38 +5,13 @@
 //! always returned zero). This test checks both backends see the same
 //! per-file numbers after a modification.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 
 use reef::backend::{Backend, LocalBackend, RemoteBackend};
-use test_support::{commit_file, tempdir_repo, write_file};
+use test_support::{agent_bin, commit_file, tempdir_repo, write_file};
 
 static BACKEND_LOCK: Mutex<()> = Mutex::new(());
-
-fn agent_bin() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_reef-agent") {
-        return PathBuf::from(path);
-    }
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let root = PathBuf::from(manifest_dir);
-    // cargo-llvm-cov sets CARGO_TARGET_DIR to target/llvm-cov-target;
-    // check that first so coverage CI finds the binary.
-    let target_dirs: Vec<PathBuf> = std::env::var("CARGO_TARGET_DIR")
-        .map(|d| vec![PathBuf::from(d)])
-        .unwrap_or_default()
-        .into_iter()
-        .chain([root.join("target")])
-        .collect();
-    for target in &target_dirs {
-        for profile in ["debug", "release"] {
-            let candidate = target.join(profile).join("reef-agent");
-            if candidate.exists() {
-                return candidate;
-            }
-        }
-    }
-    panic!("reef-agent binary not found under target/{{debug,release}}");
-}
 
 fn spawn_remote(workdir: &Path) -> RemoteBackend {
     let argv = vec![

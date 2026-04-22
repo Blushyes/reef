@@ -7,44 +7,12 @@
 //! even this catches the biggest classes of regressions (protocol drift,
 //! DTO mis-mapping, path normalization mismatches).
 
-use std::path::PathBuf;
 use std::sync::Mutex;
 
 use reef::backend::{Backend, LocalBackend, RemoteBackend};
-use test_support::{commit_file, tempdir_repo, write_file};
+use test_support::{agent_bin, commit_file, tempdir_repo, write_file};
 
 static BACKEND_LOCK: Mutex<()> = Mutex::new(());
-
-/// Best-effort lookup for the compiled `reef-agent` binary. `CARGO_BIN_EXE_*`
-/// only works for binaries declared in the *current* crate, so we walk up
-/// from `CARGO_MANIFEST_DIR` to `target/debug/reef-agent` (or release).
-fn agent_bin() -> PathBuf {
-    // First: prefer CARGO_BIN_EXE if someone set it for us (e.g. via a
-    // custom runner or future workspace support).
-    if let Some(path) = option_env!("CARGO_BIN_EXE_reef-agent") {
-        return PathBuf::from(path);
-    }
-
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let root = PathBuf::from(manifest_dir);
-    // cargo-llvm-cov sets CARGO_TARGET_DIR to target/llvm-cov-target;
-    // check that first so coverage CI finds the binary.
-    let target_dirs: Vec<PathBuf> = std::env::var("CARGO_TARGET_DIR")
-        .map(|d| vec![PathBuf::from(d)])
-        .unwrap_or_default()
-        .into_iter()
-        .chain([root.join("target")])
-        .collect();
-    for target in &target_dirs {
-        for profile in ["debug", "release"] {
-            let candidate = target.join(profile).join("reef-agent");
-            if candidate.exists() {
-                return candidate;
-            }
-        }
-    }
-    panic!("reef-agent binary not found under target/{{debug,release}}");
-}
 
 fn spawn_remote(workdir: &std::path::Path) -> RemoteBackend {
     let argv = vec![

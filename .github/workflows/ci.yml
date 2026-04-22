@@ -61,11 +61,7 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate coverage
-        # `--all-targets` makes cargo also build bins (notably `reef-agent`),
-        # which `tests/backend_*_loopback.rs` spawns as a subprocess.
-        # Without it llvm-cov defaults to `--tests` only and the loopback
-        # tests panic with "reef-agent binary not found".
-        run: cargo llvm-cov --workspace --all-targets --lcov --output-path lcov.info
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v4
         with:

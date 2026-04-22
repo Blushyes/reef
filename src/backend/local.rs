@@ -131,7 +131,10 @@ impl Backend for LocalBackend {
     }
 
     fn read_file(&self, rel_path: &Path, max_bytes: u64) -> Result<Vec<u8>, BackendError> {
-        let full = self.workdir.join(rel_path);
+        // Route through `resolve_rel` so the workdir is a hard boundary
+        // even on read paths — every other op honours this; without it a
+        // malicious or buggy client could `ReadFile { path: "../etc/passwd" }`.
+        let full = self.resolve_rel(rel_path)?;
         if !full.is_file() {
             return Err(BackendError::NotFound);
         }

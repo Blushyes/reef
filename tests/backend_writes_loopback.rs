@@ -154,6 +154,57 @@ fn path_escape_is_rejected_by_both_backends() {
 }
 
 #[test]
+fn pending_map_does_not_leak_on_repeated_requests() {
+    // Regression: pre-PendingGuard, request() inserted into the pending
+    // map but only relied on the read loop's `remove` to clean up.
+    // That left timed-out / errored requests stuck in the map forever.
+    // The success path always removed via Response, so this test alone
+    // doesn't prove the failure-path fix — but it locks down that the
+    // guard's Drop doesn't double-free / panic on the success path
+    // (Drop should be a no-op after the read loop already removed).
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let r_tmp = TempDir::new().unwrap();
+    let r = spawn_remote(r_tmp.path());
+
+    for _ in 0..10 {
+        // `head_oid` round-trips a real RPC (workdir_name is cached
+        // client-side, so it wouldn't exercise the pending machinery).
+        // We don't care about the result — just that the call happens
+        // and the slot gets released.
+        let _ = r.head_oid();
+    }
+    assert_eq!(
+        r.__pending_len_for_tests(),
+        0,
+        "pending map leaked after 10 successful requests"
+    );
+}
+
+#[test]
+fn read_file_rejects_path_escape() {
+    // Regression: prior to this guard `read_file` did `workdir.join(rel)`
+    // unchecked, so a `ReadFile { path: "../etc/passwd" }` request from a
+    // misbehaving (or hostile) caller resolved outside the workdir. Every
+    // other op went through `resolve_rel`; this brings `read_file` in line.
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let l_tmp = TempDir::new().unwrap();
+    let r_tmp = TempDir::new().unwrap();
+    // Plant a target file *outside* the workdir to make the boundary
+    // breach observable: if the read succeeded, we'd see "secret" bytes.
+    let outside = l_tmp.path().parent().unwrap().join("outside.txt");
+    std::fs::write(&outside, b"secret").unwrap();
+
+    let l = LocalBackend::open_at(l_tmp.path().to_path_buf());
+    let r = spawn_remote(r_tmp.path());
+
+    let escaped = Path::new("../outside.txt");
+    assert!(l.read_file(escaped, 1024).is_err());
+    assert!(r.read_file(escaped, 1024).is_err());
+
+    let _ = std::fs::remove_file(&outside);
+}
+
+#[test]
 fn hard_delete_parity() {
     let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let l_tmp = TempDir::new().unwrap();

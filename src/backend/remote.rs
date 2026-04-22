@@ -41,6 +41,44 @@ const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_FILE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 type PendingMap = HashMap<u64, mpsc::Sender<Response>>;
+
+/// RAII cleanup for the `pending` map. Construct via `register` after
+/// allocating an envelope id; Drop unconditionally removes the id from
+/// the map. The read loop also removes on Response receipt — that
+/// turns Drop into a no-op rather than racing with us, because the
+/// removal is keyed by id.
+///
+/// Why a guard instead of inline cleanup: the two RPC sites
+/// (`request` and `search_content`) both register a pending entry and
+/// must release it on every error / cancel / timeout path. Having one
+/// place that owns the cleanup keeps the two sites from drifting
+/// apart again.
+struct PendingGuard<'a> {
+    map: &'a Arc<Mutex<PendingMap>>,
+    id: u64,
+}
+
+impl<'a> PendingGuard<'a> {
+    fn register(
+        map: &'a Arc<Mutex<PendingMap>>,
+        id: u64,
+        tx: mpsc::Sender<Response>,
+    ) -> Result<Self, BackendError> {
+        let mut m = map
+            .lock()
+            .map_err(|e| BackendError::Rpc(format!("pending lock poisoned: {e}")))?;
+        m.insert(id, tx);
+        Ok(Self { map, id })
+    }
+}
+
+impl<'a> Drop for PendingGuard<'a> {
+    fn drop(&mut self) {
+        if let Ok(mut m) = self.map.lock() {
+            m.remove(&self.id);
+        }
+    }
+}
 /// `request_id` → sender for streaming `SearchChunk` notifications. The
 /// read thread consults this map on every `Notification::SearchChunk`
 /// frame so hits land at the right in-flight search worker. The map is
@@ -241,13 +279,11 @@ impl RemoteBackend {
     fn request<T: serde::de::DeserializeOwned>(&self, req: Request) -> Result<T, BackendError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel::<Response>();
-        {
-            let mut pending = self
-                .pending
-                .lock()
-                .map_err(|e| BackendError::Rpc(format!("pending lock poisoned: {e}")))?;
-            pending.insert(id, tx);
-        }
+        // Drop on every exit path removes the id from `pending`. The read
+        // loop also `remove`s on Response receipt — Drop becomes a no-op
+        // in that case. Without this guard, RPC timeouts silently leak
+        // map slots until the session ends.
+        let _pending = PendingGuard::register(&self.pending, id, tx)?;
         self.send_envelope(Envelope { id, body: req })?;
         let response = rx
             .recv_timeout(DEFAULT_RPC_TIMEOUT)
@@ -257,6 +293,14 @@ impl RemoteBackend {
                 .map_err(|e| BackendError::Protocol(format!("response decode: {e}"))),
             Response::Err { message, .. } => Err(BackendError::Rpc(message)),
         }
+    }
+
+    /// Test-only accessor for the in-flight RPC map size. Used by the
+    /// leak regression test in `tests/backend_writes_loopback.rs` —
+    /// verifies that timed-out / errored requests release their slot.
+    #[doc(hidden)]
+    pub fn __pending_len_for_tests(&self) -> usize {
+        self.pending.lock().map(|m| m.len()).unwrap_or(0)
     }
 
     /// Shut the agent down cleanly. Called by Drop; exposed for tests that
@@ -843,13 +887,7 @@ impl Backend for RemoteBackend {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<MatchHitDto>>();
         let (resp_tx, resp_rx) = mpsc::channel::<Response>();
-        {
-            let mut pending = self
-                .pending
-                .lock()
-                .map_err(|e| BackendError::Rpc(format!("pending lock poisoned: {e}")))?;
-            pending.insert(id, resp_tx);
-        }
+        let _pending = PendingGuard::register(&self.pending, id, resp_tx)?;
         {
             let mut chunks = self
                 .search_chunks
@@ -858,8 +896,7 @@ impl Backend for RemoteBackend {
             chunks.insert(id, chunk_tx);
         }
         // Small RAII guard so any exit path below unregisters the chunk
-        // sink. (The pending map self-cleans on Response receipt; on
-        // early error we remove it manually.)
+        // sink. The pending map cleanup is owned by `PendingGuard` above.
         struct ChunkGuard<'a> {
             map: &'a Arc<Mutex<ChunkSinkMap>>,
             id: u64,
@@ -871,21 +908,15 @@ impl Backend for RemoteBackend {
                 }
             }
         }
-        let _guard = ChunkGuard {
+        let _chunks_guard = ChunkGuard {
             map: &self.search_chunks,
             id,
         };
 
-        if let Err(e) = self.send_envelope(Envelope {
+        self.send_envelope(Envelope {
             id,
             body: Request::SearchContent { request: dto },
-        }) {
-            // Pending map: remove so we don't leak a slot.
-            if let Ok(mut pending) = self.pending.lock() {
-                pending.remove(&id);
-            }
-            return Err(e);
-        }
+        })?;
 
         // Concurrent drain: prioritise forwarding chunks promptly. We
         // poll the response channel with a short timeout so a slow

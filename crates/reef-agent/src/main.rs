@@ -227,33 +227,42 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
         }
 
         Request::ReadFile { path, max_bytes } => {
-            let abs = workdir.join(&path);
-            if !abs.is_file() {
-                serde_json::to_value(ReadFileResponse {
-                    is_file: false,
-                    bytes: Vec::new(),
-                    size: 0,
-                })
-                .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}")))
-            } else {
-                match std::fs::read(&abs) {
-                    Ok(raw) => {
-                        let size = raw.len() as u64;
-                        let bytes = if size > max_bytes {
-                            raw[..max_bytes as usize].to_vec()
-                        } else {
-                            raw
-                        };
+            // Boundary check: refuse `..` / absolute paths so a malicious
+            // or buggy client can't `ReadFile { path: "../etc/passwd" }`.
+            // Other write ops route through `LocalBackend::resolve_rel`;
+            // this path bypasses the backend (so it can return
+            // `is_file: false` instead of NotFound), so we apply the
+            // same guard inline here.
+            reef::backend::local::resolve_rel_within(workdir, Path::new(&path))
+                .map_err(backend_err)
+                .and_then(|abs| {
+                    if !abs.is_file() {
                         serde_json::to_value(ReadFileResponse {
-                            is_file: true,
-                            bytes,
-                            size,
+                            is_file: false,
+                            bytes: Vec::new(),
+                            size: 0,
                         })
                         .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}")))
+                    } else {
+                        match std::fs::read(&abs) {
+                            Ok(raw) => {
+                                let size = raw.len() as u64;
+                                let bytes = if size > max_bytes {
+                                    raw[..max_bytes as usize].to_vec()
+                                } else {
+                                    raw
+                                };
+                                serde_json::to_value(ReadFileResponse {
+                                    is_file: true,
+                                    bytes,
+                                    size,
+                                })
+                                .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}")))
+                            }
+                            Err(e) => Err((ErrorCode::Io, e.to_string())),
+                        }
                     }
-                    Err(e) => Err((ErrorCode::Io, e.to_string())),
-                }
-            }
+                })
         }
 
         Request::GitStatus => match backend.git_status() {

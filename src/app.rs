@@ -269,6 +269,26 @@ pub struct App {
     // ── Files tab state ──
     pub file_tree: FileTree,
     pub preview_content: Option<PreviewContent>,
+    /// Terminal-capability probe for image rendering. `None` on terminals
+    /// with no graphics-protocol support or when the user set
+    /// `REEF_IMAGE_PROTOCOL=off`. Populated once at startup by
+    /// `images::probe_picker` in `main.rs` (before raw mode); stays set
+    /// for the life of the session — the terminal capabilities don't
+    /// change mid-run.
+    pub image_picker: Option<ratatui_image::picker::Picker>,
+    /// Resize-aware protocol state for the currently-previewed image.
+    /// Built on the main thread in `apply_worker_result` when the worker
+    /// hands back a decoded `DynamicImage`; cleared when a text/binary
+    /// body arrives or `image_picker` is `None`. `ratatui-image` needs
+    /// this to be `&mut` across frames so it can cache the encoded output
+    /// keyed by target cell area and only re-encode on panel resize.
+    pub preview_image_protocol: Option<ratatui_image::protocol::StatefulProtocol>,
+    /// Monotonic counter incremented every time `apply_worker_result`
+    /// constructs a fresh `StatefulProtocol`. Tests observe this to tell
+    /// "reused existing protocol" from "rebuilt" — address-based identity
+    /// doesn't work because the Option slot lives at a fixed offset. Not
+    /// used in any production codepath.
+    pub preview_image_protocol_builds: u64,
     pub tree_scroll: usize,
     /// The `file_tree.selected` value we observed on the previous render.
     /// Used by the Files-tab tree panel to distinguish "selection just changed
@@ -455,7 +475,7 @@ pub struct PreviewHighlight {
 }
 
 impl App {
-    pub fn new(theme: Theme) -> Self {
+    pub fn new(theme: Theme, image_picker: Option<ratatui_image::picker::Picker>) -> Self {
         // Fold pre-1.0 unprefixed keys (`layout=`, `mode=`) and the retired
         // `~/.config/reef/git.prefs` into the current prefixed namespace
         // BEFORE any `prefs::get` runs. Order matters: `load_prefs` below
@@ -505,6 +525,9 @@ impl App {
             diff_h_scroll: 0,
             file_tree,
             preview_content: None,
+            image_picker,
+            preview_image_protocol: None,
+            preview_image_protocol_builds: 0,
             tree_scroll: 0,
             last_rendered_tree_selected: None,
             preview_scroll: 0,
@@ -1681,12 +1704,65 @@ impl App {
                 }
             },
             WorkerResult::Preview { generation, result } => match result {
-                Ok(content) => {
+                Ok(mut content) => {
                     if self.preview_load.complete_ok(generation) {
                         let same_file = matches!(
                             (self.preview_content.as_ref(), content.as_ref()),
                             (Some(old), Some(new)) if old.file_path == new.file_path
                         );
+                        // Decide the protocol fate in three buckets:
+                        //
+                        // 1. Same-file re-load where old and new are both
+                        //    images with identical (bytes_on_disk, w, h,
+                        //    format) — a conservative "pixels probably
+                        //    didn't change" heuristic that covers
+                        //    re-selecting the same file. Keep the existing
+                        //    protocol so ratatui-image doesn't re-encode
+                        //    and the UI doesn't flicker.
+                        // 2. Other Image bodies — build a fresh protocol
+                        //    by moving the decoded `DynamicImage` out of
+                        //    the worker payload (so we don't keep two
+                        //    copies of the pixels alive).
+                        // 3. Non-image bodies or no picker — drop any
+                        //    stale protocol so we don't keep a previous
+                        //    image lingering.
+                        let reuse_protocol = same_file
+                            && self.preview_image_protocol.is_some()
+                            && matches!(
+                                (
+                                    self.preview_content.as_ref().map(|c| &c.body),
+                                    content.as_ref().map(|c| &c.body),
+                                ),
+                                (
+                                    Some(crate::file_tree::PreviewBody::Image(old)),
+                                    Some(crate::file_tree::PreviewBody::Image(new)),
+                                ) if old.bytes_on_disk == new.bytes_on_disk
+                                    && old.width_px == new.width_px
+                                    && old.height_px == new.height_px
+                                    && old.format == new.format
+                            );
+                        if !reuse_protocol {
+                            self.preview_image_protocol = match (
+                                self.image_picker.as_mut(),
+                                content.as_mut().map(|c| &mut c.body),
+                            ) {
+                                (Some(picker), Some(crate::file_tree::PreviewBody::Image(img))) => {
+                                    img.image
+                                        .take()
+                                        .map(|dyn_img| picker.new_resize_protocol(dyn_img))
+                                }
+                                _ => None,
+                            };
+                            if self.preview_image_protocol.is_some() {
+                                self.preview_image_protocol_builds += 1;
+                            }
+                        } else if let Some(crate::file_tree::PreviewBody::Image(img)) =
+                            content.as_mut().map(|c| &mut c.body)
+                        {
+                            // Drop the new DynamicImage — the kept
+                            // protocol already has its own copy.
+                            img.image = None;
+                        }
                         self.preview_content = content;
                         if !same_file {
                             self.preview_scroll = 0;

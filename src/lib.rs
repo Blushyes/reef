@@ -10,6 +10,7 @@ pub mod fs_watcher;
 pub mod git;
 pub mod global_search;
 pub mod i18n;
+pub mod images;
 pub mod input;
 pub mod input_edit;
 pub mod place_mode;

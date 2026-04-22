@@ -11,6 +11,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use reef::app::App;
 use reef::i18n;
+use reef::images;
 use reef::ui::theme::Theme;
 use reef::ui::toast::Toast;
 use reef::{editor, input, ui};
@@ -42,6 +43,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `ui.theme` pref override and a non-TTY fallback.
     let theme = Theme::resolve();
 
+    // Probe image-rendering capabilities using the same pre-raw-mode
+    // window: `Picker::from_query_stdio` sends a CSI query and reads the
+    // reply on stdin, just like OSC 11 above. `None` means the terminal
+    // has no graphics protocol (or the user set REEF_IMAGE_PROTOCOL=off)
+    // — image files will render as a friendly metadata card instead.
+    let image_picker = images::probe_picker();
+
     // Terminal setup
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -69,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     // App init
-    let mut app = App::new(theme);
+    let mut app = App::new(theme, image_picker);
 
     // Main loop
     loop {

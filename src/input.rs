@@ -1645,77 +1645,109 @@ pub fn handle_paste(s: String, app: &mut App) {
 /// Extract filesystem paths from a bracketed-paste payload.
 ///
 /// Terminals normalise file drops into paste content, but the exact
-/// framing varies:
+/// framing varies — and multi-file drops use *different separators* per
+/// terminal:
 ///
-/// - iTerm2: single-quote wrapped, `\ ` for spaces, one path per line.
-/// - Ghostty / WezTerm / Alacritty / Kitty: raw path with `\ ` escapes.
-/// - GNOME Terminal / older: `file:///…` URI with `%xx` URL-encoding.
+/// - iTerm2: each path single-quote wrapped, **space-separated** on a
+///   single line. Single paths may still arrive per-line.
+/// - Ghostty / WezTerm / Alacritty / Kitty: raw paths with `\ ` escaping
+///   spaces, **space-separated** (no quotes).
+/// - Terminal.app: `\ ` escaped, space-separated.
+/// - GNOME Terminal / older: `file:///…` URIs, typically newline-separated.
 ///
-/// We tolerate all of the above, then demand that every candidate be an
-/// absolute path (drops from Finder always are) that `exists()` on disk.
-/// Relative paths and non-existent strings are rejected outright — a
-/// user pasting the word `settings.json` into the quick-open palette
-/// must NOT trip place mode, and the absolute-path requirement is what
-/// makes that reliable.
+/// So we do two-level splitting: first by newline (which `file://` URIs
+/// and GNOME-style drops rely on), then shell-tokenize each line so a
+/// line like `'/a/b.txt' '/c/d.txt'` or `/a/b /c/d` yields two tokens.
+///
+/// Every candidate must be an absolute path (drops from Finder always
+/// are) that `exists()` on disk. Relative paths and non-existent strings
+/// are rejected outright — a user pasting the word `settings.json` into
+/// the quick-open palette must NOT trip place mode, and the
+/// absolute-path requirement is what makes that reliable.
 ///
 /// Returns an empty vector when the payload is "not a drop"; callers
 /// use that as the signal to forward the paste to the focused text input.
 pub fn parse_dropped_paths(s: &str) -> Vec<std::path::PathBuf> {
-    let trimmed = s.trim_matches(|c: char| c == '\n' || c == '\r');
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-    // Newline is the common multi-file separator across every terminal we
-    // support. Single-segment → single path (even if it contains spaces);
-    // multi-segment → one path per line.
     let mut out = Vec::new();
-    for segment in trimmed.split('\n') {
-        let seg = segment.trim().trim_end_matches('\r');
-        if seg.is_empty() {
+    for line in s.lines() {
+        let line = line.trim();
+        if line.is_empty() {
             continue;
         }
-        let Some(p) = normalize_segment(seg) else {
-            continue;
-        };
-        if p.is_absolute() && p.exists() {
-            out.push(p);
+        for token in shell_tokenize(line) {
+            let Some(p) = normalize_token(&token) else {
+                continue;
+            };
+            if p.is_absolute() && p.exists() {
+                out.push(p);
+            }
         }
     }
     out
 }
 
-/// Strip one layer of framing from a single dropped-path segment:
-/// matched outer quotes → removed; `file://` scheme → stripped + URL
-/// decoded; backslash escapes → unescaped. Returns `None` if the segment
-/// ends up empty or can't be interpreted as a path.
-fn normalize_segment(raw: &str) -> Option<std::path::PathBuf> {
-    let mut s = raw.to_string();
-
-    // Outer quote pair — some terminals (iTerm2 by default) wrap drag
-    // payloads in single quotes; paste-from-clipboard in others may use
-    // double quotes. Only strip if both ends match.
-    if s.len() >= 2 {
-        let first = s.chars().next().unwrap();
-        let last = s.chars().last().unwrap();
-        if (first == '\'' && last == '\'') || (first == '"' && last == '"') {
-            s = s[1..s.len() - 1].to_string();
+/// Shell-style tokenize: split on unquoted whitespace, respecting matched
+/// single/double quote regions and backslash escapes. Keeps multi-file
+/// drops like `'/a/b' '/c/d'` or `/a/b /c\ d` as separate tokens while
+/// leaving `'hello world.txt'` (quoted intra-path space) as one.
+fn shell_tokenize(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for c in s.chars() {
+        if escaped {
+            cur.push(c);
+            escaped = false;
+            continue;
         }
+        if c == '\\' && !in_single {
+            escaped = true;
+            continue;
+        }
+        if c == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if c == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        if c.is_whitespace() && !in_single && !in_double {
+            if !cur.is_empty() {
+                tokens.push(std::mem::take(&mut cur));
+            }
+            continue;
+        }
+        cur.push(c);
     }
-
-    // `file://` URI → filesystem path + URL decode. We accept both
-    // `file:///Users/...` (triple-slash, most common) and `file://localhost/...`
-    // (hostname-qualified, older macOS) by stripping the authority.
-    if let Some(rest) = s.strip_prefix("file://") {
-        let path_part = rest.strip_prefix("localhost").unwrap_or(rest).to_string();
-        s = url_decode(&path_part);
+    if escaped {
+        // Dangling backslash at EOL — keep it literal rather than dropping.
+        cur.push('\\');
     }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    tokens
+}
 
-    s = unescape_backslashes(&s);
-
-    if s.is_empty() {
+/// Convert an already-unquoted, already-unescaped token into a path.
+/// Only the `file://` URI scheme needs handling here (quotes and
+/// backslash escapes are consumed by `shell_tokenize`).
+fn normalize_token(raw: &str) -> Option<std::path::PathBuf> {
+    if raw.is_empty() {
         return None;
     }
-    Some(std::path::PathBuf::from(s))
+    if let Some(rest) = raw.strip_prefix("file://") {
+        let path_part = rest.strip_prefix("localhost").unwrap_or(rest);
+        let decoded = url_decode(path_part);
+        if decoded.is_empty() {
+            return None;
+        }
+        return Some(std::path::PathBuf::from(decoded));
+    }
+    Some(std::path::PathBuf::from(raw))
 }
 
 /// Minimal `%xx` percent-decoder, enough for common file URIs. Invalid
@@ -1745,28 +1777,6 @@ fn hex_digit(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
-}
-
-/// Unescape shell-style backslash sequences commonly used by terminals
-/// when injecting dropped paths: `\ ` → ` `, `\\` → `\`, `\t` → tab, etc.
-/// A trailing unmatched backslash is passed through verbatim.
-fn unescape_backslashes(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some('r') => out.push('\r'),
-                Some(other) => out.push(other),
-                None => out.push('\\'),
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -2016,6 +2026,60 @@ mod paste_parser_tests {
         let tmp = TempDir::new().unwrap();
         let file = touch(tmp.path(), "loc.txt");
         let paste = format!("file://localhost{}", file.to_string_lossy());
+        let got = parse_dropped_paths(&paste);
+        assert_eq!(got, vec![file]);
+    }
+
+    #[test]
+    fn multi_file_iterm2_single_quoted_space_separated() {
+        // iTerm2 default: `'/path/a.txt' '/path/b.txt'` on one line.
+        let tmp = TempDir::new().unwrap();
+        let a = touch(tmp.path(), "a.txt");
+        let b = touch(tmp.path(), "b.txt");
+        let paste = format!("'{}' '{}'", a.to_string_lossy(), b.to_string_lossy());
+        let got = parse_dropped_paths(&paste);
+        assert_eq!(got, vec![a, b]);
+    }
+
+    #[test]
+    fn multi_file_ghostty_backslash_escaped_space_separated() {
+        // Ghostty / WezTerm / Terminal.app: `/path/a /path/b` with `\ ` for
+        // embedded spaces.
+        let tmp = TempDir::new().unwrap();
+        let a = touch(tmp.path(), "a b.txt");
+        let c = touch(tmp.path(), "c.txt");
+        let paste = format!(
+            "{} {}",
+            a.to_string_lossy().replace(' ', r"\ "),
+            c.to_string_lossy()
+        );
+        let got = parse_dropped_paths(&paste);
+        assert_eq!(got, vec![a, c]);
+    }
+
+    #[test]
+    fn multi_file_mixed_newline_and_space() {
+        // Tolerate payloads that mix the two separators.
+        let tmp = TempDir::new().unwrap();
+        let a = touch(tmp.path(), "a.txt");
+        let b = touch(tmp.path(), "b.txt");
+        let c = touch(tmp.path(), "c.txt");
+        let paste = format!(
+            "{} {}\n{}",
+            a.to_string_lossy(),
+            b.to_string_lossy(),
+            c.to_string_lossy()
+        );
+        let got = parse_dropped_paths(&paste);
+        assert_eq!(got, vec![a, b, c]);
+    }
+
+    #[test]
+    fn quoted_path_with_intra_space_stays_single_token() {
+        // `'hello world.txt'` must remain one path, not two.
+        let tmp = TempDir::new().unwrap();
+        let file = touch(tmp.path(), "hello world.txt");
+        let paste = format!("'{}'", file.to_string_lossy());
         let got = parse_dropped_paths(&paste);
         assert_eq!(got, vec![file]);
     }

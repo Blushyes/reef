@@ -12,6 +12,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+/// Worker-produced `StatefulProtocol` carried back to the main thread
+/// so it can be slotted into the current `ThreadProtocol`. The
+/// `generation` matches the corresponding `preview_load` request — a
+/// mismatch on arrival (user has since selected a different file)
+/// means the build is stale and gets dropped.
+pub struct BuiltProtocol {
+    pub generation: u64,
+    pub protocol: ratatui_image::protocol::StatefulProtocol,
+}
+
 /// How long a preview request sits in `preview_schedule` before the
 /// worker is kicked. 80 ms is below the ~100 ms threshold where users
 /// perceive delay but well above the keystroke rate of arrow-repeat,
@@ -308,6 +318,13 @@ pub struct App {
     /// Drained in `tick` — each message carries a resized protocol the
     /// main thread puts back via `ThreadProtocol::update_resized_protocol`.
     pub preview_resize_rx: mpsc::Receiver<ratatui_image::thread::ResizeResponse>,
+    /// Drained in `tick` — each message carries a freshly-built
+    /// `StatefulProtocol` that was constructed off-thread to avoid
+    /// blocking the render loop on `Picker::new_resize_protocol`'s
+    /// full-image SipHash pass (~16-30 ms for a 2048² image).
+    pub preview_build_rx: mpsc::Receiver<BuiltProtocol>,
+    /// Sender cloned into each protocol-build worker spawn.
+    pub preview_build_tx: mpsc::Sender<BuiltProtocol>,
     /// Monotonic counter incremented every time `apply_worker_result`
     /// constructs a fresh `StatefulProtocol`. Tests observe this to tell
     /// "reused existing protocol" from "rebuilt" — address-based identity
@@ -576,6 +593,12 @@ impl App {
             (req_tx, resp_rx)
         };
 
+        // Channel for `StatefulProtocol` construction results. Protocol
+        // construction hashes every pixel of the decoded image (~16-30 ms
+        // for 2048² RGBA on main thread) — so we spawn a one-shot thread
+        // per build request and merge the result back via this channel.
+        let (preview_build_tx, preview_build_rx) = mpsc::channel::<BuiltProtocol>();
+
         // `repo` is kept for the legacy stage/unstage/restore/push paths in
         // `App` (and for back-compat with existing tests that assert
         // `app.repo.is_none()`). It mirrors the backend's repo view — when
@@ -614,6 +637,8 @@ impl App {
             preview_image_protocol: None,
             preview_resize_tx,
             preview_resize_rx,
+            preview_build_tx,
+            preview_build_rx,
             preview_image_protocol_builds: 0,
             preview_schedule: None,
             preview_in_flight_path: None,
@@ -1293,6 +1318,23 @@ impl App {
         while let Ok(resp) = self.preview_resize_rx.try_recv() {
             if let Some(proto) = self.preview_image_protocol.as_mut() {
                 proto.update_resized_protocol(resp);
+            }
+        }
+    }
+
+    /// Pick up freshly-built `StatefulProtocol`s and slot them into the
+    /// current `ThreadProtocol`. A result is only applied when its
+    /// generation matches the current in-flight `preview_load` — if
+    /// the user switched files before the build completed, the build
+    /// is stale and gets dropped; the next `BuiltProtocol` arriving
+    /// with the new generation wins.
+    fn drain_preview_protocol_builds(&mut self) {
+        while let Ok(built) = self.preview_build_rx.try_recv() {
+            if built.generation != self.preview_load.generation {
+                continue;
+            }
+            if let Some(proto) = self.preview_image_protocol.as_mut() {
+                proto.replace_protocol(built.protocol);
             }
         }
     }
@@ -2025,25 +2067,53 @@ impl App {
                                     && old.format == new.format
                             );
                         if !reuse_protocol {
-                            let fresh_inner = match (
-                                self.image_picker.as_mut(),
+                            // Two-step protocol swap-in:
+                            //   1. Immediately install an EMPTY
+                            //      ThreadProtocol so render can already
+                            //      enter the image branch (it no-ops on
+                            //      the image area until inner lands).
+                            //   2. Spawn a one-shot thread to run
+                            //      `Picker::new_resize_protocol` — that
+                            //      call hashes the full decoded image
+                            //      which on a 2048² RGBA is ~16-30 ms
+                            //      of main-thread work we can't afford
+                            //      during a frame. Result flows back
+                            //      via `preview_build_tx` and gets
+                            //      merged in `drain_preview_protocol_builds`.
+                            let dyn_img = match (
+                                self.image_picker.as_ref(),
                                 content.as_mut().map(|c| &mut c.body),
                             ) {
-                                (Some(picker), Some(crate::file_tree::PreviewBody::Image(img))) => {
-                                    img.image
-                                        .take()
-                                        .map(|dyn_img| picker.new_resize_protocol(dyn_img))
+                                (Some(_), Some(crate::file_tree::PreviewBody::Image(img))) => {
+                                    img.image.take()
                                 }
                                 _ => None,
                             };
-                            self.preview_image_protocol = fresh_inner.map(|proto| {
-                                ratatui_image::thread::ThreadProtocol::new(
-                                    self.preview_resize_tx.clone(),
-                                    Some(proto),
-                                )
-                            });
-                            if self.preview_image_protocol.is_some() {
+                            if let (Some(dyn_img), Some(picker)) =
+                                (dyn_img, self.image_picker.as_ref())
+                            {
+                                self.preview_image_protocol =
+                                    Some(ratatui_image::thread::ThreadProtocol::new(
+                                        self.preview_resize_tx.clone(),
+                                        None,
+                                    ));
                                 self.preview_image_protocol_builds += 1;
+                                let picker_clone = picker.clone();
+                                let build_tx = self.preview_build_tx.clone();
+                                let build_gen = generation;
+                                std::thread::Builder::new()
+                                    .name("reef-image-build".into())
+                                    .spawn(move || {
+                                        let proto = picker_clone.new_resize_protocol(dyn_img);
+                                        let _ = build_tx.send(BuiltProtocol {
+                                            generation: build_gen,
+                                            protocol: proto,
+                                        });
+                                    })
+                                    .ok();
+                            } else {
+                                // Non-image body, or no picker available.
+                                self.preview_image_protocol = None;
                             }
                         } else if let Some(crate::file_tree::PreviewBody::Image(img)) =
                             content.as_mut().map(|c| &mut c.body)
@@ -2075,11 +2145,16 @@ impl App {
                             }
                         }
                         // Warm the cache for the next file the user
-                        // might step onto. Cheap when neighbors are
-                        // already cached (linear scan + clone); does a
-                        // real decode only for fresh neighbors, on an
-                        // idle preview worker.
-                        self.prefetch_preview_neighbors();
+                        // might step onto — but only when we *know* the
+                        // user isn't still scrubbing. A pending
+                        // `preview_schedule` means a fresh selection is
+                        // already committed; prefetching now would queue
+                        // two decodes ahead of the real request and the
+                        // worker would process them in order, making the
+                        // user's actual click wait for them.
+                        if self.preview_schedule.is_none() {
+                            self.prefetch_preview_neighbors();
+                        }
                     }
                 }
                 Err(error) => {
@@ -2710,6 +2785,7 @@ impl App {
         self.drain_preview_sync_debounce();
         self.drain_preview_schedule();
         self.drain_preview_resize_responses();
+        self.drain_preview_protocol_builds();
         self.drain_push_result();
         self.kick_active_tab_work();
         self.tick_place_mode_auto_expand();

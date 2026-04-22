@@ -124,7 +124,11 @@ fn load_preview_missing_file_returns_none_on_both() {
     let local = LocalBackend::open_at(tmp.path().to_path_buf());
     let remote = spawn_remote(tmp.path());
 
-    assert!(local.load_preview(Path::new("no-such.txt"), true, true).is_none());
+    assert!(
+        local
+            .load_preview(Path::new("no-such.txt"), true, true)
+            .is_none()
+    );
     assert!(
         remote
             .load_preview(Path::new("no-such.txt"), true, true)

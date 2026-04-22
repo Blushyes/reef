@@ -1,0 +1,24 @@
+---
+source: tests/ui_snapshots.rs
+expression: output
+---
+ reef  [TMPDIR]  ⎇ (detached)
+ 📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph           1:Files 2:Search 3:Git 4:Graph
+ +   📁    ↻   ⊟        │ doc.pdf
+   doc.pdf U           │ ──────────────────────────────────────────────────────
+                       │ application/pdf · 14 B
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │                      binary file
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                     q:quit Tab:switch s:stage u:unstage r:refresh h:help

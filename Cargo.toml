@@ -34,6 +34,14 @@ reef-proto    = { path = "crates/reef-proto" }
 # SHFileOperationW. Safer default than `std::fs::remove_*` — hard delete
 # stays behind Shift+Delete.
 trash         = "5"
+# Image preview in the file-preview panel. `ratatui-image` drives Kitty /
+# iTerm2 / Halfblocks protocols; `image` decodes pixels off the render
+# path; `infer` sniffs MIME from magic bytes so `.png`-extension-on-a-jpg
+# still routes correctly. Sixel/chafa features are deliberately disabled
+# — those would pull C system libs (libsixel / libchafa) we want to avoid.
+ratatui-image = { version = "10.0.6", default-features = false, features = ["crossterm"] }
+image         = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+infer         = { version = "0.16", default-features = false }
 
 [dev-dependencies]
 tempfile     = "3"

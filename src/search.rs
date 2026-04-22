@@ -351,7 +351,10 @@ fn collect_rows(app: &App, target: SearchTarget) -> Vec<String> {
             .map(|r| r.commit.subject.clone())
             .collect(),
         SearchTarget::FilePreview => match &app.preview_content {
-            Some(p) if !p.is_binary => p.lines.clone(),
+            Some(p) => match &p.body {
+                crate::file_tree::PreviewBody::Text { lines, .. } => lines.clone(),
+                _ => Vec::new(),
+            },
             _ => Vec::new(),
         },
         SearchTarget::Diff => match &app.diff_content {

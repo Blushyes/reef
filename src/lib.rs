@@ -14,6 +14,7 @@ pub mod global_search;
 pub mod hosts;
 pub mod hosts_picker;
 pub mod i18n;
+pub mod images;
 pub mod input;
 pub mod input_edit;
 pub mod place_mode;

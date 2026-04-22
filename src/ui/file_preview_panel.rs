@@ -1,5 +1,5 @@
 use crate::app::App;
-use crate::file_tree::PreviewContent;
+use crate::file_tree::{BinaryInfo, BinaryReason, ImagePreview, PreviewBody, PreviewContent};
 use crate::i18n::{Msg, t};
 use crate::search::SearchTarget;
 use crate::ui::text::{clip_spans, overlay_match_highlight, overlay_selection_highlight};
@@ -8,7 +8,14 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding};
+use ratatui_image::StatefulImage;
 use unicode_width::UnicodeWidthStr;
+
+/// Below this panel height we drop the metadata line (dimensions/format/
+/// size) and the blank spacer so the image body gets more rows. Chosen
+/// so header (1) + separator (1) + meta (1) + blank (1) + at-least-1
+/// image row still fits.
+const MIN_META_HEIGHT: u16 = 5;
 
 pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default().padding(Padding::new(1, 1, 0, 0));
@@ -27,10 +34,10 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         Some(preview) => preview,
     };
 
-    if preview.is_binary {
-        render_binary(f, app, inner, &preview.file_path);
-    } else {
-        render_content(f, app, inner, &preview);
+    match &preview.body {
+        PreviewBody::Text { .. } => render_text(f, app, inner, &preview),
+        PreviewBody::Image(img) => render_image(f, app, inner, &preview.file_path, img),
+        PreviewBody::Binary(info) => render_binary_info(f, app, inner, &preview.file_path, info),
     }
 
     app.preview_content = Some(preview);
@@ -49,67 +56,185 @@ fn render_empty(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(msg, Rect::new(x, y, area.width, 1));
 }
 
-fn render_binary(f: &mut Frame, app: &App, area: Rect, path: &str) {
-    if area.height < 2 {
+/// Draw the shared "bold filename + horizontal separator" top used by
+/// every preview body variant (text / image / binary). Returns the next
+/// free y coordinate — callers continue rendering from there. Callers
+/// whose available height is `< 1` shouldn't call this; we clamp
+/// internally so a single-row panel shows at least the filename.
+fn render_card_header(
+    f: &mut Frame,
+    area: Rect,
+    path: &str,
+    theme: &crate::ui::theme::Theme,
+) -> u16 {
+    let mut y = area.y;
+    let max_y = area.y + area.height;
+    if y >= max_y {
+        return y;
+    }
+    f.render_widget(
+        Line::from(Span::styled(
+            path,
+            Style::default()
+                .fg(theme.fg_primary)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Rect::new(area.x, y, area.width, 1),
+    );
+    y += 1;
+    if y < max_y {
+        f.render_widget(
+            Line::from(Span::styled(
+                "─".repeat(area.width as usize),
+                Style::default().fg(theme.fg_secondary),
+            )),
+            Rect::new(area.x, y, area.width, 1),
+        );
+        y += 1;
+    }
+    y
+}
+
+/// Image preview. Header + separator + metadata line + StatefulImage.
+/// `StatefulProtocol` lives on `App` (not on `PreviewContent`) because it
+/// holds non-`Send` state and is constructed on the main thread when the
+/// worker's `DynamicImage` lands. See `App::apply_worker_result`.
+fn render_image(f: &mut Frame, app: &mut App, area: Rect, path: &str, img: &ImagePreview) {
+    if area.height < 1 {
         return;
     }
     let th = app.theme;
-    let header = Line::from(Span::styled(
-        path,
-        Style::default()
-            .fg(th.fg_primary)
-            .add_modifier(Modifier::BOLD),
-    ));
-    f.render_widget(header, Rect::new(area.x, area.y, area.width, 1));
+    let max_y = area.y + area.height;
+    let mut y = render_card_header(f, area, path, &th);
 
-    let msg = Line::from(Span::styled(
-        "(binary file)",
-        Style::default().fg(th.fg_secondary),
-    ));
-    let y = area.y + area.height / 2;
-    let x = area.x + area.width.saturating_sub(14) / 2;
-    f.render_widget(msg, Rect::new(x, y, area.width, 1));
+    // Metadata line. Skipped when the panel is too short — in that case
+    // we'd rather reclaim the row for actual pixels than spend it on text.
+    // `img.meta_line` was built once at load time (see `ImagePreview::new`)
+    // so we don't allocate on the render hot path.
+    let wants_meta = area.height >= MIN_META_HEIGHT;
+    if wants_meta && y < max_y {
+        f.render_widget(
+            Line::from(Span::styled(
+                img.meta_line.as_str(),
+                Style::default().fg(th.fg_secondary),
+            )),
+            Rect::new(area.x, y, area.width, 1),
+        );
+        y += 1;
+        // Blank spacer row for visual breathing room.
+        if y < max_y {
+            y += 1;
+        }
+    }
+
+    // Image body. ratatui-image handles the encoding to whichever protocol
+    // the Picker detected. If the picker wasn't detected at all (None),
+    // fall back to a text card — nothing is renderable without it.
+    if y >= max_y {
+        return;
+    }
+    let image_area = Rect::new(area.x, y, area.width, max_y - y);
+    if image_area.height < 1 || image_area.width < 1 {
+        return;
+    }
+    match app.preview_image_protocol.as_mut() {
+        Some(proto) => {
+            let widget = StatefulImage::default();
+            f.render_stateful_widget(widget, image_area, proto);
+        }
+        None => {
+            let msg = Line::from(Span::styled(
+                t(Msg::PreviewImageUnavailable),
+                Style::default().fg(th.fg_secondary),
+            ));
+            let cy = image_area.y + image_area.height / 2;
+            let cx = image_area.x
+                + image_area
+                    .width
+                    .saturating_sub(UnicodeWidthStr::width(t(Msg::PreviewImageUnavailable)) as u16)
+                    / 2;
+            f.render_widget(msg, Rect::new(cx, cy, image_area.width, 1));
+        }
+    }
 }
 
-fn render_content(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewContent) {
+/// Friendly metadata card for anything we can't render as pixels —
+/// non-image binaries (PDF, zip, video…), oversized images, unsupported
+/// formats (SVG/AVIF/HEIC), corrupt files, and the 0-byte case. The
+/// `reason` decides the one-line message; the header carries the filename
+/// and the metadata line carries MIME + size.
+fn render_binary_info(f: &mut Frame, app: &App, area: Rect, path: &str, info: &BinaryInfo) {
+    if area.height < 1 {
+        return;
+    }
     let th = app.theme;
-    let mut y = area.y;
     let max_y = area.y + area.height;
+    let mut y = render_card_header(f, area, path, &th);
 
-    // File header
-    if y < max_y {
-        let header = Line::from(Span::styled(
-            preview.file_path.as_str(),
-            Style::default()
-                .fg(th.fg_primary)
-                .add_modifier(Modifier::BOLD),
-        ));
-        f.render_widget(header, Rect::new(area.x, y, area.width, 1));
+    // MIME + size line (e.g. "application/pdf · 2.4 MB"). Pre-rendered
+    // at load time on `BinaryInfo::new`; empty when we have neither a
+    // MIME nor a size (e.g. `Empty` reason).
+    if y < max_y && !info.meta_line.is_empty() {
+        f.render_widget(
+            Line::from(Span::styled(
+                info.meta_line.as_str(),
+                Style::default().fg(th.fg_secondary),
+            )),
+            Rect::new(area.x, y, area.width, 1),
+        );
         y += 1;
     }
 
-    // Separator
+    // Reason line, centred vertically in the remaining space.
+    let reason = binary_reason_text(info);
     if y < max_y {
-        let sep = Line::from(Span::styled(
-            "─".repeat(area.width as usize),
-            Style::default().fg(th.fg_secondary),
-        ));
-        f.render_widget(sep, Rect::new(area.x, y, area.width, 1));
-        y += 1;
+        let cy = y + (max_y - y) / 2;
+        let reason_w = UnicodeWidthStr::width(reason.as_str()) as u16;
+        let cx = area.x + area.width.saturating_sub(reason_w) / 2;
+        f.render_widget(
+            Line::from(Span::styled(reason, Style::default().fg(th.fg_secondary))),
+            Rect::new(cx, cy, area.width.saturating_sub(cx - area.x), 1),
+        );
     }
+}
+
+fn binary_reason_text(info: &BinaryInfo) -> String {
+    match &info.reason {
+        // NonImage and NullBytes both render as a generic "binary file"
+        // line — the distinction matters only for classification
+        // (NonImage has a MIME, NullBytes doesn't) and telemetry/tests.
+        BinaryReason::NonImage | BinaryReason::NullBytes => {
+            t(Msg::PreviewBinaryNonImage).to_string()
+        }
+        BinaryReason::UnsupportedImage => t(Msg::PreviewBinaryUnsupportedImage).to_string(),
+        BinaryReason::TooLarge => t(Msg::PreviewBinaryTooLarge).to_string(),
+        BinaryReason::DecodeError(msg) => {
+            format!("{}: {}", t(Msg::PreviewBinaryDecodeError), msg)
+        }
+        BinaryReason::Empty => t(Msg::PreviewBinaryEmpty).to_string(),
+    }
+}
+
+fn render_text(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewContent) {
+    let (lines, highlighted) = match &preview.body {
+        PreviewBody::Text { lines, highlighted } => (lines, highlighted),
+        _ => return,
+    };
+    let th = app.theme;
+    let max_y = area.y + area.height;
+    let y = render_card_header(f, area, &preview.file_path, &th);
 
     let content_height = (max_y - y) as usize;
     // Cache the content viewport height so search-jump can center matches.
     app.last_preview_view_h = content_height as u16;
-    let max_scroll = preview.lines.len().saturating_sub(content_height);
+    let max_scroll = lines.len().saturating_sub(content_height);
     app.preview_scroll = app.preview_scroll.min(max_scroll);
 
     let gutter_w = 6usize; // " NNNNN "
     let content_w = (area.width as usize).saturating_sub(gutter_w);
 
     // Clamp horizontal scroll against the widest line currently in view.
-    let max_visible_w: usize = preview
-        .lines
+    let max_visible_w: usize = lines
         .iter()
         .skip(app.preview_scroll)
         .take(content_height)
@@ -125,7 +250,7 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewCon
     app.last_preview_content_origin = Some((area.x + gutter_w as u16, y, gutter_w as u16));
     let selection = app.preview_selection;
 
-    for (i, line) in preview.lines.iter().skip(app.preview_scroll).enumerate() {
+    for (i, line) in lines.iter().skip(app.preview_scroll).enumerate() {
         let cy = y + i as u16;
         if cy >= max_y {
             break;
@@ -143,7 +268,7 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewCon
         // then clip horizontally. Keeps horizontal-scroll and search highlight
         // independent of whether syntax tokens were produced.
         let base_tokens: Vec<(Style, String)> =
-            match preview.highlighted.as_ref().and_then(|hh| hh.get(real_idx)) {
+            match highlighted.as_ref().and_then(|hh| hh.get(real_idx)) {
                 Some(tokens) => tokens.clone(),
                 None => vec![(Style::default().fg(th.fg_primary), line.clone())],
             };

@@ -13,6 +13,7 @@ use reef::agent_deploy::{self, InstallPath, SshSession};
 use reef::app::App;
 use reef::backend::{Backend, LocalBackend, RemoteBackend};
 use reef::i18n;
+use reef::images;
 use reef::ui::theme::Theme;
 use reef::ui::toast::Toast;
 use reef::{editor, input, ui};
@@ -130,6 +131,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `ui.theme` pref override and a non-TTY fallback.
     let theme = Theme::resolve();
 
+    // Probe image-rendering capabilities using the same pre-raw-mode
+    // window: `Picker::from_query_stdio` sends a CSI query and reads the
+    // reply on stdin, just like OSC 11 above. `None` means the terminal
+    // has no graphics protocol (or the user set REEF_IMAGE_PROTOCOL=off)
+    // — image files will render as a friendly metadata card instead.
+    let image_picker = images::probe_picker();
+
     // Build the backend before terminal setup so any spawn failure surfaces
     // as a normal error (stderr) rather than painting half-initialised on
     // the alt-screen.
@@ -185,8 +193,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // queue instead.
     let mut pending_connect_error: Option<String> = None;
     'session: loop {
-        // App init
-        let mut app = App::new_with_backend(theme, Arc::clone(&backend));
+        // App init — clone the picker per session because each App owns
+        // it for its preview-protocol lifecycle.
+        let mut app = App::new_with_backend(theme, Arc::clone(&backend), image_picker.clone());
         if let Some(msg) = pending_connect_error.take() {
             app.toasts.push(Toast::error(msg));
             // Re-open the picker so the user has a visible recovery path

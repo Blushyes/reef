@@ -439,8 +439,13 @@ impl Backend for RemoteBackend {
     }
 
     fn load_preview(&self, rel_path: &Path, dark: bool) -> Option<PreviewContent> {
-        // Fetch bytes over RPC then reuse the local preview-construction
-        // logic (binary detect, 10k-line cap, syntect highlight).
+        // Fetch bytes over RPC and rebuild a `PreviewContent`. The new
+        // `PreviewBody::Image` variant on this enum holds a decoded
+        // `DynamicImage` that isn't trivially shipped over the wire — for
+        // M1 we surface every binary (image or otherwise) as a `Binary`
+        // metadata card. Real image rendering over SSH would need raw
+        // bytes + client-side decode; tracked separately.
+        use crate::file_tree::{BinaryInfo, BinaryReason, PreviewBody};
         let rel_str = rel_path.to_string_lossy().to_string();
         let resp: ReadFileResponse = self
             .request(Request::ReadFile {
@@ -452,14 +457,17 @@ impl Backend for RemoteBackend {
             return None;
         }
         let raw = resp.bytes;
+        let bytes_on_disk = resp.size;
 
         let check_len = raw.len().min(8192);
         if raw[..check_len].contains(&0) {
             return Some(PreviewContent {
                 file_path: rel_str,
-                lines: Vec::new(),
-                is_binary: true,
-                highlighted: None,
+                body: PreviewBody::Binary(BinaryInfo::new(
+                    bytes_on_disk,
+                    None,
+                    BinaryReason::NonImage,
+                )),
             });
         }
 
@@ -479,9 +487,7 @@ impl Backend for RemoteBackend {
 
         Some(PreviewContent {
             file_path: rel_str,
-            lines,
-            is_binary: false,
-            highlighted,
+            body: PreviewBody::Text { lines, highlighted },
         })
     }
 

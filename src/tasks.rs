@@ -193,6 +193,19 @@ enum FilesTask {
         backend: Arc<dyn Backend>,
         rel_path: PathBuf,
         dark: bool,
+        wants_decoded_image: bool,
+    },
+    /// Warm the preview cache for a neighbor of the currently-selected
+    /// file. Same decode path as `LoadPreview`, but the result is
+    /// **discarded** — the side effect is populating
+    /// `LocalBackend::preview_cache`, so when the user actually
+    /// cursor-steps onto the neighbor the real `LoadPreview` is a cheap
+    /// clone instead of a 50-200 ms decode.
+    PrefetchPreview {
+        backend: Arc<dyn Backend>,
+        rel_path: PathBuf,
+        dark: bool,
+        wants_decoded_image: bool,
     },
     /// Drag-and-drop copy: each source lands under `dest_dir`. A name
     /// collision auto-renames VSCode-style (`foo.txt` → `foo (1).txt`).
@@ -327,6 +340,12 @@ enum GraphTask {
 
 pub struct TaskCoordinator {
     files_tx: mpsc::Sender<FilesTask>,
+    /// Dedicated channel for `FilesTask::LoadPreview`. Keeping previews
+    /// on their own worker thread means a slow directory rebuild or an
+    /// in-flight copy never queues in front of the image the user just
+    /// clicked. Both threads can hit the `LocalBackend` preview cache
+    /// safely via the internal `Mutex`.
+    preview_tx: mpsc::Sender<FilesTask>,
     git_tx: mpsc::Sender<GitTask>,
     graph_tx: mpsc::Sender<GraphTask>,
     global_search_tx: mpsc::Sender<GlobalSearchTask>,
@@ -338,6 +357,7 @@ impl TaskCoordinator {
         let (result_tx, result_rx) = mpsc::channel();
         Self {
             files_tx: spawn_files_worker(result_tx.clone()),
+            preview_tx: spawn_preview_worker(result_tx.clone()),
             git_tx: spawn_git_worker(result_tx.clone()),
             graph_tx: spawn_graph_worker(result_tx.clone()),
             global_search_tx: spawn_global_search_worker(result_tx),
@@ -374,12 +394,35 @@ impl TaskCoordinator {
         backend: Arc<dyn Backend>,
         rel_path: PathBuf,
         dark: bool,
+        wants_decoded_image: bool,
     ) {
-        let _ = self.files_tx.send(FilesTask::LoadPreview {
+        // Route to the dedicated preview worker so an in-flight tree
+        // rebuild or copy doesn't sit ahead of an image the user just
+        // clicked on.
+        let _ = self.preview_tx.send(FilesTask::LoadPreview {
             generation,
             backend,
             rel_path,
             dark,
+            wants_decoded_image,
+        });
+    }
+
+    /// Warm the preview cache for a file the user hasn't selected yet
+    /// but probably will. Result is dropped by the worker; the cache
+    /// side effect is the point.
+    pub fn prefetch_preview(
+        &self,
+        backend: Arc<dyn Backend>,
+        rel_path: PathBuf,
+        dark: bool,
+        wants_decoded_image: bool,
+    ) {
+        let _ = self.preview_tx.send(FilesTask::PrefetchPreview {
+            backend,
+            rel_path,
+            dark,
+            wants_decoded_image,
         });
     }
 
@@ -627,8 +670,9 @@ fn spawn_files_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Fil
                         backend,
                         rel_path,
                         dark,
+                        wants_decoded_image,
                     } => {
-                        let result = Ok(backend.load_preview(&rel_path, dark));
+                        let result = Ok(backend.load_preview(&rel_path, dark, wants_decoded_image));
                         let _ = result_tx.send(WorkerResult::Preview { generation, result });
                     }
                     FilesTask::CopyFiles {
@@ -734,6 +778,10 @@ fn spawn_files_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Fil
                             result,
                         });
                     }
+                    // Prefetch routes to the preview worker; this arm
+                    // never fires in practice but exhaustiveness needs
+                    // it.
+                    FilesTask::PrefetchPreview { .. } => {}
                 }
             }
         });
@@ -1010,6 +1058,46 @@ fn split_stem_ext(name: &str) -> (&str, Option<&str>) {
         }
         None => (name, None),
     }
+}
+
+/// Dedicated worker thread for `FilesTask::LoadPreview`. Same task
+/// shape as the main files worker, but sitting on its own channel so
+/// slow preview decodes can't queue behind a big tree rebuild or a
+/// long-running copy. Non-preview tasks arriving here are silently
+/// ignored — they're never routed to `preview_tx` in practice.
+fn spawn_preview_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<FilesTask> {
+    let (tx, rx) = mpsc::channel();
+    let _ = thread::Builder::new()
+        .name("reef-preview-worker".into())
+        .spawn(move || {
+            while let Ok(task) = rx.recv() {
+                match task {
+                    FilesTask::LoadPreview {
+                        generation,
+                        backend,
+                        rel_path,
+                        dark,
+                        wants_decoded_image,
+                    } => {
+                        let result = Ok(backend.load_preview(&rel_path, dark, wants_decoded_image));
+                        let _ = result_tx.send(WorkerResult::Preview { generation, result });
+                    }
+                    FilesTask::PrefetchPreview {
+                        backend,
+                        rel_path,
+                        dark,
+                        wants_decoded_image,
+                    } => {
+                        // Fire-and-forget: the backend's LRU cache
+                        // absorbs the result. No WorkerResult because
+                        // the main thread has nothing to apply here.
+                        let _ = backend.load_preview(&rel_path, dark, wants_decoded_image);
+                    }
+                    _ => {}
+                }
+            }
+        });
+    tx
 }
 
 fn spawn_git_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<GitTask> {

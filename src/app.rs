@@ -12,6 +12,31 @@ use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+/// Worker-produced `StatefulProtocol` carried back to the main thread
+/// so it can be slotted into the current `ThreadProtocol`. The
+/// `generation` matches the corresponding `preview_load` request — a
+/// mismatch on arrival (user has since selected a different file)
+/// means the build is stale and gets dropped.
+pub struct BuiltProtocol {
+    pub generation: u64,
+    pub protocol: ratatui_image::protocol::StatefulProtocol,
+}
+
+/// How long a preview request sits in `preview_schedule` before the
+/// worker is kicked. 80 ms is below the ~100 ms threshold where users
+/// perceive delay but well above the keystroke rate of arrow-repeat,
+/// so rapid scrubbing coalesces into a single load.
+const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(80);
+
+/// How long we wait after a preview lands before firing neighbor
+/// prefetches. Short enough that a user who pauses to look still gets
+/// the next step cached; long enough that a user pressing the next
+/// key 5-50 ms after a landing never queues prefetches in front of
+/// their real `LoadPreview`. `load_preview_for_path` clears the
+/// schedule on every keystroke, so rapid scrubbing never fires
+/// prefetch at all.
+const PREFETCH_DELAY: Duration = Duration::from_millis(300);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Git,
@@ -288,16 +313,50 @@ pub struct App {
     /// Resize-aware protocol state for the currently-previewed image.
     /// Built on the main thread in `apply_worker_result` when the worker
     /// hands back a decoded `DynamicImage`; cleared when a text/binary
-    /// body arrives or `image_picker` is `None`. `ratatui-image` needs
-    /// this to be `&mut` across frames so it can cache the encoded output
-    /// keyed by target cell area and only re-encode on panel resize.
-    pub preview_image_protocol: Option<ratatui_image::protocol::StatefulProtocol>,
+    /// body arrives or `image_picker` is `None`.
+    ///
+    /// Wrapped in `ThreadProtocol` so the resize+encode step (tens of
+    /// ms for Kitty on large images) runs on a dedicated worker thread
+    /// instead of blocking the render frame. During the resize window
+    /// the inner `StatefulProtocol` is held by the worker and render
+    /// no-ops on the image area — the rest of the UI stays responsive.
+    pub preview_image_protocol: Option<ratatui_image::thread::ThreadProtocol>,
+    /// Sender handed to every fresh `ThreadProtocol` so it can dispatch
+    /// resize requests to the background worker.
+    pub preview_resize_tx: mpsc::Sender<ratatui_image::thread::ResizeRequest>,
+    /// Drained in `tick` — each message carries a resized protocol the
+    /// main thread puts back via `ThreadProtocol::update_resized_protocol`.
+    pub preview_resize_rx: mpsc::Receiver<ratatui_image::thread::ResizeResponse>,
+    /// Drained in `tick` — each message carries a freshly-built
+    /// `StatefulProtocol` that was constructed off-thread to avoid
+    /// blocking the render loop on `Picker::new_resize_protocol`'s
+    /// full-image SipHash pass (~16-30 ms for a 2048² image).
+    pub preview_build_rx: mpsc::Receiver<BuiltProtocol>,
+    /// Sender cloned into each protocol-build worker spawn.
+    pub preview_build_tx: mpsc::Sender<BuiltProtocol>,
     /// Monotonic counter incremented every time `apply_worker_result`
     /// constructs a fresh `StatefulProtocol`. Tests observe this to tell
     /// "reused existing protocol" from "rebuilt" — address-based identity
     /// doesn't work because the Option slot lives at a fixed offset. Not
     /// used in any production codepath.
     pub preview_image_protocol_builds: u64,
+    /// Debounced preview-load schedule. `load_preview_for_path` writes
+    /// `(path, fire_deadline)` here instead of dispatching immediately;
+    /// `tick` fires it when the deadline passes. Arrow-scrubbing through
+    /// a directory of images no longer decodes every file flown past —
+    /// only the last selection survives the `PREVIEW_DEBOUNCE` window.
+    pub preview_schedule: Option<(PathBuf, Instant)>,
+    /// Deadline for firing neighbor prefetch. Set when a preview lands;
+    /// cleared on the next `load_preview_for_path`. Prefetch fires only
+    /// if the deadline elapses without a fresh selection — i.e. the
+    /// user paused long enough to justify warming the cache.
+    pub prefetch_schedule: Option<Instant>,
+    /// Path of the preview currently being decoded by the worker.
+    /// Populated at dispatch, cleared when the result arrives (or on
+    /// error). Render consults this + `preview_schedule` to decide
+    /// whether to show a "loading …" placeholder for a different file
+    /// instead of the stale previous preview.
+    pub preview_in_flight_path: Option<PathBuf>,
     pub tree_scroll: usize,
     /// The `file_tree.selected` value we observed on the previous render.
     /// Used by the Files-tab tree panel to distinguish "selection just changed
@@ -526,6 +585,34 @@ impl App {
         // legacy install.
         crate::prefs::migrate_legacy_prefs();
 
+        // Spin up the image-resize worker. Every `ThreadProtocol` we
+        // build later clones this sender; the receiver is drained in
+        // `tick`. Keeping the worker alive for the life of App means
+        // subsequent preview switches reuse the same channel (and its
+        // serial ordering guarantees — no "request N finished after
+        // request N+1" races).
+        let (preview_resize_tx, preview_resize_rx) = {
+            let (req_tx, req_rx) = mpsc::channel::<ratatui_image::thread::ResizeRequest>();
+            let (resp_tx, resp_rx) = mpsc::channel::<ratatui_image::thread::ResizeResponse>();
+            std::thread::Builder::new()
+                .name("reef-image-resize".into())
+                .spawn(move || {
+                    while let Ok(req) = req_rx.recv() {
+                        if let Ok(resp) = req.resize_encode() {
+                            let _ = resp_tx.send(resp);
+                        }
+                    }
+                })
+                .ok();
+            (req_tx, resp_rx)
+        };
+
+        // Channel for `StatefulProtocol` construction results. Protocol
+        // construction hashes every pixel of the decoded image (~16-30 ms
+        // for 2048² RGBA on main thread) — so we spawn a one-shot thread
+        // per build request and merge the result back via this channel.
+        let (preview_build_tx, preview_build_rx) = mpsc::channel::<BuiltProtocol>();
+
         // `repo` is kept for the legacy stage/unstage/restore/push paths in
         // `App` (and for back-compat with existing tests that assert
         // `app.repo.is_none()`). It mirrors the backend's repo view — when
@@ -562,7 +649,14 @@ impl App {
             preview_content: None,
             image_picker,
             preview_image_protocol: None,
+            preview_resize_tx,
+            preview_resize_rx,
+            preview_build_tx,
+            preview_build_rx,
             preview_image_protocol_builds: 0,
+            preview_schedule: None,
+            prefetch_schedule: None,
+            preview_in_flight_path: None,
             tree_scroll: 0,
             last_rendered_tree_selected: None,
             preview_scroll: 0,
@@ -1199,13 +1293,145 @@ impl App {
                 self.preview_highlight = None;
             }
         }
+        // Debounce: stash the path + deadline and let `tick` kick the
+        // worker once the scrubbing settles. Holding ↓ across 20 PNGs
+        // used to enqueue 20 full decodes (generation tokens dropped
+        // the 19 stale *results*, but the worker already did the work).
+        // With the window in place we do one decode for the final stop.
+        self.preview_schedule = Some((rel_path, Instant::now() + PREVIEW_DEBOUNCE));
+        // Cancel any pending neighbor prefetch — the user is on the
+        // move, don't warm caches for files they'll flip past.
+        self.prefetch_schedule = None;
+    }
+
+    /// Immediate-dispatch path for `load_preview_for_path`. Callers that
+    /// have a specific path already loaded and want to refresh it RIGHT
+    /// NOW (fs-watcher refresh of the currently-displayed file, where
+    /// there's no scrubbing in play) bypass the debounce window.
+    fn dispatch_preview_load(&mut self, rel_path: PathBuf) {
         let generation = self.preview_load.begin();
+        self.preview_in_flight_path = Some(rel_path.clone());
+        // Skip the image decode when we can't render pixels anyway —
+        // the worker will return a metadata-only `ImagePreview` with
+        // dims + format + size, and the render path shows the
+        // "image preview unavailable" card instead. Saves 50-200 ms
+        // per PNG on non-graphics terminals (legacy Terminal.app, SSH,
+        // `REEF_IMAGE_PROTOCOL=off`).
+        let wants_decoded_image = self.image_picker.is_some();
         self.tasks.load_preview(
             generation,
             Arc::clone(&self.backend),
             rel_path,
             self.theme.is_dark,
+            wants_decoded_image,
         );
+    }
+
+    /// Pull any completed resize responses from the background
+    /// resize worker and merge them into the current protocol. Drops
+    /// stale responses whose id doesn't match (the `ThreadProtocol`
+    /// bumps its id each time it dispatches, so a resize for an older
+    /// selection arrives as a no-op after the user already switched).
+    fn drain_preview_resize_responses(&mut self) {
+        while let Ok(resp) = self.preview_resize_rx.try_recv() {
+            if let Some(proto) = self.preview_image_protocol.as_mut() {
+                proto.update_resized_protocol(resp);
+            }
+        }
+    }
+
+    /// Pick up freshly-built `StatefulProtocol`s and slot them into the
+    /// current `ThreadProtocol`. A result is only applied when its
+    /// generation matches the current in-flight `preview_load` — if
+    /// the user switched files before the build completed, the build
+    /// is stale and gets dropped; the next `BuiltProtocol` arriving
+    /// with the new generation wins.
+    fn drain_preview_protocol_builds(&mut self) {
+        while let Ok(built) = self.preview_build_rx.try_recv() {
+            if built.generation != self.preview_load.generation {
+                continue;
+            }
+            if let Some(proto) = self.preview_image_protocol.as_mut() {
+                proto.replace_protocol(built.protocol);
+            }
+        }
+    }
+
+    /// Fire the deferred neighbor prefetch if the user has stayed on
+    /// the same file for `PREFETCH_DELAY`. Any `load_preview_for_path`
+    /// cancels the schedule, so this never fires during active
+    /// scrubbing — the preview worker stays clear for the user's
+    /// actual next `LoadPreview`.
+    fn drain_prefetch_schedule(&mut self) {
+        let Some(deadline) = self.prefetch_schedule else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+        self.prefetch_schedule = None;
+        if self.preview_schedule.is_some() {
+            return;
+        }
+        self.prefetch_preview_neighbors();
+    }
+
+    /// Fire any debounced preview request whose deadline has elapsed.
+    /// Called from `tick`. Uses the STORED path, not the current
+    /// selection — if the user scrubbed past this file already, they'll
+    /// have replaced the schedule with the new path themselves.
+    fn drain_preview_schedule(&mut self) {
+        let Some((_, deadline)) = self.preview_schedule.as_ref() else {
+            return;
+        };
+        if Instant::now() < *deadline {
+            return;
+        }
+        let (path, _) = self.preview_schedule.take().expect("checked above");
+        self.dispatch_preview_load(path);
+    }
+
+    /// After a preview lands, warm the cache for the next/prev file in
+    /// the tree. The decode cost is paid on an idle preview worker so
+    /// by the time the user presses ↓↑ again, `backend.load_preview`
+    /// hits the cache instead of running a fresh 50-200 ms decode.
+    ///
+    /// Only runs on the Files tab and when no modal (tree edit, place
+    /// mode, context menu, delete confirm) owns input — prefetching
+    /// during editing would queue pointless work.
+    fn prefetch_preview_neighbors(&self) {
+        if self.active_tab != Tab::Files {
+            return;
+        }
+        if self.place_mode.active
+            || self.tree_edit.active
+            || self.tree_context_menu.active
+            || self.tree_delete_confirm.is_some()
+        {
+            return;
+        }
+        let sel = self.file_tree.selected;
+        let entries = &self.file_tree.entries;
+        if entries.is_empty() || sel >= entries.len() {
+            return;
+        }
+        let candidates = [
+            sel.checked_sub(1),
+            (sel + 1 < entries.len()).then_some(sel + 1),
+        ];
+        let wants_decoded_image = self.image_picker.is_some();
+        for idx in candidates.into_iter().flatten() {
+            let entry = &entries[idx];
+            if entry.is_dir {
+                continue;
+            }
+            self.tasks.prefetch_preview(
+                Arc::clone(&self.backend),
+                entry.path.clone(),
+                self.theme.is_dark,
+                wants_decoded_image,
+            );
+        }
     }
 
     pub fn select_file(&mut self, path: &str, is_staged: bool) {
@@ -1839,6 +2065,9 @@ impl App {
             WorkerResult::Preview { generation, result } => match result {
                 Ok(mut content) => {
                     if self.preview_load.complete_ok(generation) {
+                        // Worker has landed — the loading indicator can stop
+                        // pointing at the in-flight path.
+                        self.preview_in_flight_path = None;
                         let same_file = matches!(
                             (self.preview_content.as_ref(), content.as_ref()),
                             (Some(old), Some(new)) if old.file_path == new.file_path
@@ -1875,19 +2104,53 @@ impl App {
                                     && old.format == new.format
                             );
                         if !reuse_protocol {
-                            self.preview_image_protocol = match (
-                                self.image_picker.as_mut(),
+                            // Two-step protocol swap-in:
+                            //   1. Immediately install an EMPTY
+                            //      ThreadProtocol so render can already
+                            //      enter the image branch (it no-ops on
+                            //      the image area until inner lands).
+                            //   2. Spawn a one-shot thread to run
+                            //      `Picker::new_resize_protocol` — that
+                            //      call hashes the full decoded image
+                            //      which on a 2048² RGBA is ~16-30 ms
+                            //      of main-thread work we can't afford
+                            //      during a frame. Result flows back
+                            //      via `preview_build_tx` and gets
+                            //      merged in `drain_preview_protocol_builds`.
+                            let dyn_img = match (
+                                self.image_picker.as_ref(),
                                 content.as_mut().map(|c| &mut c.body),
                             ) {
-                                (Some(picker), Some(crate::file_tree::PreviewBody::Image(img))) => {
-                                    img.image
-                                        .take()
-                                        .map(|dyn_img| picker.new_resize_protocol(dyn_img))
+                                (Some(_), Some(crate::file_tree::PreviewBody::Image(img))) => {
+                                    img.image.take()
                                 }
                                 _ => None,
                             };
-                            if self.preview_image_protocol.is_some() {
+                            if let (Some(dyn_img), Some(picker)) =
+                                (dyn_img, self.image_picker.as_ref())
+                            {
+                                self.preview_image_protocol =
+                                    Some(ratatui_image::thread::ThreadProtocol::new(
+                                        self.preview_resize_tx.clone(),
+                                        None,
+                                    ));
                                 self.preview_image_protocol_builds += 1;
+                                let picker_clone = picker.clone();
+                                let build_tx = self.preview_build_tx.clone();
+                                let build_gen = generation;
+                                std::thread::Builder::new()
+                                    .name("reef-image-build".into())
+                                    .spawn(move || {
+                                        let proto = picker_clone.new_resize_protocol(dyn_img);
+                                        let _ = build_tx.send(BuiltProtocol {
+                                            generation: build_gen,
+                                            protocol: proto,
+                                        });
+                                    })
+                                    .ok();
+                            } else {
+                                // Non-image body, or no picker available.
+                                self.preview_image_protocol = None;
                             }
                         } else if let Some(crate::file_tree::PreviewBody::Image(img)) =
                             content.as_mut().map(|c| &mut c.body)
@@ -1918,10 +2181,20 @@ impl App {
                                 self.preview_scroll = crate::search::center_scroll(hl.row, view_h);
                             }
                         }
+                        // Defer prefetch: if we fired right now, a user
+                        // who presses ↓ within ~50 ms of this landing
+                        // would find two prefetch decodes already
+                        // queued ahead of their real `LoadPreview`.
+                        // Schedule instead, and `load_preview_for_path`
+                        // cancels if the user moves first.
+                        if self.preview_schedule.is_none() {
+                            self.prefetch_schedule = Some(Instant::now() + PREFETCH_DELAY);
+                        }
                     }
                 }
                 Err(error) => {
                     self.preview_load.complete_err(generation, error);
+                    self.preview_in_flight_path = None;
                 }
             },
             WorkerResult::GitStatus { generation, result } => match result {
@@ -2545,6 +2818,10 @@ impl App {
 
         self.maybe_kick_global_search();
         self.drain_preview_sync_debounce();
+        self.drain_preview_schedule();
+        self.drain_prefetch_schedule();
+        self.drain_preview_resize_responses();
+        self.drain_preview_protocol_builds();
         self.drain_push_result();
         self.kick_active_tab_work();
         self.tick_place_mode_auto_expand();

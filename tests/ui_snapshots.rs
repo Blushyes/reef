@@ -516,12 +516,35 @@ fn snapshot_image_preview_halfblocks() {
     app.load_preview();
     wait_for_preview(&mut app);
 
-    // `StatefulImage` is lazy: the first render call hands the protocol
-    // the cell area, and the widget encodes against that size on the
-    // next frame. Draw twice so the snapshot captures pixels, not a
-    // placeholder. A real user never notices (frame 1→2 is 16 ms) but
-    // TestBackend stops at whatever frame we ask it to.
+    // Three-phase sequence for the async ThreadProtocol pipeline:
+    // 1. After `wait_for_preview`, the decode is done but
+    //    `preview_image_protocol` is `Some(ThreadProtocol { inner: None })`
+    //    — the build thread hasn't populated the inner protocol yet.
+    //    Spin until it does.
+    // 2. First render call dispatches a ResizeRequest to the resize
+    //    worker (inner → None again while the resize runs).
+    // 3. Spin until the resize response lands and inner is Some again,
+    //    now carrying encoded halfblocks data.
+    // 4. Second render writes the pixels into the buffer.
+    let wait_for_inner_some = |app: &mut App| {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            app.tick();
+            if app
+                .preview_image_protocol
+                .as_ref()
+                .and_then(|p| p.protocol_type())
+                .is_some()
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("timed out waiting for image protocol inner");
+    };
+    wait_for_inner_some(&mut app);
     let _warmup = render_app(&mut app, 80, 20);
+    wait_for_inner_some(&mut app);
     let output = render_app(&mut app, 80, 20);
     with_filters(&[], || {
         insta::assert_snapshot!("image_preview_halfblocks", output)

@@ -20,13 +20,13 @@ pub struct TreeEntry {
 /// a codepath without boolean gymnastics, and lets the worker surface
 /// *why* something isn't renderable (too large vs unsupported vs decode
 /// error) so the UI can tell the user.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PreviewContent {
     pub file_path: String,
     pub body: PreviewBody,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum PreviewBody {
     Text {
         lines: Vec<String>,
@@ -60,7 +60,7 @@ impl PreviewContent {
 /// fps during active interaction (mouse drag, scroll), and rebuilding
 /// the same String through two `format!()` calls per frame is pure
 /// allocator churn — cache it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ImagePreview {
     pub image: Option<image::DynamicImage>,
     pub width_px: u32,
@@ -76,7 +76,7 @@ pub struct ImagePreview {
     pub meta_line: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BinaryInfo {
     pub bytes_on_disk: u64,
     /// MIME as reported by `infer`, e.g. "application/pdf". `None` when
@@ -91,7 +91,7 @@ pub struct BinaryInfo {
     pub meta_line: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BinaryReason {
     /// Not an image at all — PDF, zip, video, audio, font, etc.
     NonImage,
@@ -114,6 +114,15 @@ pub enum BinaryReason {
     /// 0-byte file. Shown as "(empty file)" in the preview card.
     Empty,
 }
+
+/// Fast-path image header read for the `wants_decoded_image == false`
+/// branch of `load_image_preview`. 64 KB covers the header of every
+/// format we care about (PNG IHDR lives at byte 16; JPEG SOF markers
+/// usually within the first few KB; GIF LSD is the first 13 bytes; WebP
+/// VP8 chunk header is near the start). Huge files that put metadata
+/// farther in would miss dimensions, but such files are rare and the
+/// fallback is "unsupported image" — never a crash.
+const METADATA_HEADER_BYTES: usize = 64 * 1024;
 
 /// Cap the length of an error message we stuff into a `BinaryReason::
 /// DecodeError`. Longer strings get ellipsis-truncated. Keeps the
@@ -189,6 +198,57 @@ fn binary_meta_line(mime: Option<&'static str>, bytes_on_disk: u64) -> String {
     }
 }
 
+/// Read the first `cap` bytes of `path` without slurping the rest.
+/// Returns fewer bytes if the file is shorter than the cap.
+fn read_up_to(path: &Path, cap: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; cap];
+    let n = f.read(&mut buf)?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+/// Build an `ImagePreview` with `image: None` and dimensions probed from
+/// raw header bytes. Used on terminals without a graphics protocol —
+/// we still want the user to see "1920×1080 · PNG · 2.4 MB" instead of
+/// a generic binary card, but we don't decode pixels we'd throw away.
+fn metadata_only_from_bytes<F>(
+    bytes: &[u8],
+    rel_str: &str,
+    file_size: u64,
+    card: F,
+) -> PreviewContent
+where
+    F: Fn(BinaryReason) -> PreviewContent,
+{
+    use image::ImageReader;
+    use std::io::Cursor;
+    let reader = match ImageReader::new(Cursor::new(bytes)).with_guessed_format() {
+        Ok(r) => r,
+        Err(e) => return card(decode_error(e.to_string())),
+    };
+    let format = match reader.format() {
+        Some(f) => f,
+        None => return card(BinaryReason::UnsupportedImage),
+    };
+    let (w, h) = match reader.into_dimensions() {
+        Ok(d) => d,
+        Err(e) => {
+            let reason = if matches!(e, image::ImageError::Unsupported(_)) {
+                BinaryReason::UnsupportedImage
+            } else {
+                decode_error(e.to_string())
+            };
+            return card(reason);
+        }
+    };
+    PreviewContent {
+        file_path: rel_str.to_string(),
+        body: PreviewBody::Image(ImagePreview::metadata_only(w, h, format, file_size, false)),
+    }
+}
+
 impl BinaryInfo {
     /// Build a `BinaryInfo` with its metadata line pre-rendered. Keeps
     /// the render path allocation-free and centralises the construction
@@ -218,6 +278,27 @@ impl ImagePreview {
     ) -> Self {
         Self {
             image: Some(image),
+            width_px,
+            height_px,
+            format,
+            bytes_on_disk,
+            animated,
+            meta_line: image_meta_line(width_px, height_px, format, bytes_on_disk, animated),
+        }
+    }
+
+    /// Metadata-only preview for terminals that don't support a
+    /// graphics protocol: we still want the user to see dimensions and
+    /// size, but we skipped the full decode to save the CPU cost.
+    fn metadata_only(
+        width_px: u32,
+        height_px: u32,
+        format: image::ImageFormat,
+        bytes_on_disk: u64,
+        animated: bool,
+    ) -> Self {
+        Self {
+            image: None,
             width_px,
             height_px,
             format,
@@ -512,14 +593,26 @@ const MAX_TEXT_PROBE_BYTES: u64 = 10 * 1024 * 1024;
 ///   with the MIME so the UI can show "(application/pdf · 2.4 MB)".
 /// - `infer` returns `None` → legacy 8KB null-byte heuristic decides
 ///   text vs `Binary(NullBytes)`.
-pub fn load_preview(root: &Path, rel_path: &Path, dark: bool) -> Option<PreviewContent> {
+pub fn load_preview(
+    root: &Path,
+    rel_path: &Path,
+    dark: bool,
+    wants_decoded_image: bool,
+) -> Option<PreviewContent> {
+    use std::io::Read;
     let full = root.join(rel_path);
-    if !full.is_file() {
+    let rel_str = rel_path.to_string_lossy().to_string();
+
+    // Single `File::open` serves three purposes: file-type check, size
+    // (via handle `metadata`, no extra stat), and probe bytes. The old
+    // path did `is_file` + `metadata` + `File::open` + `read` — three
+    // syscalls to the same inode.
+    let mut file = std::fs::File::open(&full).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
         return None;
     }
-
-    let rel_str = rel_path.to_string_lossy().to_string();
-    let file_size = std::fs::metadata(&full).ok().map(|m| m.len()).unwrap_or(0);
+    let file_size = meta.len();
 
     if file_size == 0 {
         return Some(PreviewContent {
@@ -528,10 +621,13 @@ pub fn load_preview(root: &Path, rel_path: &Path, dark: bool) -> Option<PreviewC
         });
     }
 
-    // Read enough bytes for MIME sniffing. We purposely keep this small
-    // for huge files; decoding happens in the image branch below against
-    // a full read, bounded by DECODE_CAP_BYTES.
-    let probe = read_prefix(&full, PROBE_BYTES)?;
+    // Read enough bytes for MIME sniffing. For small files this is the
+    // whole file; we'll reuse the buffer for the text branch below
+    // instead of reopening.
+    let probe_len = (file_size as usize).min(PROBE_BYTES);
+    let mut probe = vec![0u8; probe_len];
+    let n = file.read(&mut probe).ok()?;
+    probe.truncate(n);
 
     let mime: Option<&'static str> = infer::get(&probe).map(|k| k.mime_type());
 
@@ -539,7 +635,13 @@ pub fn load_preview(root: &Path, rel_path: &Path, dark: bool) -> Option<PreviewC
     if let Some(m) = mime
         && m.starts_with("image/")
     {
-        return Some(load_image_preview(&full, &rel_str, file_size, m));
+        return Some(load_image_preview(
+            &full,
+            &rel_str,
+            file_size,
+            m,
+            wants_decoded_image,
+        ));
     }
 
     // ── Non-image binary branch ─────────────────────────────────────
@@ -562,17 +664,20 @@ pub fn load_preview(root: &Path, rel_path: &Path, dark: bool) -> Option<PreviewC
         });
     }
 
-    let raw = match std::fs::read(&full) {
-        Ok(r) => r,
-        Err(_) => return None,
-    };
-
-    let check_len = raw.len().min(PROBE_BYTES);
-    if raw[..check_len].contains(&0) {
+    if probe.contains(&0) {
         return Some(PreviewContent {
             file_path: rel_str,
             body: PreviewBody::Binary(BinaryInfo::new(file_size, None, BinaryReason::NullBytes)),
         });
+    }
+
+    // Continue from the same file handle to fetch the remaining bytes.
+    // `probe` already holds the first `probe_len` bytes — append the
+    // rest instead of reopening from scratch.
+    let mut raw = probe;
+    if file_size as usize > raw.len() {
+        raw.reserve((file_size as usize).saturating_sub(raw.len()));
+        file.read_to_end(&mut raw).ok()?;
     }
 
     let content = String::from_utf8_lossy(&raw);
@@ -619,6 +724,7 @@ fn load_image_preview(
     rel_str: &str,
     file_size: u64,
     mime: &'static str,
+    wants_decoded_image: bool,
 ) -> PreviewContent {
     use image::ImageReader;
     use std::io::Cursor;
@@ -627,6 +733,20 @@ fn load_image_preview(
 
     if file_size > DECODE_CAP_BYTES {
         return card(BinaryReason::TooLarge);
+    }
+
+    // Fast path: caller doesn't have a graphics protocol anyway, so
+    // don't spend 50-200 ms decoding pixels that'll be dropped. Only
+    // read enough bytes to parse the header (PNG/JPEG/GIF/WebP all fit
+    // in 64 KB even for big files), then return a metadata-only
+    // `ImagePreview` (image: None). Render shows the "image preview
+    // unavailable" card with real dimensions.
+    if !wants_decoded_image {
+        let header = match read_up_to(full, METADATA_HEADER_BYTES) {
+            Ok(b) => b,
+            Err(e) => return card(decode_error(e.to_string())),
+        };
+        return metadata_only_from_bytes(&header, rel_str, file_size, card);
     }
 
     let bytes = match std::fs::read(full) {
@@ -703,6 +823,16 @@ fn load_image_preview(
         false
     };
 
+    // Downsample if the image is much bigger than any sensible preview
+    // panel would need. A 4K image in the protocol buffer is ~33 MB of
+    // RGBA and every panel-resize re-encodes the full pixel grid; by
+    // pre-shrinking to `MAX_PROTOCOL_DIM` we bound both memory and
+    // per-resize cost while keeping enough detail for halfblocks /
+    // Kitty at typical split ratios.  Report the ORIGINAL dimensions
+    // in metadata — users care about "how big is this PNG," not "how
+    // big is the copy we fed to the protocol."
+    let decoded = downscale_if_oversized(decoded);
+
     PreviewContent {
         file_path: rel_str.to_string(),
         body: PreviewBody::Image(ImagePreview::new(
@@ -711,16 +841,25 @@ fn load_image_preview(
     }
 }
 
-/// Read up to `n` bytes from the start of `path` without slurping the
-/// whole file. Returns None on any IO error. Used for MIME probing so we
-/// don't pay the full-file read cost before we know the file type.
-fn read_prefix(path: &Path, n: usize) -> Option<Vec<u8>> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut buf = vec![0u8; n];
-    let read = f.read(&mut buf).ok()?;
-    buf.truncate(read);
-    Some(buf)
+/// Largest dimension (width OR height) we'll hand to the protocol.
+/// 2048 px covers a full-screen preview on a 5K display with room to
+/// spare and keeps the worst-case RGBA buffer under ~16 MB. Anything
+/// bigger gets resized down preserving aspect ratio.
+const MAX_PROTOCOL_DIM: u32 = 2048;
+
+fn downscale_if_oversized(img: image::DynamicImage) -> image::DynamicImage {
+    let (w, h) = (img.width(), img.height());
+    if w <= MAX_PROTOCOL_DIM && h <= MAX_PROTOCOL_DIM {
+        return img;
+    }
+    // `resize` preserves aspect ratio and uses Lanczos3 (high quality
+    // downsample). The cost is a one-time step in the worker, well off
+    // the render path.
+    img.resize(
+        MAX_PROTOCOL_DIM,
+        MAX_PROTOCOL_DIM,
+        image::imageops::FilterType::Lanczos3,
+    )
 }
 
 #[cfg(test)]
@@ -892,7 +1031,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_bytes(tmp.path(), "red.png", &tiny_png(4, 4));
 
-        let content = load_preview(tmp.path(), Path::new("red.png"), true).expect("some");
+        let content = load_preview(tmp.path(), Path::new("red.png"), true, true).expect("some");
         match content.body {
             PreviewBody::Image(img) => {
                 assert_eq!(img.width_px, 4);
@@ -911,7 +1050,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_bytes(tmp.path(), "shot.jpg", &tiny_png(2, 2));
 
-        let content = load_preview(tmp.path(), Path::new("shot.jpg"), true).expect("some");
+        let content = load_preview(tmp.path(), Path::new("shot.jpg"), true, true).expect("some");
         match content.body {
             PreviewBody::Image(img) => assert_eq!(img.format, image::ImageFormat::Png),
             other => panic!("expected Image body, got {other:?}"),
@@ -944,7 +1083,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_bytes(tmp.path(), "huge.png", &png);
 
-        let content = load_preview(tmp.path(), Path::new("huge.png"), true).expect("some");
+        let content = load_preview(tmp.path(), Path::new("huge.png"), true, true).expect("some");
         match content.body {
             PreviewBody::Binary(info) => {
                 assert!(
@@ -968,7 +1107,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_bytes(tmp.path(), "src.rs", b"fn main() {}\n");
 
-        let content = load_preview(tmp.path(), Path::new("src.rs"), true).expect("some");
+        let content = load_preview(tmp.path(), Path::new("src.rs"), true, true).expect("some");
         match content.body {
             PreviewBody::Text { lines, .. } => {
                 assert_eq!(lines, vec!["fn main() {}".to_string()]);
@@ -982,13 +1121,38 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_bytes(tmp.path(), "empty.bin", b"");
 
-        let content = load_preview(tmp.path(), Path::new("empty.bin"), true).expect("some");
+        let content = load_preview(tmp.path(), Path::new("empty.bin"), true, true).expect("some");
         match content.body {
             PreviewBody::Binary(info) => {
                 assert!(matches!(info.reason, BinaryReason::Empty));
                 assert_eq!(info.bytes_on_disk, 0);
             }
             other => panic!("expected Binary(Empty), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_preview_without_decode_skips_pixels_keeps_metadata() {
+        // wants_decoded_image=false (terminal without graphics protocol):
+        // the worker returns `ImagePreview { image: None }` — dimensions
+        // and format still probed via header, but the expensive decode
+        // is skipped. The render layer shows "image preview unavailable"
+        // with real metadata instead of a generic `Binary` card.
+        let tmp = tempfile::tempdir().unwrap();
+        write_bytes(tmp.path(), "red.png", &tiny_png(8, 8));
+
+        let content = load_preview(tmp.path(), Path::new("red.png"), true, false).expect("some");
+        match content.body {
+            PreviewBody::Image(img) => {
+                assert_eq!(img.width_px, 8);
+                assert_eq!(img.height_px, 8);
+                assert_eq!(img.format, image::ImageFormat::Png);
+                assert!(
+                    img.image.is_none(),
+                    "wants_decoded_image=false should skip decode"
+                );
+            }
+            other => panic!("expected Image body, got {other:?}"),
         }
     }
 
@@ -1002,7 +1166,7 @@ mod tests {
         let pdf = b"%PDF-1.4\n%bogus content\n".to_vec();
         write_bytes(tmp.path(), "doc.pdf", &pdf);
 
-        let content = load_preview(tmp.path(), Path::new("doc.pdf"), true).expect("some");
+        let content = load_preview(tmp.path(), Path::new("doc.pdf"), true, true).expect("some");
         match content.body {
             PreviewBody::Binary(info) => {
                 assert!(matches!(info.reason, BinaryReason::NonImage));
@@ -1022,7 +1186,7 @@ mod tests {
         data[512] = 0;
         write_bytes(tmp.path(), "weird.dat", &data);
 
-        let content = load_preview(tmp.path(), Path::new("weird.dat"), true).expect("some");
+        let content = load_preview(tmp.path(), Path::new("weird.dat"), true, true).expect("some");
         match content.body {
             PreviewBody::Binary(info) => {
                 assert!(matches!(info.reason, BinaryReason::NullBytes));
@@ -1060,7 +1224,7 @@ mod tests {
             }
         }
 
-        let content = load_preview(tmp.path(), Path::new("big.dat"), true).expect("some");
+        let content = load_preview(tmp.path(), Path::new("big.dat"), true, true).expect("some");
         match content.body {
             PreviewBody::Binary(info) => {
                 assert!(matches!(info.reason, BinaryReason::NullBytes));

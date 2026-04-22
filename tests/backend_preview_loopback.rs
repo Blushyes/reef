@@ -79,10 +79,10 @@ fn load_preview_parity_for_text_empty_and_nullbyte() {
 
     for name in ["text.txt", "empty.txt", "garbage.bin"] {
         let l = local
-            .load_preview(Path::new(name), true)
+            .load_preview(Path::new(name), true, true)
             .unwrap_or_else(|| panic!("local preview None for {name}"));
         let r = remote
-            .load_preview(Path::new(name), true)
+            .load_preview(Path::new(name), true, true)
             .unwrap_or_else(|| panic!("remote preview None for {name}"));
         assert_eq!(l.file_path, r.file_path, "file_path for {name}");
         assert_eq!(
@@ -106,8 +106,8 @@ fn load_preview_text_lines_match() {
     let local = LocalBackend::open_at(tmp.path().to_path_buf());
     let remote = spawn_remote(tmp.path());
 
-    let l = local.load_preview(Path::new("a.txt"), true).unwrap();
-    let r = remote.load_preview(Path::new("a.txt"), true).unwrap();
+    let l = local.load_preview(Path::new("a.txt"), true, true).unwrap();
+    let r = remote.load_preview(Path::new("a.txt"), true, true).unwrap();
     let (PreviewBody::Text { lines: ll, .. }, PreviewBody::Text { lines: rl, .. }) =
         (&l.body, &r.body)
     else {
@@ -124,10 +124,14 @@ fn load_preview_missing_file_returns_none_on_both() {
     let local = LocalBackend::open_at(tmp.path().to_path_buf());
     let remote = spawn_remote(tmp.path());
 
-    assert!(local.load_preview(Path::new("no-such.txt"), true).is_none());
+    assert!(
+        local
+            .load_preview(Path::new("no-such.txt"), true, true)
+            .is_none()
+    );
     assert!(
         remote
-            .load_preview(Path::new("no-such.txt"), true)
+            .load_preview(Path::new("no-such.txt"), true, true)
             .is_none()
     );
 }

@@ -9,6 +9,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding};
 use ratatui_image::StatefulImage;
+use std::path::Path;
 use unicode_width::UnicodeWidthStr;
 
 /// Below this panel height we drop the metadata line (dimensions/format/
@@ -26,6 +27,27 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     // tabs that don't render this panel.
     app.last_preview_rect = Some(inner);
 
+    // A load is "in transit" when we've either scheduled a debounced
+    // dispatch or a dispatch is already in flight against a path that
+    // differs from the currently-displayed preview. In that window,
+    // showing the stale preview makes the UI feel laggy — the user
+    // pressed ↓ but nothing appears to change. Render a dedicated
+    // "loading <target>…" card instead.
+    let loading_target = app
+        .preview_schedule
+        .as_ref()
+        .map(|(p, _)| p.clone())
+        .or_else(|| app.preview_in_flight_path.clone());
+    let show_loading = match (&loading_target, app.preview_content.as_ref()) {
+        (Some(target), Some(current)) => current.file_path != target.to_string_lossy(),
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if show_loading {
+        render_loading(f, app, inner, loading_target.as_ref().unwrap());
+        return;
+    }
+
     let preview = match app.preview_content.take() {
         None => {
             render_empty(f, app, inner);
@@ -41,6 +63,32 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     app.preview_content = Some(preview);
+}
+
+/// Transitional card shown while a preview request is in flight against a
+/// different file than the one currently displayed. Writes the **target**
+/// filename in the header so the user sees their cursor-follow immediately
+/// instead of the previous file's content. Body is a centred "loading…"
+/// label; we don't show a spinner because the typical decode window
+/// (~100-200 ms) is too short to animate meaningfully.
+fn render_loading(f: &mut Frame, app: &App, area: Rect, target: &Path) {
+    if area.height < 1 {
+        return;
+    }
+    let th = app.theme;
+    let max_y = area.y + area.height;
+    let y = render_card_header(f, area, &target.to_string_lossy(), &th);
+    if y >= max_y {
+        return;
+    }
+    let msg = t(Msg::PreviewLoading);
+    let msg_w = UnicodeWidthStr::width(msg) as u16;
+    let cy = y + (max_y - y) / 2;
+    let cx = area.x + area.width.saturating_sub(msg_w) / 2;
+    f.render_widget(
+        Line::from(Span::styled(msg, Style::default().fg(th.fg_secondary))),
+        Rect::new(cx, cy, area.width.saturating_sub(cx - area.x), 1),
+    );
 }
 
 fn render_empty(f: &mut Frame, app: &App, area: Rect) {

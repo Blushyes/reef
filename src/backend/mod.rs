@@ -225,7 +225,19 @@ pub trait Backend: Send + Sync {
 
     /// Load a file preview (relative path). Honours backend-internal size
     /// caps (binary detection, 10k-line cap, 512KB highlight cap).
-    fn load_preview(&self, rel_path: &Path, dark: bool) -> Option<PreviewContent>;
+    ///
+    /// `wants_decoded_image` tells the backend whether the caller will be
+    /// able to actually render pixels (i.e. a graphics protocol was
+    /// detected). When `false`, image files still sniff their MIME and
+    /// return an `ImagePreview` with `image: None` for the friendly
+    /// metadata card; skipping the full decode saves 50-200 ms on
+    /// non-graphics terminals where the pixels would be thrown away.
+    fn load_preview(
+        &self,
+        rel_path: &Path,
+        dark: bool,
+        wants_decoded_image: bool,
+    ) -> Option<PreviewContent>;
 
     /// Raw file bytes. Returns `BackendError::NotFound` if the path isn't a
     /// regular file. `max_bytes` caps how many bytes are returned; remote

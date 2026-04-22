@@ -837,41 +837,114 @@ impl GitRepo {
             Err(_) => return Vec::new(),
         };
 
-        let mut files = Vec::new();
-        diff.foreach(
-            &mut |delta, _progress| {
-                let path = delta
-                    .new_file()
-                    .path()
-                    .or_else(|| delta.old_file().path())
-                    .and_then(|p| p.to_str())
-                    .map(String::from);
-                if let Some(path) = path {
-                    let status = match delta.status() {
-                        git2::Delta::Added => FileStatus::Added,
-                        git2::Delta::Deleted => FileStatus::Deleted,
-                        git2::Delta::Renamed | git2::Delta::Copied => FileStatus::Renamed,
-                        git2::Delta::Untracked => FileStatus::Untracked,
-                        _ => FileStatus::Modified,
-                    };
-                    files.push(FileEntry {
-                        path,
-                        status,
-                        additions: 0,
-                        deletions: 0,
-                    });
-                }
-                true
-            },
-            None,
-            None,
-            None,
-        )
-        .ok();
-
-        files.sort_by(|a, b| a.path.cmp(&b.path));
-        files
+        collect_files_from_diff(&diff)
     }
+
+    /// Files changed by the range [oldest, newest] (inclusive) — computed as
+    /// the net tree delta `parent(oldest).tree → newest.tree`. Merge commits
+    /// (either endpoint or anywhere inside the range) follow first-parent, the
+    /// same convention as single-commit diffs.
+    pub fn get_range_files(&self, oldest_oid: &str, newest_oid: &str) -> Vec<FileEntry> {
+        let Some(oldest) = git2::Oid::from_str(oldest_oid)
+            .ok()
+            .and_then(|o| self.repo.find_commit(o).ok())
+        else {
+            return Vec::new();
+        };
+        let Some(newest) = git2::Oid::from_str(newest_oid)
+            .ok()
+            .and_then(|o| self.repo.find_commit(o).ok())
+        else {
+            return Vec::new();
+        };
+        let Ok(new_tree) = newest.tree() else {
+            return Vec::new();
+        };
+        // None = oldest is a root commit; diff against empty tree.
+        let parent_tree = oldest.parents().next().and_then(|p| p.tree().ok());
+
+        let diff = match self
+            .repo
+            .diff_tree_to_tree(parent_tree.as_ref(), Some(&new_tree), None)
+        {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+
+        collect_files_from_diff(&diff)
+    }
+
+    /// Single-file diff for a commit range: same semantics as
+    /// `get_range_files` — `parent(oldest).tree → newest.tree`, first-parent
+    /// on merges, empty-tree baseline if `oldest` has no parent.
+    pub fn get_range_file_diff(
+        &self,
+        oldest_oid: &str,
+        newest_oid: &str,
+        path: &str,
+        context_lines: u32,
+    ) -> Option<DiffContent> {
+        let oldest = self
+            .repo
+            .find_commit(git2::Oid::from_str(oldest_oid).ok()?)
+            .ok()?;
+        let newest = self
+            .repo
+            .find_commit(git2::Oid::from_str(newest_oid).ok()?)
+            .ok()?;
+        let new_tree = newest.tree().ok()?;
+        let parent_tree = oldest.parents().next().and_then(|p| p.tree().ok());
+
+        let mut opts = DiffOptions::new();
+        opts.pathspec(path).context_lines(context_lines);
+
+        let diff = self
+            .repo
+            .diff_tree_to_tree(parent_tree.as_ref(), Some(&new_tree), Some(&mut opts))
+            .ok()?;
+
+        self.parse_git2_diff(&diff, path)
+    }
+}
+
+/// Shared `git2::Diff → Vec<FileEntry>` reducer. Keeps the delta→status map
+/// and the trailing sort in one place so `commit_files` and `get_range_files`
+/// stay structurally identical.
+fn collect_files_from_diff(diff: &git2::Diff) -> Vec<FileEntry> {
+    let mut files = Vec::new();
+    diff.foreach(
+        &mut |delta, _progress| {
+            let path = delta
+                .new_file()
+                .path()
+                .or_else(|| delta.old_file().path())
+                .and_then(|p| p.to_str())
+                .map(String::from);
+            if let Some(path) = path {
+                let status = match delta.status() {
+                    git2::Delta::Added => FileStatus::Added,
+                    git2::Delta::Deleted => FileStatus::Deleted,
+                    git2::Delta::Renamed | git2::Delta::Copied => FileStatus::Renamed,
+                    git2::Delta::Untracked => FileStatus::Untracked,
+                    _ => FileStatus::Modified,
+                };
+                files.push(FileEntry {
+                    path,
+                    status,
+                    additions: 0,
+                    deletions: 0,
+                });
+            }
+            true
+        },
+        None,
+        None,
+        None,
+    )
+    .ok();
+
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files
 }
 
 fn commit_to_info(commit: &git2::Commit) -> CommitInfo {

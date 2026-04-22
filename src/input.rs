@@ -639,16 +639,31 @@ fn handle_key_search_input_mode(key: KeyEvent, app: &mut App, ctrl: bool, alt: b
 fn handle_key_graph(key: KeyEvent, app: &mut App) {
     use ui::{commit_detail_panel, git_graph_panel};
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    // While in visual mode every direction key extends (no Shift needed —
+    // works in terminals that intercept Shift+Click / Shift+Arrow for text
+    // selection), a mouse click on a commit moves the endpoint, and `V` /
+    // `Esc` exits. This is the primary path; Shift+Arrow below is kept as
+    // a convenience for terminals that *do* forward the modifier.
+    let in_visual = app.git_graph.in_visual_mode() && app.active_panel == Panel::Files;
     match key.code {
         KeyCode::Up | KeyCode::Char('k') if !ctrl => match app.active_panel {
             Panel::Files => {
-                git_graph_panel::handle_key(app, "k");
+                if shift || in_visual {
+                    app.extend_graph_selection(-1);
+                } else {
+                    git_graph_panel::handle_key(app, "k");
+                }
             }
             Panel::Diff => commit_detail_panel::scroll(app, -1),
         },
         KeyCode::Down | KeyCode::Char('j') if !ctrl => match app.active_panel {
             Panel::Files => {
-                git_graph_panel::handle_key(app, "j");
+                if shift || in_visual {
+                    app.extend_graph_selection(1);
+                } else {
+                    git_graph_panel::handle_key(app, "j");
+                }
             }
             Panel::Diff => commit_detail_panel::scroll(app, 1),
         },
@@ -656,32 +671,65 @@ fn handle_key_graph(key: KeyEvent, app: &mut App) {
         // Files/Git tabs bind).
         KeyCode::Char('p' | 'k') if ctrl => match app.active_panel {
             Panel::Files => {
-                git_graph_panel::handle_key(app, "k");
+                if shift || in_visual {
+                    app.extend_graph_selection(-1);
+                } else {
+                    git_graph_panel::handle_key(app, "k");
+                }
             }
             Panel::Diff => commit_detail_panel::scroll(app, -1),
         },
         KeyCode::Char('n' | 'j') if ctrl => match app.active_panel {
             Panel::Files => {
-                git_graph_panel::handle_key(app, "j");
+                if shift || in_visual {
+                    app.extend_graph_selection(1);
+                } else {
+                    git_graph_panel::handle_key(app, "j");
+                }
             }
             Panel::Diff => commit_detail_panel::scroll(app, 1),
         },
         KeyCode::PageUp => match app.active_panel {
             Panel::Files => {
-                for _ in 0..10 {
-                    git_graph_panel::handle_key(app, "k");
+                if shift || in_visual {
+                    app.extend_graph_selection(-10);
+                } else {
+                    for _ in 0..10 {
+                        git_graph_panel::handle_key(app, "k");
+                    }
                 }
             }
             Panel::Diff => commit_detail_panel::scroll(app, -20),
         },
         KeyCode::PageDown => match app.active_panel {
             Panel::Files => {
-                for _ in 0..10 {
-                    git_graph_panel::handle_key(app, "j");
+                if shift || in_visual {
+                    app.extend_graph_selection(10);
+                } else {
+                    for _ in 0..10 {
+                        git_graph_panel::handle_key(app, "j");
+                    }
                 }
             }
             Panel::Diff => commit_detail_panel::scroll(app, 20),
         },
+        // `V` (uppercase = Shift+v) toggles visual mode. Entering: anchor
+        // collapses onto the cursor (is_range() stays false until the user
+        // actually extends), so the status bar can distinguish "armed but
+        // empty" from an active range if it wants to.
+        KeyCode::Char('V') if app.active_panel == Panel::Files => {
+            if app.git_graph.in_visual_mode() {
+                app.clear_graph_range();
+            } else if !app.git_graph.rows.is_empty() {
+                app.git_graph.selection_anchor = Some(app.git_graph.selected_idx);
+            }
+        }
+        // Esc exits visual mode / collapses any range back to single-select.
+        // Only consumed when actually armed on the Files panel so higher
+        // priority Esc handlers (overlays etc.) aren't shadowed elsewhere.
+        KeyCode::Esc if app.active_panel == Panel::Files && app.git_graph.in_visual_mode() => {
+            app.clear_graph_range();
+        }
         KeyCode::Char('r') => {
             // `r` on the graph sidebar = force a graph cache refresh
             app.git_graph.cache_key = None;
@@ -1189,6 +1237,27 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
                 } else {
                     action
                 };
+                // Shift+Click on a graph row = extend the range, for
+                // terminals that actually forward Shift+Click to the app.
+                // Most macOS terminals intercept this for text selection;
+                // those users should press `V` to enter visual mode and
+                // click normally instead — the in-visual-mode click path
+                // lives in `git_graph_panel::handle_command`.
+                if mouse.modifiers.contains(KeyModifiers::SHIFT)
+                    && let ui::mouse::ClickAction::GitCommand { command, args, .. } = &effective
+                    && command == "git.selectCommit"
+                    && let Some(oid) = args.get("oid").and_then(|v| v.as_str())
+                    && let Some(target_idx) = app.git_graph.find_row_by_oid(oid)
+                {
+                    let delta = target_idx as i32 - app.git_graph.selected_idx as i32;
+                    app.extend_graph_selection(delta);
+                    app.last_click = if is_double {
+                        None
+                    } else {
+                        Some((now, mouse.column, mouse.row))
+                    };
+                    return;
+                }
                 app.handle_action(effective);
             }
 

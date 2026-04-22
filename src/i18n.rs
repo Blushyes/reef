@@ -408,6 +408,24 @@ pub fn ssh_connect_failed(target: &str, e: &str) -> String {
     }
 }
 
+/// First-time SSH-connect hint: points users at the one-liner that
+/// enables auto-SSH on terminal split. Shown once per install; after
+/// they run `reef shell-integration …` the marker file silences it.
+pub fn shell_integration_hint(shell: crate::shell_integration::Shell) -> String {
+    let name = shell.name();
+    let rc = shell.rc_path_suffix();
+    match lang() {
+        Lang::Zh => {
+            format!("提示：运行 `reef shell-integration {name} >> ~/{rc}` 启用分屏自动 SSH")
+        }
+        Lang::En => {
+            format!(
+                "Tip: run `reef shell-integration {name} >> ~/{rc}` to enable auto-SSH on split"
+            )
+        }
+    }
+}
+
 pub fn push_failed_toast(e: &str) -> String {
     match lang() {
         Lang::Zh => format!("推送失败: {e}"),

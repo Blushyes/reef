@@ -273,6 +273,22 @@ pub trait Backend: Send + Sync {
         context_lines: u32,
     ) -> Result<Option<DiffContent>, BackendError>;
 
+    /// Union of files changed across the commit range `oldest..=newest`.
+    fn range_files(
+        &self,
+        oldest_oid: &str,
+        newest_oid: &str,
+    ) -> Result<Vec<FileEntry>, BackendError>;
+
+    /// Single-file diff for a commit range (same tree baseline as `range_files`).
+    fn range_file_diff(
+        &self,
+        oldest_oid: &str,
+        newest_oid: &str,
+        path: &str,
+        context_lines: u32,
+    ) -> Result<Option<DiffContent>, BackendError>;
+
     // ─── fs watcher / editor ────────────────────────────────────────────────
     /// Subscribe to debounced fs-change events. Each backend decides whether
     /// to spawn a local watcher (LocalBackend) or relay notifications from

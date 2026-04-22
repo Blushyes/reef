@@ -67,6 +67,8 @@ pub enum Msg {
     PushSuccess,
     ForcePushSuccess,
     PushThreadCrashed,
+    ClipboardCopied,
+    ClipboardCopyFailed,
 
     // Git status panel
     PushingHint,
@@ -131,6 +133,15 @@ pub enum Msg {
     HelpPageDown,
     HelpHScroll,
     HelpHScrollFast,
+    HelpGraphRangeExtend,
+    HelpGraphRangeExtendFast,
+    HelpGraphRangeClear,
+    HelpGraphShiftExtend,
+    HelpGraphShiftClick,
+    HelpGraphVisualMode,
+    HelpGraphVisualClick,
+    RangeHint,
+    StatusBarRangeHint,
     HelpHomeEnd,
     HelpMouseHScroll,
     HelpStageUnstage,
@@ -175,6 +186,8 @@ fn t_zh(m: Msg) -> &'static str {
         PushSuccess => "推送成功",
         ForcePushSuccess => "强制推送成功",
         PushThreadCrashed => "推送线程异常退出，请重试",
+        ClipboardCopied => "已复制到剪贴板",
+        ClipboardCopyFailed => "复制到剪贴板失败",
         PushingHint => "  ⋯ 推送中…",
         PushFailedPrefix => "  ✖ 推送失败: ",
         DismissClose => "  [关闭]",
@@ -226,6 +239,15 @@ fn t_zh(m: Msg) -> &'static str {
         HelpPageDown => "快速向下翻页",
         HelpHScroll => "横向滚动（Diff/预览 面板聚焦时）",
         HelpHScrollFast => "横向快速滚动（10 列）",
+        HelpGraphRangeExtend => "扩选一行提交（Graph 标签页）",
+        HelpGraphRangeExtendFast => "扩选 10 行提交（Graph 标签页）",
+        HelpGraphRangeClear => "退出可视模式 / 清除范围选择",
+        HelpGraphShiftExtend => "扩选（在支持 Shift 透传的终端，否则按 V 进入可视模式）",
+        HelpGraphShiftClick => "Shift+点击：扩选到该提交（同上，否则用可视模式）",
+        HelpGraphVisualMode => "进入/退出可视模式（Graph 标签页）",
+        HelpGraphVisualClick => "可视模式下点击提交 = 改变终点",
+        RangeHint => "点击下方任一提交即可折叠范围回到单选",
+        StatusBarRangeHint => "↑↓/点击 扩选 · V/Esc 退出",
         HelpHomeEnd => "回到行首 / 跳到行尾",
         HelpMouseHScroll => "鼠标横向滚动",
         HelpStageUnstage => "暂存 / 取消暂存（Git tab）",
@@ -264,6 +286,8 @@ fn t_en(m: Msg) -> &'static str {
         PushSuccess => "Push succeeded",
         ForcePushSuccess => "Force push succeeded",
         PushThreadCrashed => "Push worker crashed, please retry",
+        ClipboardCopied => "Copied to clipboard",
+        ClipboardCopyFailed => "Clipboard copy failed",
         PushingHint => "  ⋯ Pushing…",
         PushFailedPrefix => "  ✖ Push failed: ",
         DismissClose => "  [dismiss]",
@@ -315,6 +339,15 @@ fn t_en(m: Msg) -> &'static str {
         HelpPageDown => "Page down",
         HelpHScroll => "Horizontal scroll (when Diff/Preview focused)",
         HelpHScrollFast => "Horizontal fast scroll (10 cols)",
+        HelpGraphRangeExtend => "Extend commit range by 1 (Graph tab)",
+        HelpGraphRangeExtendFast => "Extend commit range by 10 (Graph tab)",
+        HelpGraphRangeClear => "Exit visual mode / clear range",
+        HelpGraphShiftExtend => "Extend range (terminals that forward Shift; else use V)",
+        HelpGraphShiftClick => "Shift+Click: extend range (same; else use visual mode)",
+        HelpGraphVisualMode => "Enter/exit visual mode (Graph tab)",
+        HelpGraphVisualClick => "In visual mode: click = move endpoint",
+        RangeHint => "Click any commit below to collapse back to single-select",
+        StatusBarRangeHint => "↑↓/click extend · V/Esc exit",
         HelpHomeEnd => "Jump to line start / end",
         HelpMouseHScroll => "Mouse horizontal scroll",
         HelpStageUnstage => "Stage / unstage (Git tab)",
@@ -423,6 +456,19 @@ pub fn discard_section_prefix_and_count(is_staged: bool, count: usize) -> (Strin
 
 pub fn changed_files_header(n: usize) -> String {
     format!("{} ({})", t(Msg::ChangedFiles), n)
+}
+
+pub fn range_header_count(n: usize) -> String {
+    match lang() {
+        Lang::Zh => format!("范围 · {} 个提交", n),
+        Lang::En => format!("Range · {} commits", n),
+    }
+}
+
+pub fn range_badge(n: usize) -> String {
+    // "RANGE" is a fixed UI token (matches SELECT/PLACE/TRASH badge style),
+    // not a translatable word; keep it language-agnostic.
+    format!(" RANGE {} ", n)
 }
 
 /// Trailing "  [label]  t 切换" / "  [label]  t toggle" hint on the commit

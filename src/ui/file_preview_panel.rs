@@ -2,7 +2,7 @@ use crate::app::App;
 use crate::file_tree::PreviewContent;
 use crate::i18n::{Msg, t};
 use crate::search::SearchTarget;
-use crate::ui::text::{clip_spans, overlay_match_highlight};
+use crate::ui::text::{clip_spans, overlay_match_highlight, overlay_selection_highlight};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -14,6 +14,10 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default().padding(Padding::new(1, 1, 0, 0));
     let inner = block.inner(area);
     f.render_widget(block, area);
+    // Cache the preview-panel rect so the mouse handler can hit-test
+    // drag-to-select events. Reset to None at the top of `ui::render` on
+    // tabs that don't render this panel.
+    app.last_preview_rect = Some(inner);
 
     let preview = match app.preview_content.take() {
         None => {
@@ -116,6 +120,11 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewCon
     app.preview_h_scroll = app.preview_h_scroll.min(max_h);
     let h = app.preview_h_scroll;
 
+    // Cache the content-area origin so the mouse handler can translate a
+    // `(column, row)` hit into `(file_line, byte_offset)`.
+    app.last_preview_content_origin = Some((area.x + gutter_w as u16, y, gutter_w as u16));
+    let selection = app.preview_selection;
+
     for (i, line) in preview.lines.iter().skip(app.preview_scroll).enumerate() {
         let cy = y + i as u16;
         if cy >= max_y {
@@ -164,6 +173,15 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewCon
                 th.search_match,
                 th.search_current,
             )
+        };
+        // Drag-selection highlight layered on top — `Modifier::REVERSED`
+        // so it composes cleanly with any theme / search background.
+        let tokens = match selection
+            .as_ref()
+            .and_then(|s| s.line_byte_range(real_idx, line))
+        {
+            Some(r) if r.start < r.end => overlay_selection_highlight(tokens, r),
+            _ => tokens,
         };
 
         let mut spans = vec![gutter];

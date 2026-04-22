@@ -17,7 +17,7 @@ use super::{
     EditorLaunchSpec, SearchChunkSink, StatusSnapshot, TrashOutcome, WalkOpts, WalkResponse,
 };
 use crate::file_tree::{self, PreviewContent, TreeEntry};
-use crate::git::{CommitDetail, CommitInfo, DiffContent, GitRepo, RefLabel};
+use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, GitRepo, RefLabel};
 use std::ops::ControlFlow;
 
 /// Local filesystem + libgit2 backend.
@@ -237,6 +237,24 @@ impl Backend for LocalBackend {
         context_lines: u32,
     ) -> Result<Option<DiffContent>, BackendError> {
         Ok(self.repo()?.get_commit_file_diff(oid, path, context_lines))
+    }
+
+    fn range_files(
+        &self,
+        oldest_oid: &str,
+        newest_oid: &str,
+    ) -> Result<Vec<FileEntry>, BackendError> {
+        Ok(self.repo()?.get_range_files(oldest_oid, newest_oid))
+    }
+
+    fn range_file_diff(
+        &self,
+        oldest_oid: &str,
+        newest_oid: &str,
+        path: &str,
+        context_lines: u32,
+    ) -> Result<Option<DiffContent>, BackendError> {
+        Ok(self.repo()?.get_range_file_diff(oldest_oid, newest_oid, path, context_lines))
     }
 
     fn subscribe_fs_events(&self) -> mpsc::Receiver<()> {

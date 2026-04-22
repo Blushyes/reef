@@ -116,6 +116,19 @@ pub enum WorkerResult {
         generation: u64,
         result: Result<Option<CommitFileDiff>, String>,
     },
+    /// Merged-file list for a commit range — `parent(oldest).tree → newest.tree`.
+    /// Consumed by the Graph tab's range-select mode. Per-commit subject
+    /// metadata is filled in on the main thread from cached `rows`.
+    RangeDetail {
+        generation: u64,
+        result: Result<Vec<FileEntry>, String>,
+    },
+    /// Single-file diff for a commit range, same semantics as `CommitFileDiff`
+    /// but sourced from `GitRepo::get_range_file_diff`.
+    RangeFileDiff {
+        generation: u64,
+        result: Result<Option<CommitFileDiff>, String>,
+    },
     /// A batch of global-search hits. Streamed from the worker so the UI
     /// stays responsive on big workdirs; can fire multiple times per search
     /// before the matching `GlobalSearchDone`. Consumers drop the payload
@@ -293,6 +306,21 @@ enum GraphTask {
         context_lines: u32,
         /// Picks the syntect theme (dark vs light) so highlighted tokens
         /// read correctly against the active UI theme — same as `load_preview`.
+        dark: bool,
+    },
+    LoadCommitRangeDetail {
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        oldest_oid: String,
+        newest_oid: String,
+    },
+    LoadRangeFileDiff {
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        oldest_oid: String,
+        newest_oid: String,
+        path: String,
+        context_lines: u32,
         dark: bool,
     },
 }
@@ -504,6 +532,43 @@ impl TaskCoordinator {
             generation,
             backend,
             oid,
+            path,
+            context_lines,
+            dark,
+        });
+    }
+
+    pub fn load_commit_range_detail(
+        &self,
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        oldest_oid: String,
+        newest_oid: String,
+    ) {
+        let _ = self.graph_tx.send(GraphTask::LoadCommitRangeDetail {
+            generation,
+            backend,
+            oldest_oid,
+            newest_oid,
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_range_file_diff(
+        &self,
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        oldest_oid: String,
+        newest_oid: String,
+        path: String,
+        context_lines: u32,
+        dark: bool,
+    ) {
+        let _ = self.graph_tx.send(GraphTask::LoadRangeFileDiff {
+            generation,
+            backend,
+            oldest_oid,
+            newest_oid,
             path,
             context_lines,
             dark,
@@ -1045,6 +1110,32 @@ fn spawn_graph_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Gra
                             .map_err(|e| e.to_string())
                             .map(|opt| opt.map(|diff| build_commit_file_diff(path, diff, dark)));
                         let _ = result_tx.send(WorkerResult::CommitFileDiff { generation, result });
+                    }
+                    GraphTask::LoadCommitRangeDetail {
+                        generation,
+                        backend,
+                        oldest_oid,
+                        newest_oid,
+                    } => {
+                        let result = backend
+                            .range_files(&oldest_oid, &newest_oid)
+                            .map_err(|e| e.to_string());
+                        let _ = result_tx.send(WorkerResult::RangeDetail { generation, result });
+                    }
+                    GraphTask::LoadRangeFileDiff {
+                        generation,
+                        backend,
+                        oldest_oid,
+                        newest_oid,
+                        path,
+                        context_lines,
+                        dark,
+                    } => {
+                        let result = backend
+                            .range_file_diff(&oldest_oid, &newest_oid, &path, context_lines)
+                            .map_err(|e| e.to_string())
+                            .map(|opt| opt.map(|diff| build_commit_file_diff(path, diff, dark)));
+                        let _ = result_tx.send(WorkerResult::RangeFileDiff { generation, result });
                     }
                 }
             }

@@ -457,15 +457,25 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
         "git.selectCommitFile" => {
             let oid = args.get("oid").and_then(|v| v.as_str()).unwrap_or("");
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            if oid.is_empty() || path.is_empty() {
+            if path.is_empty() {
                 return true;
             }
-            if app.git_graph.selected_commit.as_deref() != Some(oid) {
-                if let Some(idx) = app.git_graph.rows.iter().position(|r| r.commit.oid == oid) {
-                    app.git_graph.selected_idx = idx;
+            // In range mode, keep the range intact — file clicks load the
+            // range diff (routed inside `load_commit_file_diff`). The `oid`
+            // arg on range rows is just the "newest" marker; we deliberately
+            // don't compare it against `selected_commit` because that would
+            // spuriously flip us into single-select.
+            if !app.git_graph.is_range() {
+                if oid.is_empty() {
+                    return true;
                 }
-                app.git_graph.selected_commit = Some(oid.to_string());
-                app.load_commit_detail();
+                if app.git_graph.selected_commit.as_deref() != Some(oid) {
+                    if let Some(idx) = app.git_graph.find_row_by_oid(oid) {
+                        app.git_graph.selected_idx = idx;
+                    }
+                    app.git_graph.selected_commit = Some(oid.to_string());
+                    app.load_commit_detail();
+                }
             }
             app.load_commit_file_diff(path);
             true
@@ -608,18 +618,103 @@ fn from_ratatui_span(span: Span<'static>) -> RowSpan {
 fn build_rows(app: &App, width: u16, display_w: u16, theme: &Theme) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
     let cd = &app.commit_detail;
-
-    let Some(detail) = &cd.detail else {
-        rows.push(Row::new(vec![RowSpan::styled(
-            t(Msg::CommitDetailEmpty),
-            Style::default().fg(theme.fg_secondary),
-        )]));
-        return rows;
-    };
-
-    let info = &detail.info;
     let max_msg = (width as usize).saturating_sub(4);
     let max_path = (width as usize).saturating_sub(6);
+
+    // Range mode and single mode share the bottom half (files list + inline
+    // diff) but have different headers. Collect the common data — (files
+    // slice, stable oid for selectCommitFile clicks) — then emit the
+    // appropriate header, and hand off to the shared tail.
+    let (files_source, stable_oid): (&[FileEntry], &str) = match (&cd.range_detail, &cd.detail) {
+        (Some(range), _) => {
+            append_range_header(&mut rows, range, max_msg, theme);
+            (range.files.as_slice(), range.newest_oid.as_str())
+        }
+        (None, Some(detail)) => {
+            append_commit_header(&mut rows, app, detail, max_msg, theme);
+            (detail.files.as_slice(), detail.info.oid.as_str())
+        }
+        (None, None) => {
+            rows.push(Row::new(vec![RowSpan::styled(
+                t(Msg::CommitDetailEmpty),
+                Style::default().fg(theme.fg_secondary),
+            )]));
+            return rows;
+        }
+    };
+
+    let view_label = if cd.files_tree_mode {
+        t(Msg::ViewTree)
+    } else {
+        t(Msg::ViewList)
+    };
+    rows.push(Row::new(vec![
+        RowSpan::styled(
+            crate::i18n::changed_files_header(files_source.len()),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        RowSpan::styled(
+            crate::i18n::view_toggle_hint(view_label),
+            Style::default().fg(theme.fg_secondary),
+        )
+        .on_click("git.toggleCommitFilesView", Value::Null),
+    ]));
+
+    let ctx = CommitFilesCtx {
+        selected_file: cd.file_diff.as_ref().map(|d| d.path.as_str()),
+        sel_bg: theme.selection_bg,
+        max_path,
+        commit_oid: stable_oid,
+        collapsed: &cd.files_collapsed,
+        fg: theme.fg_primary,
+    };
+
+    if cd.files_tree_mode {
+        let nodes = gtree::build(files_source);
+        render_commit_file_tree(&nodes, 1, &ctx, &mut rows, theme);
+    } else {
+        for file in files_source {
+            rows.push(commit_file_row(file, &file.path, "  ", &ctx));
+        }
+    }
+
+    if let Some(file_diff) = &cd.file_diff {
+        rows.push(Row::blank());
+        rows.push(diff_header_row(
+            &file_diff.path,
+            cd.diff_layout,
+            cd.diff_mode,
+            width,
+            theme,
+        ));
+        rows.push(diff_separator_row(width, theme));
+        append_diff_rows(
+            &mut rows,
+            &file_diff.diff,
+            file_diff.highlighted.as_ref(),
+            cd.diff_layout,
+            width,
+            display_w,
+            theme,
+        );
+    }
+
+    rows
+}
+
+/// Single-commit header: oid/author/date/refs + message body. Unchanged from
+/// the original inline version — just extracted so range-mode can substitute
+/// `append_range_header`.
+fn append_commit_header(
+    rows: &mut Vec<Row>,
+    app: &App,
+    detail: &crate::git::CommitDetail,
+    max_msg: usize,
+    theme: &Theme,
+) {
+    let info = &detail.info;
 
     rows.push(Row::new(vec![
         RowSpan::styled(t(Msg::CommitLabel), Style::default().fg(theme.fg_secondary)),
@@ -678,66 +773,74 @@ fn build_rows(app: &App, width: u16, display_w: u16, theme: &Theme) -> Vec<Row> 
     }
 
     rows.push(Row::blank());
+}
 
-    let view_label = if cd.files_tree_mode {
-        t(Msg::ViewTree)
-    } else {
-        t(Msg::ViewList)
-    };
+/// Range-mode header: "N commits: oldest..newest" plus a clickable list of
+/// subjects. Each commit row emits `git.graph.focusCommit` — a zoom-in
+/// command that always collapses the range back to single-select on the
+/// target commit regardless of visual mode. Plain `git.selectCommit`
+/// behaves differently inside visual mode (it extends the endpoint), which
+/// is the wrong semantic for this list.
+fn append_range_header(
+    rows: &mut Vec<Row>,
+    range: &crate::app::RangeDetail,
+    max_msg: usize,
+    theme: &Theme,
+) {
+    let oldest_short: String = range.oldest_oid.chars().take(7).collect();
+    let newest_short: String = range.newest_oid.chars().take(7).collect();
+
     rows.push(Row::new(vec![
         RowSpan::styled(
-            crate::i18n::changed_files_header(detail.files.len()),
+            crate::i18n::range_header_count(range.commit_count),
             Style::default()
-                .fg(Color::Green)
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ),
         RowSpan::styled(
-            crate::i18n::view_toggle_hint(view_label),
-            Style::default().fg(theme.fg_secondary),
-        )
-        .on_click("git.toggleCommitFilesView", Value::Null),
+            format!(" {}..{}", oldest_short, newest_short),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::DIM),
+        ),
     ]));
+    rows.push(Row::new(vec![RowSpan::styled(
+        t(Msg::RangeHint),
+        Style::default().fg(theme.fg_secondary),
+    )]));
+    rows.push(Row::blank());
 
-    let ctx = CommitFilesCtx {
-        selected_file: cd.file_diff.as_ref().map(|d| d.path.as_str()),
-        sel_bg: theme.selection_bg,
-        max_path,
-        commit_oid: &info.oid,
-        collapsed: &cd.files_collapsed,
-        fg: theme.fg_primary,
-    };
+    // Commit list: newest first (matches the graph panel's order). Click
+    // any row → collapse range to single on that commit.
+    for commit in &range.commits {
+        let short: String = commit.short_oid.clone();
+        let mut subject = commit.subject.clone();
+        // Reserve room for the short oid + separator + author column.
+        let subject_budget = max_msg.saturating_sub(short.len() + 16);
+        truncate_in_place(&mut subject, subject_budget);
+        let raw_w = UnicodeWidthStr::width(subject.as_str()) + short.len() + 3;
 
-    if cd.files_tree_mode {
-        let nodes = gtree::build(&detail.files);
-        render_commit_file_tree(&nodes, 1, &ctx, &mut rows, theme);
-    } else {
-        for file in &detail.files {
-            rows.push(commit_file_row(file, &file.path, "  ", &ctx));
-        }
-    }
-
-    if let Some(file_diff) = &cd.file_diff {
-        rows.push(Row::blank());
-        rows.push(diff_header_row(
-            &file_diff.path,
-            cd.diff_layout,
-            cd.diff_mode,
-            width,
-            theme,
-        ));
-        rows.push(diff_separator_row(width, theme));
-        append_diff_rows(
-            &mut rows,
-            &file_diff.diff,
-            file_diff.highlighted.as_ref(),
-            cd.diff_layout,
-            width,
-            display_w,
-            theme,
+        rows.push(
+            Row::new(vec![
+                RowSpan::plain("  "),
+                RowSpan::styled(
+                    short,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::DIM),
+                ),
+                RowSpan::plain(" "),
+                RowSpan::styled(subject, Style::default().fg(theme.fg_primary)),
+            ])
+            .on_click(
+                "git.graph.focusCommit",
+                serde_json::json!({ "oid": commit.oid }),
+            )
+            .with_content_width(raw_w),
         );
     }
 
-    rows
+    rows.push(Row::blank());
 }
 
 struct CommitFilesCtx<'a> {

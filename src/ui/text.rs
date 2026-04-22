@@ -191,6 +191,72 @@ fn apply_search_bg(base: Style, bg: Color) -> Style {
     }
 }
 
+/// Overlay a visual-selection range onto already-styled tokens. The range is
+/// byte offsets into the concatenated plain text of `tokens`. Segments inside
+/// the range get `Modifier::REVERSED` (fg/bg swap), which is theme-agnostic
+/// and also works on rows that already carry a background (diff added/removed).
+///
+/// Empty ranges round-trip the tokens unchanged. Mirrors the split-at-boundary
+/// pattern in [`overlay_match_highlight`].
+pub fn overlay_selection_highlight(
+    tokens: Vec<(Style, String)>,
+    range: Range<usize>,
+) -> Vec<(Style, String)> {
+    if range.start >= range.end {
+        return tokens;
+    }
+    let mut out: Vec<(Style, String)> = Vec::with_capacity(tokens.len());
+    let mut abs = 0usize;
+    for (style, text) in tokens {
+        if text.is_empty() {
+            out.push((style, text));
+            continue;
+        }
+        let base_abs = abs;
+        let len = text.len();
+        abs += len;
+
+        let mut seg_start = 0usize;
+        let mut run_selected = byte_in_range(base_abs, &range);
+        for (i, _) in text.char_indices() {
+            if i == 0 {
+                continue;
+            }
+            let next_selected = byte_in_range(base_abs + i, &range);
+            if next_selected != run_selected {
+                out.push(styled_selection_segment(
+                    style,
+                    &text[seg_start..i],
+                    run_selected,
+                ));
+                seg_start = i;
+                run_selected = next_selected;
+            }
+        }
+        if seg_start < len {
+            out.push(styled_selection_segment(
+                style,
+                &text[seg_start..len],
+                run_selected,
+            ));
+        }
+    }
+    out
+}
+
+fn byte_in_range(abs: usize, range: &Range<usize>) -> bool {
+    abs >= range.start && abs < range.end
+}
+
+fn styled_selection_segment(base: Style, text: &str, selected: bool) -> (Style, String) {
+    let style = if selected {
+        base.add_modifier(Modifier::REVERSED)
+    } else {
+        base
+    };
+    (style, text.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,5 +486,57 @@ mod tests {
             ratatui::style::Color::Red,
         );
         assert_eq!(collect_text(&out), "hello world");
+    }
+
+    // ── overlay_selection_highlight ──────────────────────────────────────────
+
+    #[test]
+    fn selection_overlay_empty_range_is_identity() {
+        let tokens = vec![(Style::default(), "hello".to_string())];
+        let out = overlay_selection_highlight(tokens.clone(), 3..3);
+        assert_eq!(out, tokens);
+    }
+
+    #[test]
+    fn selection_overlay_reverses_range() {
+        let tokens = vec![(Style::default(), "abcdef".to_string())];
+        let out = overlay_selection_highlight(tokens, 2..4);
+        assert_eq!(collect_text(&out), "abcdef");
+        assert_eq!(out.len(), 3);
+        assert!(!out[0].0.add_modifier.contains(Modifier::REVERSED));
+        assert!(out[1].0.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(out[1].1, "cd");
+        assert!(!out[2].0.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn selection_overlay_spans_token_boundary() {
+        let tokens = vec![
+            (Style::default(), "abc".to_string()),
+            (
+                Style::default().fg(ratatui::style::Color::Red),
+                "def".to_string(),
+            ),
+        ];
+        let out = overlay_selection_highlight(tokens, 1..5);
+        assert_eq!(collect_text(&out), "abcdef");
+        // Segments: a | bc | de | f
+        assert_eq!(out.len(), 4);
+        assert!(!out[0].0.add_modifier.contains(Modifier::REVERSED));
+        assert!(out[1].0.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(out[1].1, "bc");
+        assert!(out[2].0.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(out[2].1, "de");
+        // 2nd segment preserves fg.
+        assert_eq!(out[2].0.fg, Some(ratatui::style::Color::Red));
+        assert!(!out[3].0.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn selection_overlay_full_token_range() {
+        let tokens = vec![(Style::default(), "abc".to_string())];
+        let out = overlay_selection_highlight(tokens, 0..3);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].0.add_modifier.contains(Modifier::REVERSED));
     }
 }

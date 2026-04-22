@@ -5,6 +5,7 @@
 pub mod agent_deploy;
 pub mod app;
 pub mod backend;
+pub mod clipboard;
 pub mod editor;
 pub mod file_tree;
 pub mod fs_watcher;

@@ -579,6 +579,28 @@ impl Backend for RemoteBackend {
         Ok(resp.map(Into::into))
     }
 
+    fn range_files(
+        &self,
+        _oldest_oid: &str,
+        _newest_oid: &str,
+    ) -> Result<Vec<FileEntry>, BackendError> {
+        Err(BackendError::Unimplemented(
+            "range_files not yet implemented for remote backend".into(),
+        ))
+    }
+
+    fn range_file_diff(
+        &self,
+        _oldest_oid: &str,
+        _newest_oid: &str,
+        _path: &str,
+        _context_lines: u32,
+    ) -> Result<Option<DiffContent>, BackendError> {
+        Err(BackendError::Unimplemented(
+            "range_file_diff not yet implemented for remote backend".into(),
+        ))
+    }
+
     fn subscribe_fs_events(&self) -> mpsc::Receiver<()> {
         // First subscriber gets the channel created in `spawn`. Subsequent
         // calls would lose events — but the App only calls this once.

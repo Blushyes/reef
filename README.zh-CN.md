@@ -45,6 +45,20 @@ reef --ssh user@host:/path      # 打开远端的 /path
 - 一条 SSH ControlMaster 会话包办全部：JSON-RPC over stdio 走数据，`scp` 走拖拽上传，`ssh -t` 走 `$EDITOR` 透传。
 - 内容搜索、diff、graph、暂存/取消暂存、文件树增删改名——远程全部等效于本地。
 
+### 分屏自动 SSH
+
+`--ssh` 连上远端后，终端原生的分屏快捷键（Ghostty <kbd>Cmd</kbd>+<kbd>D</kbd>、iTerm2 <kbd>Cmd</kbd>+<kbd>D</kbd>、Terminal.app <kbd>Cmd</kbd>+<kbd>D</kbd>……）会直接开一个 `ssh` shell 进到同一台主机的同一 workdir——复用 ControlMaster socket，**不会再问密码**。
+
+一次性配置（按你的 shell 选一条）：
+
+```bash
+reef shell-integration zsh  >> ~/.zshrc
+reef shell-integration bash >> ~/.bashrc
+reef shell-integration fish >> ~/.config/fish/config.fish
+```
+
+Reef 在 SSH session 期间对终端发 OSC 7 `cwd` 指向 `~/.reef/sessions/<pid>/`；上面的片段识别到这个锚点目录就 `exec ssh` 接管。想在 reef pane 里开本地 shell：分屏前 `cd ~` 跳出锚点目录，或者新开窗口而不是分屏即可。所有支持 OSC 7 的终端都能用——不依赖特定终端的 CLI API。
+
 ### 文件操作
 
 - 在文件树里创建、改名、移到回收站、硬删除——工具栏、右键菜单、键盘（`F2`、`d` / `Del`、`Shift+D` / `Shift+Del`）都走得通。

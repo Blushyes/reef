@@ -35,8 +35,31 @@ use std::time::Duration;
 ///                                 version lives on the remote, and
 ///                             (c) connect to it.
 ///   --help / -h               Print usage and exit.
-fn parse_args() -> Result<AppArgs, String> {
-    let mut args = std::env::args().skip(1);
+///
+/// Subcommands (first positional arg):
+///   shell-integration <zsh|bash|fish>    Print the shell snippet that
+///                             enables auto-SSH on terminal split. Pipe
+///                             into your rc: `reef shell-integration zsh
+///                             >> ~/.zshrc`.
+fn parse_args() -> Result<ParsedArgs, String> {
+    let mut args = std::env::args().skip(1).peekable();
+    // Peek the first arg: if it's a known subcommand, route early.
+    if let Some(first) = args.peek() {
+        if first == "shell-integration" {
+            args.next();
+            let raw = args.next().ok_or_else(|| {
+                "shell-integration requires a shell name (zsh|bash|fish)".to_string()
+            })?;
+            let shell = reef::shell_integration::Shell::parse(&raw).ok_or_else(|| {
+                format!("unknown shell '{raw}'; expected one of: zsh, bash, fish")
+            })?;
+            if args.next().is_some() {
+                return Err("shell-integration accepts exactly one argument".into());
+            }
+            return Ok(ParsedArgs::ShellIntegration(shell));
+        }
+    }
+
     let mut agent_exec: Option<String> = None;
     let mut ssh_target: Option<String> = None;
     while let Some(arg) = args.next() {
@@ -63,10 +86,15 @@ fn parse_args() -> Result<AppArgs, String> {
     if agent_exec.is_some() && ssh_target.is_some() {
         return Err("--agent-exec and --ssh are mutually exclusive".into());
     }
-    Ok(AppArgs {
+    Ok(ParsedArgs::App(AppArgs {
         agent_exec,
         ssh_target,
-    })
+    }))
+}
+
+enum ParsedArgs {
+    App(AppArgs),
+    ShellIntegration(reef::shell_integration::Shell),
 }
 
 fn print_usage() {
@@ -84,6 +112,11 @@ fn print_usage() {
     eprintln!();
     eprintln!("The --agent-exec value is whitespace-split into argv. Typical remote:");
     eprintln!("    reef --agent-exec \"ssh user@host reef-agent --stdio --workdir /path\"");
+    eprintln!();
+    eprintln!("SUBCOMMANDS:");
+    eprintln!("    reef shell-integration zsh    # print shell snippet enabling auto-SSH on split");
+    eprintln!("    reef shell-integration bash   # pipe into your rc: `… >> ~/.zshrc`/`~/.bashrc`");
+    eprintln!("    reef shell-integration fish");
 }
 
 struct AppArgs {
@@ -106,7 +139,15 @@ fn split_ssh_target(target: &str) -> (String, String) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let parsed = parse_args()?;
+    let parsed = match parse_args()? {
+        ParsedArgs::App(args) => args,
+        ParsedArgs::ShellIntegration(shell) => return run_shell_integration(shell),
+    };
+
+    // One-shot housekeeping: drop leftover anchor dirs from reef instances
+    // that died without running their Drop (e.g. killed with SIGKILL or
+    // lost power). Safe to run unconditionally — live sessions survive.
+    reef::shell_integration::sweep_stale_sessions();
 
     // Set up panic hook to restore terminal
     let original_hook = panic::take_hook();
@@ -192,6 +233,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // invisible while the alt-screen is up, so we route through the toast
     // queue instead.
     let mut pending_connect_error: Option<String> = None;
+    // `pending_hint` carries the "run shell-integration to enable split
+    // auto-SSH" info toast into the next App. Seeded once per reef
+    // lifetime — after `hint_shown` flips, subsequent session swaps
+    // leave the hint alone so users cycling through Ctrl+O don't see
+    // the same tip repeated on every connection.
+    let mut pending_hint: Option<String> = hint_for_ssh_connect(parsed.ssh_target.as_deref());
+    let mut hint_shown = false;
     'session: loop {
         // App init — clone the picker per session because each App owns
         // it for its preview-protocol lifecycle.
@@ -201,6 +249,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Re-open the picker so the user has a visible recovery path
             // — they came here trying to connect to *something*.
             app.open_hosts_picker();
+        }
+        if let Some(msg) = pending_hint.take() {
+            app.toasts.push(Toast::info(msg));
+            hint_shown = true;
         }
 
         // First-run heuristic: if the user launched reef without `--ssh`
@@ -352,6 +404,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match build_ssh_backend(&target_arg) {
                 Ok(new_backend) => {
                     backend = Arc::new(new_backend);
+                    if !hint_shown {
+                        pending_hint = hint_for_ssh_connect(Some(&target_arg));
+                    }
                     continue 'session;
                 }
                 Err(e) => {
@@ -366,6 +421,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         break 'session;
     } // end 'session
+
+    // Drop the backend explicitly before LeaveAlternateScreen so the
+    // RemoteBackend's OSC 7 restore (via `shell_session`'s Drop) fires
+    // while the terminal is still in the same pane/mode context as the
+    // original emit. Without this, the restore byte stream arrives
+    // after the terminal has already swapped screens, which works on
+    // modern terminals but is semantically backwards.
+    drop(backend);
 
     // Restore terminal. Pop the keyboard enhancement flags only if the
     // push succeeded earlier — popping on a terminal that never received
@@ -432,4 +495,53 @@ fn remote_path_suffix(path: &str) -> String {
     } else {
         format!(":{path}")
     }
+}
+
+/// Returns the install-shell-integration hint to surface once, when:
+///   (a) the user asked for `--ssh <target>` (so they'll plausibly want
+///       split auto-SSH), and
+///   (b) the `~/.reef/snippet-installed` marker is absent (they haven't
+///       run `reef shell-integration …` yet).
+///
+/// Returns `None` otherwise so the session loop is a no-op. The shell
+/// is detected from `$SHELL` with a zsh fallback — users on exotic
+/// shells get pointed at zsh's instructions but the principle is the
+/// same.
+fn hint_for_ssh_connect(ssh_target: Option<&str>) -> Option<String> {
+    ssh_target?;
+    let marker = reef::shell_integration::snippet_installed_marker()?;
+    if marker.exists() {
+        return None;
+    }
+    Some(i18n::shell_integration_hint(detect_shell()))
+}
+
+/// Best-effort `$SHELL` → `Shell` parse. Users on exotic shells fall
+/// back to zsh instructions — all three shells' snippets follow the
+/// same pattern, so the wrong hint is still directionally useful.
+fn detect_shell() -> reef::shell_integration::Shell {
+    std::env::var_os("SHELL")
+        .as_deref()
+        .and_then(|s| std::path::Path::new(s).file_name())
+        .and_then(|name| reef::shell_integration::Shell::parse(&name.to_string_lossy()))
+        .unwrap_or(reef::shell_integration::Shell::Zsh)
+}
+
+/// Implements `reef shell-integration <shell>`: prints the embedded
+/// snippet to stdout and touches `~/.reef/snippet-installed` so the
+/// first-connect toast stops reminding the user.
+fn run_shell_integration(
+    shell: reef::shell_integration::Shell,
+) -> Result<(), Box<dyn std::error::Error>> {
+    print!("{}", shell.snippet());
+    // Touch the marker. Ignore errors (HOME-less env, permission etc.) —
+    // the worst case is the user sees the install toast once more per
+    // session, which is not broken.
+    if let Some(marker) = reef::shell_integration::snippet_installed_marker() {
+        if let Some(parent) = marker.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&marker, b"");
+    }
+    Ok(())
 }

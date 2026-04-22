@@ -45,6 +45,20 @@ reef --ssh user@host:/path      # open /path on host
 - One ControlMaster SSH session powers the whole thing: JSON-RPC over stdio for data, `scp` over the existing socket for drag-drop upload, `ssh -t` for `$EDITOR`.
 - Content search, diff, graph, stage/unstage, file-tree create/rename/delete — all work identically remote.
 
+### Auto-SSH on terminal split
+
+Once you're `--ssh`'d into a host, the terminal's native split (Ghostty <kbd>Cmd</kbd>+<kbd>D</kbd>, iTerm2 <kbd>Cmd</kbd>+<kbd>D</kbd>, Terminal.app <kbd>Cmd</kbd>+<kbd>D</kbd>, …) drops you straight into an `ssh` shell on the same host + same workdir — reusing the ControlMaster socket so there's no second password prompt.
+
+One-time setup (pick your shell):
+
+```bash
+reef shell-integration zsh  >> ~/.zshrc
+reef shell-integration bash >> ~/.bashrc
+reef shell-integration fish >> ~/.config/fish/config.fish
+```
+
+Reef emits an OSC 7 `cwd` pointing at `~/.reef/sessions/<pid>/` while the SSH session is live; the snippet above recognises that anchor dir and execs `ssh` into the same host. `cd ~` inside a reef pane before splitting (or open a new window instead of a split) to skip the auto-SSH and get a plain local shell. Works in every terminal that honours OSC 7 — no terminal-specific CLI integration.
+
 ### File operations
 
 - Create, rename, move-to-trash, and hard-delete from the file tree — via toolbar, right-click context menu, or keyboard (`F2`, `d` / `Del`, `Shift+D` / `Shift+Del`).

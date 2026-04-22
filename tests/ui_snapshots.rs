@@ -139,7 +139,9 @@ fn snapshot_with_staged_and_unstaged() {
     app.refresh_status();
     wait_for_git_status(&mut app);
     let output = render_app(&mut app, 80, 20);
-    with_filters(&[], || insta::assert_snapshot!("with_staged_and_unstaged", output));
+    with_filters(&[], || {
+        insta::assert_snapshot!("with_staged_and_unstaged", output)
+    });
 }
 
 #[test]
@@ -225,7 +227,9 @@ fn snapshot_tree_edit_row_new_file() {
     );
 
     let output = render_app(&mut app, 80, 20);
-    with_filters(&[], || insta::assert_snapshot!("tree_edit_row_new_file", output));
+    with_filters(&[], || {
+        insta::assert_snapshot!("tree_edit_row_new_file", output)
+    });
 }
 
 #[test]
@@ -353,5 +357,7 @@ fn snapshot_with_staged_and_unstaged_light_theme() {
     app.refresh_status();
     wait_for_git_status(&mut app);
     let output = render_app(&mut app, 80, 20);
-    with_filters(&[], || insta::assert_snapshot!("with_staged_and_unstaged_light", output));
+    with_filters(&[], || {
+        insta::assert_snapshot!("with_staged_and_unstaged_light", output)
+    });
 }

@@ -793,7 +793,9 @@ fn append_range_header(
     rows.push(Row::new(vec![
         RowSpan::styled(
             crate::i18n::range_header_count(range.commit_count),
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
         ),
         RowSpan::styled(
             format!(" {}..{}", oldest_short, newest_short),

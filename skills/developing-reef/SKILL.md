@@ -49,4 +49,23 @@ Read `references/runtime-architecture.md` before changing `src/app.rs`, `src/tas
 - Add unit tests for pure helpers and state transitions when practical.
 - Update snapshot tests only when rendered text/layout intentionally changes.
 - For async UI behavior, tests should wait for `tick` to consume worker results instead of assuming synchronous state.
-- Run at least focused tests for touched areas; for architecture changes prefer `cargo check`, `cargo test --lib`, relevant integration/snapshot tests, `cargo fmt --all -- --check`, and clippy with `-D warnings`.
+
+## Pre-PR Checks
+
+Run these locally before `git push`. CI runs exactly these commands — mirroring them avoids the "commit → push → CI red → fmt fix → force push" round-trip on every PR.
+
+```
+cargo fmt --all
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-features
+cargo test --workspace --doc
+```
+
+Failure modes that keep catching people:
+
+- **`cargo test --lib` is not enough.** It skips integration tests (`tests/*.rs`), snapshot tests (`tests/ui_snapshots.rs`), and doctests. CI runs `--workspace --all-features` — so must you.
+- **Clippy without `--workspace` misses `test-support`.** The scope flag is load-bearing; drop it and a broken lint in a helper crate sails through locally then trips CI.
+- **`cargo fmt` edits in place; `--check` only verifies.** Run the first to fix, the second to gate. Omit the first and every stylebot nit becomes a second commit on your PR.
+
+Coverage (`cargo llvm-cov`) is advisory and doesn't block PRs; no need to run it locally unless you're inspecting coverage deltas.

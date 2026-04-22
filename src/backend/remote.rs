@@ -41,50 +41,44 @@ const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_FILE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 type PendingMap = HashMap<u64, mpsc::Sender<Response>>;
-
-/// RAII cleanup for the `pending` map. Construct via `register` after
-/// allocating an envelope id; Drop unconditionally removes the id from
-/// the map. The read loop also removes on Response receipt — that
-/// turns Drop into a no-op rather than racing with us, because the
-/// removal is keyed by id.
-///
-/// Why a guard instead of inline cleanup: the two RPC sites
-/// (`request` and `search_content`) both register a pending entry and
-/// must release it on every error / cancel / timeout path. Having one
-/// place that owns the cleanup keeps the two sites from drifting
-/// apart again.
-struct PendingGuard<'a> {
-    map: &'a Arc<Mutex<PendingMap>>,
-    id: u64,
-}
-
-impl<'a> PendingGuard<'a> {
-    fn register(
-        map: &'a Arc<Mutex<PendingMap>>,
-        id: u64,
-        tx: mpsc::Sender<Response>,
-    ) -> Result<Self, BackendError> {
-        let mut m = map
-            .lock()
-            .map_err(|e| BackendError::Rpc(format!("pending lock poisoned: {e}")))?;
-        m.insert(id, tx);
-        Ok(Self { map, id })
-    }
-}
-
-impl<'a> Drop for PendingGuard<'a> {
-    fn drop(&mut self) {
-        if let Ok(mut m) = self.map.lock() {
-            m.remove(&self.id);
-        }
-    }
-}
 /// `request_id` → sender for streaming `SearchChunk` notifications. The
 /// read thread consults this map on every `Notification::SearchChunk`
 /// frame so hits land at the right in-flight search worker. The map is
 /// mutated by `search_content` around the RPC (register before send,
 /// drop after the final response is received or on error).
 type ChunkSinkMap = HashMap<u64, mpsc::Sender<Vec<MatchHitDto>>>;
+
+/// RAII registration in a `request_id → sender` map. Drop removes the
+/// id; the read loop also removes on receipt, so Drop becomes a no-op
+/// on the success path. Used for both `pending` and `search_chunks` so
+/// the two cleanup paths can't drift.
+struct MapGuard<'a, V: Send> {
+    map: &'a Arc<Mutex<HashMap<u64, V>>>,
+    id: u64,
+}
+
+impl<'a, V: Send> MapGuard<'a, V> {
+    fn register(
+        map: &'a Arc<Mutex<HashMap<u64, V>>>,
+        id: u64,
+        value: V,
+        lock_label: &'static str,
+    ) -> Result<Self, BackendError> {
+        let mut m = map
+            .lock()
+            .map_err(|e| BackendError::Rpc(format!("{lock_label} lock poisoned: {e}")))?;
+        m.insert(id, value);
+        Ok(Self { map, id })
+    }
+}
+
+impl<'a, V: Send> Drop for MapGuard<'a, V> {
+    fn drop(&mut self) {
+        if let Ok(mut m) = self.map.lock() {
+            m.remove(&self.id);
+        }
+    }
+}
 
 pub struct RemoteBackend {
     // Set once during handshake via interior mutability so the post-spawn
@@ -279,11 +273,9 @@ impl RemoteBackend {
     fn request<T: serde::de::DeserializeOwned>(&self, req: Request) -> Result<T, BackendError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel::<Response>();
-        // Drop on every exit path removes the id from `pending`. The read
-        // loop also `remove`s on Response receipt — Drop becomes a no-op
-        // in that case. Without this guard, RPC timeouts silently leak
-        // map slots until the session ends.
-        let _pending = PendingGuard::register(&self.pending, id, tx)?;
+        // Without this guard, RPC timeouts / send errors leak `pending`
+        // slots — the read loop only removes on Response receipt.
+        let _pending = MapGuard::register(&self.pending, id, tx, "pending")?;
         self.send_envelope(Envelope { id, body: req })?;
         let response = rx
             .recv_timeout(DEFAULT_RPC_TIMEOUT)
@@ -887,31 +879,8 @@ impl Backend for RemoteBackend {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<MatchHitDto>>();
         let (resp_tx, resp_rx) = mpsc::channel::<Response>();
-        let _pending = PendingGuard::register(&self.pending, id, resp_tx)?;
-        {
-            let mut chunks = self
-                .search_chunks
-                .lock()
-                .map_err(|e| BackendError::Rpc(format!("chunk lock poisoned: {e}")))?;
-            chunks.insert(id, chunk_tx);
-        }
-        // Small RAII guard so any exit path below unregisters the chunk
-        // sink. The pending map cleanup is owned by `PendingGuard` above.
-        struct ChunkGuard<'a> {
-            map: &'a Arc<Mutex<ChunkSinkMap>>,
-            id: u64,
-        }
-        impl<'a> Drop for ChunkGuard<'a> {
-            fn drop(&mut self) {
-                if let Ok(mut m) = self.map.lock() {
-                    m.remove(&self.id);
-                }
-            }
-        }
-        let _chunks_guard = ChunkGuard {
-            map: &self.search_chunks,
-            id,
-        };
+        let _pending = MapGuard::register(&self.pending, id, resp_tx, "pending")?;
+        let _chunks = MapGuard::register(&self.search_chunks, id, chunk_tx, "chunk")?;
 
         self.send_envelope(Envelope {
             id,

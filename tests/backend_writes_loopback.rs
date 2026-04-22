@@ -155,42 +155,29 @@ fn path_escape_is_rejected_by_both_backends() {
 
 #[test]
 fn pending_map_does_not_leak_on_repeated_requests() {
-    // Regression: pre-PendingGuard, request() inserted into the pending
-    // map but only relied on the read loop's `remove` to clean up.
-    // That left timed-out / errored requests stuck in the map forever.
-    // The success path always removed via Response, so this test alone
-    // doesn't prove the failure-path fix — but it locks down that the
-    // guard's Drop doesn't double-free / panic on the success path
-    // (Drop should be a no-op after the read loop already removed).
+    // Locks down that `MapGuard::Drop` is a no-op after the read loop
+    // already removed via Response receipt — i.e. doesn't double-free
+    // or grow the map on the success path.
     let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let r_tmp = TempDir::new().unwrap();
     let r = spawn_remote(r_tmp.path());
 
     for _ in 0..10 {
-        // `head_oid` round-trips a real RPC (workdir_name is cached
-        // client-side, so it wouldn't exercise the pending machinery).
-        // We don't care about the result — just that the call happens
-        // and the slot gets released.
+        // `head_oid` round-trips a real RPC; `workdir_name` would
+        // hit the client-side cache and skip the pending machinery.
         let _ = r.head_oid();
     }
-    assert_eq!(
-        r.__pending_len_for_tests(),
-        0,
-        "pending map leaked after 10 successful requests"
-    );
+    assert_eq!(r.__pending_len_for_tests(), 0);
 }
 
 #[test]
 fn read_file_rejects_path_escape() {
-    // Regression: prior to this guard `read_file` did `workdir.join(rel)`
-    // unchecked, so a `ReadFile { path: "../etc/passwd" }` request from a
-    // misbehaving (or hostile) caller resolved outside the workdir. Every
-    // other op went through `resolve_rel`; this brings `read_file` in line.
     let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let l_tmp = TempDir::new().unwrap();
     let r_tmp = TempDir::new().unwrap();
-    // Plant a target file *outside* the workdir to make the boundary
-    // breach observable: if the read succeeded, we'd see "secret" bytes.
+    // Plant a real file outside the workdir so a successful boundary
+    // breach would actually return bytes — without this, `is_err` could
+    // mean either "rejected" or "no such file".
     let outside = l_tmp.path().parent().unwrap().join("outside.txt");
     std::fs::write(&outside, b"secret").unwrap();
 

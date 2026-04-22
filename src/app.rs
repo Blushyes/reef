@@ -28,6 +28,15 @@ pub struct BuiltProtocol {
 /// so rapid scrubbing coalesces into a single load.
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(80);
 
+/// How long we wait after a preview lands before firing neighbor
+/// prefetches. Short enough that a user who pauses to look still gets
+/// the next step cached; long enough that a user pressing the next
+/// key 5-50 ms after a landing never queues prefetches in front of
+/// their real `LoadPreview`. `load_preview_for_path` clears the
+/// schedule on every keystroke, so rapid scrubbing never fires
+/// prefetch at all.
+const PREFETCH_DELAY: Duration = Duration::from_millis(300);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Git,
@@ -337,6 +346,11 @@ pub struct App {
     /// a directory of images no longer decodes every file flown past —
     /// only the last selection survives the `PREVIEW_DEBOUNCE` window.
     pub preview_schedule: Option<(PathBuf, Instant)>,
+    /// Deadline for firing neighbor prefetch. Set when a preview lands;
+    /// cleared on the next `load_preview_for_path`. Prefetch fires only
+    /// if the deadline elapses without a fresh selection — i.e. the
+    /// user paused long enough to justify warming the cache.
+    pub prefetch_schedule: Option<Instant>,
     /// Path of the preview currently being decoded by the worker.
     /// Populated at dispatch, cleared when the result arrives (or on
     /// error). Render consults this + `preview_schedule` to decide
@@ -641,6 +655,7 @@ impl App {
             preview_build_rx,
             preview_image_protocol_builds: 0,
             preview_schedule: None,
+            prefetch_schedule: None,
             preview_in_flight_path: None,
             tree_scroll: 0,
             last_rendered_tree_selected: None,
@@ -1284,6 +1299,9 @@ impl App {
         // the 19 stale *results*, but the worker already did the work).
         // With the window in place we do one decode for the final stop.
         self.preview_schedule = Some((rel_path, Instant::now() + PREVIEW_DEBOUNCE));
+        // Cancel any pending neighbor prefetch — the user is on the
+        // move, don't warm caches for files they'll flip past.
+        self.prefetch_schedule = None;
     }
 
     /// Immediate-dispatch path for `load_preview_for_path`. Callers that
@@ -1337,6 +1355,25 @@ impl App {
                 proto.replace_protocol(built.protocol);
             }
         }
+    }
+
+    /// Fire the deferred neighbor prefetch if the user has stayed on
+    /// the same file for `PREFETCH_DELAY`. Any `load_preview_for_path`
+    /// cancels the schedule, so this never fires during active
+    /// scrubbing — the preview worker stays clear for the user's
+    /// actual next `LoadPreview`.
+    fn drain_prefetch_schedule(&mut self) {
+        let Some(deadline) = self.prefetch_schedule else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+        self.prefetch_schedule = None;
+        if self.preview_schedule.is_some() {
+            return;
+        }
+        self.prefetch_preview_neighbors();
     }
 
     /// Fire any debounced preview request whose deadline has elapsed.
@@ -2144,16 +2181,14 @@ impl App {
                                 self.preview_scroll = crate::search::center_scroll(hl.row, view_h);
                             }
                         }
-                        // Warm the cache for the next file the user
-                        // might step onto — but only when we *know* the
-                        // user isn't still scrubbing. A pending
-                        // `preview_schedule` means a fresh selection is
-                        // already committed; prefetching now would queue
-                        // two decodes ahead of the real request and the
-                        // worker would process them in order, making the
-                        // user's actual click wait for them.
+                        // Defer prefetch: if we fired right now, a user
+                        // who presses ↓ within ~50 ms of this landing
+                        // would find two prefetch decodes already
+                        // queued ahead of their real `LoadPreview`.
+                        // Schedule instead, and `load_preview_for_path`
+                        // cancels if the user moves first.
                         if self.preview_schedule.is_none() {
-                            self.prefetch_preview_neighbors();
+                            self.prefetch_schedule = Some(Instant::now() + PREFETCH_DELAY);
                         }
                     }
                 }
@@ -2784,6 +2819,7 @@ impl App {
         self.maybe_kick_global_search();
         self.drain_preview_sync_debounce();
         self.drain_preview_schedule();
+        self.drain_prefetch_schedule();
         self.drain_preview_resize_responses();
         self.drain_preview_protocol_builds();
         self.drain_push_result();

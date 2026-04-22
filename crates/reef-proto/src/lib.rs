@@ -52,7 +52,11 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 ///       frames before the Ok response lands. Older agents that return
 ///       all hits in the response body would be misinterpreted (missing
 ///       notifications, wrong response shape) so this is a hard bump.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// - v5: adds `RangeFiles` / `RangeFileDiff` for the Graph tab's
+///       multi-commit range mode. v4 agents would error `Unknown op`
+///       on these requests, which a v5 client surfaces as a toast — so
+///       a hard bump keeps the auto-redeploy path honest.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Encode a single envelope-level value to `writer` using the
 /// length-prefixed framing. The caller is expected to flush.
@@ -199,6 +203,21 @@ pub enum Request {
     },
     CommitFileDiff {
         oid: String,
+        path: String,
+        context_lines: u32,
+    },
+    /// Union of files changed across `oldest..=newest`. Mirrors
+    /// `Backend::range_files` — wire format is `Vec<FileEntryDto>`.
+    RangeFiles {
+        oldest_oid: String,
+        newest_oid: String,
+    },
+    /// Single-file diff for the same range as `RangeFiles`. Wire format
+    /// is `Option<DiffContentDto>` (None when the path isn't part of the
+    /// range diff).
+    RangeFileDiff {
+        oldest_oid: String,
+        newest_oid: String,
         path: String,
         context_lines: u32,
     },

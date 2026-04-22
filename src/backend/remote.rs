@@ -581,24 +581,30 @@ impl Backend for RemoteBackend {
 
     fn range_files(
         &self,
-        _oldest_oid: &str,
-        _newest_oid: &str,
+        oldest_oid: &str,
+        newest_oid: &str,
     ) -> Result<Vec<FileEntry>, BackendError> {
-        Err(BackendError::Unimplemented(
-            "range_files not yet implemented for remote backend".into(),
-        ))
+        let resp: Vec<reef_proto::FileEntryDto> = self.request(Request::RangeFiles {
+            oldest_oid: oldest_oid.to_string(),
+            newest_oid: newest_oid.to_string(),
+        })?;
+        Ok(resp.into_iter().map(Into::into).collect())
     }
 
     fn range_file_diff(
         &self,
-        _oldest_oid: &str,
-        _newest_oid: &str,
-        _path: &str,
-        _context_lines: u32,
+        oldest_oid: &str,
+        newest_oid: &str,
+        path: &str,
+        context_lines: u32,
     ) -> Result<Option<DiffContent>, BackendError> {
-        Err(BackendError::Unimplemented(
-            "range_file_diff not yet implemented for remote backend".into(),
-        ))
+        let resp: Option<reef_proto::DiffContentDto> = self.request(Request::RangeFileDiff {
+            oldest_oid: oldest_oid.to_string(),
+            newest_oid: newest_oid.to_string(),
+            path: path.to_string(),
+            context_lines,
+        })?;
+        Ok(resp.map(Into::into))
     }
 
     fn subscribe_fs_events(&self) -> mpsc::Receiver<()> {

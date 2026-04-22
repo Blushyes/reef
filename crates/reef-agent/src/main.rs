@@ -353,6 +353,28 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
             Err(e) => Err(backend_err(e)),
         },
 
+        Request::RangeFiles {
+            oldest_oid,
+            newest_oid,
+        } => match backend.range_files(&oldest_oid, &newest_oid) {
+            Ok(files) => {
+                let dtos: Vec<FileEntryDto> = files.into_iter().map(file_entry_to_dto).collect();
+                serde_json::to_value(dtos)
+                    .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}")))
+            }
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::RangeFileDiff {
+            oldest_oid,
+            newest_oid,
+            path,
+            context_lines,
+        } => match backend.range_file_diff(&oldest_oid, &newest_oid, &path, context_lines) {
+            Ok(opt) => serde_json::to_value(opt.map(diff_to_dto))
+                .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
+            Err(e) => Err(backend_err(e)),
+        },
+
         // ── M3 Track 1: write operations ────────────────────────────────
         Request::CreateFile { rel_path } => match backend.create_file(Path::new(&rel_path)) {
             Ok(()) => Ok(serde_json::json!({"ok": true})),

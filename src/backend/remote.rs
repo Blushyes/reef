@@ -438,12 +438,18 @@ impl Backend for RemoteBackend {
         Ok(out)
     }
 
-    fn load_preview(&self, rel_path: &Path, dark: bool) -> Option<PreviewContent> {
+    fn load_preview(
+        &self,
+        rel_path: &Path,
+        dark: bool,
+        _wants_decoded_image: bool,
+    ) -> Option<PreviewContent> {
         // Fetch bytes over RPC and rebuild a `PreviewContent`. `PreviewBody`'s
         // `Image` variant carries a decoded `DynamicImage` that isn't serde-
         // shippable, so for now we surface every binary (image or otherwise)
-        // as the generic Binary metadata card. Image rendering over SSH would
-        // need raw bytes + client-side decode; tracked in issue #31.
+        // as the generic Binary metadata card regardless of the decode
+        // hint. Image rendering over SSH would need raw bytes +
+        // client-side decode; tracked in issue #31.
         use crate::file_tree::{BinaryInfo, BinaryReason, PreviewBody};
         let rel_str = rel_path.to_string_lossy().to_string();
         let resp: ReadFileResponse = self

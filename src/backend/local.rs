@@ -8,9 +8,9 @@
 //! any `Mutex` dance around `Repository` (which is non-Send).
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 
 use super::{
     Backend, BackendError, ContentMatchHit, ContentSearchCompleted, ContentSearchRequest,
@@ -20,9 +20,64 @@ use crate::file_tree::{self, PreviewContent, TreeEntry};
 use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, GitRepo, RefLabel};
 use std::ops::ControlFlow;
 
+/// How many decoded previews to keep around. 8 covers the typical
+/// "click around a directory" workflow without inflating memory for
+/// pathological browsing sessions. Each entry can hold a decoded
+/// `DynamicImage` (up to ~16 MB after `MAX_PROTOCOL_DIM` downscaling),
+/// so a full cache is bounded at ~128 MB worst-case but usually much
+/// smaller (text files are tiny, most images are small).
+const PREVIEW_CACHE_CAP: usize = 8;
+
+/// Key shape that makes cache hits correct across:
+/// - file edits (`mtime_ns` changes → miss → fresh decode)
+/// - file truncation / growth (`size` changes → miss)
+/// - theme toggles (`dark` changes → syntect highlight differs)
+/// - graphics-protocol toggles (`wants_decoded_image` changes → need
+///   the decoded `DynamicImage` vs the lighter metadata-only shape)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviewCacheKey {
+    rel_path: PathBuf,
+    mtime_ns: Option<i128>,
+    size: u64,
+    dark: bool,
+    wants_decoded_image: bool,
+}
+
+#[derive(Default)]
+struct PreviewCache {
+    /// Front = least-recently-used, back = most. Eight linear-scan
+    /// lookups per load is far cheaper than a PNG decode, so we don't
+    /// bother with a hash index.
+    entries: VecDeque<(PreviewCacheKey, PreviewContent)>,
+}
+
+impl PreviewCache {
+    fn get(&mut self, key: &PreviewCacheKey) -> Option<PreviewContent> {
+        let pos = self.entries.iter().position(|(k, _)| k == key)?;
+        let (k, v) = self.entries.remove(pos).expect("position checked");
+        let cloned = v.clone();
+        self.entries.push_back((k, v));
+        Some(cloned)
+    }
+
+    fn put(&mut self, key: PreviewCacheKey, value: PreviewContent) {
+        while self.entries.len() >= PREVIEW_CACHE_CAP {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((key, value));
+    }
+}
+
 /// Local filesystem + libgit2 backend.
 pub struct LocalBackend {
     workdir: PathBuf,
+    /// Decoded-preview LRU. Re-selecting a file — whether via cursor
+    /// bounce, quick-open, or fs-watcher refresh with no actual change
+    /// — returns the cached `PreviewContent` (deep-clone, ~ms for the
+    /// biggest images) instead of re-running the 50-200 ms PNG decode.
+    /// Wrapped in a `Mutex` so the worker thread can hit it from
+    /// `load_preview` without requiring `&mut self`.
+    preview_cache: Mutex<PreviewCache>,
 }
 
 impl LocalBackend {
@@ -31,12 +86,18 @@ impl LocalBackend {
     /// the cwd is not a git repo (the Files tab still works).
     pub fn open_cwd() -> std::io::Result<Self> {
         let workdir = std::env::current_dir()?;
-        Ok(Self { workdir })
+        Ok(Self {
+            workdir,
+            preview_cache: Mutex::new(PreviewCache::default()),
+        })
     }
 
     /// Open at an explicit workdir. Used by `reef-agent --workdir`.
     pub fn open_at(workdir: PathBuf) -> Self {
-        Self { workdir }
+        Self {
+            workdir,
+            preview_cache: Mutex::new(PreviewCache::default()),
+        }
     }
 
     pub fn workdir(&self) -> &Path {
@@ -126,8 +187,45 @@ impl Backend for LocalBackend {
         ))
     }
 
-    fn load_preview(&self, rel_path: &Path, dark: bool) -> Option<PreviewContent> {
-        file_tree::load_preview(&self.workdir, rel_path, dark)
+    fn load_preview(
+        &self,
+        rel_path: &Path,
+        dark: bool,
+        wants_decoded_image: bool,
+    ) -> Option<PreviewContent> {
+        // Build the cache key from a single `metadata()` call — cheaper
+        // than `file_tree::load_preview`'s full `File::open + read
+        // header + decode` path, so the lookup is effectively free on
+        // hits. On cache miss (fresh file or changed mtime/size) we
+        // fall through to the decoder.
+        let full = self.workdir.join(rel_path);
+        let meta = std::fs::metadata(&full).ok();
+        let key = PreviewCacheKey {
+            rel_path: rel_path.to_path_buf(),
+            mtime_ns: meta.as_ref().and_then(|m| {
+                m.modified().ok().and_then(|t| {
+                    t.duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| d.as_nanos() as i128)
+                })
+            }),
+            size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+            dark,
+            wants_decoded_image,
+        };
+
+        if let Ok(mut cache) = self.preview_cache.lock() {
+            if let Some(cached) = cache.get(&key) {
+                return Some(cached);
+            }
+        }
+
+        let fresh = file_tree::load_preview(&self.workdir, rel_path, dark, wants_decoded_image)?;
+
+        if let Ok(mut cache) = self.preview_cache.lock() {
+            cache.put(key, fresh.clone());
+        }
+        Some(fresh)
     }
 
     fn read_file(&self, rel_path: &Path, max_bytes: u64) -> Result<Vec<u8>, BackendError> {

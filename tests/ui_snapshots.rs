@@ -71,12 +71,20 @@ fn wait_for_git_status(app: &mut App) {
     panic!("timed out waiting for background git status");
 }
 
-/// Apply filters to mask nondeterministic tokens (tempdir name, path segments).
-fn with_filters<F: FnOnce()>(body: F) {
+/// Apply the shared TMPDIR masks plus any per-test `extra` filters, then
+/// run `body` under the resulting insta settings. `extra` is a slice of
+/// `(regex, replacement)` pairs — pass `&[]` when no extras are needed.
+/// Keeps the two TMPDIR regex defaults in exactly one place so tests that
+/// need to mask additional nondeterministic tokens (e.g. short OIDs for the
+/// graph-range snapshot) don't drift out of sync.
+fn with_filters<F: FnOnce()>(extra: &[(&str, &str)], body: F) {
     let mut settings = insta::Settings::clone_current();
     // TempDir names are `.tmpXXXXXX` on most platforms.
     settings.add_filter(r"\.tmp[A-Za-z0-9]{6,}", "[TMPDIR]");
     settings.add_filter(r"tmp[A-Za-z0-9]{6,}", "[TMPDIR]");
+    for (pat, replacement) in extra {
+        settings.add_filter(pat, *replacement);
+    }
     settings.bind(body);
 }
 
@@ -93,7 +101,7 @@ fn snapshot_empty_repo() {
 
     let mut app = App::new(Theme::dark(), None);
     let output = render_app(&mut app, 80, 20);
-    with_filters(|| insta::assert_snapshot!("empty_repo", output));
+    with_filters(&[], || insta::assert_snapshot!("empty_repo", output));
 }
 
 #[test]
@@ -114,7 +122,9 @@ fn snapshot_with_staged_and_unstaged() {
     app.refresh_status();
     wait_for_git_status(&mut app);
     let output = render_app(&mut app, 80, 20);
-    with_filters(|| insta::assert_snapshot!("with_staged_and_unstaged", output));
+    with_filters(&[], || {
+        insta::assert_snapshot!("with_staged_and_unstaged", output)
+    });
 }
 
 #[test]
@@ -158,7 +168,7 @@ fn snapshot_place_mode_renders_banner_and_border() {
     app.enter_place_mode(vec![source]);
 
     let output = render_app(&mut app, 80, 20);
-    with_filters(|| insta::assert_snapshot!("place_mode", output));
+    with_filters(&[], || insta::assert_snapshot!("place_mode", output));
 }
 
 #[test]
@@ -200,7 +210,9 @@ fn snapshot_tree_edit_row_new_file() {
     );
 
     let output = render_app(&mut app, 80, 20);
-    with_filters(|| insta::assert_snapshot!("tree_edit_row_new_file", output));
+    with_filters(&[], || {
+        insta::assert_snapshot!("tree_edit_row_new_file", output)
+    });
 }
 
 #[test]
@@ -236,7 +248,74 @@ fn snapshot_tree_context_menu() {
     app.open_tree_context_menu(Some(0), (4, 5));
 
     let output = render_app(&mut app, 80, 20);
-    with_filters(|| insta::assert_snapshot!("tree_context_menu", output));
+    with_filters(&[], || insta::assert_snapshot!("tree_context_menu", output));
+}
+
+/// Wait for the graph worker to populate `rows` and then for the initial
+/// commit-detail / range-detail load to finish. Polls `tick` with a 2s
+/// deadline — matches the `wait_for_git_status` pattern above.
+fn wait_for_graph_ready(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        app.tick();
+        let graph_ready = !app.graph_load.loading && !app.git_graph.rows.is_empty();
+        let detail_ready = !app.commit_detail_load.loading;
+        if graph_ready && detail_ready {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for graph / commit detail to load");
+}
+
+#[test]
+fn snapshot_graph_range_mode() {
+    // Lock in the Graph tab's range-mode visuals: three contiguous commits
+    // selected via `extend_graph_selection`, right panel showing the
+    // "Range · N commits" header, the commit list, and the union of files
+    // changed. Regressions here would indicate either the range payload
+    // plumbing (app.rs → tasks.rs → git/mod.rs) or the commit_detail_panel
+    // range-mode render path drifted. 80×24 is tall enough to show the
+    // full header + all commits + the 3-file list without truncation.
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "a.txt", "v1\n", "first");
+    commit_file(&raw, "b.txt", "v1\n", "second");
+    commit_file(&raw, "c.txt", "v1\n", "third");
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark());
+    app.set_active_tab(reef::app::Tab::Graph);
+    wait_for_graph_ready(&mut app);
+    // Extend by 2 → range of 3 (newest + 2 older). `rows` is newest-first,
+    // so `selected_idx=0` starts on "third"; extending downward (+delta)
+    // grows the range toward older commits.
+    app.extend_graph_selection(2);
+    // Wait for the range-detail worker (files union) to land.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        app.tick();
+        let has_files = app
+            .commit_detail
+            .range_detail
+            .as_ref()
+            .map(|r| !r.files.is_empty())
+            .unwrap_or(false);
+        if has_files && !app.commit_detail_load.loading {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let output = render_app(&mut app, 80, 24);
+    // Short OIDs (7-hex prefix) are fresh per run; mask them so the
+    // snapshot captures layout/text, not the non-deterministic SHAs.
+    with_filters(&[(r"\b[0-9a-f]{7}\b", "[OID]")], || {
+        insta::assert_snapshot!("graph_range_mode", output)
+    });
 }
 
 #[test]
@@ -261,7 +340,9 @@ fn snapshot_with_staged_and_unstaged_light_theme() {
     app.refresh_status();
     wait_for_git_status(&mut app);
     let output = render_app(&mut app, 80, 20);
-    with_filters(|| insta::assert_snapshot!("with_staged_and_unstaged_light", output));
+    with_filters(&[], || {
+        insta::assert_snapshot!("with_staged_and_unstaged_light", output)
+    });
 }
 
 /// Wait until the preview worker delivers a result (either text, image,

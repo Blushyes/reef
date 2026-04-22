@@ -1,7 +1,7 @@
 use crate::file_tree::{FileTree, PreviewContent};
 use crate::fs_watcher;
 use crate::git::graph::GraphRow;
-use crate::git::{CommitDetail, DiffContent, FileEntry, GitRepo, RefLabel};
+use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, GitRepo, RefLabel};
 use crate::tasks::{AsyncState, TaskCoordinator, WorkerResult};
 use crate::ui::highlight::StyledToken;
 use crate::ui::mouse::{ClickAction, HitTestRegistry};
@@ -98,6 +98,11 @@ pub struct GitGraphState {
     pub cache_key: Option<(String, u64)>,
     pub selected_idx: usize,
     pub selected_commit: Option<String>,
+    /// Anchor index for Shift-extended range selection. `None` = single-select
+    /// mode; `Some(i)` pairs with `selected_idx` as cursor. `i == selected_idx`
+    /// is normalised to single-select by `selected_range` / `is_range`.
+    /// Cleared on plain nav, refresh, tab-internal search jump, and Esc.
+    pub selection_anchor: Option<usize>,
     pub scroll: usize,
     /// `selected_idx` observed on the previous render. Used to distinguish
     /// selection-change follow (bring the selected commit into view) from
@@ -105,6 +110,43 @@ pub struct GitGraphState {
     /// for the Files tab — without this, mouse-wheel scroll snapped back to
     /// the selected commit on the next tick.
     pub last_rendered_selected: Option<usize>,
+}
+
+impl GitGraphState {
+    /// Inclusive `(lo, hi)` bounds of the current selection. Returns
+    /// `(selected_idx, selected_idx)` when there's no anchor or the anchor
+    /// has collapsed onto the cursor (= single-select).
+    pub fn selected_range(&self) -> (usize, usize) {
+        match self.selection_anchor {
+            Some(a) if a != self.selected_idx => {
+                (a.min(self.selected_idx), a.max(self.selected_idx))
+            }
+            _ => (self.selected_idx, self.selected_idx),
+        }
+    }
+
+    pub fn is_range(&self) -> bool {
+        matches!(self.selection_anchor, Some(a) if a != self.selected_idx)
+    }
+
+    /// Visual mode is armed iff the anchor is set, regardless of whether
+    /// the cursor has actually moved away from it. Used for UI affordances
+    /// (status bar badge, input dispatch, mouse click semantics) where
+    /// "armed but collapsed" and "armed + extended" behave identically;
+    /// use `is_range` when a real range of ≥2 commits is required (e.g.
+    /// the data loader needs oldest ≠ newest to make `diff_tree_to_tree`
+    /// meaningful).
+    pub fn in_visual_mode(&self) -> bool {
+        self.selection_anchor.is_some()
+    }
+
+    /// Linear scan for the row holding `oid`. Hot enough (status bar clicks,
+    /// worker-result merges, focus commands all go through here) to warrant
+    /// a named helper — without it, `rows.iter().position(|r| r.commit.oid == oid)`
+    /// spread across six sites and drifted on `&str` vs `&String` match.
+    pub fn find_row_by_oid(&self, oid: &str) -> Option<usize> {
+        self.rows.iter().position(|r| r.commit.oid == oid)
+    }
 }
 
 /// Syntect tokens for one line of a diff. `Arc` so the render pipeline can
@@ -138,10 +180,28 @@ pub struct CommitFileDiff {
     pub highlighted: Option<DiffHighlighted>,
 }
 
+/// Range-mode summary for the Graph tab's right panel. Shown instead of
+/// `CommitDetail` when the user has a Shift-extended range. Files are the
+/// net `parent(oldest).tree → newest.tree` delta (matches IntelliJ); the
+/// per-commit list is a snapshot of `rows[lo..=hi]` taken on the main
+/// thread, so the worker only needs to compute `files`.
+#[derive(Debug, Clone)]
+pub struct RangeDetail {
+    pub oldest_oid: String,
+    pub newest_oid: String,
+    pub commit_count: usize,
+    pub commits: Vec<CommitInfo>,
+    pub files: Vec<FileEntry>,
+}
+
 /// State for the inline commit-detail editor panel (Tab::Graph right side).
 #[derive(Debug)]
 pub struct CommitDetailState {
     pub detail: Option<CommitDetail>,
+    /// Range-mode payload. Mutually exclusive with `detail` in practice —
+    /// `reload_graph_selection` flips the panel into exactly one of the two
+    /// modes and clears the other.
+    pub range_detail: Option<RangeDetail>,
     pub file_diff: Option<CommitFileDiff>,
     /// Intentionally independent of `App.diff_layout` — the Git tab and the
     /// Graph tab track their diff layout separately (see plan pitfall #1).
@@ -170,6 +230,7 @@ impl Default for CommitDetailState {
     fn default() -> Self {
         Self {
             detail: None,
+            range_detail: None,
             file_diff: None,
             diff_layout: DiffLayout::Unified,
             diff_mode: DiffMode::Compact,
@@ -1273,15 +1334,82 @@ impl App {
             .load_commit_detail(generation, self.file_tree.root.clone(), oid);
     }
 
-    /// Load the inline diff for a file inside the currently-selected commit.
+    /// (Re)load the range-mode payload for the current Shift-extended
+    /// selection. Fills per-commit metadata synchronously from the cached
+    /// `rows` slice (no git walk needed) and dispatches the file-list
+    /// computation — `parent(oldest).tree → newest.tree` — to the graph
+    /// worker. No-ops when the selection is actually a single row.
+    pub fn load_commit_range_detail(&mut self) {
+        self.commit_detail.file_diff = None;
+        self.commit_detail.diff_h_scroll = 0;
+        self.commit_detail.sbs_left_h_scroll = 0;
+        self.commit_detail.sbs_right_h_scroll = 0;
+        if !self.git_graph.is_range() {
+            self.commit_detail.range_detail = None;
+            return;
+        }
+        let (lo, hi) = self.git_graph.selected_range();
+        let Some(oldest_row) = self.git_graph.rows.get(hi) else {
+            self.commit_detail.range_detail = None;
+            return;
+        };
+        let Some(newest_row) = self.git_graph.rows.get(lo) else {
+            self.commit_detail.range_detail = None;
+            return;
+        };
+        // `rows` is newest-first (revwalk order), so the higher index is the
+        // chronologically older commit; `parent(oldest)` is the baseline.
+        let oldest_oid = oldest_row.commit.oid.clone();
+        let newest_oid = newest_row.commit.oid.clone();
+        let commits: Vec<CommitInfo> = self.git_graph.rows[lo..=hi]
+            .iter()
+            .map(|r| r.commit.clone())
+            .collect();
+        let commit_count = commits.len();
+        // Seed with empty files so the panel has something to render while
+        // the worker computes the union list. Worker result replaces it on
+        // arrival via generation match.
+        self.commit_detail.range_detail = Some(RangeDetail {
+            oldest_oid: oldest_oid.clone(),
+            newest_oid: newest_oid.clone(),
+            commit_count,
+            commits,
+            files: Vec::new(),
+        });
+        if self.repo.is_none() {
+            return;
+        }
+        let generation = self.commit_detail_load.begin();
+        self.tasks.load_commit_range_detail(
+            generation,
+            self.file_tree.root.clone(),
+            oldest_oid,
+            newest_oid,
+        );
+    }
+
+    /// Dispatch the correct loader based on the current selection shape.
+    /// Single-commit selection → `load_commit_detail`; range selection →
+    /// `load_commit_range_detail`. Callers who previously called
+    /// `load_commit_detail` directly on selection change should switch to
+    /// this so range mode is exercised automatically.
+    pub fn reload_graph_selection(&mut self) {
+        if self.git_graph.is_range() {
+            self.commit_detail.detail = None;
+            self.load_commit_range_detail();
+        } else {
+            self.commit_detail.range_detail = None;
+            self.load_commit_detail();
+        }
+    }
+
+    /// Load the inline diff for a file inside the currently-selected commit
+    /// or commit range. Routes to range-file-diff plumbing when a range is
+    /// active so the diff baseline matches the file list.
     pub fn load_commit_file_diff(&mut self, path: &str) {
         let context = match self.commit_detail.diff_mode {
             DiffMode::Compact => 3,
             DiffMode::FullFile => 9999,
-        };
-        let Some(oid) = self.git_graph.selected_commit.clone() else {
-            self.commit_detail.file_diff = None;
-            return;
         };
         if self.repo.is_none() {
             self.commit_detail.file_diff = None;
@@ -1301,6 +1429,28 @@ impl App {
             self.commit_detail.sbs_left_h_scroll = 0;
             self.commit_detail.sbs_right_h_scroll = 0;
         }
+        if self.git_graph.is_range() {
+            let Some(range) = self.commit_detail.range_detail.as_ref() else {
+                self.commit_detail.file_diff = None;
+                return;
+            };
+            let (oldest, newest) = (range.oldest_oid.clone(), range.newest_oid.clone());
+            let generation = self.commit_file_diff_load.begin();
+            self.tasks.load_range_file_diff(
+                generation,
+                self.file_tree.root.clone(),
+                oldest,
+                newest,
+                path.to_string(),
+                context,
+                self.theme.is_dark,
+            );
+            return;
+        }
+        let Some(oid) = self.git_graph.selected_commit.clone() else {
+            self.commit_detail.file_diff = None;
+            return;
+        };
         let generation = self.commit_file_diff_load.begin();
         self.tasks.load_commit_file_diff(
             generation,
@@ -1325,11 +1475,49 @@ impl App {
         }
     }
 
-    /// Move the graph selection by `delta` rows (clamped). Updates
-    /// selected_commit and reloads commit detail.
+    /// Move the graph selection by `delta` rows (clamped). Clears any
+    /// Shift-anchor (plain nav drops range mode) and reloads the single
+    /// commit detail.
     pub fn move_graph_selection(&mut self, delta: i32) {
         if self.git_graph.rows.is_empty() {
             return;
+        }
+        // Plain navigation always collapses to single-select. `anchor=None`
+        // means `reload_graph_selection()` below (and the cursor-didn't-move
+        // branch) always take the single-commit path — we call
+        // `load_commit_detail()` directly to skip that dispatch hop.
+        self.git_graph.selection_anchor = None;
+        let last = self.git_graph.rows.len() - 1;
+        let current = self.git_graph.selected_idx as i32;
+        let next = (current + delta).clamp(0, last as i32) as usize;
+        if next == self.git_graph.selected_idx {
+            // Edge-clamp with a stale range still visible (user was in
+            // visual mode, pressed plain ↓ at the bottom). Clear the
+            // range payload so the panel snaps back to single-commit.
+            if self.commit_detail.range_detail.is_some() {
+                self.commit_detail.range_detail = None;
+                self.load_commit_detail();
+            }
+            return;
+        }
+        self.git_graph.selected_idx = next;
+        self.git_graph.selected_commit =
+            self.git_graph.rows.get(next).map(|r| r.commit.oid.clone());
+        self.commit_detail.scroll = 0;
+        self.commit_detail.range_detail = None;
+        self.load_commit_detail();
+    }
+
+    /// Shift-extend the selection by `delta` rows. Sets the anchor to the
+    /// current cursor on first call, then moves the cursor; the range always
+    /// spans `[min(anchor, cursor), max(anchor, cursor)]`. When the cursor
+    /// collapses back onto the anchor the selection normalises to single.
+    pub fn extend_graph_selection(&mut self, delta: i32) {
+        if self.git_graph.rows.is_empty() {
+            return;
+        }
+        if self.git_graph.selection_anchor.is_none() {
+            self.git_graph.selection_anchor = Some(self.git_graph.selected_idx);
         }
         let last = self.git_graph.rows.len() - 1;
         let current = self.git_graph.selected_idx as i32;
@@ -1340,9 +1528,18 @@ impl App {
         self.git_graph.selected_idx = next;
         self.git_graph.selected_commit =
             self.git_graph.rows.get(next).map(|r| r.commit.oid.clone());
-        // Reset commit-detail scroll so the new commit starts at the top.
         self.commit_detail.scroll = 0;
-        self.load_commit_detail();
+        self.reload_graph_selection();
+    }
+
+    /// Drop any Shift-anchor, collapsing to single-select on the current
+    /// cursor. No-op when not in range mode.
+    pub fn clear_graph_range(&mut self) {
+        if self.git_graph.selection_anchor.take().is_some() {
+            self.commit_detail.scroll = 0;
+            self.commit_detail.range_detail = None;
+            self.reload_graph_selection();
+        }
     }
 
     /// Kick off a `git push` in the background. Returns immediately; the
@@ -1642,19 +1839,37 @@ impl App {
                 Ok(payload) => {
                     if self.graph_load.complete_ok(generation) {
                         let previous_commit = self.git_graph.selected_commit.clone();
+                        // Snapshot the anchor's OID before the re-walk
+                        // overwrites `rows`. The graph is revalidated every
+                        // ~5s on a timer (`next_graph_revalidate_at`), so
+                        // dropping the anchor here would silently exit the
+                        // user's visual mode every few seconds — the
+                        // "range disappears" symptom. We relocate by OID
+                        // instead, same as `selected_commit` below.
+                        let previous_anchor_oid = self
+                            .git_graph
+                            .selection_anchor
+                            .and_then(|idx| self.git_graph.rows.get(idx))
+                            .map(|r| r.commit.oid.clone());
+                        // Detect whether the incoming payload is a no-op
+                        // (HEAD + ref-hash unchanged). The worker always
+                        // re-walks; this cheap comparison on the main
+                        // thread lets us skip a range-detail reload — and
+                        // the `file_diff = None` reset that comes with it
+                        // — when nothing actually changed. Without this,
+                        // visual-mode users watching a file diff saw it
+                        // blink every 5s.
+                        let cache_key_changed =
+                            self.git_graph.cache_key.as_ref() != Some(&payload.cache_key);
+
                         self.git_graph.rows = payload.rows;
                         self.git_graph.ref_map = payload.ref_map;
                         self.git_graph.cache_key = Some(payload.cache_key);
 
-                        if let Some(ref oid) = previous_commit {
-                            if let Some(idx) = self
-                                .git_graph
-                                .rows
-                                .iter()
-                                .position(|r| r.commit.oid == *oid)
-                            {
-                                self.git_graph.selected_idx = idx;
-                            }
+                        if let Some(ref oid) = previous_commit
+                            && let Some(idx) = self.git_graph.find_row_by_oid(oid)
+                        {
+                            self.git_graph.selected_idx = idx;
                         }
                         if self.git_graph.selected_idx >= self.git_graph.rows.len() {
                             self.git_graph.selected_idx =
@@ -1666,7 +1881,29 @@ impl App {
                             .get(self.git_graph.selected_idx)
                             .map(|r| r.commit.oid.clone());
 
-                        if self.git_graph.selected_commit != previous_commit
+                        // Relocate the anchor by OID. Only clear when the
+                        // anchor commit genuinely vanished from history
+                        // (rebase / amend / prune rewrote it away).
+                        let anchor_survived = previous_anchor_oid
+                            .as_ref()
+                            .and_then(|oid| self.git_graph.find_row_by_oid(oid));
+                        self.git_graph.selection_anchor = anchor_survived;
+                        if anchor_survived.is_none() {
+                            self.commit_detail.range_detail = None;
+                        }
+
+                        // Reload the right panel only when something
+                        // actually shifted. In visual mode we skip the
+                        // range rebuild when cache_key matched — rows
+                        // are byte-identical so the cached range_detail
+                        // still describes the same slice. Single-select
+                        // keeps its pre-existing short-circuit on
+                        // selected_commit identity.
+                        if self.git_graph.selection_anchor.is_some() {
+                            if cache_key_changed {
+                                self.reload_graph_selection();
+                            }
+                        } else if self.git_graph.selected_commit != previous_commit
                             || self.commit_detail.detail.is_none()
                         {
                             self.load_commit_detail();
@@ -1688,6 +1925,28 @@ impl App {
                 }
             },
             WorkerResult::CommitFileDiff { generation, result } => match result {
+                Ok(file_diff) => {
+                    if self.commit_file_diff_load.complete_ok(generation) {
+                        self.commit_detail.file_diff = file_diff;
+                    }
+                }
+                Err(error) => {
+                    self.commit_file_diff_load.complete_err(generation, error);
+                }
+            },
+            WorkerResult::RangeDetail { generation, result } => match result {
+                Ok(files) => {
+                    if self.commit_detail_load.complete_ok(generation) {
+                        if let Some(rd) = self.commit_detail.range_detail.as_mut() {
+                            rd.files = files;
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.commit_detail_load.complete_err(generation, error);
+                }
+            },
+            WorkerResult::RangeFileDiff { generation, result } => match result {
                 Ok(file_diff) => {
                     if self.commit_file_diff_load.complete_ok(generation) {
                         self.commit_detail.file_diff = file_diff;
@@ -2420,7 +2679,52 @@ fn save_prefs(layout: DiffLayout, mode: DiffMode) {
 
 #[cfg(test)]
 mod tests {
-    use super::folder_contains;
+    use super::{GitGraphState, folder_contains};
+
+    #[test]
+    fn graph_state_selected_range_single_without_anchor() {
+        let g = GitGraphState {
+            selected_idx: 5,
+            ..Default::default()
+        };
+        assert_eq!(g.selected_range(), (5, 5));
+        assert!(!g.is_range());
+    }
+
+    #[test]
+    fn graph_state_selected_range_collapsed_anchor_is_single() {
+        // `V` just entered visual mode — anchor sits on the cursor.
+        let g = GitGraphState {
+            selected_idx: 3,
+            selection_anchor: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(g.selected_range(), (3, 3));
+        assert!(!g.is_range());
+    }
+
+    #[test]
+    fn graph_state_selected_range_anchor_above_cursor() {
+        // (lo, hi) is always sorted — cursor can be above or below anchor.
+        let g = GitGraphState {
+            selected_idx: 2,
+            selection_anchor: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(g.selected_range(), (2, 7));
+        assert!(g.is_range());
+    }
+
+    #[test]
+    fn graph_state_selected_range_anchor_below_cursor() {
+        let g = GitGraphState {
+            selected_idx: 9,
+            selection_anchor: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(g.selected_range(), (4, 9));
+        assert!(g.is_range());
+    }
 
     #[test]
     fn folder_contains_direct_child() {

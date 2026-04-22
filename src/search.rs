@@ -539,6 +539,10 @@ fn restore_snapshot(app: &mut App, snap: &Snapshot) {
             .rows
             .get(snap.git_graph_selected_idx)
             .map(|r| r.commit.oid.clone());
+        // Snapshot restore doesn't carry the anchor, so any in-flight range
+        // would be stale relative to the restored cursor. Drop it cleanly.
+        app.git_graph.selection_anchor = None;
+        app.commit_detail.range_detail = None;
         app.commit_detail.scroll = snap.commit_detail_scroll;
         app.load_commit_detail();
     }
@@ -581,6 +585,12 @@ fn jump_to_current(app: &mut App) {
                 app.git_graph.selected_idx = m.row;
                 app.git_graph.selected_commit =
                     app.git_graph.rows.get(m.row).map(|r| r.commit.oid.clone());
+                // Search jumps always collapse any active range back to
+                // single-select: the anchor points at the commit the user was
+                // looking at before they searched, which is rarely relevant
+                // once they've jumped to a match.
+                app.git_graph.selection_anchor = None;
+                app.commit_detail.range_detail = None;
                 app.commit_detail.scroll = 0;
                 app.load_commit_detail();
             }

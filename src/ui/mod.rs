@@ -408,6 +408,35 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    // Graph-tab visual-mode indicator. Shows whenever `selection_anchor`
+    // is set — even when the range has collapsed to a single commit (user
+    // just pressed V but hasn't moved yet) — so the user always knows why
+    // arrows/clicks behave differently. Takes priority over the generic
+    // status line so the exit hint (`Esc`) is always visible.
+    if app.active_tab == crate::app::Tab::Graph && app.git_graph.in_visual_mode() {
+        let (lo, hi) = app.git_graph.selected_range();
+        let count = hi - lo + 1;
+        let hint = Line::from(vec![
+            Span::styled(
+                crate::i18n::range_badge(count),
+                Style::default()
+                    .fg(th.chrome_bg)
+                    .bg(th.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {}", t(Msg::StatusBarRangeHint)),
+                Style::default().fg(th.accent).bg(th.chrome_bg),
+            ),
+            Span::styled(
+                " ".repeat(area.width.saturating_sub(80) as usize),
+                Style::default().bg(th.chrome_bg),
+            ),
+        ]);
+        f.render_widget(hint, area);
+        return;
+    }
+
     // Show the most recent toast (push success/failure etc.) inline.
     let (notif, notif_color) = match app.toasts.last() {
         Some(t) => (
@@ -534,6 +563,13 @@ fn render_help(f: &mut Frame, app: &App, screen: Rect) {
         ("PageDown", t(Msg::HelpPageDown)),
         ("← / →", t(Msg::HelpHScroll)),
         ("Shift+← / Shift+→", t(Msg::HelpHScrollFast)),
+        ("V", t(Msg::HelpGraphVisualMode)),
+        ("↑ / ↓ (visual)", t(Msg::HelpGraphRangeExtend)),
+        ("PgUp / PgDn (visual)", t(Msg::HelpGraphRangeExtendFast)),
+        ("Click (visual)", t(Msg::HelpGraphVisualClick)),
+        ("Esc", t(Msg::HelpGraphRangeClear)),
+        ("Shift+↑ / Shift+↓", t(Msg::HelpGraphShiftExtend)),
+        ("Shift+Click", t(Msg::HelpGraphShiftClick)),
         ("Home / End", t(Msg::HelpHomeEnd)),
         (t(Msg::HelpKeyMouseHScroll), t(Msg::HelpMouseHScroll)),
         ("s / u", t(Msg::HelpStageUnstage)),

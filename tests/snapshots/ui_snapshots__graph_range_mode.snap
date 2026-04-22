@@ -1,0 +1,29 @@
+---
+source: tests/ui_snapshots.rs
+assertion_line: 325
+expression: output
+---
+ reef  [TMPDIR]  ⎇ master
+ 📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph           1:Files 2:Search 3:Git 4:Graph
+ ▌● [OID]  HEAD   mas│ Range · 3 commits [OID]..[OID]
+ ● [OID] second      │ Click any commit below to collapse back to single-selec
+ ● [OID] first       │
+                       │   [OID] third
+                       │   [OID] second
+                       │   [OID] first
+                       │
+                       │ Changed files (3)  [list]  t toggle
+                       │   A a.txt
+                       │   A b.txt
+                       │   A c.txt
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+ RANGE 3  ↑↓/click extend · V/Esc exit

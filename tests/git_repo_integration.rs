@@ -237,6 +237,80 @@ fn get_commit_file_diff_shows_additions() {
     assert!(added);
 }
 
+#[test]
+fn get_range_files_degenerate_range_matches_single_commit() {
+    // Degenerate range (oldest == newest) should be indistinguishable from
+    // single-commit `commit_files` — protects the v1 claim that range mode
+    // reuses the same first-parent diff semantics as single-commit mode.
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "a.txt", "v1\n", "first");
+    let oid = commit_file(&raw, "b.txt", "v1\n", "second");
+
+    let (_g, repo) = open_in(tmp.path());
+    let files = repo.get_range_files(&oid.to_string(), &oid.to_string());
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, "b.txt");
+    assert!(matches!(files[0].status, FileStatus::Added));
+}
+
+#[test]
+fn get_range_files_multi_commit_is_union() {
+    // Range spanning 3 commits should list every file touched by any of
+    // them (net `parent(oldest).tree → newest.tree` delta). Confirms the
+    // IntelliJ-style semantics: 3 distinct files added across 3 commits
+    // all show up, not just the newest one. Also exercises root-commit
+    // handling — `a.txt` was added in the initial commit, and we diff
+    // from `parent(c1)` (empty tree), so it's still `Added` in the range.
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, raw) = tempdir_repo();
+    let _c1 = commit_file(&raw, "a.txt", "v1\n", "first");
+    let _c2 = commit_file(&raw, "b.txt", "v1\n", "second");
+    let _c3 = commit_file(&raw, "c.txt", "v1\n", "third");
+
+    let (_g, repo) = open_in(tmp.path());
+    // list_commits is newest-first, so oldest = first commit, newest = third.
+    let commits = repo.list_commits(10);
+    let oldest = &commits[2].oid;
+    let newest = &commits[0].oid;
+    let files = repo.get_range_files(oldest, newest);
+    let paths: Vec<_> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, vec!["a.txt", "b.txt", "c.txt"]);
+}
+
+#[test]
+fn get_range_file_diff_collapses_multiple_edits() {
+    // A single file edited across three commits, then diffed over the
+    // whole range, should show the *net* change from baseline → final —
+    // intermediate "v1→v2" and "v2→v3" don't appear as separate hunks.
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, raw) = tempdir_repo();
+    let _c1 = commit_file(&raw, "a.txt", "v1\n", "first");
+    let _c2 = commit_file(&raw, "a.txt", "v2\n", "second");
+    let _c3 = commit_file(&raw, "a.txt", "v3\n", "third");
+
+    let (_g, repo) = open_in(tmp.path());
+    let commits = repo.list_commits(10);
+    let oldest = &commits[2].oid;
+    let newest = &commits[0].oid;
+    let diff = repo
+        .get_range_file_diff(oldest, newest, "a.txt", 3)
+        .expect("diff available");
+    // Net delta: `a.txt` didn't exist at parent(c1) (root) → now contains
+    // "v3\n". Intermediate v1/v2 content should NOT appear.
+    let all_content: String = diff
+        .hunks
+        .iter()
+        .flat_map(|h| h.lines.iter())
+        .filter(|l| matches!(l.tag, LineTag::Added))
+        .map(|l| l.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(all_content.contains("v3"));
+    assert!(!all_content.contains("v1"));
+    assert!(!all_content.contains("v2"));
+}
+
 // ── Remote sync state (ahead_behind / push) ─────────────────────────────────
 
 /// Seeds a local repo, registers a fake `origin` remote (bogus URL — we never

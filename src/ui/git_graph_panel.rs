@@ -58,14 +58,23 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
 
     let rows: Vec<&GraphRow> = app.git_graph.rows.iter().collect();
     let theme = app.theme;
+    // Range highlight bounds. Collapsed range (lo == hi) = single-select;
+    // `in_range` check below only fires when the user actually Shift-extended.
+    let (range_lo, range_hi) = app.git_graph.selected_range();
+    let is_range = app.git_graph.is_range();
+    let anchor_idx = app.git_graph.selection_anchor;
     for (i, row) in rows.iter().skip(scroll).take(height).enumerate() {
         let idx = scroll + i;
         let y = area.y + i as u16;
         let hover = crate::ui::hover::is_hover(app, area, y);
         let (search_ranges, search_cur) = app.search.ranges_on_row(SearchTarget::CommitGraph, idx);
+        let in_range = is_range && idx >= range_lo && idx <= range_hi;
+        let is_anchor = is_range && Some(idx) == anchor_idx;
         let (line, click_x_w) = build_row_line(
             row,
             idx == app.git_graph.selected_idx,
+            in_range,
+            is_anchor,
             show_meta,
             max_subject,
             head_oid,
@@ -117,14 +126,41 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.selectCommit" => {
+            // Click on a graph row. In visual mode (anchor set) it moves
+            // the endpoint, keeping the anchor — this is the primary way
+            // to build a range in terminals that intercept Shift+Click.
+            // Out of visual mode, single-select behaviour as before.
             let oid = args.get("oid").and_then(|v| v.as_str()).unwrap_or("");
-            if !oid.is_empty() {
-                if let Some(idx) = app.git_graph.rows.iter().position(|r| r.commit.oid == oid) {
+            if !oid.is_empty()
+                && let Some(idx) = app.git_graph.find_row_by_oid(oid)
+            {
+                if app.git_graph.in_visual_mode() {
+                    let delta = idx as i32 - app.git_graph.selected_idx as i32;
+                    app.extend_graph_selection(delta);
+                } else {
                     app.git_graph.selected_idx = idx;
                     app.git_graph.selected_commit = Some(oid.to_string());
+                    app.commit_detail.range_detail = None;
                     app.commit_detail.scroll = 0;
                     app.load_commit_detail();
                 }
+            }
+            true
+        }
+        "git.graph.focusCommit" => {
+            // Range-list "zoom-in" click: always collapse to single-select
+            // on the target commit, regardless of visual mode. Emitted by
+            // the commit_detail_panel range-header commit list.
+            let oid = args.get("oid").and_then(|v| v.as_str()).unwrap_or("");
+            if !oid.is_empty()
+                && let Some(idx) = app.git_graph.find_row_by_oid(oid)
+            {
+                app.git_graph.selected_idx = idx;
+                app.git_graph.selected_commit = Some(oid.to_string());
+                app.git_graph.selection_anchor = None;
+                app.commit_detail.range_detail = None;
+                app.commit_detail.scroll = 0;
+                app.load_commit_detail();
             }
             true
         }
@@ -152,6 +188,8 @@ pub fn scroll(app: &mut App, delta: i32) {
 fn build_row_line(
     row: &GraphRow,
     selected: bool,
+    in_range: bool,
+    is_anchor: bool,
     show_meta: bool,
     max_subject: usize,
     head_oid: Option<&str>,
@@ -166,6 +204,16 @@ fn build_row_line(
     let is_head = head_oid == Some(oid.as_str());
 
     let mut spans: Vec<Span<'static>> = Vec::new();
+
+    // Anchor indicator: a slim accent bar at the very left, so the user can
+    // always see where the range started even when the cursor has drifted
+    // far away. Costs one cell of horizontal space on the anchor row only.
+    if is_anchor && !selected {
+        spans.push(Span::styled(
+            "▌".to_string(),
+            Style::default().fg(theme.accent),
+        ));
+    }
 
     let glyphs = render_lane_chars(row);
     for (col, ch) in glyphs.iter().enumerate() {
@@ -237,6 +285,28 @@ fn build_row_line(
     }
 
     if selected {
+        // All selected rows wear `selection_bg`; when the selection is
+        // part of an active range the cursor additionally picks up BOLD
+        // so it reads as the focused commit within its peers. BOLD alone
+        // isn't applied outside range mode to keep single-select look
+        // unchanged from pre-visual-mode versions.
+        spans = spans
+            .into_iter()
+            .map(|s| {
+                let mut style = s.style.bg(sel_bg);
+                if in_range {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                Span::styled(s.content.into_owned(), style)
+            })
+            .collect();
+    } else if in_range {
+        // Range peers share the cursor's `selection_bg` so the whole bundle
+        // reads as one highlighted block. Earlier we tried `hover_bg` here
+        // to dim non-cursor rows, but on dark themes that's Rgb(40,40,50) —
+        // visually indistinguishable from the default background. Using the
+        // same `selection_bg` with a bold cursor gives stronger affordance
+        // for "these are the commits being merged".
         spans = spans
             .into_iter()
             .map(|s| Span::styled(s.content.into_owned(), s.style.bg(sel_bg)))

@@ -56,6 +56,45 @@ fn render_empty(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(msg, Rect::new(x, y, area.width, 1));
 }
 
+/// Draw the shared "bold filename + horizontal separator" top used by
+/// every preview body variant (text / image / binary). Returns the next
+/// free y coordinate — callers continue rendering from there. Callers
+/// whose available height is `< 1` shouldn't call this; we clamp
+/// internally so a single-row panel shows at least the filename.
+fn render_card_header(
+    f: &mut Frame,
+    area: Rect,
+    path: &str,
+    theme: &crate::ui::theme::Theme,
+) -> u16 {
+    let mut y = area.y;
+    let max_y = area.y + area.height;
+    if y >= max_y {
+        return y;
+    }
+    f.render_widget(
+        Line::from(Span::styled(
+            path,
+            Style::default()
+                .fg(theme.fg_primary)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Rect::new(area.x, y, area.width, 1),
+    );
+    y += 1;
+    if y < max_y {
+        f.render_widget(
+            Line::from(Span::styled(
+                "─".repeat(area.width as usize),
+                Style::default().fg(theme.fg_secondary),
+            )),
+            Rect::new(area.x, y, area.width, 1),
+        );
+        y += 1;
+    }
+    y
+}
+
 /// Image preview. Header + separator + metadata line + StatefulImage.
 /// `StatefulProtocol` lives on `App` (not on `PreviewContent`) because it
 /// holds non-`Send` state and is constructed on the main thread when the
@@ -65,40 +104,20 @@ fn render_image(f: &mut Frame, app: &mut App, area: Rect, path: &str, img: &Imag
         return;
     }
     let th = app.theme;
-
-    // Header.
-    let mut y = area.y;
     let max_y = area.y + area.height;
-    f.render_widget(
-        Line::from(Span::styled(
-            path,
-            Style::default()
-                .fg(th.fg_primary)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Rect::new(area.x, y, area.width, 1),
-    );
-    y += 1;
-
-    // Separator.
-    if y < max_y {
-        f.render_widget(
-            Line::from(Span::styled(
-                "─".repeat(area.width as usize),
-                Style::default().fg(th.fg_secondary),
-            )),
-            Rect::new(area.x, y, area.width, 1),
-        );
-        y += 1;
-    }
+    let mut y = render_card_header(f, area, path, &th);
 
     // Metadata line. Skipped when the panel is too short — in that case
     // we'd rather reclaim the row for actual pixels than spend it on text.
+    // `img.meta_line` was built once at load time (see `ImagePreview::new`)
+    // so we don't allocate on the render hot path.
     let wants_meta = area.height >= MIN_META_HEIGHT;
     if wants_meta && y < max_y {
-        let meta = image_meta_text(img);
         f.render_widget(
-            Line::from(Span::styled(meta, Style::default().fg(th.fg_secondary))),
+            Line::from(Span::styled(
+                img.meta_line.as_str(),
+                Style::default().fg(th.fg_secondary),
+            )),
             Rect::new(area.x, y, area.width, 1),
         );
         y += 1;
@@ -139,47 +158,6 @@ fn render_image(f: &mut Frame, app: &mut App, area: Rect, path: &str, img: &Imag
     }
 }
 
-fn image_meta_text(img: &ImagePreview) -> String {
-    let fmt = format_name(img.format);
-    let size = format_size(img.bytes_on_disk);
-    if img.animated {
-        format!(
-            "{}×{} · {} · {} · animated (first frame shown)",
-            img.width_px, img.height_px, fmt, size
-        )
-    } else {
-        format!("{}×{} · {} · {}", img.width_px, img.height_px, fmt, size)
-    }
-}
-
-fn format_name(f: image::ImageFormat) -> &'static str {
-    match f {
-        image::ImageFormat::Png => "PNG",
-        image::ImageFormat::Jpeg => "JPEG",
-        image::ImageFormat::Gif => "GIF",
-        image::ImageFormat::WebP => "WebP",
-        image::ImageFormat::Bmp => "BMP",
-        image::ImageFormat::Tiff => "TIFF",
-        image::ImageFormat::Ico => "ICO",
-        _ => "image",
-    }
-}
-
-fn format_size(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * 1024;
-    const GB: u64 = 1024 * 1024 * 1024;
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
-}
-
 /// Friendly metadata card for anything we can't render as pixels —
 /// non-image binaries (PDF, zip, video…), oversized images, unsupported
 /// formats (SVG/AVIF/HEIC), corrupt files, and the 0-byte case. The
@@ -190,50 +168,21 @@ fn render_binary_info(f: &mut Frame, app: &App, area: Rect, path: &str, info: &B
         return;
     }
     let th = app.theme;
-    let mut y = area.y;
     let max_y = area.y + area.height;
+    let mut y = render_card_header(f, area, path, &th);
 
-    f.render_widget(
-        Line::from(Span::styled(
-            path,
-            Style::default()
-                .fg(th.fg_primary)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Rect::new(area.x, y, area.width, 1),
-    );
-    y += 1;
-
-    if y < max_y {
+    // MIME + size line (e.g. "application/pdf · 2.4 MB"). Pre-rendered
+    // at load time on `BinaryInfo::new`; empty when we have neither a
+    // MIME nor a size (e.g. `Empty` reason).
+    if y < max_y && !info.meta_line.is_empty() {
         f.render_widget(
             Line::from(Span::styled(
-                "─".repeat(area.width as usize),
+                info.meta_line.as_str(),
                 Style::default().fg(th.fg_secondary),
             )),
             Rect::new(area.x, y, area.width, 1),
         );
         y += 1;
-    }
-
-    // MIME + size line (e.g. "application/pdf · 2.4 MB"). Skipped if we
-    // have no MIME (NullBytes / Empty reasons).
-    if y < max_y {
-        let parts: Vec<String> = match info.mime {
-            Some(m) if info.bytes_on_disk > 0 => {
-                vec![m.to_string(), format_size(info.bytes_on_disk)]
-            }
-            Some(m) => vec![m.to_string()],
-            None if info.bytes_on_disk > 0 => vec![format_size(info.bytes_on_disk)],
-            None => Vec::new(),
-        };
-        if !parts.is_empty() {
-            let meta = parts.join(" · ");
-            f.render_widget(
-                Line::from(Span::styled(meta, Style::default().fg(th.fg_secondary))),
-                Rect::new(area.x, y, area.width, 1),
-            );
-            y += 1;
-        }
     }
 
     // Reason line, centred vertically in the remaining space.
@@ -272,30 +221,8 @@ fn render_text(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewConten
         _ => return,
     };
     let th = app.theme;
-    let mut y = area.y;
     let max_y = area.y + area.height;
-
-    // File header
-    if y < max_y {
-        let header = Line::from(Span::styled(
-            preview.file_path.as_str(),
-            Style::default()
-                .fg(th.fg_primary)
-                .add_modifier(Modifier::BOLD),
-        ));
-        f.render_widget(header, Rect::new(area.x, y, area.width, 1));
-        y += 1;
-    }
-
-    // Separator
-    if y < max_y {
-        let sep = Line::from(Span::styled(
-            "─".repeat(area.width as usize),
-            Style::default().fg(th.fg_secondary),
-        ));
-        f.render_widget(sep, Rect::new(area.x, y, area.width, 1));
-        y += 1;
-    }
+    let y = render_card_header(f, area, &preview.file_path, &th);
 
     let content_height = (max_y - y) as usize;
     // Cache the content viewport height so search-jump can center matches.

@@ -16,7 +16,7 @@ use reef::ui::theme::Theme;
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
-use test_support::{HomeGuard, commit_file, tempdir_repo, write_file, write_striped_png};
+use test_support::{CwdGuard, HomeGuard, commit_file, tempdir_repo, write_file, write_striped_png};
 
 static CWD_LOCK: Mutex<()> = Mutex::new(());
 
@@ -32,25 +32,7 @@ fn force_en_lang() {
     }
 }
 
-struct CwdGuard {
-    original: std::path::PathBuf,
-}
-
-impl CwdGuard {
-    fn enter(path: &std::path::Path) -> Self {
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(path).unwrap();
-        Self { original }
-    }
-}
-
-impl Drop for CwdGuard {
-    fn drop(&mut self) {
-        let _ = std::env::set_current_dir(&self.original);
-    }
-}
-
-// `HomeGuard` — redirect $HOME for the snapshot — lives in `test-support`.
+// `HomeGuard` and `CwdGuard` — redirect $HOME / cwd for the snapshot — live in `test-support`.
 // The local `CWD_LOCK` doubles as the HOME_LOCK here because every test in
 // this file swaps both in lockstep and nothing else touches HOME concurrently.
 

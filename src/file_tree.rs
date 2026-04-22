@@ -54,6 +54,12 @@ impl PreviewContent {
 /// `StatefulProtocol`. Once that's done, the stored `PreviewContent`
 /// carries `image: None` and just the metadata — avoids keeping a
 /// second copy of the pixels alongside the protocol's own buffer.
+///
+/// `meta_line` is the pre-rendered "40×40 · PNG · 242 B" string, built
+/// once at load time instead of on every render frame. render hits 60
+/// fps during active interaction (mouse drag, scroll), and rebuilding
+/// the same String through two `format!()` calls per frame is pure
+/// allocator churn — cache it.
 #[derive(Debug)]
 pub struct ImagePreview {
     pub image: Option<image::DynamicImage>,
@@ -67,6 +73,7 @@ pub struct ImagePreview {
     /// whole thing. Exact frame count isn't worth re-decoding the entire
     /// GIF just to display.
     pub animated: bool,
+    pub meta_line: String,
 }
 
 #[derive(Debug)]
@@ -77,6 +84,11 @@ pub struct BinaryInfo {
     /// heuristic.
     pub mime: Option<&'static str>,
     pub reason: BinaryReason,
+    /// Pre-rendered "application/pdf · 2.4 MB" line for the metadata
+    /// card. Empty when we have neither a MIME nor a size to show
+    /// (e.g. the `Empty` reason). Cached at load time so render doesn't
+    /// reallocate per frame.
+    pub meta_line: String,
 }
 
 #[derive(Debug)]
@@ -117,6 +129,103 @@ fn decode_error(msg: impl Into<String>) -> BinaryReason {
         s.push('…');
     }
     BinaryReason::DecodeError(s)
+}
+
+/// Short display name for an `image::ImageFormat`. The `image` crate
+/// has no `Display` impl so we map the variants we decode.
+fn image_format_name(f: image::ImageFormat) -> &'static str {
+    match f {
+        image::ImageFormat::Png => "PNG",
+        image::ImageFormat::Jpeg => "JPEG",
+        image::ImageFormat::Gif => "GIF",
+        image::ImageFormat::WebP => "WebP",
+        image::ImageFormat::Bmp => "BMP",
+        image::ImageFormat::Tiff => "TIFF",
+        image::ImageFormat::Ico => "ICO",
+        _ => "image",
+    }
+}
+
+/// Human-readable byte size: "512 B" / "2.4 KB" / "5.7 MB" / "1.2 GB".
+/// Single-precision is enough for the preview metadata card where
+/// users just need a rough sense of scale.
+fn human_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * 1024 * 1024;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn image_meta_line(
+    width_px: u32,
+    height_px: u32,
+    format: image::ImageFormat,
+    bytes_on_disk: u64,
+    animated: bool,
+) -> String {
+    let fmt = image_format_name(format);
+    let size = human_bytes(bytes_on_disk);
+    if animated {
+        format!("{width_px}×{height_px} · {fmt} · {size} · animated (first frame shown)")
+    } else {
+        format!("{width_px}×{height_px} · {fmt} · {size}")
+    }
+}
+
+fn binary_meta_line(mime: Option<&'static str>, bytes_on_disk: u64) -> String {
+    match mime {
+        Some(m) if bytes_on_disk > 0 => format!("{m} · {}", human_bytes(bytes_on_disk)),
+        Some(m) => m.to_string(),
+        None if bytes_on_disk > 0 => human_bytes(bytes_on_disk),
+        None => String::new(),
+    }
+}
+
+impl BinaryInfo {
+    /// Build a `BinaryInfo` with its metadata line pre-rendered. Keeps
+    /// the render path allocation-free and centralises the construction
+    /// so the `meta_line` format stays consistent across the five
+    /// binary-classification call sites.
+    pub fn new(bytes_on_disk: u64, mime: Option<&'static str>, reason: BinaryReason) -> Self {
+        Self {
+            bytes_on_disk,
+            mime,
+            reason,
+            meta_line: binary_meta_line(mime, bytes_on_disk),
+        }
+    }
+}
+
+impl ImagePreview {
+    /// Build an `ImagePreview` with its metadata line pre-rendered.
+    /// Takes ownership of the decoded `DynamicImage` so callers don't
+    /// have to wrap it in `Some(..)` themselves.
+    fn new(
+        image: image::DynamicImage,
+        width_px: u32,
+        height_px: u32,
+        format: image::ImageFormat,
+        bytes_on_disk: u64,
+        animated: bool,
+    ) -> Self {
+        Self {
+            image: Some(image),
+            width_px,
+            height_px,
+            format,
+            bytes_on_disk,
+            animated,
+            meta_line: image_meta_line(width_px, height_px, format, bytes_on_disk, animated),
+        }
+    }
 }
 
 /// Manages the file tree state.
@@ -415,11 +524,7 @@ pub fn load_preview(root: &Path, rel_path: &Path, dark: bool) -> Option<PreviewC
     if file_size == 0 {
         return Some(PreviewContent {
             file_path: rel_str,
-            body: PreviewBody::Binary(BinaryInfo {
-                bytes_on_disk: 0,
-                mime: None,
-                reason: BinaryReason::Empty,
-            }),
+            body: PreviewBody::Binary(BinaryInfo::new(0, None, BinaryReason::Empty)),
         });
     }
 
@@ -441,11 +546,7 @@ pub fn load_preview(root: &Path, rel_path: &Path, dark: bool) -> Option<PreviewC
     if let Some(m) = mime {
         return Some(PreviewContent {
             file_path: rel_str,
-            body: PreviewBody::Binary(BinaryInfo {
-                bytes_on_disk: file_size,
-                mime: Some(m),
-                reason: BinaryReason::NonImage,
-            }),
+            body: PreviewBody::Binary(BinaryInfo::new(file_size, Some(m), BinaryReason::NonImage)),
         });
     }
 
@@ -457,11 +558,7 @@ pub fn load_preview(root: &Path, rel_path: &Path, dark: bool) -> Option<PreviewC
     if file_size > MAX_TEXT_PROBE_BYTES {
         return Some(PreviewContent {
             file_path: rel_str,
-            body: PreviewBody::Binary(BinaryInfo {
-                bytes_on_disk: file_size,
-                mime: None,
-                reason: BinaryReason::NullBytes,
-            }),
+            body: PreviewBody::Binary(BinaryInfo::new(file_size, None, BinaryReason::NullBytes)),
         });
     }
 
@@ -474,11 +571,7 @@ pub fn load_preview(root: &Path, rel_path: &Path, dark: bool) -> Option<PreviewC
     if raw[..check_len].contains(&0) {
         return Some(PreviewContent {
             file_path: rel_str,
-            body: PreviewBody::Binary(BinaryInfo {
-                bytes_on_disk: file_size,
-                mime: None,
-                reason: BinaryReason::NullBytes,
-            }),
+            body: PreviewBody::Binary(BinaryInfo::new(file_size, None, BinaryReason::NullBytes)),
         });
     }
 
@@ -502,6 +595,22 @@ pub fn load_preview(root: &Path, rel_path: &Path, dark: bool) -> Option<PreviewC
     })
 }
 
+/// Build a `Binary` card for a file that sniffed as `image/*` but which
+/// we chose not to decode (too large, unsupported, corrupt). Factored
+/// out of `load_image_preview` so each early-exit site stays a
+/// one-liner instead of a four-line struct literal.
+fn binary_card(
+    rel_str: &str,
+    file_size: u64,
+    mime: &'static str,
+    reason: BinaryReason,
+) -> PreviewContent {
+    PreviewContent {
+        file_path: rel_str.to_string(),
+        body: PreviewBody::Binary(BinaryInfo::new(file_size, Some(mime), reason)),
+    }
+}
+
 /// Worker-side image decode. Split out from `load_preview` so the happy
 /// path stays readable. Returns a `PreviewContent` — either a successful
 /// `Image` or a `Binary` card explaining why we wouldn't decode.
@@ -514,22 +623,15 @@ fn load_image_preview(
     use image::ImageReader;
     use std::io::Cursor;
 
-    let too_large_card = |reason: BinaryReason| PreviewContent {
-        file_path: rel_str.to_string(),
-        body: PreviewBody::Binary(BinaryInfo {
-            bytes_on_disk: file_size,
-            mime: Some(mime),
-            reason,
-        }),
-    };
+    let card = |reason| binary_card(rel_str, file_size, mime, reason);
 
     if file_size > DECODE_CAP_BYTES {
-        return too_large_card(BinaryReason::TooLarge);
+        return card(BinaryReason::TooLarge);
     }
 
     let bytes = match std::fs::read(full) {
         Ok(b) => b,
-        Err(e) => return too_large_card(decode_error(e.to_string())),
+        Err(e) => return card(decode_error(e.to_string())),
     };
 
     // Build a single ImageReader and reuse it: `format()` is cheap
@@ -538,12 +640,12 @@ fn load_image_preview(
     // more before `decode()`. Three header parses → two.
     let reader = match ImageReader::new(Cursor::new(&bytes)).with_guessed_format() {
         Ok(r) => r,
-        Err(e) => return too_large_card(decode_error(e.to_string())),
+        Err(e) => return card(decode_error(e.to_string())),
     };
 
     let format = match reader.format() {
         Some(f) => f,
-        None => return too_large_card(BinaryReason::UnsupportedImage),
+        None => return card(BinaryReason::UnsupportedImage),
     };
 
     let (w, h) = match reader.into_dimensions() {
@@ -558,12 +660,12 @@ fn load_image_preview(
             } else {
                 decode_error(e.to_string())
             };
-            return too_large_card(reason);
+            return card(reason);
         }
     };
 
     if (w as u64).saturating_mul(h as u64) > MAX_PIXELS {
-        return too_large_card(BinaryReason::TooLarge);
+        return card(BinaryReason::TooLarge);
     }
 
     // Full decode now that dimensions are known safe. Rebuild the
@@ -583,7 +685,7 @@ fn load_image_preview(
             } else {
                 decode_error(msg)
             };
-            return too_large_card(reason);
+            return card(reason);
         }
     };
 
@@ -603,14 +705,9 @@ fn load_image_preview(
 
     PreviewContent {
         file_path: rel_str.to_string(),
-        body: PreviewBody::Image(ImagePreview {
-            image: Some(decoded),
-            width_px: w,
-            height_px: h,
-            format,
-            bytes_on_disk: file_size,
-            animated,
-        }),
+        body: PreviewBody::Image(ImagePreview::new(
+            decoded, w, h, format, file_size, animated,
+        )),
     }
 }
 

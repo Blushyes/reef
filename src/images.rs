@@ -8,19 +8,41 @@
 //! invariant `Theme::resolve`'s OSC 11 probe relies on.
 //!
 //! `REEF_IMAGE_PROTOCOL` is an escape hatch:
-//!   - `off` / `none`  — disable image preview entirely (friendly metadata
-//!                        cards still show for binary files).
-//!   - `halfblocks`    — force the unicode-halfblocks renderer. Works on
-//!                        every terminal; used by integration tests so
-//!                        snapshots stay deterministic against the
-//!                        ratatui `TestBackend`.
-//!   - `kitty`         — force Kitty protocol.
-//!   - `iterm` / `iterm2` — force iTerm2 inline-image protocol.
-//!   - `sixel`         — force Sixel (icy_sixel encoder bundled with
-//!                        `ratatui-image`; no libsixel needed).
-//!   - anything else / unset — auto-detect via `Picker::from_query_stdio`.
+//!   - `off` / `none`         — disable image preview entirely.
+//!   - `halfblocks`           — force the unicode-halfblocks renderer.
+//!   - `kitty`                — force Kitty protocol.
+//!   - `iterm` / `iterm2`     — force iTerm2 inline-image protocol.
+//!   - `sixel`                — force Sixel (icy_sixel encoder bundled
+//!                              with `ratatui-image`; no libsixel needed).
+//!   - anything else / unset  — auto-detect via `Picker::from_query_stdio`.
 
 use ratatui_image::picker::{Picker, ProtocolType};
+
+/// Parsed form of the `REEF_IMAGE_PROTOCOL` override. `None` means the
+/// env var was unset / empty / unrecognised → auto-detect. `Some(Off)`
+/// means the user explicitly disabled image preview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtocolOverride {
+    Off,
+    Halfblocks,
+    Kitty,
+    Iterm2,
+    Sixel,
+}
+
+impl ProtocolOverride {
+    fn from_env() -> Option<Self> {
+        let raw = std::env::var("REEF_IMAGE_PROTOCOL").ok()?;
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" => Some(Self::Off),
+            "halfblocks" => Some(Self::Halfblocks),
+            "kitty" => Some(Self::Kitty),
+            "iterm" | "iterm2" => Some(Self::Iterm2),
+            "sixel" => Some(Self::Sixel),
+            _ => None,
+        }
+    }
+}
 
 /// Probe the current terminal for image-rendering capabilities.
 ///
@@ -34,40 +56,33 @@ use ratatui_image::picker::{Picker, ProtocolType};
 /// reads from stdin synchronously and the reply lines would otherwise
 /// fragment onto the TUI.
 pub fn probe_picker() -> Option<Picker> {
-    match std::env::var("REEF_IMAGE_PROTOCOL")
-        .ok()
-        .as_deref()
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("off") | Some("none") => return None,
-        Some("halfblocks") => {
+    match ProtocolOverride::from_env() {
+        Some(ProtocolOverride::Off) => None,
+        Some(ProtocolOverride::Halfblocks) => {
             // `Picker::halfblocks` uses a built-in 10×20 cell size — good
             // enough for aspect-ratio; halfblocks doesn't care about
             // pixel-accurate cell measurements.
-            return Some(Picker::halfblocks());
+            Some(Picker::halfblocks())
         }
-        Some(forced @ ("kitty" | "iterm" | "iterm2" | "sixel")) => {
+        Some(forced) => {
             // Honor the user's protocol choice, but still try the stdio
             // query so we get an accurate cell size for the terminal.
             // Fall back to halfblocks if the query fails (silent
             // terminal): at least we have *some* picker to carry the
             // protocol override onto.
             let mut p = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
-            let pt = match forced {
-                "kitty" => ProtocolType::Kitty,
-                "iterm" | "iterm2" => ProtocolType::Iterm2,
-                "sixel" => ProtocolType::Sixel,
-                _ => p.protocol_type(),
-            };
-            p.set_protocol_type(pt);
-            return Some(p);
+            p.set_protocol_type(match forced {
+                ProtocolOverride::Kitty => ProtocolType::Kitty,
+                ProtocolOverride::Iterm2 => ProtocolType::Iterm2,
+                ProtocolOverride::Sixel => ProtocolType::Sixel,
+                // Off and Halfblocks handled in earlier arms.
+                ProtocolOverride::Off | ProtocolOverride::Halfblocks => p.protocol_type(),
+            });
+            Some(p)
         }
-        _ => {}
+        // Default path: auto-detect. The call does a short round-trip; on
+        // a silent terminal ratatui-image returns an error and we fall
+        // through to `None` so the feature degrades to the metadata card.
+        None => Picker::from_query_stdio().ok(),
     }
-
-    // Default path: auto-detect. The call does a short round-trip; on a
-    // silent terminal ratatui-image returns an error and we fall through
-    // to `None` so the feature degrades to the metadata card.
-    Picker::from_query_stdio().ok()
 }

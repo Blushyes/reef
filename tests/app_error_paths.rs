@@ -6,26 +6,9 @@ use reef::app::App;
 use reef::ui::theme::Theme;
 use std::sync::Mutex;
 use tempfile::TempDir;
+use test_support::CwdGuard;
 
 static CWD_LOCK: Mutex<()> = Mutex::new(());
-
-struct CwdGuard {
-    original: std::path::PathBuf,
-}
-
-impl CwdGuard {
-    fn enter(path: &std::path::Path) -> Self {
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(path).unwrap();
-        Self { original }
-    }
-}
-
-impl Drop for CwdGuard {
-    fn drop(&mut self) {
-        let _ = std::env::set_current_dir(&self.original);
-    }
-}
 
 #[test]
 fn app_new_outside_git_repo_does_not_panic() {

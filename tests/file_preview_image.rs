@@ -15,31 +15,13 @@ use reef::ui::theme::Theme;
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
-use test_support::{HomeGuard, tempdir_repo, write_striped_png};
+use test_support::{CwdGuard, HomeGuard, tempdir_repo, write_striped_png};
 
 // HOME/CWD mutations are process-global and this file lives in its own
 // test binary, but still guard it — the lock cost is trivial and it
 // keeps the pattern consistent with `ui_snapshots.rs` in case other
 // integration tests get added to this binary later.
 static LOCK: Mutex<()> = Mutex::new(());
-
-struct CwdGuard {
-    original: std::path::PathBuf,
-}
-
-impl CwdGuard {
-    fn enter(path: &std::path::Path) -> Self {
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(path).unwrap();
-        Self { original }
-    }
-}
-
-impl Drop for CwdGuard {
-    fn drop(&mut self) {
-        let _ = std::env::set_current_dir(&self.original);
-    }
-}
 
 fn wait_for_preview(app: &mut App) {
     let deadline = Instant::now() + Duration::from_secs(3);

@@ -3,27 +3,7 @@
 
 use reef::git::{FileStatus, GitRepo, LineTag, RefLabel};
 use std::fs;
-use test_support::{commit_file, tempdir_repo, write_file};
-
-/// `GitRepo::open()` uses `Repository::discover()` from cwd. Helper switches
-/// cwd to a temp repo, opens, then restores cwd so tests don't bleed.
-struct CwdGuard {
-    original: std::path::PathBuf,
-}
-
-impl CwdGuard {
-    fn enter(path: &std::path::Path) -> Self {
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(path).unwrap();
-        Self { original }
-    }
-}
-
-impl Drop for CwdGuard {
-    fn drop(&mut self) {
-        let _ = std::env::set_current_dir(&self.original);
-    }
-}
+use test_support::{CwdGuard, commit_file, tempdir_repo, write_file};
 
 // All tests that change cwd must run serially — std::env::set_current_dir is
 // process-global. Guard via a mutex.

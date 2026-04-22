@@ -58,6 +58,28 @@ impl Drop for HomeGuard {
     }
 }
 
+/// Swap the process-wide current working directory for the duration of a
+/// test, and restore it on drop. Same serialisation warning as
+/// `HomeGuard` — `set_current_dir` is process-global, so callers must
+/// hold a test-file-local `Mutex<()>` for the guard's whole lifetime.
+pub struct CwdGuard {
+    original: std::path::PathBuf,
+}
+
+impl CwdGuard {
+    pub fn enter(path: &Path) -> Self {
+        let original = std::env::current_dir().expect("current_dir");
+        std::env::set_current_dir(path).expect("set_current_dir");
+        Self { original }
+    }
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.original);
+    }
+}
+
 /// Initialize a real git repository in a temp directory. Sets the required
 /// `user.name` and `user.email` config so commits don't depend on the caller's
 /// global git config (critical for CI).

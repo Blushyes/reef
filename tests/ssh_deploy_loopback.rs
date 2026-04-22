@@ -52,18 +52,28 @@ fn ssh_localhost_reachable() -> bool {
 /// `backend_loopback.rs`: `CARGO_BIN_EXE_*` doesn't cross crates in a
 /// workspace, so we walk `target/{debug,release}`.
 fn agent_bin() -> std::path::PathBuf {
+    if let Some(path) = option_env!("CARGO_BIN_EXE_reef-agent") {
+        return std::path::PathBuf::from(path);
+    }
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let root = std::path::PathBuf::from(manifest_dir);
-    for profile in ["debug", "release"] {
-        let candidate = root.join("target").join(profile).join("reef-agent");
-        if candidate.exists() {
-            return candidate;
+    // cargo-llvm-cov sets CARGO_TARGET_DIR to target/llvm-cov-target;
+    // check that first so coverage CI finds the binary.
+    let target_dirs: Vec<std::path::PathBuf> = std::env::var("CARGO_TARGET_DIR")
+        .map(|d| vec![std::path::PathBuf::from(d)])
+        .unwrap_or_default()
+        .into_iter()
+        .chain([root.join("target")])
+        .collect();
+    for target in &target_dirs {
+        for profile in ["debug", "release"] {
+            let candidate = target.join(profile).join("reef-agent");
+            if candidate.exists() {
+                return candidate;
+            }
         }
     }
-    panic!(
-        "reef-agent binary not found under target/{{debug,release}}/ — \
-         run `cargo build -p reef-agent` first"
-    );
+    panic!("reef-agent binary not found under target/{{debug,release}}");
 }
 
 struct HomeGuard {

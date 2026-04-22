@@ -178,9 +178,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // backend. Each iteration owns one `App` + one backend; the terminal
     // setup/teardown lives outside so the new session inherits the
     // existing alt-screen/mouse-capture state instead of flashing.
+    //
+    // `pending_connect_error` carries a connect failure from the *previous*
+    // iteration into the next App as a toast — `eprintln!` to stderr is
+    // invisible while the alt-screen is up, so we route through the toast
+    // queue instead.
+    let mut pending_connect_error: Option<String> = None;
     'session: loop {
         // App init
         let mut app = App::new_with_backend(theme, Arc::clone(&backend));
+        if let Some(msg) = pending_connect_error.take() {
+            app.toasts.push(Toast::error(msg));
+            // Re-open the picker so the user has a visible recovery path
+            // — they came here trying to connect to *something*.
+            app.open_hosts_picker();
+        }
 
         // First-run heuristic: if the user launched reef without `--ssh`
         // and the cwd isn't a repo, auto-open the hosts picker so they
@@ -334,8 +346,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue 'session;
                 }
                 Err(e) => {
-                    eprintln!("reef: failed to connect to {target_arg}: {e}");
-                    // Keep the previous backend and let the user try again.
+                    // Surface via the next App's toast queue (stderr
+                    // would be eaten by the alt-screen). The previous
+                    // backend is retained so the user can retry.
+                    pending_connect_error =
+                        Some(i18n::ssh_connect_failed(&target_arg, &e.to_string()));
                     continue 'session;
                 }
             }

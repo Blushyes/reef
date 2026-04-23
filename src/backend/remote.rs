@@ -271,6 +271,14 @@ impl RemoteBackend {
     }
 
     fn request<T: serde::de::DeserializeOwned>(&self, req: Request) -> Result<T, BackendError> {
+        self.request_with_timeout(req, DEFAULT_RPC_TIMEOUT)
+    }
+
+    fn request_with_timeout<T: serde::de::DeserializeOwned>(
+        &self,
+        req: Request,
+        timeout: Duration,
+    ) -> Result<T, BackendError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel::<Response>();
         // Without this guard, RPC timeouts / send errors leak `pending`
@@ -278,12 +286,12 @@ impl RemoteBackend {
         let _pending = MapGuard::register(&self.pending, id, tx, "pending")?;
         self.send_envelope(Envelope { id, body: req })?;
         let response = rx
-            .recv_timeout(DEFAULT_RPC_TIMEOUT)
+            .recv_timeout(timeout)
             .map_err(|e| BackendError::Rpc(format!("recv: {e}")))?;
         match response {
             Response::Ok { result, .. } => serde_json::from_value::<T>(result)
                 .map_err(|e| BackendError::Protocol(format!("response decode: {e}"))),
-            Response::Err { message, .. } => Err(BackendError::Rpc(message)),
+            Response::Err { code, message, .. } => Err(BackendError::from_wire(code, message)),
         }
     }
 
@@ -293,6 +301,31 @@ impl RemoteBackend {
     #[doc(hidden)]
     pub fn __pending_len_for_tests(&self) -> usize {
         self.pending.lock().map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Test-only entry to `request_with_timeout`, so the leak regression
+    /// test can drive the failure path (100ms timeout against a killed
+    /// agent) without having to wait the full `DEFAULT_RPC_TIMEOUT`.
+    #[doc(hidden)]
+    pub fn __request_with_timeout_for_tests<T: serde::de::DeserializeOwned>(
+        &self,
+        req: Request,
+        timeout: Duration,
+    ) -> Result<T, BackendError> {
+        self.request_with_timeout(req, timeout)
+    }
+
+    /// Test-only helper that kills the agent subprocess so subsequent
+    /// RPCs are guaranteed to fail (send hits BrokenPipe, or
+    /// recv_timeout never gets a response). Used by the PendingGuard
+    /// failure-path regression test; no production path should call
+    /// this.
+    #[doc(hidden)]
+    pub fn __kill_agent_for_tests(&self) {
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 
     /// Shut the agent down cleanly. Called by Drop; exposed for tests that
@@ -952,8 +985,8 @@ impl Backend for RemoteBackend {
                         truncated: completed.truncated,
                     });
                 }
-                Ok(Response::Err { message, .. }) => {
-                    return Err(BackendError::Rpc(message));
+                Ok(Response::Err { code, message, .. }) => {
+                    return Err(BackendError::from_wire(code, message));
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     // Loop back: drain more chunks, then try the

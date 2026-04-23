@@ -116,6 +116,10 @@ fn main() -> io::Result<()> {
         None => std::env::current_dir()?,
     };
     std::env::set_current_dir(&workdir)?;
+    // Canonicalise once so the symlink-escape guard on every `ReadFile`
+    // doesn't repeat the syscall. `workdir` is immutable for the
+    // agent's lifetime, so a single call covers every later request.
+    let workdir = std::fs::canonicalize(&workdir)?;
 
     let backend = Arc::new(LocalBackend::open_at(workdir.clone()));
     let stdout = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
@@ -226,44 +230,7 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
             }
         }
 
-        Request::ReadFile { path, max_bytes } => {
-            // Boundary check: refuse `..` / absolute paths so a malicious
-            // or buggy client can't `ReadFile { path: "../etc/passwd" }`.
-            // Other write ops route through `LocalBackend::resolve_rel`;
-            // this path bypasses the backend (so it can return
-            // `is_file: false` instead of NotFound), so we apply the
-            // same guard inline here.
-            reef::backend::local::resolve_rel_within(workdir, Path::new(&path))
-                .map_err(backend_err)
-                .and_then(|abs| {
-                    if !abs.is_file() {
-                        serde_json::to_value(ReadFileResponse {
-                            is_file: false,
-                            bytes: Vec::new(),
-                            size: 0,
-                        })
-                        .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}")))
-                    } else {
-                        match std::fs::read(&abs) {
-                            Ok(raw) => {
-                                let size = raw.len() as u64;
-                                let bytes = if size > max_bytes {
-                                    raw[..max_bytes as usize].to_vec()
-                                } else {
-                                    raw
-                                };
-                                serde_json::to_value(ReadFileResponse {
-                                    is_file: true,
-                                    bytes,
-                                    size,
-                                })
-                                .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}")))
-                            }
-                            Err(e) => Err((ErrorCode::Io, e.to_string())),
-                        }
-                    }
-                })
-        }
+        Request::ReadFile { path, max_bytes } => read_file_response(workdir, &path, max_bytes),
 
         Request::GitStatus => match backend.git_status() {
             Ok(snap) => serde_json::to_value(StatusSnapshotDto {
@@ -554,20 +521,50 @@ fn dispatch_search_content(
 }
 
 fn backend_err(e: reef::backend::BackendError) -> (ErrorCode, String) {
+    (e.wire_code(), e.to_string())
+}
+
+/// Agent-side `ReadFile` dispatcher. Rejects lexical escapes *and*
+/// symlink escapes — a workdir containing `link → /etc/passwd` would
+/// otherwise let a malicious client exfiltrate any file the agent user
+/// can read. `NotFound` is folded into `is_file: false` so the client
+/// contract stays "no error on missing file"; `PathEscape` and other
+/// filesystem errors surface through the normal error channel.
+fn read_file_response(
+    workdir: &Path,
+    rel: &str,
+    max_bytes: u64,
+) -> Result<serde_json::Value, (ErrorCode, String)> {
     use reef::backend::BackendError;
-    let code = match &e {
-        BackendError::NotFound => ErrorCode::NotFound,
-        BackendError::Io(_) => ErrorCode::Io,
-        BackendError::Git(_) => ErrorCode::Git,
-        BackendError::Rpc(_) => ErrorCode::Other,
-        BackendError::Protocol(_) => ErrorCode::Protocol,
-        BackendError::Unimplemented(_) => ErrorCode::Unimplemented,
-        BackendError::PathExists(_) => ErrorCode::PathExists,
-        BackendError::PathEscape(_) => ErrorCode::PathEscape,
-        BackendError::TrashUnavailable(_) => ErrorCode::TrashUnavailable,
-        BackendError::Other(_) => ErrorCode::Other,
+    let missing = || {
+        serde_json::to_value(ReadFileResponse {
+            is_file: false,
+            bytes: Vec::new(),
+            size: 0,
+        })
+        .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}")))
     };
-    (code, e.to_string())
+    let abs = match reef::backend::local::canonical_child_within(workdir, Path::new(rel)) {
+        Ok(p) => p,
+        Err(BackendError::NotFound) => return missing(),
+        Err(e) => return Err(backend_err(e)),
+    };
+    if !abs.is_file() {
+        return missing();
+    }
+    let raw = std::fs::read(&abs).map_err(|e| (ErrorCode::Io, e.to_string()))?;
+    let size = raw.len() as u64;
+    let bytes = if size > max_bytes {
+        raw[..max_bytes as usize].to_vec()
+    } else {
+        raw
+    };
+    serde_json::to_value(ReadFileResponse {
+        is_file: true,
+        bytes,
+        size,
+    })
+    .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}")))
 }
 
 /// Probe once for `gio` and cache the result. `0` = unknown, `1` =

@@ -82,6 +82,47 @@ impl From<io::Error> for BackendError {
     }
 }
 
+impl BackendError {
+    /// Reconstruct a `BackendError` from a wire-level `(ErrorCode, message)`
+    /// pair. Inverse of `wire_code` — keep the two arms in sync; the
+    /// exhaustive `match` below forces an update whenever a new
+    /// `ErrorCode` variant lands.
+    pub fn from_wire(code: reef_proto::ErrorCode, message: String) -> Self {
+        use reef_proto::ErrorCode;
+        match code {
+            ErrorCode::NotFound => BackendError::NotFound,
+            ErrorCode::Io => BackendError::Io(message),
+            ErrorCode::Git => BackendError::Git(message),
+            ErrorCode::Protocol => BackendError::Protocol(message),
+            ErrorCode::Unimplemented => BackendError::Unimplemented(message),
+            ErrorCode::PathExists => BackendError::PathExists(message),
+            ErrorCode::PathEscape => BackendError::PathEscape(message),
+            ErrorCode::TrashUnavailable => BackendError::TrashUnavailable(message),
+            ErrorCode::Other => BackendError::Other(message),
+        }
+    }
+
+    /// Pick the wire-level `ErrorCode` that best represents this error.
+    /// Inverse of `from_wire`. `Rpc` collapses to `Other` because it's a
+    /// client-side condition that never appears on the wire going the
+    /// other direction.
+    pub fn wire_code(&self) -> reef_proto::ErrorCode {
+        use reef_proto::ErrorCode;
+        match self {
+            BackendError::NotFound => ErrorCode::NotFound,
+            BackendError::Io(_) => ErrorCode::Io,
+            BackendError::Git(_) => ErrorCode::Git,
+            BackendError::Rpc(_) => ErrorCode::Other,
+            BackendError::Protocol(_) => ErrorCode::Protocol,
+            BackendError::Unimplemented(_) => ErrorCode::Unimplemented,
+            BackendError::PathExists(_) => ErrorCode::PathExists,
+            BackendError::PathEscape(_) => ErrorCode::PathEscape,
+            BackendError::TrashUnavailable(_) => ErrorCode::TrashUnavailable,
+            BackendError::Other(_) => ErrorCode::Other,
+        }
+    }
+}
+
 /// Snapshot of the repo status returned by `git_status`.
 #[derive(Debug, Clone)]
 pub struct StatusSnapshot {

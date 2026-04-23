@@ -589,7 +589,10 @@ const MAX_TEXT_PROBE_BYTES: u64 = 10 * 1024 * 1024;
 /// - `image/*` → probe dimensions, decode via the `image` crate, return
 ///   `PreviewBody::Image`. Oversized files/dimensions or unsupported
 ///   formats (SVG/AVIF/HEIC) become `Binary(TooLarge | UnsupportedImage)`.
-/// - non-image MIME (PDF/zip/video/audio/font…) → `Binary(NonImage)`
+/// - `text/*` (HTML/XML-shaped text; `.vue`, `.svelte`, etc. land here
+///   because `infer` sniffs them as `text/html`) → fall through to the
+///   text decode path so the preview shows source, not "binary file".
+/// - other MIME (PDF/zip/video/audio/font…) → `Binary(NonImage)`
 ///   with the MIME so the UI can show "(application/pdf · 2.4 MB)".
 /// - `infer` returns `None` → legacy 8KB null-byte heuristic decides
 ///   text vs `Binary(NullBytes)`.
@@ -645,7 +648,13 @@ pub fn load_preview(
     }
 
     // ── Non-image binary branch ─────────────────────────────────────
-    if let Some(m) = mime {
+    // `text/*` stays out of this branch — `infer` sniffs `.vue`,
+    // `.svelte`, and HTML-ish fragments as `text/html`, and the user
+    // wants to read the source, not a "binary file" stub. Fall
+    // through to the text decode path below.
+    if let Some(m) = mime
+        && !m.starts_with("text/")
+    {
         return Some(PreviewContent {
             file_path: rel_str,
             body: PreviewBody::Binary(BinaryInfo::new(file_size, Some(m), BinaryReason::NonImage)),
@@ -1173,6 +1182,28 @@ mod tests {
                 assert_eq!(info.mime, Some("application/pdf"));
             }
             other => panic!("expected Binary(NonImage), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_preview_vue_sfc_renders_as_text() {
+        // `.vue` single-file components start with `<template>`, which
+        // `infer` sniffs as `text/html`. Before this regression guard
+        // the MIME branch classified any non-image match as binary, so
+        // Vue/Svelte/XML source files showed "binary file" in the
+        // preview panel instead of their actual contents.
+        let tmp = tempfile::tempdir().unwrap();
+        let sfc = b"<template>\n  <div>hello</div>\n</template>\n";
+        write_bytes(tmp.path(), "General.vue", sfc);
+
+        let content = load_preview(tmp.path(), Path::new("General.vue"), true, true).expect("some");
+        match content.body {
+            PreviewBody::Text { lines, .. } => {
+                assert_eq!(lines[0], "<template>");
+                assert_eq!(lines[1], "  <div>hello</div>");
+                assert_eq!(lines[2], "</template>");
+            }
+            other => panic!("expected Text body for .vue, got {other:?}"),
         }
     }
 

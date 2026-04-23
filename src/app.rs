@@ -1955,9 +1955,8 @@ impl App {
         // when the staged tree is empty; we don't emulate auto-stage-on-
         // commit yet).
         if self.staged_files.is_empty() {
-            self.git_status.commit_error = Some(
-                crate::i18n::t(crate::i18n::Msg::CommitNothingStaged).to_string(),
-            );
+            self.git_status.commit_error =
+                Some(crate::i18n::t(crate::i18n::Msg::CommitNothingStaged).to_string());
             return;
         }
         let backend = Arc::clone(&self.backend);

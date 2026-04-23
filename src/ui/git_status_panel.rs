@@ -1212,18 +1212,22 @@ fn push_commit_box(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Them
         theme.fg_secondary
     };
     // Top border
-    rows.push(Row::new(vec![RowSpan::styled(
-        format!(" ┌ {} ", t(Msg::CommitMessagePlaceholder)),
-        Style::default().fg(border_color),
-    )])
-    .on_click("git.commitFocus", Value::Null));
-
-    if !has_text && !editing {
-        rows.push(Row::new(vec![RowSpan::styled(
-            " │ ".to_string(),
+    rows.push(
+        Row::new(vec![RowSpan::styled(
+            format!(" ┌ {} ", t(Msg::CommitMessagePlaceholder)),
             Style::default().fg(border_color),
         )])
-        .on_click("git.commitFocus", Value::Null));
+        .on_click("git.commitFocus", Value::Null),
+    );
+
+    if !has_text && !editing {
+        rows.push(
+            Row::new(vec![RowSpan::styled(
+                " │ ".to_string(),
+                Style::default().fg(border_color),
+            )])
+            .on_click("git.commitFocus", Value::Null),
+        );
     } else {
         // Walk the buffer line by line, emitting one row each. Track
         // a running byte offset so we can decide which line holds
@@ -1285,11 +1289,13 @@ fn push_commit_box(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Them
     }
 
     // Bottom border
-    rows.push(Row::new(vec![RowSpan::styled(
-        " └".to_string(),
-        Style::default().fg(border_color),
-    )])
-    .on_click("git.commitFocus", Value::Null));
+    rows.push(
+        Row::new(vec![RowSpan::styled(
+            " └".to_string(),
+            Style::default().fg(border_color),
+        )])
+        .on_click("git.commitFocus", Value::Null),
+    );
 
     // Action row: [✓ Commit] + hint. Button is dimmed when the
     // draft or staged tree is empty — click still works but the

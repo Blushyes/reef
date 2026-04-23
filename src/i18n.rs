@@ -450,7 +450,11 @@ pub fn push_failed_toast(e: &str) -> String {
 /// bar items. The full text still surfaces in the in-panel
 /// `commit_error` banner.
 pub fn commit_failed_toast(e: &str) -> String {
-    let first = e.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or(e);
+    let first = e
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or(e);
     match lang() {
         Lang::Zh => format!("提交失败: {first}"),
         Lang::En => format!("Commit failed: {first}"),

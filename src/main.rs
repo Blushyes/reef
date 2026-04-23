@@ -19,10 +19,15 @@ use reef::ui::toast::Toast;
 use reef::{editor, input, ui};
 use std::io;
 use std::panic;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Minimal argv parsing. Flags recognised:
+///   <PATH>                    Positional: open this local directory instead
+///                             of the current working directory. Supports
+///                             leading `~/` expansion. Mutually exclusive
+///                             with `--ssh` / `--agent-exec`.
 ///   --agent-exec <COMMAND>    Spawn the given shell-split command as a
 ///                             reef-agent subprocess and drive the UI through
 ///                             it. Typical value: `ssh host reef-agent --stdio`.
@@ -39,6 +44,7 @@ fn parse_args() -> Result<AppArgs, String> {
     let mut args = std::env::args().skip(1);
     let mut agent_exec: Option<String> = None;
     let mut ssh_target: Option<String> = None;
+    let mut path: Option<String> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => {
@@ -57,15 +63,28 @@ fn parse_args() -> Result<AppArgs, String> {
                         .ok_or_else(|| "--ssh requires a [user@]host[:path] value".to_string())?,
                 );
             }
-            other => return Err(format!("unknown argument: {other}")),
+            other if other.starts_with('-') => {
+                return Err(format!("unknown argument: {other}"));
+            }
+            other => {
+                if path.is_some() {
+                    return Err(format!("unexpected extra path argument: {other}"));
+                }
+                path = Some(other.to_string());
+            }
         }
     }
-    if agent_exec.is_some() && ssh_target.is_some() {
-        return Err("--agent-exec and --ssh are mutually exclusive".into());
+    let modes = [agent_exec.is_some(), ssh_target.is_some(), path.is_some()]
+        .into_iter()
+        .filter(|b| *b)
+        .count();
+    if modes > 1 {
+        return Err("--agent-exec, --ssh, and <PATH> are mutually exclusive".into());
     }
     Ok(AppArgs {
         agent_exec,
         ssh_target,
+        path,
     })
 }
 
@@ -74,6 +93,7 @@ fn print_usage() {
     eprintln!();
     eprintln!("USAGE:");
     eprintln!("    reef                            # open cwd with local backend");
+    eprintln!("    reef <PATH>                     # open PATH (supports ~/)");
     eprintln!(
         "    reef --ssh user@host            # open remote HOME on host (agent auto-installed)"
     );
@@ -89,6 +109,38 @@ fn print_usage() {
 struct AppArgs {
     agent_exec: Option<String>,
     ssh_target: Option<String>,
+    path: Option<String>,
+}
+
+/// Expand a leading `~/` (or bare `~`) against `$HOME`. Any other form is
+/// returned verbatim — absolute, relative, `./`, etc. are all handled by
+/// the subsequent canonicalize step.
+fn expand_tilde(raw: &str) -> Result<PathBuf, String> {
+    if raw == "~" {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "cannot expand `~`: $HOME not set".to_string())
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| "cannot expand `~`: $HOME not set".to_string())?;
+        let mut p = PathBuf::from(home);
+        p.push(rest);
+        Ok(p)
+    } else {
+        Ok(PathBuf::from(raw))
+    }
+}
+
+/// Resolve a user-supplied local path: expand `~/`, make absolute,
+/// verify it exists and is a directory.
+fn resolve_local_path(raw: &str) -> Result<PathBuf, String> {
+    let expanded = expand_tilde(raw)?;
+    let canonical =
+        std::fs::canonicalize(&expanded).map_err(|e| format!("cannot open `{raw}`: {e}"))?;
+    if !canonical.is_dir() {
+        return Err(format!("`{raw}` is not a directory"));
+    }
+    Ok(canonical)
 }
 
 /// Split a `[user@]host[:path]` target. Returns `(host_with_user, path)`;
@@ -149,6 +201,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("--agent-exec value is empty".into());
         }
         Arc::new(RemoteBackend::spawn(&argv)?)
+    } else if let Some(raw) = parsed.path.as_deref() {
+        // Switch the process cwd so spawned subprocesses ($EDITOR, git hooks)
+        // inherit the same workdir — matches reef-agent's --workdir path.
+        let workdir = resolve_local_path(raw)?;
+        std::env::set_current_dir(&workdir)?;
+        Arc::new(LocalBackend::open_at(workdir))
     } else {
         Arc::new(LocalBackend::open_cwd()?)
     };
@@ -210,6 +268,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // session swaps — those always have a backend picked already.
         if parsed.ssh_target.is_none()
             && parsed.agent_exec.is_none()
+            && parsed.path.is_none()
             && !app.backend.has_repo()
             && app.hosts_picker.all_hosts.is_empty()
         {

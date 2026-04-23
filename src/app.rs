@@ -111,6 +111,27 @@ pub struct GitStatusState {
     pub push_error: Option<String>,
     pub scroll: usize,
     pub ahead_behind: Option<(usize, usize)>,
+
+    // ─── Commit input (VSCode-style "Source Control" message box) ───
+    /// Draft commit message buffer. Freeform UTF-8 — newlines are
+    /// literal `\n`, which the render layer splits into one row per
+    /// line and the commit shell-out passes through on stdin
+    /// unchanged.
+    pub commit_message: String,
+    /// Byte offset of the caret inside `commit_message`. Kept in sync
+    /// by the shared `input_edit` helpers so cursor motion matches the
+    /// other text inputs in the app (search, quick-open, global-search).
+    pub commit_cursor: usize,
+    /// `true` while the commit box is focused for typing — gates
+    /// character input in `handle_key_git` so `s`/`u`/`d` chords don't
+    /// fire when the user is writing a message. Cleared by Esc, by
+    /// submitting the commit, or by clicking anywhere outside the input.
+    pub commit_editing: bool,
+    /// Last `git commit` failure surfaced as an in-panel banner, same
+    /// lifetime semantics as `push_error`. Kept out of the toast queue
+    /// so the user can read a multi-line hook rejection without it
+    /// timing out.
+    pub commit_error: Option<String>,
 }
 
 /// State for the inline commit graph sidebar.
@@ -408,6 +429,14 @@ pub struct App {
     /// `App::tick`; once the result is consumed we drop the channel.
     pub push_rx: Option<mpsc::Receiver<(bool, Result<(), String>)>>,
 
+    /// `true` while a background `git commit` is in flight. Blocks
+    /// additional commit attempts and lets the status panel render a
+    /// "提交中…" indicator.
+    pub commit_in_flight: bool,
+    /// Receives the commit worker's result. Same drain-on-tick pattern
+    /// as `push_rx`.
+    pub commit_rx: Option<mpsc::Receiver<Result<(), String>>>,
+
     /// Host-owned fs watcher channel. `None` when the watcher couldn't start —
     /// the sender inside the thread was dropped so `try_recv` returns `Disconnected`.
     pub fs_watcher_rx: Option<mpsc::Receiver<()>>,
@@ -691,6 +720,8 @@ impl App {
             toasts: Vec::new(),
             push_in_flight: false,
             push_rx: None,
+            commit_in_flight: false,
+            commit_rx: None,
             fs_watcher_rx,
             should_quit: false,
             select_mode: false,
@@ -1900,6 +1931,99 @@ impl App {
         }
     }
 
+    /// Kick off a `git commit` in the background. Snapshots the current
+    /// draft message, hands it to a worker thread, and returns. Empty /
+    /// whitespace-only drafts are rejected client-side (same contract as
+    /// the VSCode SCM "Commit" button, which is disabled until the
+    /// input has content) so the worker never hits the `commit_at`
+    /// guard. A commit already in flight drops the request to avoid
+    /// racing pre-commit hooks against a concurrent run.
+    pub fn run_commit(&mut self) {
+        if self.commit_in_flight {
+            return;
+        }
+        if !self.backend.has_repo() {
+            return;
+        }
+        let message = self.git_status.commit_message.trim().to_string();
+        if message.is_empty() {
+            return;
+        }
+        // Nothing staged → fail fast with an in-panel banner rather than
+        // hitting `git commit` for a "nothing to commit" error
+        // response. Matches VSCode behaviour (Commit button is disabled
+        // when the staged tree is empty; we don't emulate auto-stage-on-
+        // commit yet).
+        if self.staged_files.is_empty() {
+            self.git_status.commit_error =
+                Some(crate::i18n::t(crate::i18n::Msg::CommitNothingStaged).to_string());
+            return;
+        }
+        let backend = Arc::clone(&self.backend);
+        let (tx, rx) = mpsc::channel();
+        self.commit_rx = Some(rx);
+        self.commit_in_flight = true;
+        std::thread::spawn(move || {
+            let result = backend.commit(&message).map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Called from `tick()`. Folds the commit worker's result into App
+    /// state — success clears the draft, pops a toast, and marks caches
+    /// stale (HEAD moved, graph cache key is now wrong); failure lands
+    /// in `git_status.commit_error` as a banner so the user can read
+    /// hook output without losing their draft.
+    fn drain_commit_result(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let Some(rx) = self.commit_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.commit_in_flight = false;
+                self.commit_rx = None;
+                match result {
+                    Ok(()) => {
+                        use crate::i18n::{Msg, t};
+                        self.git_status.commit_error = None;
+                        self.git_status.commit_message.clear();
+                        self.git_status.commit_cursor = 0;
+                        self.git_status.commit_editing = false;
+                        // Previously-selected file is almost certainly no
+                        // longer in staged/unstaged after the commit —
+                        // reload the diff so the right pane doesn't
+                        // linger on stale hunks until the next nav.
+                        self.load_diff();
+                        self.toasts.push(Toast::info(t(Msg::CommitSuccess)));
+                    }
+                    Err(e) => {
+                        self.git_status.commit_error = Some(e.clone());
+                        self.toasts
+                            .push(Toast::error(crate::i18n::commit_failed_toast(&e)));
+                    }
+                }
+                // A new commit advances HEAD — bust the graph cache and
+                // mark status stale so the new HEAD / ahead-behind land
+                // on the next coordinator pass. Mirrors
+                // `drain_push_result`.
+                self.git_graph.cache_key = None;
+                self.git_status_load.mark_stale();
+                self.graph_load.mark_stale();
+            }
+            Err(TryRecvError::Empty) => {
+                // Worker still running.
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.commit_in_flight = false;
+                self.commit_rx = None;
+                self.toasts.push(Toast::error(crate::i18n::t(
+                    crate::i18n::Msg::CommitThreadCrashed,
+                )));
+            }
+        }
+    }
+
     /// Kick off a `git push` in the background. Returns immediately; the
     /// result is collected in `App::tick` when the worker thread posts it
     /// back through `push_rx`. If a push is already in flight the new
@@ -2823,6 +2947,7 @@ impl App {
         self.drain_preview_resize_responses();
         self.drain_preview_protocol_builds();
         self.drain_push_result();
+        self.drain_commit_result();
         self.kick_active_tab_work();
         self.tick_place_mode_auto_expand();
         self.drain_task_results();

@@ -763,8 +763,142 @@ fn handle_key_graph(key: KeyEvent, app: &mut App) {
     }
 }
 
+/// Route a key event to the commit-box buffer when the Git tab's
+/// commit input is focused. Mirrors the text-input contract used by
+/// `handle_key_search_input_mode`: typing fills the draft, standard
+/// nav / edit keys move the cursor, Esc blurs, Ctrl+Enter submits,
+/// bare Enter inserts a newline (subject + body pattern). Returns
+/// `true` when the key was consumed.
+fn handle_key_git_commit(key: KeyEvent, app: &mut App, ctrl: bool, alt: bool) -> bool {
+    use crate::app::Panel;
+    if app.active_panel != Panel::Files || !app.git_status.commit_editing {
+        return false;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            app.git_status.commit_editing = false;
+            true
+        }
+        KeyCode::Enter if ctrl => {
+            app.run_commit();
+            true
+        }
+        KeyCode::Enter => {
+            crate::input_edit::insert_char(
+                &mut app.git_status.commit_message,
+                &mut app.git_status.commit_cursor,
+                '\n',
+            );
+            true
+        }
+        KeyCode::Backspace if alt || ctrl => {
+            crate::input_edit::delete_word_backward(
+                &mut app.git_status.commit_message,
+                &mut app.git_status.commit_cursor,
+            );
+            true
+        }
+        KeyCode::Backspace => {
+            crate::input_edit::backspace(
+                &mut app.git_status.commit_message,
+                &mut app.git_status.commit_cursor,
+            );
+            true
+        }
+        KeyCode::Delete if alt || ctrl => {
+            crate::input_edit::delete_word_forward(
+                &mut app.git_status.commit_message,
+                &mut app.git_status.commit_cursor,
+            );
+            true
+        }
+        KeyCode::Delete => {
+            crate::input_edit::delete_char_forward(
+                &mut app.git_status.commit_message,
+                &mut app.git_status.commit_cursor,
+            );
+            true
+        }
+        KeyCode::Left if alt || ctrl => {
+            crate::input_edit::move_cursor_word_backward(
+                &app.git_status.commit_message,
+                &mut app.git_status.commit_cursor,
+            );
+            true
+        }
+        KeyCode::Right if alt || ctrl => {
+            crate::input_edit::move_cursor_word_forward(
+                &app.git_status.commit_message,
+                &mut app.git_status.commit_cursor,
+            );
+            true
+        }
+        KeyCode::Left => {
+            crate::input_edit::move_cursor(
+                &app.git_status.commit_message,
+                &mut app.git_status.commit_cursor,
+                -1,
+            );
+            true
+        }
+        KeyCode::Right => {
+            crate::input_edit::move_cursor(
+                &app.git_status.commit_message,
+                &mut app.git_status.commit_cursor,
+                1,
+            );
+            true
+        }
+        KeyCode::Home => {
+            app.git_status.commit_cursor = 0;
+            true
+        }
+        KeyCode::End => {
+            app.git_status.commit_cursor = app.git_status.commit_message.len();
+            true
+        }
+        KeyCode::Char('u') if ctrl => {
+            crate::input_edit::clear(
+                &mut app.git_status.commit_message,
+                &mut app.git_status.commit_cursor,
+            );
+            true
+        }
+        KeyCode::Char('w') if ctrl => {
+            crate::input_edit::delete_word_backward(
+                &mut app.git_status.commit_message,
+                &mut app.git_status.commit_cursor,
+            );
+            true
+        }
+        KeyCode::Char('a') if ctrl => {
+            app.git_status.commit_cursor = 0;
+            true
+        }
+        KeyCode::Char('e') if ctrl => {
+            app.git_status.commit_cursor = app.git_status.commit_message.len();
+            true
+        }
+        KeyCode::Char(c) if !ctrl => {
+            crate::input_edit::insert_char(
+                &mut app.git_status.commit_message,
+                &mut app.git_status.commit_cursor,
+                c,
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
 fn handle_key_git(key: KeyEvent, app: &mut App) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    // Commit-box input mode owns the keyboard while focused so the
+    // letter chords below (s/u/d/…) don't fire mid-message.
+    if handle_key_git_commit(key, app, ctrl, alt) {
+        return;
+    }
     match key.code {
         KeyCode::Up | KeyCode::Char('k') if !ctrl => match app.active_panel {
             Panel::Files => app.navigate_files(-1),

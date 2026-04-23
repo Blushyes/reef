@@ -285,6 +285,10 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
             Ok(()) => Ok(serde_json::json!({"ok": true})),
             Err(e) => Err(backend_err(e)),
         },
+        Request::Commit { message } => match backend.commit(&message) {
+            Ok(()) => Ok(serde_json::json!({"ok": true})),
+            Err(e) => Err(backend_err(e)),
+        },
 
         Request::ListCommits { limit } => match backend.list_commits(limit as usize) {
             Ok(list) => {

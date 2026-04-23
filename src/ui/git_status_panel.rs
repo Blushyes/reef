@@ -402,6 +402,22 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             app.load_diff();
             true
         }
+        "git.commitFocus" => {
+            app.git_status.commit_editing = true;
+            true
+        }
+        "git.commitBlur" => {
+            app.git_status.commit_editing = false;
+            true
+        }
+        "git.commitSubmit" => {
+            app.run_commit();
+            true
+        }
+        "git.dismissCommitError" => {
+            app.git_status.commit_error = None;
+            true
+        }
         _ => false,
     }
 }
@@ -643,6 +659,48 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
         ]));
         rows.push(Row::blank());
     }
+
+    // Commit in-flight banner — while the worker is committing, the
+    // input is read-only (commit_in_flight gates run_commit) and the
+    // UI shows a spinner.
+    if app.commit_in_flight {
+        rows.push(Row::new(vec![RowSpan::styled(
+            t(Msg::CommittingHint),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        rows.push(Row::blank());
+    }
+
+    // Commit error banner — mirrors push_error. Sticks around until
+    // the user clicks [dismiss] or starts a new commit attempt.
+    if let Some(ref err) = status.commit_error {
+        let mut msg = err.clone();
+        truncate_in_place(&mut msg, max_path);
+        rows.push(
+            Row::new(vec![
+                RowSpan::styled(
+                    t(Msg::CommitFailedPrefix),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                RowSpan::styled(msg, Style::default().fg(theme.fg_primary)),
+                RowSpan::styled(
+                    t(Msg::DismissClose),
+                    Style::default().fg(theme.fg_secondary),
+                ),
+            ])
+            .on_click("git.dismissCommitError", Value::Null),
+        );
+        rows.push(Row::blank());
+    }
+
+    // Commit message box + Commit button. Anchored just above the
+    // staged/unstaged sections to mirror VSCode's Source Control
+    // layout. Editing is routed through `git.commit*` commands so
+    // mouse and keyboard paths share the same buffer mutation code.
+    push_commit_box(&mut rows, app, max_path, theme);
+    rows.push(Row::blank());
 
     // View mode toggle
     let mode_label = if status.tree_mode {
@@ -1124,6 +1182,186 @@ fn section_header(
     }
 
     Row::new(spans).on_click(toggle_cmd, Value::Null)
+}
+
+/// Render the VSCode-style commit message box.
+///
+/// Layout (single column, the right-hand diff pane stays untouched):
+///   ┌─ Commit message ─┐
+///   │ subject…          │
+///   │ (body line …)     │
+///   └───────────────────┘
+///   [ ✓ Commit ]  (Ctrl+Enter · Esc)
+///
+/// - Empty + unfocused: shows a dimmed placeholder string so the box
+///   communicates its purpose before the user clicks.
+/// - Focused: the caret is drawn as a reverse-video block at
+///   `commit_cursor` so the user can see where typing will land.
+/// - Multi-line messages are split on `\n` and rendered as
+///   successive rows. Long single lines are truncated with `…` to
+///   stay inside the sidebar width; the full buffer is preserved in
+///   state and ships to `git commit -F -` verbatim.
+fn push_commit_box(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Theme) {
+    let msg = &app.git_status.commit_message;
+    let editing = app.git_status.commit_editing;
+    let cursor = app.git_status.commit_cursor.min(msg.len());
+    let has_text = !msg.trim().is_empty();
+    let border_color = if editing {
+        theme.accent
+    } else {
+        theme.fg_secondary
+    };
+    // Top border
+    rows.push(
+        Row::new(vec![RowSpan::styled(
+            format!(" ┌ {} ", t(Msg::CommitMessagePlaceholder)),
+            Style::default().fg(border_color),
+        )])
+        .on_click("git.commitFocus", Value::Null),
+    );
+
+    if !has_text && !editing {
+        rows.push(
+            Row::new(vec![RowSpan::styled(
+                " │ ".to_string(),
+                Style::default().fg(border_color),
+            )])
+            .on_click("git.commitFocus", Value::Null),
+        );
+    } else {
+        // Walk the buffer line by line, emitting one row each. Track
+        // a running byte offset so we can decide which line holds
+        // the caret and compute its intra-line column.
+        let mut offset: usize = 0;
+        let lines: Vec<&str> = msg.split('\n').collect();
+        let last_idx = lines.len().saturating_sub(1);
+        for (i, line) in lines.iter().enumerate() {
+            let line_start = offset;
+            let line_end = offset + line.len();
+            let cursor_in_line = editing
+                && cursor >= line_start
+                && (cursor < line_end
+                    || (cursor == line_end && (i == last_idx || cursor == msg.len())));
+            // Truncate overly long lines so the box stays inside
+            // the sidebar budget. Budget is in *display columns*
+            // (via UnicodeWidthStr) not chars, so a CJK-heavy
+            // message line doesn't overflow the sidebar — each
+            // ideograph counts as 2 cells on most terminals.
+            let budget = max_path.saturating_sub(4).max(1);
+            let display = truncate_to_width(line, budget);
+            let mut spans = vec![RowSpan::styled(
+                " │ ".to_string(),
+                Style::default().fg(border_color),
+            )];
+            if cursor_in_line {
+                let col_bytes = cursor - line_start;
+                // Convert byte offset to char offset so the caret
+                // lands on a grapheme boundary in the displayed line.
+                let before_chars = line[..col_bytes.min(line.len())]
+                    .chars()
+                    .count()
+                    .min(budget);
+                let (before, after) = split_chars(&display, before_chars);
+                spans.push(RowSpan::plain(before));
+                // Caret glyph: reverse-video space so it shows at
+                // end-of-line too. When there's a char under the
+                // caret, render it with reverse-video so the user
+                // sees which char they're on.
+                let (caret, rest) = split_chars(&after, 1);
+                let caret_glyph = if caret.is_empty() {
+                    " ".to_string()
+                } else {
+                    caret
+                };
+                spans.push(RowSpan::styled(
+                    caret_glyph,
+                    Style::default().add_modifier(Modifier::REVERSED),
+                ));
+                spans.push(RowSpan::plain(rest));
+            } else if display.is_empty() {
+                spans.push(RowSpan::plain(" "));
+            } else {
+                spans.push(RowSpan::plain(display));
+            }
+            rows.push(Row::new(spans).on_click("git.commitFocus", Value::Null));
+            offset = line_end + 1; // +1 for the consumed '\n'
+        }
+    }
+
+    // Bottom border
+    rows.push(
+        Row::new(vec![RowSpan::styled(
+            " └".to_string(),
+            Style::default().fg(border_color),
+        )])
+        .on_click("git.commitFocus", Value::Null),
+    );
+
+    // Action row: [✓ Commit] + hint. Button is dimmed when the
+    // draft or staged tree is empty — click still works but the
+    // toast/banner tells the user why nothing happened.
+    let enabled = has_text && !app.staged_files.is_empty() && !app.commit_in_flight;
+    let (btn_fg, btn_bg) = if enabled {
+        (Color::Black, Color::Green)
+    } else {
+        (theme.chrome_fg, theme.chrome_muted_fg)
+    };
+    rows.push(Row::new(vec![
+        RowSpan::plain("  "),
+        RowSpan {
+            text: t(Msg::CommitButton).to_string(),
+            style: Style::default()
+                .fg(btn_fg)
+                .bg(btn_bg)
+                .add_modifier(Modifier::BOLD),
+            click: Some(("git.commitSubmit".into(), Value::Null)),
+            dbl: None,
+        },
+        RowSpan::plain("  "),
+        RowSpan::styled(
+            t(Msg::CommitHint).to_string(),
+            Style::default().fg(theme.fg_secondary),
+        ),
+    ]));
+}
+
+/// Split `s` into `(first n chars, rest)` in char units so truncation
+/// respects grapheme-ish boundaries instead of slicing mid-UTF-8.
+/// Used by `push_commit_box` to draw the caret glyph between
+/// before/after runs.
+fn split_chars(s: &str, n: usize) -> (String, String) {
+    let mut chars = s.chars();
+    let before: String = (&mut chars).take(n).collect();
+    let after: String = chars.collect();
+    (before, after)
+}
+
+/// Clip `s` so its rendered width is ≤ `max_cols` display columns
+/// (via `UnicodeWidthStr`). Appends an `…` when truncation happens.
+/// Used by `push_commit_box` instead of char-count clipping so
+/// wide-column glyphs (CJK, emoji) don't overflow the sidebar.
+fn truncate_to_width(s: &str, max_cols: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    if max_cols == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(s) <= max_cols {
+        return s.to_string();
+    }
+    // Reserve one column for the trailing ellipsis.
+    let cap = max_cols.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in s.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > cap {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+    out
 }
 
 fn push_indicator_row(ahead: usize, behind: usize) -> Option<Row> {

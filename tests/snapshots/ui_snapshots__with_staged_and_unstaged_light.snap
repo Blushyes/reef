@@ -1,20 +1,20 @@
 ---
 source: tests/ui_snapshots.rs
-assertion_line: 281
+assertion_line: 454
 expression: output
 ---
  reef  [TMPDIR]  ⎇ master
  📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph           1:Files 2:Search 3:Git 4:Graph
+  ┌ Message (commit sta│
+  │                    │
+  └                    │
+    ✓ Commit   (Ctrl+En│
+                       │
  View: list            │
                        │
  ⌄ Changes  2 Stage all│
-   new.txt +1 U + ↺    │
+   new.txt +1 U + ↺    │                 Select a file to view diff
    ...txt +1 -1 M + ↺  │
-                       │
-                       │
-                       │
-                       │                 Select a file to view diff
-                       │
                        │
                        │
                        │

@@ -710,6 +710,70 @@ pub fn push_at(workdir: &Path, force: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Commit the staged index at `workdir` with `message`. Shells out to
+/// `git commit -F -` (message via stdin) for the same reason `push_at`
+/// does: respects the user's pre-commit / commit-msg hooks, GPG signing
+/// config (`commit.gpgsign`, `user.signingkey`), `user.name`/`user.email`,
+/// and any `commit.template` / `commit.cleanup` behaviour — things that
+/// libgit2's `Repository::commit` would otherwise reimplement piecemeal
+/// and still miss the hook story entirely.
+///
+/// Free function (not a `GitRepo` method) so the background worker
+/// thread can call it: `GitRepo` holds a non-Send libgit2 handle and
+/// can't cross thread boundaries.
+///
+/// An empty / whitespace-only `message` returns an error without
+/// invoking git — matches the UI invariant that the Commit button is
+/// disabled when the draft is empty. `-F -` avoids a temp file and
+/// passes the message bytes through unchanged.
+pub fn commit_at(workdir: &Path, message: &str) -> Result<(), String> {
+    use std::io::Write;
+    if message.trim().is_empty() {
+        return Err("empty commit message".to_string());
+    }
+    let mut child = std::process::Command::new("git")
+        .current_dir(workdir)
+        .args(["commit", "-F", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "git executable not found on PATH — commit requires a `git` binary \
+                 on the host running the backend (install git on the remote to enable commit)"
+                    .to_string()
+            } else {
+                format!("failed to run git: {e}")
+            }
+        })?;
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "failed to open git stdin".to_string())?;
+        stdin
+            .write_all(message.as_bytes())
+            .map_err(|e| format!("failed to write commit message: {e}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("failed to wait on git: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let err = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            "commit failed".to_string()
+        };
+        return Err(err);
+    }
+    Ok(())
+}
+
 impl GitRepo {
     // ── commit history / refs ──────────────────────────────────────────────
 

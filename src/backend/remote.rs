@@ -626,6 +626,13 @@ impl Backend for RemoteBackend {
         Ok(())
     }
 
+    fn commit(&self, message: &str) -> Result<(), BackendError> {
+        let _: serde_json::Value = self.request(Request::Commit {
+            message: message.to_string(),
+        })?;
+        Ok(())
+    }
+
     fn list_commits(&self, limit: usize) -> Result<Vec<CommitInfo>, BackendError> {
         let list: Vec<reef_proto::CommitInfoDto> = self.request(Request::ListCommits {
             limit: limit as u64,

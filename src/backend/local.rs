@@ -382,6 +382,10 @@ impl Backend for LocalBackend {
         crate::git::push_at(&self.workdir, force).map_err(BackendError::Git)
     }
 
+    fn commit(&self, message: &str) -> Result<(), BackendError> {
+        crate::git::commit_at(&self.workdir, message).map_err(BackendError::Git)
+    }
+
     fn list_commits(&self, limit: usize) -> Result<Vec<CommitInfo>, BackendError> {
         Ok(self.repo()?.list_commits(limit))
     }

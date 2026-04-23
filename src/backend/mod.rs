@@ -314,6 +314,11 @@ pub trait Backend: Send + Sync {
 
     fn push(&self, force: bool) -> Result<(), BackendError>;
 
+    /// Commit the staged index with `message`. Same shell-out rationale
+    /// as `push` — respects hooks, signing, and the user's git config.
+    /// Errors from `git commit` bubble up as `BackendError::Git`.
+    fn commit(&self, message: &str) -> Result<(), BackendError>;
+
     // ─── git: history ───────────────────────────────────────────────────────
     fn list_commits(&self, limit: usize) -> Result<Vec<CommitInfo>, BackendError>;
     fn list_refs(&self) -> Result<HashMap<String, Vec<RefLabel>>, BackendError>;

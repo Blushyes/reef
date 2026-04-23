@@ -67,6 +67,8 @@ pub enum Msg {
     PushSuccess,
     ForcePushSuccess,
     PushThreadCrashed,
+    CommitSuccess,
+    CommitThreadCrashed,
     ClipboardCopied,
     ClipboardCopyFailed,
 
@@ -92,6 +94,14 @@ pub enum Msg {
     UnstageAll,
     DiscardAll,
     NoFiles,
+
+    // Commit box
+    CommitMessagePlaceholder,
+    CommitButton,
+    CommittingHint,
+    CommitFailedPrefix,
+    CommitHint,
+    CommitNothingStaged,
 
     // Diff panel
     DiffEmpty,
@@ -193,6 +203,8 @@ fn t_zh(m: Msg) -> &'static str {
         PushSuccess => "推送成功",
         ForcePushSuccess => "强制推送成功",
         PushThreadCrashed => "推送线程异常退出，请重试",
+        CommitSuccess => "提交成功",
+        CommitThreadCrashed => "提交线程异常退出，请重试",
         ClipboardCopied => "已复制到剪贴板",
         ClipboardCopyFailed => "复制到剪贴板失败",
         PushingHint => "  ⋯ 推送中…",
@@ -216,6 +228,12 @@ fn t_zh(m: Msg) -> &'static str {
         UnstageAll => "取消全部",
         DiscardAll => "全部撤回",
         NoFiles => "  无文件",
+        CommitMessagePlaceholder => "输入提交消息…",
+        CommitButton => " ✓ 提交 ",
+        CommittingHint => "  ⋯ 提交中…",
+        CommitFailedPrefix => "  ✖ 提交失败: ",
+        CommitHint => "(Ctrl+Enter 提交 · Esc 取消)",
+        CommitNothingStaged => "没有可提交的已暂存文件",
         DiffEmpty => "选择一个文件查看 diff",
         PreviewEmpty => "选择一个文件预览内容",
         PreviewImageUnavailable => "当前终端不支持图片预览",
@@ -300,6 +318,8 @@ fn t_en(m: Msg) -> &'static str {
         PushSuccess => "Push succeeded",
         ForcePushSuccess => "Force push succeeded",
         PushThreadCrashed => "Push worker crashed, please retry",
+        CommitSuccess => "Commit succeeded",
+        CommitThreadCrashed => "Commit worker crashed, please retry",
         ClipboardCopied => "Copied to clipboard",
         ClipboardCopyFailed => "Clipboard copy failed",
         PushingHint => "  ⋯ Pushing…",
@@ -323,6 +343,12 @@ fn t_en(m: Msg) -> &'static str {
         UnstageAll => "Unstage all",
         DiscardAll => "Discard all",
         NoFiles => "  (no files)",
+        CommitMessagePlaceholder => "Message (commit staged)…",
+        CommitButton => " ✓ Commit ",
+        CommittingHint => "  ⋯ Committing…",
+        CommitFailedPrefix => "  ✖ Commit failed: ",
+        CommitHint => "(Ctrl+Enter to commit · Esc to cancel)",
+        CommitNothingStaged => "Nothing staged to commit",
         DiffEmpty => "Select a file to view diff",
         PreviewEmpty => "Select a file to preview",
         PreviewImageUnavailable => "image preview unavailable in this terminal",
@@ -415,6 +441,19 @@ pub fn push_failed_toast(e: &str) -> String {
     match lang() {
         Lang::Zh => format!("推送失败: {e}"),
         Lang::En => format!("Push failed: {e}"),
+    }
+}
+
+/// Toast variant for commit failure. Commit errors are often multi-line
+/// (hook output, rejected commit-msg template, etc.); the toast picks
+/// the first non-empty line so it stays readable next to other status
+/// bar items. The full text still surfaces in the in-panel
+/// `commit_error` banner.
+pub fn commit_failed_toast(e: &str) -> String {
+    let first = e.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or(e);
+    match lang() {
+        Lang::Zh => format!("提交失败: {first}"),
+        Lang::En => format!("Commit failed: {first}"),
     }
 }
 

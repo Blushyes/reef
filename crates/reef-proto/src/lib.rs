@@ -56,7 +56,11 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 ///       multi-commit range mode. v4 agents would error `Unknown op`
 ///       on these requests, which a v5 client surfaces as a toast — so
 ///       a hard bump keeps the auto-redeploy path honest.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// - v6: adds `Commit { message }` so the Git tab can create commits
+///       from the staged index. A v5 agent would respond `Unknown op`
+///       to the new request, so bumping surfaces the stale agent as a
+///       toast rather than a silent no-op.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Encode a single envelope-level value to `writer` using the
 /// length-prefixed framing. The caller is expected to flush.
@@ -190,6 +194,13 @@ pub enum Request {
 
     Push {
         force: bool,
+    },
+
+    /// Create a commit from the staged index with `message`. Agent-side
+    /// dispatches to `Backend::commit` which shells out to `git commit -F -`;
+    /// wire format on success is `{"ok": true}`.
+    Commit {
+        message: String,
     },
 
     // ── Git: history ────

@@ -5,20 +5,22 @@ description: How to cut a reef release — version bump, tag push, and the GitHu
 
 # Releasing reef
 
-Reef releases are driven by **git tags matching `v*`**. Pushing such a tag is the single trigger for `.github/workflows/release.yml`, which does the rest automatically: binaries for five targets, npm publish of `@reef-tui/cli` + five platform subpackages, GitHub Release with assets. You never run `cargo publish`, never `npm publish` by hand, never upload binaries manually. The contract is **bump Cargo.toml, commit, tag, push**.
+Reef releases are driven by **git tags matching `v*`**. Pushing such a tag is the single trigger for `.github/workflows/release.yml`, which does the rest automatically: `reef` + `reef-agent` binaries for five targets, npm publish of `@reef-tui/cli` + five platform subpackages, GitHub Release with assets. You never run `cargo publish`, never `npm publish` by hand, never upload binaries manually. The contract is **bump Cargo.toml, commit, tag, push**.
 
 ## What a `v*` tag push actually runs
 
 `.github/workflows/release.yml`:
 
-1. **Build matrix** — `cargo build --release --locked` for:
+1. **Build matrix** — for each target, builds **`reef-agent` first, then `reef`** (`cargo build --release --locked -p <crate>`). reef-agent goes first because reef's `build.rs` embeds the freshly-built agent as the upload-fallback blob (see `src/agent_deploy/upload.rs`). Targets:
    - `aarch64-apple-darwin`, `x86_64-apple-darwin`
    - `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` (via `cross`)
    - `x86_64-pc-windows-msvc`
-2. **npm platform subpackages** — publishes `@reef-tui/cli-{darwin-arm64,darwin-x64,linux-arm64,linux-x64,win32-x64}`. Each subpackage's `package.json` version is overwritten at publish time to `${TAG#v}`.
+
+   Each row uploads two artifacts: `reef-<platform>` and `reef-agent-<platform>`.
+2. **npm platform subpackages** — publishes `@reef-tui/cli-{darwin-arm64,darwin-x64,linux-arm64,linux-x64,win32-x64}`. Each subpackage bundles **only the `reef` binary** (the agent is embedded inside it). Each subpackage's `package.json` version is overwritten at publish time to `${TAG#v}`.
 3. **npm main package** — publishes `@reef-tui/cli` with `optionalDependencies` pinned to the same version.
 4. **GitHub Release** — via `softprops/action-gh-release@v2`:
-   - Attaches `reef-{darwin,linux}-*.tar.gz` and `reef-win32-x64.zip` archives.
+   - Attaches ten archives — `reef-{darwin-arm64,darwin-x64,linux-arm64,linux-x64}.tar.gz` + `reef-win32-x64.zip`, and the same set prefixed `reef-agent-`. The standalone agent archives are for users running it outside the upload-fallback path (e.g. preseeding it on a remote host).
    - Has `generate_release_notes: true` — this **appends** auto-generated `## What's Changed` notes to whatever body the release already has; it does not overwrite a pre-existing body.
 
 Implications:
@@ -150,12 +152,15 @@ npm view @reef-tui/cli version                     # matches ${NEW#v}?
 npm view @reef-tui/cli-darwin-arm64 version        # and subpackages
 ```
 
-Expected assets on the Release:
+Expected assets on the Release (**10 total**):
 - `reef-darwin-arm64.tar.gz`, `reef-darwin-x64.tar.gz`
 - `reef-linux-arm64.tar.gz`, `reef-linux-x64.tar.gz`
 - `reef-win32-x64.zip`
+- `reef-agent-darwin-arm64.tar.gz`, `reef-agent-darwin-x64.tar.gz`
+- `reef-agent-linux-arm64.tar.gz`, `reef-agent-linux-x64.tar.gz`
+- `reef-agent-win32-x64.zip`
 
-If any are missing, the matrix job for that target failed — open `gh run view <run_id>`, check which job, re-run just the failed jobs with `gh run rerun <run_id> --failed`. A partial build does **not** block the npm publish jobs that already ran successfully, so your npm package may be live without the missing platform. Decide: rerun (good if the failure was transient) or cut a patch release (if the failure is real).
+If any are missing, the matrix job for that target failed — open `gh run view <run_id>`, check which job, re-run just the failed jobs with `gh run rerun <run_id> --failed`. A partial build does **not** block the npm publish jobs that already ran successfully, so your npm package may be live without the missing platform. Decide: rerun (good if the failure was transient) or cut a patch release (if the failure is real). Note: because reef's `build.rs` embeds `reef-agent`, a reef-agent build failure cascades into the reef build for that target — the two binaries for a given platform fail or succeed together.
 
 ## Pitfalls we've paid for
 

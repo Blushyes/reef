@@ -190,11 +190,10 @@ fn pending_map_cleaned_on_rpc_failure() {
 
     r.__kill_agent_for_tests();
 
-    let res: Result<reef_proto::HandshakeResponse, _> = r
-        .__request_with_timeout_for_tests(
-            reef_proto::Request::Handshake,
-            std::time::Duration::from_millis(100),
-        );
+    let res: Result<reef_proto::HandshakeResponse, _> = r.__request_with_timeout_for_tests(
+        reef_proto::Request::Handshake,
+        std::time::Duration::from_millis(100),
+    );
     assert!(res.is_err(), "expected failure after agent kill, got Ok");
     assert_eq!(
         r.__pending_len_for_tests(),

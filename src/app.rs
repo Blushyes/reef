@@ -1991,6 +1991,11 @@ impl App {
                         self.git_status.commit_message.clear();
                         self.git_status.commit_cursor = 0;
                         self.git_status.commit_editing = false;
+                        // Previously-selected file is almost certainly no
+                        // longer in staged/unstaged after the commit —
+                        // reload the diff so the right pane doesn't
+                        // linger on stale hunks until the next nav.
+                        self.load_diff();
                         self.toasts.push(Toast::info(t(Msg::CommitSuccess)));
                     }
                     Err(e) => {

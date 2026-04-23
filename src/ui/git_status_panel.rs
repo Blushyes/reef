@@ -1239,15 +1239,12 @@ fn push_commit_box(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Them
                 && (cursor < line_end
                     || (cursor == line_end && (i == last_idx || cursor == msg.len())));
             // Truncate overly long lines so the box stays inside
-            // the sidebar budget. Cursor clipping falls out of
-            // `char_count.min(truncated_len)` below.
+            // the sidebar budget. Budget is in *display columns*
+            // (via UnicodeWidthStr) not chars, so a CJK-heavy
+            // message line doesn't overflow the sidebar — each
+            // ideograph counts as 2 cells on most terminals.
             let budget = max_path.saturating_sub(4).max(1);
-            let mut display = (*line).to_string();
-            let chars: Vec<char> = display.chars().collect();
-            if chars.len() > budget {
-                display = chars.into_iter().take(budget.saturating_sub(1)).collect();
-                display.push('…');
-            }
+            let display = truncate_to_width(line, budget);
             let mut spans = vec![RowSpan::styled(
                 " │ ".to_string(),
                 Style::default().fg(border_color),
@@ -1331,6 +1328,34 @@ fn split_chars(s: &str, n: usize) -> (String, String) {
     let before: String = (&mut chars).take(n).collect();
     let after: String = chars.collect();
     (before, after)
+}
+
+/// Clip `s` so its rendered width is ≤ `max_cols` display columns
+/// (via `UnicodeWidthStr`). Appends an `…` when truncation happens.
+/// Used by `push_commit_box` instead of char-count clipping so
+/// wide-column glyphs (CJK, emoji) don't overflow the sidebar.
+fn truncate_to_width(s: &str, max_cols: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    if max_cols == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(s) <= max_cols {
+        return s.to_string();
+    }
+    // Reserve one column for the trailing ellipsis.
+    let cap = max_cols.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in s.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > cap {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+    out
 }
 
 fn push_indicator_row(ahead: usize, behind: usize) -> Option<Row> {

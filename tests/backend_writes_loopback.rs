@@ -171,6 +171,39 @@ fn pending_map_does_not_leak_on_repeated_requests() {
 }
 
 #[test]
+fn pending_map_cleaned_on_rpc_failure() {
+    // The whole point of `PendingGuard` is the *failure* path: if the
+    // read loop never delivers a Response (agent died, socket dropped,
+    // RPC timed out), the guard's `Drop` has to remove the in-flight
+    // slot — otherwise the map grows unbounded across transient SSH
+    // blips. The success-path test above wouldn't catch a regression
+    // where the guard only fires on Ok(Response).
+    //
+    // Setup: spawn a real agent, complete the handshake, kill it. The
+    // stdin pipe closes, so `send_envelope` may or may not fail
+    // depending on buffering — either way we get an Err. If the write
+    // buffers, `recv_timeout(100ms)` fires and PendingGuard::Drop
+    // cleans up. We assert both: Err surfaces, and `pending_len == 0`.
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let r_tmp = TempDir::new().unwrap();
+    let r = spawn_remote(r_tmp.path());
+
+    r.__kill_agent_for_tests();
+
+    let res: Result<reef_proto::HandshakeResponse, _> = r
+        .__request_with_timeout_for_tests(
+            reef_proto::Request::Handshake,
+            std::time::Duration::from_millis(100),
+        );
+    assert!(res.is_err(), "expected failure after agent kill, got Ok");
+    assert_eq!(
+        r.__pending_len_for_tests(),
+        0,
+        "pending map must be empty after failed RPC",
+    );
+}
+
+#[test]
 fn read_file_rejects_path_escape() {
     let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let l_tmp = TempDir::new().unwrap();

@@ -10,7 +10,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, mpsc};
+use std::sync::{Mutex, OnceLock, mpsc};
 
 use super::{
     Backend, BackendError, ContentMatchHit, ContentSearchCompleted, ContentSearchRequest,
@@ -71,6 +71,12 @@ impl PreviewCache {
 /// Local filesystem + libgit2 backend.
 pub struct LocalBackend {
     workdir: PathBuf,
+    /// Cached `fs::canonicalize(workdir)`. Populated lazily on the first
+    /// symlink-safe read because `workdir` is immutable after
+    /// construction — without the cache every `read_file` / preview
+    /// would pay one extra syscall to canonicalise the root before
+    /// resolving the target.
+    canon_workdir: OnceLock<PathBuf>,
     /// Decoded-preview LRU. Re-selecting a file — whether via cursor
     /// bounce, quick-open, or fs-watcher refresh with no actual change
     /// — returns the cached `PreviewContent` (deep-clone, ~ms for the
@@ -88,6 +94,7 @@ impl LocalBackend {
         let workdir = std::env::current_dir()?;
         Ok(Self {
             workdir,
+            canon_workdir: OnceLock::new(),
             preview_cache: Mutex::new(PreviewCache::default()),
         })
     }
@@ -96,6 +103,7 @@ impl LocalBackend {
     pub fn open_at(workdir: PathBuf) -> Self {
         Self {
             workdir,
+            canon_workdir: OnceLock::new(),
             preview_cache: Mutex::new(PreviewCache::default()),
         }
     }
@@ -113,6 +121,18 @@ impl LocalBackend {
     /// traversal. Accepts the root itself (`""` or `.`).
     fn resolve_rel(&self, rel: &Path) -> Result<PathBuf, BackendError> {
         resolve_rel_within(&self.workdir, rel)
+    }
+
+    fn canonical_workdir(&self) -> Result<&Path, BackendError> {
+        if let Some(p) = self.canon_workdir.get() {
+            return Ok(p);
+        }
+        let canon = canonicalize_or_backend_err(&self.workdir, "canonicalize workdir")?;
+        let _ = self.canon_workdir.set(canon);
+        Ok(self
+            .canon_workdir
+            .get()
+            .expect("just populated via OnceLock::set"))
     }
 }
 
@@ -144,6 +164,38 @@ pub fn resolve_rel_within(root: &Path, rel: &Path) -> Result<PathBuf, BackendErr
         }
     }
     Ok(root.join(rel))
+}
+
+/// `fs::canonicalize` lifted into `BackendError`. Missing path → `NotFound`;
+/// anything else → `Io` with the provided `context` prefix.
+fn canonicalize_or_backend_err(path: &Path, context: &str) -> Result<PathBuf, BackendError> {
+    std::fs::canonicalize(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => BackendError::NotFound,
+        _ => BackendError::Io(format!("{context}: {e}")),
+    })
+}
+
+/// Canonicalising variant of `resolve_rel_within` for *read* paths.
+/// Follows symlinks and rejects targets outside `canon_root` — without
+/// this, a workdir containing `link → /etc/passwd` would let a caller
+/// read the symlink target. Only matters in remote/agent mode (malicious
+/// workdir threat model); applied uniformly so local and remote behave
+/// the same.
+///
+/// `canon_root` MUST already be canonicalised (callers typically cache
+/// it — see `LocalBackend::canonical_workdir`). TOCTOU: a symlink swap
+/// between this call and the subsequent open is possible; `openat2`
+/// would close it but is Linux-only.
+pub fn canonical_child_within(canon_root: &Path, rel: &Path) -> Result<PathBuf, BackendError> {
+    let joined = resolve_rel_within(canon_root, rel)?;
+    let canon_target = canonicalize_or_backend_err(&joined, "canonicalize target")?;
+    if !canon_target.starts_with(canon_root) {
+        return Err(BackendError::PathEscape(format!(
+            "symlink escapes workdir: {}",
+            rel.display()
+        )));
+    }
+    Ok(canon_target)
 }
 
 impl Backend for LocalBackend {
@@ -220,6 +272,15 @@ impl Backend for LocalBackend {
             }
         }
 
+        // Symlink-escape gate only fires on cache miss — hits return
+        // content we already validated on a prior read, so no fresh
+        // filesystem traversal is about to happen. `file_tree::load_preview`
+        // below does a raw `File::open` that follows symlinks without
+        // any boundary check, so without this gate a workdir-relative
+        // symlink could exfiltrate arbitrary files.
+        let canon_root = self.canonical_workdir().ok()?;
+        canonical_child_within(canon_root, rel_path).ok()?;
+
         let fresh = file_tree::load_preview(&self.workdir, rel_path, dark, wants_decoded_image)?;
 
         if let Ok(mut cache) = self.preview_cache.lock() {
@@ -229,10 +290,12 @@ impl Backend for LocalBackend {
     }
 
     fn read_file(&self, rel_path: &Path, max_bytes: u64) -> Result<Vec<u8>, BackendError> {
-        // Route through `resolve_rel` so the workdir is a hard boundary
-        // even on read paths — every other op honours this; without it a
-        // malicious or buggy client could `ReadFile { path: "../etc/passwd" }`.
-        let full = self.resolve_rel(rel_path)?;
+        // `canonical_child_within` enforces the workdir boundary *after*
+        // symlink resolution. Without it a workdir-relative symlink
+        // would let a caller exfiltrate any file the backend process
+        // can read — critical in remote/agent mode where the caller is
+        // untrusted relative to the host filesystem.
+        let full = canonical_child_within(self.canonical_workdir()?, rel_path)?;
         if !full.is_file() {
             return Err(BackendError::NotFound);
         }

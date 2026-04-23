@@ -1220,12 +1220,18 @@ fn push_commit_box(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Them
         .on_click("git.commitFocus", Value::Null),
     );
 
+    // Trailing pad width so the whole interior of the box is a click
+    // target for `git.commitFocus`, not just the `│` and caret cells.
+    let pad_to = |used: usize| -> String { " ".repeat(max_path.saturating_sub(used)) };
+
     if !has_text && !editing {
+        let prefix = " │ ";
+        let used = UnicodeWidthStr::width(prefix);
         rows.push(
-            Row::new(vec![RowSpan::styled(
-                " │ ".to_string(),
-                Style::default().fg(border_color),
-            )])
+            Row::new(vec![
+                RowSpan::styled(prefix.to_string(), Style::default().fg(border_color)),
+                RowSpan::plain(pad_to(used)),
+            ])
             .on_click("git.commitFocus", Value::Null),
         );
     } else {
@@ -1283,6 +1289,11 @@ fn push_commit_box(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Them
             } else {
                 spans.push(RowSpan::plain(display));
             }
+            let used: usize = spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.text.as_str()))
+                .sum();
+            spans.push(RowSpan::plain(pad_to(used)));
             rows.push(Row::new(spans).on_click("git.commitFocus", Value::Null));
             offset = line_end + 1; // +1 for the consumed '\n'
         }
@@ -1306,23 +1317,26 @@ fn push_commit_box(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Them
     } else {
         (theme.chrome_fg, theme.chrome_muted_fg)
     };
-    rows.push(Row::new(vec![
-        RowSpan::plain("  "),
-        RowSpan {
-            text: t(Msg::CommitButton).to_string(),
-            style: Style::default()
-                .fg(btn_fg)
-                .bg(btn_bg)
-                .add_modifier(Modifier::BOLD),
-            click: Some(("git.commitSubmit".into(), Value::Null)),
-            dbl: None,
-        },
-        RowSpan::plain("  "),
-        RowSpan::styled(
-            t(Msg::CommitHint).to_string(),
-            Style::default().fg(theme.fg_secondary),
-        ),
-    ]));
+    rows.push(
+        Row::new(vec![
+            RowSpan::plain("  "),
+            RowSpan {
+                text: t(Msg::CommitButton).to_string(),
+                style: Style::default()
+                    .fg(btn_fg)
+                    .bg(btn_bg)
+                    .add_modifier(Modifier::BOLD),
+                click: Some(("git.commitSubmit".into(), Value::Null)),
+                dbl: None,
+            },
+            RowSpan::plain("  "),
+            RowSpan::styled(
+                t(Msg::CommitHint).to_string(),
+                Style::default().fg(theme.fg_secondary),
+            ),
+        ])
+        .on_click("git.commitSubmit", Value::Null),
+    );
 }
 
 /// Split `s` into `(first n chars, rest)` in char units so truncation

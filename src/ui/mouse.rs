@@ -13,6 +13,9 @@ pub enum ClickAction {
     ToggleStaged,
     ToggleUnstaged,
     StartDragSplit,
+    /// Graph tab 3-col 布局下,中间 commit 列与右侧 diff 列之间的拖拽
+    /// 分界。跟 `StartDragSplit` 互不干扰。
+    StartDragGraphDiffSplit,
     SwitchTab(Tab),
     TreeClick(usize),
     /// Click on a row in the quick-open palette. The `usize` indexes

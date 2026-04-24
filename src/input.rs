@@ -247,9 +247,20 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             return;
         }
         KeyCode::BackTab => {
-            app.active_panel = match app.active_panel {
-                Panel::Files => Panel::Diff,
-                Panel::Diff => Panel::Files,
+            // Graph tab 3-col cycles Files → Commit → Diff → Files so
+            // Shift+Tab reaches the new middle column. Other tabs (and the
+            // Graph 2-col fallback) keep the two-way toggle.
+            app.active_panel = if app.graph_uses_three_col() {
+                match app.active_panel {
+                    Panel::Files => Panel::Commit,
+                    Panel::Commit => Panel::Diff,
+                    Panel::Diff => Panel::Files,
+                }
+            } else {
+                match app.active_panel {
+                    Panel::Files | Panel::Commit => Panel::Diff,
+                    Panel::Diff => Panel::Files,
+                }
             };
             app.search.clear();
             return;
@@ -366,6 +377,10 @@ fn handle_key_search(key: KeyEvent, app: &mut App) {
                 handle_key_search_list_mode(key, app, ctrl);
             }
         }
+        // Search tab has no middle column. `normalize_active_panel`
+        // demotes Commit elsewhere, but guard here in case a key lands
+        // mid-transition.
+        Panel::Commit => {}
         Panel::Diff => {
             // Preview panel on the right — same scrolling keys as the
             // Files-tab Diff panel. `/` is handled at the global level
@@ -650,6 +665,76 @@ fn handle_key_search_input_mode(key: KeyEvent, app: &mut App, ctrl: bool, alt: b
     }
 }
 
+/// Set `active_panel` based on which column the cursor hit. For tabs with
+/// only two columns this is a Files/Diff toggle; Graph 3-col adds a
+/// Commit variant for the middle column. Called on every Down(Left) so
+/// the user's subsequent arrow keys go to whatever they just clicked —
+/// matching the VSCode focus-follows-click behaviour, and avoiding the
+/// surprise where the scroll keys "aim" at a different column than the
+/// mouse just poked.
+fn focus_panel_under_cursor(app: &mut App, column: u16, total_width: u16) {
+    let graph_x = total_width * app.split_percent / 100;
+    if column < graph_x {
+        app.active_panel = Panel::Files;
+        return;
+    }
+    // Right of the graph split. 3-col Graph splits this further.
+    if let Some(diff_start) = graph_diff_column_start(app, total_width) {
+        if column >= diff_start {
+            app.active_panel = Panel::Diff;
+        } else {
+            app.active_panel = Panel::Commit;
+        }
+    } else {
+        app.active_panel = Panel::Diff;
+    }
+}
+
+/// Screen column where the Graph 3-col diff column starts, mirroring the
+/// layout math in `ui::render`. Returns `None` when the Graph tab isn't in
+/// 3-col mode (no standalone diff column), so callers can fall through to
+/// the 2-col routing. Stays in sync with `ui::render` by using the same
+/// floors/clamps — update both together if the ratio constants change.
+fn graph_diff_column_start(app: &App, total_width: u16) -> Option<u16> {
+    if !app.graph_uses_three_col() {
+        return None;
+    }
+    let graph_x = total_width * app.split_percent / 100;
+    let remainder = total_width.saturating_sub(graph_x);
+    let diff_w_raw = remainder as u32 * app.graph_diff_split_percent as u32 / 100;
+    let diff_w = (diff_w_raw as u16)
+        .max(20)
+        .min(remainder.saturating_sub(20));
+    Some(total_width.saturating_sub(diff_w))
+}
+
+/// Route a vertical-scroll delta to whichever Graph-tab panel currently
+/// owns focus. Panel::Files (the graph sidebar) is handled by the caller
+/// — its delta is tied to visual-mode extend vs graph navigation and
+/// doesn't reduce to a plain scroll. Panel::Commit always scrolls the
+/// commit-detail row list (metadata + files). Panel::Diff scrolls the
+/// standalone diff column in 3-col mode, or the whole commit-detail
+/// panel in 2-col fallback (where the diff is rendered inline).
+fn graph_scroll_right_panel(app: &mut App, delta: i32) {
+    use ui::commit_detail_panel;
+    match app.active_panel {
+        Panel::Files => {}
+        Panel::Commit => commit_detail_panel::scroll(app, delta),
+        Panel::Diff => {
+            if app.graph_uses_three_col() {
+                let s = &mut app.commit_detail.file_diff_scroll;
+                *s = if delta < 0 {
+                    s.saturating_sub((-delta) as usize)
+                } else {
+                    s.saturating_add(delta as usize)
+                };
+            } else {
+                commit_detail_panel::scroll(app, delta);
+            }
+        }
+    }
+}
+
 fn handle_key_graph(key: KeyEvent, app: &mut App) {
     use ui::{commit_detail_panel, git_graph_panel};
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -661,50 +746,54 @@ fn handle_key_graph(key: KeyEvent, app: &mut App) {
     // a convenience for terminals that *do* forward the modifier.
     let in_visual = app.git_graph.in_visual_mode() && app.active_panel == Panel::Files;
     match key.code {
-        KeyCode::Up | KeyCode::Char('k') if !ctrl => match app.active_panel {
-            Panel::Files => {
+        KeyCode::Up | KeyCode::Char('k') if !ctrl => {
+            if app.active_panel == Panel::Files {
                 if shift || in_visual {
                     app.extend_graph_selection(-1);
                 } else {
                     git_graph_panel::handle_key(app, "k");
                 }
+            } else {
+                graph_scroll_right_panel(app, -1);
             }
-            Panel::Diff => commit_detail_panel::scroll(app, -1),
-        },
-        KeyCode::Down | KeyCode::Char('j') if !ctrl => match app.active_panel {
-            Panel::Files => {
+        }
+        KeyCode::Down | KeyCode::Char('j') if !ctrl => {
+            if app.active_panel == Panel::Files {
                 if shift || in_visual {
                     app.extend_graph_selection(1);
                 } else {
                     git_graph_panel::handle_key(app, "j");
                 }
+            } else {
+                graph_scroll_right_panel(app, 1);
             }
-            Panel::Diff => commit_detail_panel::scroll(app, 1),
-        },
+        }
         // Readline-style nav aliases (parallel to what palettes and
         // Files/Git tabs bind).
-        KeyCode::Char('p' | 'k') if ctrl => match app.active_panel {
-            Panel::Files => {
+        KeyCode::Char('p' | 'k') if ctrl => {
+            if app.active_panel == Panel::Files {
                 if shift || in_visual {
                     app.extend_graph_selection(-1);
                 } else {
                     git_graph_panel::handle_key(app, "k");
                 }
+            } else {
+                graph_scroll_right_panel(app, -1);
             }
-            Panel::Diff => commit_detail_panel::scroll(app, -1),
-        },
-        KeyCode::Char('n' | 'j') if ctrl => match app.active_panel {
-            Panel::Files => {
+        }
+        KeyCode::Char('n' | 'j') if ctrl => {
+            if app.active_panel == Panel::Files {
                 if shift || in_visual {
                     app.extend_graph_selection(1);
                 } else {
                     git_graph_panel::handle_key(app, "j");
                 }
+            } else {
+                graph_scroll_right_panel(app, 1);
             }
-            Panel::Diff => commit_detail_panel::scroll(app, 1),
-        },
-        KeyCode::PageUp => match app.active_panel {
-            Panel::Files => {
+        }
+        KeyCode::PageUp => {
+            if app.active_panel == Panel::Files {
                 if shift || in_visual {
                     app.extend_graph_selection(-10);
                 } else {
@@ -712,11 +801,12 @@ fn handle_key_graph(key: KeyEvent, app: &mut App) {
                         git_graph_panel::handle_key(app, "k");
                     }
                 }
+            } else {
+                graph_scroll_right_panel(app, -20);
             }
-            Panel::Diff => commit_detail_panel::scroll(app, -20),
-        },
-        KeyCode::PageDown => match app.active_panel {
-            Panel::Files => {
+        }
+        KeyCode::PageDown => {
+            if app.active_panel == Panel::Files {
                 if shift || in_visual {
                     app.extend_graph_selection(10);
                 } else {
@@ -724,9 +814,10 @@ fn handle_key_graph(key: KeyEvent, app: &mut App) {
                         git_graph_panel::handle_key(app, "j");
                     }
                 }
+            } else {
+                graph_scroll_right_panel(app, 20);
             }
-            Panel::Diff => commit_detail_panel::scroll(app, 20),
-        },
+        }
         // `V` (uppercase = Shift+v) toggles visual mode. Entering: anchor
         // collapses onto the cursor (is_range() stays false until the user
         // actually extends), so the status bar can distinguish "armed but
@@ -902,13 +993,15 @@ fn handle_key_git(key: KeyEvent, app: &mut App) {
     match key.code {
         KeyCode::Up | KeyCode::Char('k') if !ctrl => match app.active_panel {
             Panel::Files => app.navigate_files(-1),
-            Panel::Diff => {
+            // Git tab has no middle column — Panel::Commit should never
+            // be set here, but if it slips through treat it as Diff.
+            Panel::Diff | Panel::Commit => {
                 app.diff_scroll = app.diff_scroll.saturating_sub(1);
             }
         },
         KeyCode::Down | KeyCode::Char('j') if !ctrl => match app.active_panel {
             Panel::Files => app.navigate_files(1),
-            Panel::Diff => {
+            Panel::Diff | Panel::Commit => {
                 app.diff_scroll += 1;
             }
         },
@@ -920,25 +1013,25 @@ fn handle_key_git(key: KeyEvent, app: &mut App) {
         // matched only if the Ctrl arm above didn't fire.
         KeyCode::Char('p' | 'k') if ctrl => match app.active_panel {
             Panel::Files => app.navigate_files(-1),
-            Panel::Diff => {
+            Panel::Diff | Panel::Commit => {
                 app.diff_scroll = app.diff_scroll.saturating_sub(1);
             }
         },
         KeyCode::Char('n' | 'j') if ctrl => match app.active_panel {
             Panel::Files => app.navigate_files(1),
-            Panel::Diff => {
+            Panel::Diff | Panel::Commit => {
                 app.diff_scroll += 1;
             }
         },
         KeyCode::PageUp => match app.active_panel {
             Panel::Files => app.navigate_files(-10),
-            Panel::Diff => {
+            Panel::Diff | Panel::Commit => {
                 app.diff_scroll = app.diff_scroll.saturating_sub(20);
             }
         },
         KeyCode::PageDown => match app.active_panel {
             Panel::Files => app.navigate_files(10),
-            Panel::Diff => {
+            Panel::Diff | Panel::Commit => {
                 app.diff_scroll += 20;
             }
         },
@@ -1028,7 +1121,9 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 app.file_tree.navigate(-1);
                 app.load_preview();
             }
-            Panel::Diff => {
+            // Files tab has no middle column — Panel::Commit should never
+            // be set here, but fall back to Diff behaviour defensively.
+            Panel::Diff | Panel::Commit => {
                 app.preview_scroll = app.preview_scroll.saturating_sub(1);
             }
         },
@@ -1037,7 +1132,7 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 app.file_tree.navigate(1);
                 app.load_preview();
             }
-            Panel::Diff => {
+            Panel::Diff | Panel::Commit => {
                 app.preview_scroll += 1;
             }
         },
@@ -1051,7 +1146,7 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 app.file_tree.navigate(-1);
                 app.load_preview();
             }
-            Panel::Diff => {
+            Panel::Diff | Panel::Commit => {
                 app.preview_scroll = app.preview_scroll.saturating_sub(1);
             }
         },
@@ -1060,7 +1155,7 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 app.file_tree.navigate(1);
                 app.load_preview();
             }
-            Panel::Diff => {
+            Panel::Diff | Panel::Commit => {
                 app.preview_scroll += 1;
             }
         },
@@ -1069,7 +1164,7 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 app.file_tree.navigate(-10);
                 app.load_preview();
             }
-            Panel::Diff => {
+            Panel::Diff | Panel::Commit => {
                 app.preview_scroll = app.preview_scroll.saturating_sub(20);
             }
         },
@@ -1078,7 +1173,7 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 app.file_tree.navigate(10);
                 app.load_preview();
             }
-            Panel::Diff => {
+            Panel::Diff | Panel::Commit => {
                 app.preview_scroll += 20;
             }
         },
@@ -1410,6 +1505,13 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            // Click-to-focus: land the active panel on whichever column
+            // the click landed in. VSCode-style — previously you had to
+            // Shift+Tab into a column before its arrows responded.
+            if let Ok(size) = terminal.size() {
+                focus_panel_under_cursor(app, mouse.column, size.width);
+            }
+
             let now = Instant::now();
             let is_double = matches!(
                 app.last_click,
@@ -1487,13 +1589,27 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
         }
         MouseEventKind::Up(MouseButton::Left) => {
             app.dragging_split = false;
+            app.dragging_graph_diff_split = false;
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            let total_width = terminal.size().map(|s| s.width).unwrap_or(80);
             if app.dragging_split {
-                let total_width = terminal.size().map(|s| s.width).unwrap_or(80);
                 if total_width > 0 {
                     let percent = (mouse.column * 100 / total_width).clamp(10, 80);
                     app.split_percent = percent;
+                }
+            } else if app.dragging_graph_diff_split && total_width > 0 {
+                // Boundary is inside the non-graph region. Express the drag
+                // position as the diff column's fraction of the remainder,
+                // measured from the right edge so "pull left" = grow diff.
+                let graph_x = total_width * app.split_percent / 100;
+                let remainder = total_width.saturating_sub(graph_x);
+                if remainder > 0 {
+                    let from_right = total_width.saturating_sub(mouse.column);
+                    let diff_pct = (from_right as u32 * 100 / remainder as u32) as u16;
+                    // Floor 20 / ceiling 80 keeps both sub-columns usable
+                    // and leaves room for drag to snap back either way.
+                    app.graph_diff_split_percent = diff_pct.clamp(20, 80);
                 }
             }
         }
@@ -1524,6 +1640,13 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
                 Tab::Graph => {
                     if is_left {
                         ui::git_graph_panel::scroll(app, -3);
+                    } else if let Some(diff_start) = graph_diff_column_start(app, total_width)
+                        && mouse.column >= diff_start
+                    {
+                        // 3-col diff column — scroll only the diff viewport
+                        // so commit metadata under the cursor's path stays put.
+                        app.commit_detail.file_diff_scroll =
+                            app.commit_detail.file_diff_scroll.saturating_sub(3);
                     } else {
                         ui::commit_detail_panel::scroll(app, -3);
                     }
@@ -1566,6 +1689,10 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
                 Tab::Graph => {
                     if is_left {
                         ui::git_graph_panel::scroll(app, 3);
+                    } else if let Some(diff_start) = graph_diff_column_start(app, total_width)
+                        && mouse.column >= diff_start
+                    {
+                        app.commit_detail.file_diff_scroll += 3;
                     } else {
                         ui::commit_detail_panel::scroll(app, 3);
                     }
@@ -1797,20 +1924,55 @@ fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: 
         },
         (Tab::Search, false) => Some(&mut app.preview_h_scroll),
         (Tab::Graph, false) => {
-            // Graph's right panel is the commit detail. SBS layout splits
-            // that panel in half visually, and each half scrolls
-            // independently (old vs new version). Unified layout has one
-            // scroll for the whole panel.
+            // In 3-col mode the right portion is [commit | diff]; figure
+            // out which column the cursor sits over so h_scroll targets
+            // the right triad.
+            let three_col = app.graph_uses_three_col();
+            let diff_start = if three_col {
+                let remainder = total_width.saturating_sub(split_x);
+                let diff_w_raw = remainder as u32 * app.graph_diff_split_percent as u32 / 100;
+                let diff_w = (diff_w_raw as u16)
+                    .max(20)
+                    .min(remainder.saturating_sub(20));
+                total_width.saturating_sub(diff_w)
+            } else {
+                // No diff column — every column in the right portion is
+                // the commit-detail panel.
+                total_width
+            };
+            let in_diff_column = three_col && column >= diff_start;
             match app.commit_detail.diff_layout {
-                crate::app::DiffLayout::Unified => Some(&mut app.commit_detail.diff_h_scroll),
+                crate::app::DiffLayout::Unified => {
+                    if in_diff_column {
+                        Some(&mut app.commit_detail.file_diff_h_scroll)
+                    } else {
+                        Some(&mut app.commit_detail.diff_h_scroll)
+                    }
+                }
                 crate::app::DiffLayout::SideBySide => {
-                    let panel_start = split_x;
-                    let panel_w = total_width.saturating_sub(panel_start);
+                    let (panel_start, panel_w, left_h, right_h) = if in_diff_column {
+                        let panel_w = total_width.saturating_sub(diff_start);
+                        (
+                            diff_start,
+                            panel_w,
+                            &mut app.commit_detail.file_diff_sbs_left_h_scroll,
+                            &mut app.commit_detail.file_diff_sbs_right_h_scroll,
+                        )
+                    } else {
+                        let panel_end = diff_start;
+                        let panel_w = panel_end.saturating_sub(split_x);
+                        (
+                            split_x,
+                            panel_w,
+                            &mut app.commit_detail.sbs_left_h_scroll,
+                            &mut app.commit_detail.sbs_right_h_scroll,
+                        )
+                    };
                     let panel_mid = panel_start.saturating_add(panel_w / 2);
                     if column < panel_mid {
-                        Some(&mut app.commit_detail.sbs_left_h_scroll)
+                        Some(left_h)
                     } else {
-                        Some(&mut app.commit_detail.sbs_right_h_scroll)
+                        Some(right_h)
                     }
                 }
             }

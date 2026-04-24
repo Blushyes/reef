@@ -680,7 +680,14 @@ fn build_rows(app: &App, width: u16, display_w: u16, theme: &Theme) -> Vec<Row> 
         }
     }
 
-    if let Some(file_diff) = &cd.file_diff {
+    // Inline diff section: only rendered in the 2-col fallback. When the
+    // Graph tab is in 3-col mode the diff lives in its own right column
+    // (rendered by `ui::mod::render_graph_diff_column`), so skipping it
+    // here avoids a stale duplicate row list and shrinks `scroll`'s clamp
+    // back to just metadata + files.
+    if !app.graph_uses_three_col()
+        && let Some(file_diff) = &cd.file_diff
+    {
         rows.push(Row::blank());
         rows.push(diff_header_row(
             &file_diff.path,

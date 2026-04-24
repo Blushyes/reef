@@ -105,6 +105,7 @@ pub enum Msg {
 
     // Diff panel
     DiffEmpty,
+    DiffLoading,
     PreviewEmpty,
     PreviewImageUnavailable,
     PreviewLoading,
@@ -235,6 +236,7 @@ fn t_zh(m: Msg) -> &'static str {
         CommitHint => "(Ctrl+Enter 提交 · Esc 取消)",
         CommitNothingStaged => "没有可提交的已暂存文件",
         DiffEmpty => "选择一个文件查看 diff",
+        DiffLoading => "diff 载入中…",
         PreviewEmpty => "选择一个文件预览内容",
         PreviewImageUnavailable => "当前终端不支持图片预览",
         PreviewLoading => "加载中…",
@@ -350,6 +352,7 @@ fn t_en(m: Msg) -> &'static str {
         CommitHint => "(Ctrl+Enter to commit · Esc to cancel)",
         CommitNothingStaged => "Nothing staged to commit",
         DiffEmpty => "Select a file to view diff",
+        DiffLoading => "Loading diff…",
         PreviewEmpty => "Select a file to preview",
         PreviewImageUnavailable => "image preview unavailable in this terminal",
         PreviewLoading => "loading…",

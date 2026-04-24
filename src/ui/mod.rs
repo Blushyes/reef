@@ -53,23 +53,59 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_title_bar(f, app, main_layout[0]);
     render_tab_bar(f, app, main_layout[1]);
 
-    // Body: left + right
+    // Cache body width before layout math so `graph_uses_three_col` and
+    // `normalize_active_panel` can see the current frame's geometry. The
+    // title/tab/status bars are fixed-width siblings, so the body width
+    // equals the frame width here.
+    app.last_total_width = main_layout[2].width;
+    app.normalize_active_panel();
+
+    // Body: left + right (+ optional diff column for Graph tab 3-col mode)
     let left_width = (main_layout[2].width as u32 * app.split_percent as u32 / 100) as u16;
     let left_width = left_width
         .max(10)
         .min(main_layout[2].width.saturating_sub(20));
 
-    let body_layout = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(left_width), Constraint::Min(20)])
-        .split(main_layout[2]);
+    let three_col = app.graph_uses_three_col();
+    let body_layout = if three_col {
+        // Graph 3-col: graph | commit | diff. Split the non-graph remainder
+        // between commit and diff by `graph_diff_split_percent` (% of the
+        // remainder that goes to the diff column, counted from the right).
+        let remainder = main_layout[2].width.saturating_sub(left_width);
+        let diff_w = (remainder as u32 * app.graph_diff_split_percent as u32 / 100) as u16;
+        // Keep both right-side columns usable — diff gets a floor so a
+        // really narrow `graph_diff_split_percent` doesn't squish it away.
+        let diff_w = diff_w.max(20).min(remainder.saturating_sub(20));
+        let commit_w = remainder.saturating_sub(diff_w);
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(left_width),
+                Constraint::Length(commit_w),
+                Constraint::Min(20),
+            ])
+            .split(main_layout[2])
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(left_width), Constraint::Min(20)])
+            .split(main_layout[2])
+    };
 
-    // Drag zone on the split border
+    // Drag zone on the graph | right split border
     let split_x = body_layout[0].x + body_layout[0].width.saturating_sub(1);
     app.hit_registry.register(
         Rect::new(split_x, body_layout[0].y, 2, body_layout[0].height),
         ClickAction::StartDragSplit,
     );
+    // Second drag zone for the commit | diff boundary in 3-col mode.
+    if three_col && body_layout.len() >= 3 {
+        let mid_split_x = body_layout[1].x + body_layout[1].width.saturating_sub(1);
+        app.hit_registry.register(
+            Rect::new(mid_split_x, body_layout[1].y, 2, body_layout[1].height),
+            ClickAction::StartDragGraphDiffSplit,
+        );
+    }
 
     match app.active_tab {
         Tab::Git => {
@@ -86,7 +122,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
         }
         Tab::Graph => {
             render_graph_sidebar(f, app, body_layout[0]);
-            render_graph_editor(f, app, body_layout[1]);
+            if three_col {
+                render_graph_editor(f, app, body_layout[1]);
+                render_graph_diff_column(f, app, body_layout[2]);
+            } else {
+                render_graph_editor(f, app, body_layout[1]);
+            }
         }
         Tab::Search => {
             search_tab::render_sidebar(f, app, body_layout[0]);
@@ -194,7 +235,10 @@ fn render_graph_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
     git_graph_panel::render(f, app, padded, focused);
 }
 
-/// Graph tab's right editor — inline commit-detail panel.
+/// Graph tab's middle column — commit metadata + file tree. In 2-col
+/// fallback this is the whole right pane and renders the inline diff
+/// too (the `commit_detail_panel` consults `graph_uses_three_col` to
+/// decide whether to append diff rows).
 fn render_graph_editor(f: &mut Frame, app: &mut App, area: Rect) {
     let inner = Rect::new(
         area.x + 1,
@@ -202,8 +246,58 @@ fn render_graph_editor(f: &mut Frame, app: &mut App, area: Rect) {
         area.width.saturating_sub(1),
         area.height,
     );
-    let focused = matches!(app.active_panel, crate::app::Panel::Diff);
+    let focused = if app.graph_uses_three_col() {
+        // In 3-col mode Panel::Commit owns the middle column.
+        matches!(app.active_panel, crate::app::Panel::Commit)
+    } else {
+        matches!(app.active_panel, crate::app::Panel::Diff)
+    };
     commit_detail_panel::render(f, app, inner, focused);
+}
+
+/// Graph tab's right column (3-col mode only) — the diff viewport for
+/// the file selected inside the middle column. Delegates to the shared
+/// `diff_panel::render_diff` so Git-tab Diff and this column share
+/// rendering, search integration, and (after Stage 3) mouse selection.
+fn render_graph_diff_column(f: &mut Frame, app: &mut App, area: Rect) {
+    use ratatui::widgets::{Block, Padding};
+    let block = Block::default().padding(Padding::new(1, 1, 0, 0));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let Some(d) = app.commit_detail.file_diff.take() else {
+        // In 3-col mode this only fires when `commit_file_diff_load.loading`
+        // is still true. Show a quiet "loading…" banner so the column is
+        // never blank between the click and the async result landing.
+        if area.height >= 1 {
+            let msg = Line::from(Span::styled(
+                t(Msg::DiffLoading),
+                Style::default().fg(app.theme.fg_secondary),
+            ));
+            let y = area.y + area.height / 2;
+            f.render_widget(msg, Rect::new(area.x, y, area.width, 1));
+        }
+        return;
+    };
+    diff_panel::render_diff(
+        f,
+        inner,
+        &d.diff,
+        d.highlighted.as_ref(),
+        app.commit_detail.diff_layout,
+        app.commit_detail.diff_mode,
+        app.theme,
+        &app.search,
+        crate::search::SearchTarget::GraphDiff,
+        &mut diff_panel::DiffView {
+            scroll: &mut app.commit_detail.file_diff_scroll,
+            h_scroll: &mut app.commit_detail.file_diff_h_scroll,
+            sbs_left_h_scroll: &mut app.commit_detail.file_diff_sbs_left_h_scroll,
+            sbs_right_h_scroll: &mut app.commit_detail.file_diff_sbs_right_h_scroll,
+            last_view_h: &mut app.last_diff_view_h,
+        },
+    );
+    app.commit_detail.file_diff = Some(d);
 }
 
 fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {

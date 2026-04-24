@@ -648,6 +648,45 @@ pub struct PreviewHighlight {
     pub byte_range: std::ops::Range<usize>,
 }
 
+/// Pure predicate: does the Graph tab want 3-col layout given these
+/// inputs? Factored out so tests can exercise the switch matrix without
+/// instantiating a full `App`. `App::graph_uses_three_col` forwards here.
+pub(crate) fn compute_uses_three_col(
+    active_tab: Tab,
+    total_width: u16,
+    has_file_diff: bool,
+    load_in_flight: bool,
+) -> bool {
+    active_tab == Tab::Graph
+        && total_width >= App::GRAPH_THREE_COL_MIN_WIDTH
+        && (has_file_diff || load_in_flight)
+}
+
+/// Pure layout: left-sidebar width given the split percent. Kept free-
+/// standing so `ui::render`, hit-testing, and h-scroll routing share one
+/// definition; the `App::graph_sidebar_width` method forwards here.
+pub(crate) fn compute_sidebar_width(total_width: u16, split_percent: u16) -> u16 {
+    let raw = (total_width as u32 * split_percent as u32 / 100) as u16;
+    raw.max(10).min(total_width.saturating_sub(20))
+}
+
+/// Pure layout: 3-col widths `(graph, commit, diff)` summing to
+/// `total_width`. See `App::graph_three_col_widths` for caller rules.
+pub(crate) fn compute_three_col_widths(
+    total_width: u16,
+    split_percent: u16,
+    graph_diff_split_percent: u16,
+) -> (u16, u16, u16) {
+    let graph_w = compute_sidebar_width(total_width, split_percent);
+    let remainder = total_width.saturating_sub(graph_w);
+    let diff_w_raw = (remainder as u32 * graph_diff_split_percent as u32 / 100) as u16;
+    // `.max(20)` + `.min(remainder - 20)` keeps both sub-columns usable
+    // even when `graph_diff_split_percent` hits its drag clamp edges.
+    let diff_w = diff_w_raw.max(20).min(remainder.saturating_sub(20));
+    let commit_w = remainder.saturating_sub(diff_w);
+    (graph_w, commit_w, diff_w)
+}
+
 impl App {
     /// Local-backend entry point. Threads `image_picker` straight through
     /// to `new_with_backend`. Tests construct via `new(Theme::dark(), None)`;
@@ -839,6 +878,31 @@ impl App {
     /// diff column has at least ~40 cols for content after its gutter.
     pub const GRAPH_THREE_COL_MIN_WIDTH: u16 = 100;
 
+    /// Width of the left (graph / tree / status) sidebar for the current
+    /// frame. Single source of truth for the `split_percent → columns`
+    /// clamp so `ui::render`, mouse hit-testing, and h-scroll routing
+    /// never disagree about where the boundary is. Mirror of the
+    /// `.max(10).min(total - 20)` clamp `ui::render` has applied since
+    /// v0 — factored here so `input::*` and the render stay aligned
+    /// even when `split_percent` lands near the extremes.
+    pub fn graph_sidebar_width(&self, total_width: u16) -> u16 {
+        compute_sidebar_width(total_width, self.split_percent)
+    }
+
+    /// Widths for the Graph 3-col layout: `(graph, commit, diff)`. Sum
+    /// equals `total_width`. Only meaningful when `graph_uses_three_col()`
+    /// is true; callers outside the render path should gate on that
+    /// first. The `(20, 20)` floors keep both right-side columns usable
+    /// when either `split_percent` or `graph_diff_split_percent` is
+    /// near its edge — matches `ui::render`'s constraint math.
+    pub fn graph_three_col_widths(&self, total_width: u16) -> (u16, u16, u16) {
+        compute_three_col_widths(
+            total_width,
+            self.split_percent,
+            self.graph_diff_split_percent,
+        )
+    }
+
     /// Whether the Graph tab should render with 3 columns right now —
     /// graph | commit metadata+files | diff. True when a file diff is
     /// loaded (or currently loading) AND the terminal is wide enough.
@@ -849,9 +913,12 @@ impl App {
     /// resolution, panel normalization) should read `last_total_width`
     /// — `ui::render` caches it every frame before any panel runs.
     pub fn graph_uses_three_col(&self) -> bool {
-        self.active_tab == Tab::Graph
-            && self.last_total_width >= Self::GRAPH_THREE_COL_MIN_WIDTH
-            && (self.commit_detail.file_diff.is_some() || self.commit_file_diff_load.loading)
+        compute_uses_three_col(
+            self.active_tab,
+            self.last_total_width,
+            self.commit_detail.file_diff.is_some(),
+            self.commit_file_diff_load.loading,
+        )
     }
 
     /// Drop `Panel::Commit` back to a two-column-compatible panel when the
@@ -3463,5 +3530,114 @@ mod tests {
         // which makes an empty target a safe no-op rather than a
         // "revert everything" footgun.
         assert!(!folder_contains("", "anything.rs"));
+    }
+
+    // ── Graph layout math ────────────────────────────────────────────────
+
+    use super::{Tab, compute_sidebar_width, compute_three_col_widths, compute_uses_three_col};
+
+    // ── graph_uses_three_col switch matrix ───────────────────────────────
+
+    #[test]
+    fn uses_three_col_needs_graph_tab() {
+        // Exact same inputs, only the tab changes — 3-col is Graph-only.
+        assert!(compute_uses_three_col(Tab::Graph, 200, true, false));
+        assert!(!compute_uses_three_col(Tab::Git, 200, true, false));
+        assert!(!compute_uses_three_col(Tab::Files, 200, true, false));
+        assert!(!compute_uses_three_col(Tab::Search, 200, true, false));
+    }
+
+    #[test]
+    fn uses_three_col_needs_min_width() {
+        // 99 cols → below `GRAPH_THREE_COL_MIN_WIDTH` (100) → 2-col fallback.
+        assert!(!compute_uses_three_col(Tab::Graph, 99, true, false));
+        assert!(compute_uses_three_col(Tab::Graph, 100, true, false));
+    }
+
+    #[test]
+    fn uses_three_col_needs_file_diff_or_loading() {
+        // Graph tab + wide terminal but nothing to show in the diff column.
+        assert!(!compute_uses_three_col(Tab::Graph, 200, false, false));
+        // Either flag on activates 3-col.
+        assert!(compute_uses_three_col(Tab::Graph, 200, true, false));
+        assert!(compute_uses_three_col(Tab::Graph, 200, false, true));
+        // Loading-in-flight during a file click: 3-col stays active so the
+        // "loading…" banner renders where the diff will land instead of
+        // flashing 2-col for a frame.
+    }
+
+    #[test]
+    fn sidebar_width_clamps_min_10() {
+        // split_percent = 5 → raw = 5 → floor at 10.
+        assert_eq!(compute_sidebar_width(100, 5), 10);
+    }
+
+    #[test]
+    fn sidebar_width_clamps_to_leave_20_for_right() {
+        // split_percent = 95 on width 100 → raw = 95, but right panel
+        // needs at least 20 cols → clamp to 80.
+        assert_eq!(compute_sidebar_width(100, 95), 80);
+    }
+
+    #[test]
+    fn sidebar_width_passes_mid_range_through() {
+        // Default 30% on a generous terminal.
+        assert_eq!(compute_sidebar_width(200, 30), 60);
+    }
+
+    #[test]
+    fn three_col_widths_sum_to_total() {
+        // Regression guard: if the rounding ever changes, the assert below
+        // pins the invariant `graph + commit + diff == total_width`. Hit-
+        // testing + h-scroll routing rely on this exactly.
+        let (g, c, d) = compute_three_col_widths(200, 30, 60);
+        assert_eq!(g + c + d, 200);
+    }
+
+    #[test]
+    fn three_col_widths_diff_floor_20() {
+        // graph_diff_split_percent = 0 shouldn't squeeze diff to 0 —
+        // `.max(20)` keeps it usable.
+        let (_, _, d) = compute_three_col_widths(200, 30, 0);
+        assert!(d >= 20, "diff col floored at 20, got {d}");
+    }
+
+    #[test]
+    fn three_col_widths_commit_floor_20() {
+        // graph_diff_split_percent = 100 shouldn't squeeze commit to 0 —
+        // `.min(remainder - 20)` leaves commit at least 20 cols.
+        let (_, c, _) = compute_three_col_widths(200, 30, 100);
+        assert!(c >= 20, "commit col floored at 20, got {c}");
+    }
+
+    #[test]
+    fn three_col_widths_default_proportions() {
+        // Default tuning: split_percent=30, graph_diff_split_percent=60
+        // on a 200-wide terminal. Sanity-check the split feels right.
+        let (g, c, d) = compute_three_col_widths(200, 30, 60);
+        assert_eq!(g, 60);
+        // remainder = 140, diff = 60% of 140 = 84, commit = 56.
+        assert_eq!(d, 84);
+        assert_eq!(c, 56);
+    }
+
+    #[test]
+    fn three_col_widths_at_min_terminal_width() {
+        // At the 100-col 3-col threshold the floors kick in hard:
+        // graph = 30, remainder = 70, diff = 42 (rounded from 60% * 70),
+        // commit = 28. All columns remain ≥ 20.
+        let (g, c, d) = compute_three_col_widths(100, 30, 60);
+        assert_eq!(g + c + d, 100);
+        assert!(c >= 20 && d >= 20, "both right cols ≥ 20: c={c} d={d}");
+    }
+
+    #[test]
+    fn three_col_widths_share_sidebar_with_2col() {
+        // Whether the UI ends up in 2-col or 3-col, the graph sidebar
+        // width is the same value. `graph_diff_column_start` and
+        // `focus_panel_under_cursor` depend on this.
+        let sidebar_2 = compute_sidebar_width(150, 30);
+        let (graph_3, _, _) = compute_three_col_widths(150, 30, 60);
+        assert_eq!(sidebar_2, graph_3);
     }
 }

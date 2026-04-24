@@ -674,7 +674,7 @@ fn handle_key_search_input_mode(key: KeyEvent, app: &mut App, ctrl: bool, alt: b
 /// surprise where the scroll keys "aim" at a different column than the
 /// mouse just poked.
 fn focus_panel_under_cursor(app: &mut App, column: u16, total_width: u16) {
-    let graph_x = total_width * app.split_percent / 100;
+    let graph_x = app.graph_sidebar_width(total_width);
     if column < graph_x {
         app.active_panel = Panel::Files;
         return;
@@ -691,21 +691,15 @@ fn focus_panel_under_cursor(app: &mut App, column: u16, total_width: u16) {
     }
 }
 
-/// Screen column where the Graph 3-col diff column starts, mirroring the
-/// layout math in `ui::render`. Returns `None` when the Graph tab isn't in
-/// 3-col mode (no standalone diff column), so callers can fall through to
-/// the 2-col routing. Stays in sync with `ui::render` by using the same
-/// floors/clamps — update both together if the ratio constants change.
+/// Screen column where the Graph 3-col diff column starts. Returns `None`
+/// when the Graph tab isn't in 3-col mode so callers can fall through to
+/// the 2-col routing. Shares `App::graph_three_col_widths` with `ui::render`
+/// — the two paths can't drift apart.
 fn graph_diff_column_start(app: &App, total_width: u16) -> Option<u16> {
     if !app.graph_uses_three_col() {
         return None;
     }
-    let graph_x = total_width * app.split_percent / 100;
-    let remainder = total_width.saturating_sub(graph_x);
-    let diff_w_raw = remainder as u32 * app.graph_diff_split_percent as u32 / 100;
-    let diff_w = (diff_w_raw as u16)
-        .max(20)
-        .min(remainder.saturating_sub(20));
+    let (_, _, diff_w) = app.graph_three_col_widths(total_width);
     Some(total_width.saturating_sub(diff_w))
 }
 
@@ -1891,6 +1885,14 @@ fn handle_diff_selection(mouse: &MouseEvent, app: &mut App) -> bool {
                 return false;
             };
 
+            // Focus follows the click — otherwise the user is stuck
+            // scrolling the panel they came from (common in Graph 3-col:
+            // start on Panel::Commit, click into diff, expect arrows to
+            // pan the diff). Mirror of `focus_panel_under_cursor` but
+            // local — the main-dispatcher version never runs because
+            // this handler returns early on Down.
+            app.active_panel = Panel::Diff;
+
             // Advance (or reset) the click counter — same 400 ms window as
             // the preview panel so users get consistent double/triple-click
             // timing across both surfaces.
@@ -2044,7 +2046,9 @@ fn mouse_to_file_coord(
 /// h-scrolls (the results list) — other tabs' left panels are tree/list
 /// widgets with no long horizontal content.
 fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: i32) {
-    let split_x = total_width * app.split_percent / 100;
+    // Use the shared sidebar clamp so this matches `ui::render` even when
+    // `split_percent` lives near its edges on narrow terminals.
+    let split_x = app.graph_sidebar_width(total_width);
     let is_left = column < split_x;
 
     let target: Option<&mut usize> = match (app.active_tab, is_left) {
@@ -2073,20 +2077,8 @@ fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: 
             // In 3-col mode the right portion is [commit | diff]; figure
             // out which column the cursor sits over so h_scroll targets
             // the right triad.
-            let three_col = app.graph_uses_three_col();
-            let diff_start = if three_col {
-                let remainder = total_width.saturating_sub(split_x);
-                let diff_w_raw = remainder as u32 * app.graph_diff_split_percent as u32 / 100;
-                let diff_w = (diff_w_raw as u16)
-                    .max(20)
-                    .min(remainder.saturating_sub(20));
-                total_width.saturating_sub(diff_w)
-            } else {
-                // No diff column — every column in the right portion is
-                // the commit-detail panel.
-                total_width
-            };
-            let in_diff_column = three_col && column >= diff_start;
+            let diff_start = graph_diff_column_start(app, total_width).unwrap_or(total_width);
+            let in_diff_column = diff_start < total_width && column >= diff_start;
             match app.commit_detail.diff_layout {
                 crate::app::DiffLayout::Unified => {
                     if in_diff_column {

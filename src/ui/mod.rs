@@ -66,32 +66,25 @@ pub fn render(f: &mut Frame, app: &mut App) {
     app.last_total_width = main_layout[2].width;
     app.normalize_active_panel();
 
-    // Body: left + right (+ optional diff column for Graph tab 3-col mode)
-    let left_width = (main_layout[2].width as u32 * app.split_percent as u32 / 100) as u16;
-    let left_width = left_width
-        .max(10)
-        .min(main_layout[2].width.saturating_sub(20));
-
+    // Body: left + right (+ optional diff column for Graph tab 3-col mode).
+    // Width math goes through `App::graph_sidebar_width` /
+    // `graph_three_col_widths` so `input::*` and `ui::render` agree on
+    // where column boundaries fall — important for hit-testing and
+    // h-scroll routing to land in the right column.
+    let total_w = main_layout[2].width;
     let three_col = app.graph_uses_three_col();
     let body_layout = if three_col {
-        // Graph 3-col: graph | commit | diff. Split the non-graph remainder
-        // between commit and diff by `graph_diff_split_percent` (% of the
-        // remainder that goes to the diff column, counted from the right).
-        let remainder = main_layout[2].width.saturating_sub(left_width);
-        let diff_w = (remainder as u32 * app.graph_diff_split_percent as u32 / 100) as u16;
-        // Keep both right-side columns usable — diff gets a floor so a
-        // really narrow `graph_diff_split_percent` doesn't squish it away.
-        let diff_w = diff_w.max(20).min(remainder.saturating_sub(20));
-        let commit_w = remainder.saturating_sub(diff_w);
+        let (graph_w, commit_w, _) = app.graph_three_col_widths(total_w);
         Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(left_width),
+                Constraint::Length(graph_w),
                 Constraint::Length(commit_w),
                 Constraint::Min(20),
             ])
             .split(main_layout[2])
     } else {
+        let left_width = app.graph_sidebar_width(total_w);
         Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(left_width), Constraint::Min(20)])

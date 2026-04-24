@@ -1,7 +1,7 @@
-use crate::app::{App, DiffHighlighted, DiffLayout, LineTokens};
+use crate::app::{App, DiffHighlighted, DiffLayout, DiffMode, LineTokens};
 use crate::git::{DiffContent, DiffHunk, LineTag};
 use crate::i18n::{Msg, t};
-use crate::search::SearchTarget;
+use crate::search::{SearchState, SearchTarget};
 use crate::ui::highlight::StyledToken;
 use crate::ui::text::{clip_spans, overlay_match_highlight, truncate_to_width};
 use crate::ui::theme::Theme;
@@ -13,36 +13,97 @@ use ratatui::widgets::{Block, Padding};
 use std::ops::Range;
 use unicode_width::UnicodeWidthStr;
 
+/// Scroll + viewport state held by whichever layer owns a diff panel
+/// instance. Git tab stores these at App top level; Graph tab's 3-col
+/// layout will use its own copy inside `commit_detail`. Passed in by
+/// mutable ref so the render's clamping reaches back through to the
+/// owner, and the next frame sees the pinned values.
+pub struct DiffView<'a> {
+    pub scroll: &'a mut usize,
+    pub h_scroll: &'a mut usize,
+    pub sbs_left_h_scroll: &'a mut usize,
+    pub sbs_right_h_scroll: &'a mut usize,
+    pub last_view_h: &'a mut u16,
+}
+
+/// Git-tab entry point. Thin wrapper around `render_diff` that sources
+/// everything from `App`. Graph tab will call `render_diff` directly
+/// with its own scroll fields once the 3-column layout lands.
 pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default().padding(Padding::new(1, 1, 0, 0));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    match app.diff_content.take() {
-        None => {
-            render_empty(f, app, inner);
+    let Some(d) = app.diff_content.take() else {
+        render_empty(f, inner, &app.theme);
+        return;
+    };
+    render_diff(
+        f,
+        inner,
+        &d.diff,
+        d.highlighted.as_ref(),
+        app.diff_layout,
+        app.diff_mode,
+        app.theme,
+        &app.search,
+        SearchTarget::Diff,
+        &mut DiffView {
+            scroll: &mut app.diff_scroll,
+            h_scroll: &mut app.diff_h_scroll,
+            sbs_left_h_scroll: &mut app.sbs_left_h_scroll,
+            sbs_right_h_scroll: &mut app.sbs_right_h_scroll,
+            last_view_h: &mut app.last_diff_view_h,
+        },
+    );
+    app.diff_content = Some(d);
+}
+
+/// Pure diff renderer — no `App` dependency. Callers own the scroll state
+/// and pass search + theme by reference. Both Git tab (via `render`) and
+/// Graph tab's future 3-col right column use this.
+///
+/// `search_target` decides which of the caller's `/` matches the renderer
+/// will overlay on the content; pass `SearchTarget::Diff` for the Git tab
+/// and `SearchTarget::GraphDiff` once that variant lands.
+#[allow(clippy::too_many_arguments)]
+pub fn render_diff(
+    f: &mut Frame,
+    area: Rect,
+    diff: &DiffContent,
+    highlighted: Option<&DiffHighlighted>,
+    layout: DiffLayout,
+    mode: DiffMode,
+    theme: Theme,
+    search: &SearchState,
+    search_target: SearchTarget,
+    view: &mut DiffView<'_>,
+) {
+    match layout {
+        DiffLayout::Unified => {
+            render_unified(f, area, diff, highlighted, mode, theme, search, search_target, view)
         }
-        Some(d) => {
-            match app.diff_layout {
-                DiffLayout::Unified => {
-                    render_unified(f, app, inner, &d.diff, d.highlighted.as_ref())
-                }
-                DiffLayout::SideBySide => {
-                    render_side_by_side(f, app, inner, &d.diff, d.highlighted.as_ref())
-                }
-            }
-            app.diff_content = Some(d);
-        }
+        DiffLayout::SideBySide => render_side_by_side(
+            f,
+            area,
+            diff,
+            highlighted,
+            mode,
+            theme,
+            search,
+            search_target,
+            view,
+        ),
     }
 }
 
-fn render_empty(f: &mut Frame, app: &App, area: Rect) {
+fn render_empty(f: &mut Frame, area: Rect, theme: &Theme) {
     if area.height < 1 {
         return;
     }
     let msg = Line::from(Span::styled(
         t(Msg::DiffEmpty),
-        Style::default().fg(app.theme.fg_secondary),
+        Style::default().fg(theme.fg_secondary),
     ));
     let y = area.y + area.height / 2;
     let x = area.x + area.width.saturating_sub(22) / 2;
@@ -51,18 +112,22 @@ fn render_empty(f: &mut Frame, app: &App, area: Rect) {
 
 // ─── Unified view ────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn render_unified(
     f: &mut Frame,
-    app: &mut App,
     area: Rect,
     diff: &DiffContent,
     highlighted: Option<&DiffHighlighted>,
+    mode: DiffMode,
+    theme: Theme,
+    search: &SearchState,
+    search_target: SearchTarget,
+    view: &mut DiffView<'_>,
 ) {
     let mut y = area.y;
     let max_y = area.y + area.height;
-    let theme = app.theme;
 
-    render_file_header(f, app, area, diff, &mut y, max_y);
+    render_file_header(f, area, diff, DiffLayout::Unified, mode, &theme, &mut y, max_y);
 
     // Build all display lines. Content rows pick up per-line syntect tokens
     // when available so the render path can emit syntax-colored spans
@@ -89,19 +154,19 @@ fn render_unified(
     let content_w = (area.width as usize).saturating_sub(gutter_width);
     let visible_rows = max_y.saturating_sub(y) as usize;
     // Remember viewport height for search-jump centering.
-    app.last_diff_view_h = visible_rows as u16;
+    *view.last_view_h = visible_rows as u16;
 
     // Clamp vertical scroll so we can't scroll past the last displayable row.
     // Must come before the horizontal max-width calc below, which itself
-    // uses `skip(app.diff_scroll)` and would see an empty slice if we let
+    // uses `skip(*view.scroll)` and would see an empty slice if we let
     // the offset run past the end.
     let max_scroll = all_lines.len().saturating_sub(visible_rows);
-    app.diff_scroll = app.diff_scroll.min(max_scroll);
+    *view.scroll = (*view.scroll).min(max_scroll);
 
     // Clamp horizontal scroll against the widest Content line currently in view.
     let max_visible_w: usize = all_lines
         .iter()
-        .skip(app.diff_scroll)
+        .skip(*view.scroll)
         .take(visible_rows)
         .filter_map(|dl| match dl {
             UnifiedLine::Content { text, .. } => Some(UnicodeWidthStr::width(text.as_str())),
@@ -110,10 +175,10 @@ fn render_unified(
         .max()
         .unwrap_or(0);
     let max_h = max_visible_w.saturating_sub(content_w);
-    app.diff_h_scroll = app.diff_h_scroll.min(max_h);
-    let h = app.diff_h_scroll;
+    *view.h_scroll = (*view.h_scroll).min(max_h);
+    let h = *view.h_scroll;
 
-    let scroll = app.diff_scroll;
+    let scroll = *view.scroll;
     for (offset, dl) in all_lines.iter().skip(scroll).enumerate() {
         if y >= max_y {
             break;
@@ -121,7 +186,7 @@ fn render_unified(
         let row_idx = scroll + offset;
         // `collect_rows(Diff)` in `search.rs` uses the exact same
         // `UnifiedLine` order, so row_idx matches 1:1 with match row indices.
-        let (ranges, cur) = app.search.ranges_on_row(SearchTarget::Diff, row_idx);
+        let (ranges, cur) = search.ranges_on_row(search_target, row_idx);
         render_unified_line(f, area, y, dl, h, &theme, &ranges, cur);
         y += 1;
     }
@@ -361,18 +426,36 @@ fn build_sbs_lines(hunk: &DiffHunk, hunk_tokens: Option<&Vec<LineTokens>>) -> Ve
     rows
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_side_by_side(
     f: &mut Frame,
-    app: &mut App,
     area: Rect,
     diff: &DiffContent,
     highlighted: Option<&DiffHighlighted>,
+    mode: DiffMode,
+    theme: Theme,
+    search: &SearchState,
+    _search_target: SearchTarget,
+    view: &mut DiffView<'_>,
 ) {
     let mut y = area.y;
     let max_y = area.y + area.height;
-    let theme = app.theme;
 
-    render_file_header(f, app, area, diff, &mut y, max_y);
+    render_file_header(
+        f,
+        area,
+        diff,
+        DiffLayout::SideBySide,
+        mode,
+        &theme,
+        &mut y,
+        max_y,
+    );
+    // SBS has no per-row search overlay plumbing yet — the pre-split
+    // `render_unified` path is what feeds `SearchTarget::Diff` rows. Leave
+    // `search` threaded through the signature so SBS can light up matches
+    // when we add that overlay; today it's here for API symmetry.
+    let _ = search;
 
     // Build all display lines
     let mut all_lines: Vec<SbsDisplayLine> = Vec::new();
@@ -393,32 +476,44 @@ fn render_side_by_side(
     let left_content_w = (half_w as usize).saturating_sub(gutter);
     let right_content_w = (right_w as usize).saturating_sub(gutter);
     let visible_rows = max_y.saturating_sub(y) as usize;
-    app.last_diff_view_h = visible_rows as u16;
+    *view.last_view_h = visible_rows as u16;
 
     // Clamp vertical scroll so we can't scroll past the last displayable row.
     let max_scroll = all_lines.len().saturating_sub(visible_rows);
-    app.diff_scroll = app.diff_scroll.min(max_scroll);
+    *view.scroll = (*view.scroll).min(max_scroll);
 
-    // Clamp horizontal scroll against the widest text column in view (either side).
-    let max_visible_w: usize = all_lines
+    // Clamp each side's horizontal scroll against that side's widest text
+    // in view. Using a shared scroll would force both halves to pan in
+    // lockstep — rarely what you want when the two versions have very
+    // different line widths (think rename / large rewrite).
+    let max_left_w: usize = all_lines
         .iter()
-        .skip(app.diff_scroll)
+        .skip(*view.scroll)
         .take(visible_rows)
         .filter_map(|dl| match dl {
-            SbsDisplayLine::Row(row) => Some(
-                UnicodeWidthStr::width(row.left_text.as_str())
-                    .max(UnicodeWidthStr::width(row.right_text.as_str())),
-            ),
+            SbsDisplayLine::Row(row) => Some(UnicodeWidthStr::width(row.left_text.as_str())),
             _ => None,
         })
         .max()
         .unwrap_or(0);
-    let side_content_w = left_content_w.min(right_content_w);
-    let max_h = max_visible_w.saturating_sub(side_content_w);
-    app.diff_h_scroll = app.diff_h_scroll.min(max_h);
-    let h = app.diff_h_scroll;
+    let max_right_w: usize = all_lines
+        .iter()
+        .skip(*view.scroll)
+        .take(visible_rows)
+        .filter_map(|dl| match dl {
+            SbsDisplayLine::Row(row) => Some(UnicodeWidthStr::width(row.right_text.as_str())),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let max_h_left = max_left_w.saturating_sub(left_content_w);
+    let max_h_right = max_right_w.saturating_sub(right_content_w);
+    *view.sbs_left_h_scroll = (*view.sbs_left_h_scroll).min(max_h_left);
+    *view.sbs_right_h_scroll = (*view.sbs_right_h_scroll).min(max_h_right);
+    let h_left = *view.sbs_left_h_scroll;
+    let h_right = *view.sbs_right_h_scroll;
 
-    let scroll = app.diff_scroll;
+    let scroll = *view.scroll;
     for dl in all_lines.iter().skip(scroll) {
         if y >= max_y {
             break;
@@ -445,7 +540,7 @@ fn render_side_by_side(
                 f.render_widget(line, Rect::new(area.x, y, area.width, 1));
             }
             SbsDisplayLine::Row(row) => {
-                render_sbs_row(f, area, y, row, half_w, right_w, h, &theme);
+                render_sbs_row(f, area, y, row, half_w, right_w, h_left, h_right, &theme);
             }
         }
         y += 1;
@@ -460,7 +555,8 @@ fn render_sbs_row(
     row: &SbsRow,
     half_w: u16,
     right_w: u16,
-    h_scroll: usize,
+    h_scroll_left: usize,
+    h_scroll_right: usize,
     theme: &Theme,
 ) {
     // Gutter: " XXXXX " = 7 cols
@@ -472,7 +568,7 @@ fn render_sbs_row(
     let left_no = fmt_lineno(row.left_no);
     let left_body =
         build_sbs_body_tokens(&row.left_text, row.left_tokens.as_ref(), left_fg, left_bg);
-    let left_spans = clip_spans(&left_body, h_scroll, left_content_w);
+    let left_spans = clip_spans(&left_body, h_scroll_left, left_content_w);
     let left_used: usize = left_spans
         .iter()
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
@@ -505,7 +601,7 @@ fn render_sbs_row(
         right_fg,
         right_bg,
     );
-    let right_spans = clip_spans(&right_body, h_scroll, right_content_w);
+    let right_spans = clip_spans(&right_body, h_scroll_right, right_content_w);
     let right_used: usize = right_spans
         .iter()
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
@@ -544,11 +640,14 @@ fn build_sbs_body_tokens(
 
 // ─── Shared helpers ──────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn render_file_header(
     f: &mut Frame,
-    app: &App,
     area: Rect,
     diff: &DiffContent,
+    layout: DiffLayout,
+    mode: DiffMode,
+    theme: &Theme,
     y: &mut u16,
     max_y: u16,
 ) {
@@ -556,14 +655,13 @@ fn render_file_header(
         return;
     }
 
-    let th = app.theme;
-    let layout_label = match app.diff_layout {
+    let layout_label = match layout {
         DiffLayout::Unified => t(Msg::LayoutUnified),
         DiffLayout::SideBySide => t(Msg::LayoutSideBySide),
     };
-    let mode_label = match app.diff_mode {
-        crate::app::DiffMode::Compact => t(Msg::ModeCompact),
-        crate::app::DiffMode::FullFile => t(Msg::ModeFullFile),
+    let mode_label = match mode {
+        DiffMode::Compact => t(Msg::ModeCompact),
+        DiffMode::FullFile => t(Msg::ModeFullFile),
     };
 
     let tag_str = crate::i18n::diff_mode_hint(layout_label, mode_label);
@@ -575,10 +673,10 @@ fn render_file_header(
         Span::styled(
             path_display.to_string(),
             Style::default()
-                .fg(th.fg_primary)
+                .fg(theme.fg_primary)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(tag_str, Style::default().fg(th.fg_secondary)),
+        Span::styled(tag_str, Style::default().fg(theme.fg_secondary)),
     ]);
     f.render_widget(header, Rect::new(area.x, *y, area.width, 1));
     *y += 1;
@@ -589,7 +687,7 @@ fn render_file_header(
     }
     let sep = Line::from(Span::styled(
         "─".repeat(area.width as usize),
-        Style::default().fg(th.fg_secondary),
+        Style::default().fg(theme.fg_secondary),
     ));
     f.render_widget(sep, Rect::new(area.x, *y, area.width, 1));
     *y += 1;

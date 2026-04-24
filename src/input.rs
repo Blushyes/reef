@@ -948,7 +948,12 @@ fn handle_key_git(key: KeyEvent, app: &mut App) {
             } else {
                 1
             };
+            // SBS mode: keyboard pans both halves in lockstep — the user
+            // has no mouse-column to disambiguate. Mouse scroll keeps the
+            // per-side route from `apply_horizontal_scroll`.
             app.diff_h_scroll = app.diff_h_scroll.saturating_sub(step);
+            app.sbs_left_h_scroll = app.sbs_left_h_scroll.saturating_sub(step);
+            app.sbs_right_h_scroll = app.sbs_right_h_scroll.saturating_sub(step);
         }
         KeyCode::Right if app.active_panel == Panel::Diff => {
             let step = if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -957,12 +962,19 @@ fn handle_key_git(key: KeyEvent, app: &mut App) {
                 1
             };
             app.diff_h_scroll = app.diff_h_scroll.saturating_add(step);
+            app.sbs_left_h_scroll = app.sbs_left_h_scroll.saturating_add(step);
+            app.sbs_right_h_scroll = app.sbs_right_h_scroll.saturating_add(step);
         }
         KeyCode::Home if app.active_panel == Panel::Diff => {
             app.diff_h_scroll = 0;
+            app.sbs_left_h_scroll = 0;
+            app.sbs_right_h_scroll = 0;
         }
         KeyCode::End if app.active_panel == Panel::Diff => {
-            app.diff_h_scroll = usize::MAX; // render 自动钳到实际最大值
+            // render 自动钳到实际最大值
+            app.diff_h_scroll = usize::MAX;
+            app.sbs_left_h_scroll = usize::MAX;
+            app.sbs_right_h_scroll = usize::MAX;
         }
         KeyCode::Char('s') => {
             ui::git_status_panel::handle_key(app, "s");
@@ -1766,7 +1778,23 @@ fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: 
         (Tab::Search, true) => Some(&mut app.global_search.results_h_scroll),
         (_, true) => None,
         (Tab::Files, false) => Some(&mut app.preview_h_scroll),
-        (Tab::Git, false) => Some(&mut app.diff_h_scroll),
+        (Tab::Git, false) => match app.diff_layout {
+            // Unified: one h_scroll applies to the whole content column.
+            crate::app::DiffLayout::Unified => Some(&mut app.diff_h_scroll),
+            // SBS: each half scrolls independently (old vs new version
+            // line widths often diverge — rename, large rewrite). Route
+            // to whichever side the cursor sits over.
+            crate::app::DiffLayout::SideBySide => {
+                let panel_start = split_x;
+                let panel_w = total_width.saturating_sub(panel_start);
+                let panel_mid = panel_start.saturating_add(panel_w / 2);
+                if column < panel_mid {
+                    Some(&mut app.sbs_left_h_scroll)
+                } else {
+                    Some(&mut app.sbs_right_h_scroll)
+                }
+            }
+        },
         (Tab::Search, false) => Some(&mut app.preview_h_scroll),
         (Tab::Graph, false) => {
             // Graph's right panel is the commit detail. SBS layout splits

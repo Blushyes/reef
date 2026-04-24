@@ -320,6 +320,12 @@ pub struct App {
     pub file_scroll: usize,
     pub diff_scroll: usize,
     pub diff_h_scroll: usize,
+    /// SBS 模式下左右列各自的横向滚动偏移。Unified 模式用 `diff_h_scroll`,
+    /// 切到 SBS 时两列独立滚动 —— 旧版本 / 新版本的行宽差异常常较大,
+    /// 独立滚比同步滚更符合直觉。键盘 ←/→ 同步两侧,鼠标滚按光标所在
+    /// 侧路由到其中一个。语义跟 `commit_detail.sbs_left_h_scroll` 一致。
+    pub sbs_left_h_scroll: usize,
+    pub sbs_right_h_scroll: usize,
 
     // ── Files tab state ──
     pub file_tree: FileTree,
@@ -674,6 +680,8 @@ impl App {
             file_scroll: 0,
             diff_scroll: 0,
             diff_h_scroll: 0,
+            sbs_left_h_scroll: 0,
+            sbs_right_h_scroll: 0,
             file_tree,
             preview_content: None,
             image_picker,
@@ -1472,6 +1480,8 @@ impl App {
         });
         self.diff_scroll = 0;
         self.diff_h_scroll = 0;
+        self.sbs_left_h_scroll = 0;
+        self.sbs_right_h_scroll = 0;
         self.load_diff();
     }
 
@@ -1506,6 +1516,8 @@ impl App {
         };
         self.diff_scroll = 0;
         self.diff_h_scroll = 0;
+        self.sbs_left_h_scroll = 0;
+        self.sbs_right_h_scroll = 0;
         save_prefs(self.diff_layout, self.diff_mode);
     }
 
@@ -1516,6 +1528,8 @@ impl App {
         };
         self.diff_scroll = 0;
         self.diff_h_scroll = 0;
+        self.sbs_left_h_scroll = 0;
+        self.sbs_right_h_scroll = 0;
         self.load_diff();
         save_prefs(self.diff_layout, self.diff_mode);
     }
@@ -2913,6 +2927,8 @@ impl App {
         });
         self.diff_scroll = 0;
         self.diff_h_scroll = 0;
+        self.sbs_left_h_scroll = 0;
+        self.sbs_right_h_scroll = 0;
     }
 
     /// Called every frame: drain fs-watcher events and the push worker's

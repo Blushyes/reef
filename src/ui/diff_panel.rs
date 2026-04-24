@@ -155,7 +155,16 @@ fn render_unified(
     let mut y = area.y;
     let max_y = area.y + area.height;
 
-    render_file_header(f, area, diff, DiffLayout::Unified, mode, &theme, &mut y, max_y);
+    render_file_header(
+        f,
+        area,
+        diff,
+        DiffLayout::Unified,
+        mode,
+        &theme,
+        &mut y,
+        max_y,
+    );
 
     // Build all display lines. Content rows pick up per-line syntect tokens
     // when available so the render path can emit syntax-colored spans
@@ -637,10 +646,7 @@ fn render_side_by_side(
             Some(s) => match s.side {
                 DiffSide::SbsLeft => {
                     if let SbsDisplayLine::Row(row) = dl {
-                        (
-                            s.sel.line_byte_range(row_idx, row.left_text.as_str()),
-                            None,
-                        )
+                        (s.sel.line_byte_range(row_idx, row.left_text.as_str()), None)
                     } else {
                         (None, None)
                     }

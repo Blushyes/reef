@@ -2006,8 +2006,7 @@ impl App {
         // Move focus to the diff column so scroll keys target it after the
         // click. Only when we're actually on the Graph tab — some paths
         // (search restore) call this while on other tabs.
-        if self.active_tab == Tab::Graph
-            && self.last_total_width >= Self::GRAPH_THREE_COL_MIN_WIDTH
+        if self.active_tab == Tab::Graph && self.last_total_width >= Self::GRAPH_THREE_COL_MIN_WIDTH
         {
             self.active_panel = Panel::Diff;
         }

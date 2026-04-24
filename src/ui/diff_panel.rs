@@ -225,9 +225,7 @@ fn render_unified(
         .collect();
     *hit_slot = Some(DiffHit {
         layout: DiffLayout::Unified,
-        panel: area,
         content_y,
-        view_h: visible_rows as u16,
         content_x_unified: area.x.saturating_add(GUTTER_AND_PREFIX as u16),
         content_x_left: 0,
         content_x_right: 0,
@@ -536,10 +534,12 @@ fn render_side_by_side(
         &mut y,
         max_y,
     );
-    // SBS has no per-row search overlay plumbing yet — the pre-split
-    // `render_unified` path is what feeds `SearchTarget::Diff` rows. Leave
-    // `search` threaded through the signature so SBS can light up matches
-    // when we add that overlay; today it's here for API symmetry.
+    // TODO(search-sbs): SBS layout doesn't overlay `/` match highlights
+    // on its rows — only Unified does. Row index inside `build_sbs_lines`
+    // diverges from `unified_display_rows` (it pairs Removed/Added into
+    // single rows), so wiring search in needs a parallel row collector
+    // before the renderer can light up matches. `search` is threaded
+    // through to keep the signature honest once that lands.
     let _ = search;
 
     // Build all display lines
@@ -617,9 +617,7 @@ fn render_side_by_side(
     let gutter = 7u16;
     *hit_slot = Some(DiffHit {
         layout: DiffLayout::SideBySide,
-        panel: area,
         content_y,
-        view_h: visible_rows as u16,
         content_x_unified: 0,
         content_x_left: area.x.saturating_add(gutter),
         // Right half starts 1 col after the divider; content starts another

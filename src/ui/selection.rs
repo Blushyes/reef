@@ -7,7 +7,6 @@
 //! 滚动后选中范围仍然指向文件里原来的同一段文本。
 
 use crate::app::DiffLayout;
-use ratatui::layout::Rect;
 use std::ops::Range;
 use unicode_width::UnicodeWidthChar;
 
@@ -218,16 +217,9 @@ impl DiffRowText {
 #[derive(Debug, Clone)]
 pub struct DiffHit {
     pub layout: DiffLayout,
-    /// Panel-level rect, used for point-in-rect gating. Renderer caches
-    /// it separately too (`last_diff_rect`); kept here so a hit-test can
-    /// stay self-contained if needed.
-    pub panel: Rect,
     /// First content row's absolute y. Rows above this are the file
     /// header / separator line.
     pub content_y: u16,
-    /// Last-rendered viewport height in rows. Used to clamp drag past the
-    /// bottom of the panel.
-    pub view_h: u16,
 
     // Unified layout
     pub content_x_unified: u16,
@@ -581,9 +573,7 @@ mod tests {
     fn make_unified_hit(rows: Vec<DiffRowText>, scroll: usize) -> DiffHit {
         DiffHit {
             layout: DiffLayout::Unified,
-            panel: Rect::new(0, 0, 80, 20),
             content_y: 2,
-            view_h: 18,
             content_x_unified: 16,
             content_x_left: 0,
             content_x_right: 0,
@@ -600,9 +590,7 @@ mod tests {
         // Half width 40, divider at col 40, right half content starts at 48.
         DiffHit {
             layout: DiffLayout::SideBySide,
-            panel: Rect::new(0, 0, 81, 20),
             content_y: 2,
-            view_h: 18,
             content_x_unified: 0,
             content_x_left: 7,
             content_x_right: 48,

@@ -570,27 +570,20 @@ fn render_side_by_side(
     // Clamp each side's horizontal scroll against that side's widest text
     // in view. Using a shared scroll would force both halves to pan in
     // lockstep — rarely what you want when the two versions have very
-    // different line widths (think rename / large rewrite).
-    let max_left_w: usize = all_lines
+    // different line widths (think rename / large rewrite). Single fold
+    // over the visible window computes both maxes — one iteration
+    // instead of two over the same slice.
+    let (max_left_w, max_right_w): (usize, usize) = all_lines
         .iter()
         .skip(*view.scroll)
         .take(visible_rows)
-        .filter_map(|dl| match dl {
-            SbsDisplayLine::Row(row) => Some(UnicodeWidthStr::width(row.left_text.as_str())),
-            _ => None,
-        })
-        .max()
-        .unwrap_or(0);
-    let max_right_w: usize = all_lines
-        .iter()
-        .skip(*view.scroll)
-        .take(visible_rows)
-        .filter_map(|dl| match dl {
-            SbsDisplayLine::Row(row) => Some(UnicodeWidthStr::width(row.right_text.as_str())),
-            _ => None,
-        })
-        .max()
-        .unwrap_or(0);
+        .fold((0, 0), |(ml, mr), dl| match dl {
+            SbsDisplayLine::Row(row) => (
+                ml.max(UnicodeWidthStr::width(row.left_text.as_str())),
+                mr.max(UnicodeWidthStr::width(row.right_text.as_str())),
+            ),
+            _ => (ml, mr),
+        });
     let max_h_left = max_left_w.saturating_sub(left_content_w);
     let max_h_right = max_right_w.saturating_sub(right_content_w);
     *view.sbs_left_h_scroll = (*view.sbs_left_h_scroll).min(max_h_left);

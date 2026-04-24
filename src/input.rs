@@ -16,7 +16,8 @@ use crate::quick_open;
 use crate::search;
 use crate::ui;
 use crate::ui::selection::{
-    PreviewSelection, col_to_byte_offset, collect_selected_text, word_at_byte,
+    DiffSelection, DiffSide, PreviewSelection, col_to_byte_offset, collect_diff_selected_text,
+    collect_selected_text, word_at_byte,
 };
 use crate::ui::toast::Toast;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -1502,6 +1503,13 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
     if handle_preview_selection(&mouse, app) {
         return;
     }
+    // Diff-panel selection gets the same priority as preview: Down inside
+    // the cached diff rect owns the drag through Up, even if the cursor
+    // later leaves the panel. Wheel / right-click / Down outside fall
+    // through below.
+    if handle_diff_selection(&mouse, app) {
+        return;
+    }
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
@@ -1849,6 +1857,144 @@ fn handle_preview_selection(mouse: &MouseEvent, app: &mut App) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+/// Drive in-panel text selection on the diff panel. Returns `true` when
+/// the mouse event was consumed. Mirrors `handle_preview_selection` shape —
+/// click levels, anchor-drag-extend-on-Drag, copy-on-Up — but works on the
+/// flattened display-row list in `DiffHit` instead of file lines.
+///
+/// SBS side lock: the Down gesture picks a side (left/right of the divider,
+/// or `Unified` in unified layout) and stores it with the selection. A
+/// subsequent Drag clamps the cursor column into that side's content area
+/// before translating to byte offsets, so crossing the divider extends
+/// vertically along the anchored side instead of flipping. Matches VSCode's
+/// diff editor.
+fn handle_diff_selection(mouse: &MouseEvent, app: &mut App) -> bool {
+    let Some(rect) = app.last_diff_rect else {
+        return false;
+    };
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if !point_in_rect(rect, mouse.column, mouse.row) {
+                return false;
+            }
+            let Some(hit) = app.last_diff_hit.as_ref() else {
+                return false;
+            };
+            if hit.rows.is_empty() {
+                return false;
+            }
+            let side = hit.side_for_column(mouse.column);
+            let Some((row_idx, byte_offset)) = hit.coord_for(mouse.column, mouse.row, side) else {
+                return false;
+            };
+
+            // Advance (or reset) the click counter — same 400 ms window as
+            // the preview panel so users get consistent double/triple-click
+            // timing across both surfaces.
+            let now = Instant::now();
+            let click_count = if let Some((t, c, r, n)) = app.diff_click_state {
+                if c == mouse.column
+                    && r == mouse.row
+                    && now.duration_since(t) < DOUBLE_CLICK_WINDOW
+                {
+                    (n + 1).min(3)
+                } else {
+                    1
+                }
+            } else {
+                1
+            };
+            app.diff_click_state = Some((now, mouse.column, mouse.row, click_count));
+
+            let row_text = hit.rows[row_idx].text_for(side).to_string();
+            let sel = match click_count {
+                2 => {
+                    let word = word_at_byte(&row_text, byte_offset);
+                    PreviewSelection {
+                        anchor: (row_idx, word.start),
+                        active: (row_idx, word.end),
+                        dragging: true,
+                    }
+                }
+                3 => PreviewSelection {
+                    anchor: (row_idx, 0),
+                    active: (row_idx, row_text.len()),
+                    dragging: true,
+                },
+                _ => PreviewSelection::new((row_idx, byte_offset)),
+            };
+            app.diff_selection = Some(DiffSelection { sel, side });
+            true
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let dragging = app.diff_selection.is_some_and(|s| s.sel.dragging);
+            if !dragging {
+                return false;
+            }
+            let Some(hit) = app.last_diff_hit.as_ref() else {
+                return true;
+            };
+            let side = app.diff_selection.unwrap().side;
+            // Clamp the cursor column back into the anchor's side before
+            // translating — this is the SBS side-lock. In Unified the
+            // clamp is a no-op (no divider).
+            let clamped_col = clamp_col_to_side(hit, mouse.column, side);
+            if let Some(pos) = hit.coord_for(clamped_col, mouse.row, side) {
+                if let Some(s) = app.diff_selection.as_mut() {
+                    s.sel.active = pos;
+                }
+            }
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let Some(sel) = app.diff_selection.as_mut() else {
+                return false;
+            };
+            if !sel.sel.dragging {
+                return false;
+            }
+            sel.sel.dragging = false;
+            let snap = *sel;
+            if !snap.sel.is_empty() {
+                if let Some(hit) = app.last_diff_hit.as_ref() {
+                    let text = collect_diff_selected_text(hit, &snap);
+                    if !text.is_empty() {
+                        match clipboard::copy_to_clipboard(&text) {
+                            Ok(()) => app.toasts.push(Toast::info(t(Msg::ClipboardCopied))),
+                            Err(_) => app.toasts.push(Toast::error(t(Msg::ClipboardCopyFailed))),
+                        }
+                    }
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Clamp `col` into the content range of the given SBS side so drag-
+/// through-divider doesn't bleed the selection onto the other half.
+/// In Unified layout there's nothing to clamp and `col` passes through.
+fn clamp_col_to_side(
+    hit: &crate::ui::selection::DiffHit,
+    col: u16,
+    side: DiffSide,
+) -> u16 {
+    match (hit.layout, side) {
+        (crate::app::DiffLayout::Unified, _) => col,
+        (crate::app::DiffLayout::SideBySide, DiffSide::Unified) => col,
+        (crate::app::DiffLayout::SideBySide, DiffSide::SbsLeft) => {
+            // Right edge of the left half is just before `right_start_x`
+            // (which is the divider column). `saturating_sub(1)` keeps us
+            // on the left half's last content column.
+            col.min(hit.right_start_x.saturating_sub(1))
+        }
+        (crate::app::DiffLayout::SideBySide, DiffSide::SbsRight) => {
+            col.max(hit.right_start_x)
+        }
     }
 }
 

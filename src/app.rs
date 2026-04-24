@@ -431,6 +431,23 @@ pub struct App {
     /// hit_registry 的 double-click 逻辑。
     pub preview_click_state: Option<(Instant, u16, u16, u8)>,
 
+    /// Diff 面板选中状态——Git tab 的 diff 和 Graph tab 3-col 右栏共用
+    /// 同一组字段(它们永远不会同时处于激活状态)。SBS 模式下锚点
+    /// 绑定一侧(左/右),跨侧拖拽把列 clamp 回本侧。None 表示无选中。
+    pub diff_selection: Option<crate::ui::selection::DiffSelection>,
+    /// 上一帧 diff 面板的整体 rect,供 hit test 使用。跟
+    /// `last_preview_rect` 并列。切到不渲染 diff 的 tab 时被
+    /// `ui::render` 在帧头清零。
+    pub last_diff_rect: Option<ratatui::layout::Rect>,
+    /// 上一帧 diff 面板的几何快照 + 行文本快照,鼠标处理把终端列行坐标
+    /// 映射回 `(side, display_row, byte_offset)`,以及在 Up 时从缓存的
+    /// 行文本里抽取选中区间写到剪贴板。只活一帧,下一帧 render 要么覆写
+    /// 要么被清零。
+    pub last_diff_hit: Option<crate::ui::selection::DiffHit>,
+    /// 连击计数器:diff 面板的 Down(Left) 序列,和 `preview_click_state`
+    /// 语义一致,但分开存以防两个 tab 之间的点击串扰。
+    pub diff_click_state: Option<(Instant, u16, u16, u8)>,
+
     // Layout
     pub split_percent: u16,
     pub dragging_split: bool,
@@ -739,6 +756,10 @@ impl App {
             last_preview_rect: None,
             last_preview_content_origin: None,
             preview_click_state: None,
+            diff_selection: None,
+            last_diff_rect: None,
+            last_diff_hit: None,
+            diff_click_state: None,
             split_percent: 30,
             dragging_split: false,
             graph_diff_split_percent: 60,
@@ -838,9 +859,23 @@ impl App {
     /// unloaded, tab switched away). Prevents the user from being stuck
     /// focusing a column that isn't rendered. Called at the top of
     /// `ui::render` alongside `last_total_width` update.
+    ///
+    /// Also drops a stale diff selection if we just lost the panel that
+    /// owned it — row indices from the old frame would overlay on top of
+    /// whatever renders next (commit_detail's flat row list doesn't match
+    /// `DiffHit.rows`), producing a bogus highlight.
     pub fn normalize_active_panel(&mut self) {
         if self.active_panel == Panel::Commit && !self.graph_uses_three_col() {
             self.active_panel = Panel::Diff;
+        }
+        // If we're on Graph and the 3-col diff column isn't visible anymore,
+        // any selection was anchored into rows that no panel will render.
+        if self.active_tab == Tab::Graph
+            && self.diff_selection.is_some()
+            && !self.graph_uses_three_col()
+        {
+            self.diff_selection = None;
+            self.diff_click_state = None;
         }
     }
 
@@ -1555,6 +1590,8 @@ impl App {
         self.diff_h_scroll = 0;
         self.sbs_left_h_scroll = 0;
         self.sbs_right_h_scroll = 0;
+        self.diff_selection = None;
+        self.diff_click_state = None;
         self.load_diff();
     }
 
@@ -1591,6 +1628,10 @@ impl App {
         self.diff_h_scroll = 0;
         self.sbs_left_h_scroll = 0;
         self.sbs_right_h_scroll = 0;
+        // Unified↔SBS row counts differ (SBS pairs adjacent - / + lines),
+        // so a selection anchored in one layout doesn't map into the other.
+        self.diff_selection = None;
+        self.diff_click_state = None;
         save_prefs(self.diff_layout, self.diff_mode);
     }
 
@@ -1603,6 +1644,8 @@ impl App {
         self.diff_h_scroll = 0;
         self.sbs_left_h_scroll = 0;
         self.sbs_right_h_scroll = 0;
+        self.diff_selection = None;
+        self.diff_click_state = None;
         self.load_diff();
         save_prefs(self.diff_layout, self.diff_mode);
     }
@@ -1920,6 +1963,8 @@ impl App {
             self.commit_detail.file_diff_h_scroll = 0;
             self.commit_detail.file_diff_sbs_left_h_scroll = 0;
             self.commit_detail.file_diff_sbs_right_h_scroll = 0;
+            self.diff_selection = None;
+            self.diff_click_state = None;
         }
         if self.git_graph.is_range() {
             let Some(range) = self.commit_detail.range_detail.as_ref() else {
@@ -2730,6 +2775,11 @@ impl App {
         // appears on return and the click-count resets cleanly.
         self.preview_selection = None;
         self.preview_click_state = None;
+        // Same for diff-panel selection — the Git tab and the Graph tab
+        // 3-col diff column share this state, and tab-switching between
+        // them (or to Files/Search) should start fresh.
+        self.diff_selection = None;
+        self.diff_click_state = None;
         match tab {
             Tab::Git => self.git_status_load.mark_stale(),
             Tab::Graph => self.graph_load.mark_stale(),

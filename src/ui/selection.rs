@@ -6,6 +6,8 @@
 //! 显示列)。这样选中与 `preview_scroll` / `preview_h_scroll` 解耦——
 //! 滚动后选中范围仍然指向文件里原来的同一段文本。
 
+use crate::app::DiffLayout;
+use ratatui::layout::Rect;
 use std::ops::Range;
 use unicode_width::UnicodeWidthChar;
 
@@ -146,6 +148,180 @@ pub fn col_to_byte_offset(line: &str, col: usize) -> usize {
         acc += cw;
     }
     line.len()
+}
+
+// ─── Diff-panel selection ────────────────────────────────────────────────
+//
+// Same `(row, byte)` coord model as `PreviewSelection`, but `row` indexes
+// into the diff's *display* row list (separator / hunk header / content),
+// not a file. A second `side` field disambiguates SBS layout — a gesture
+// that starts on the left (old version) stays on the left even if the
+// cursor crosses the divider, matching VSCode's diff editor. In Unified
+// layout `side` is always `Unified`.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffSide {
+    Unified,
+    SbsLeft,
+    SbsRight,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DiffSelection {
+    pub sel: PreviewSelection,
+    pub side: DiffSide,
+}
+
+/// Snapshot of what a single display row carried at the time of render.
+/// Mouse-selection handlers read this to know how to extract the side-
+/// specific text for the row that was hit — without walking back into
+/// the diff hunks themselves.
+#[derive(Debug, Clone)]
+pub enum DiffRowText {
+    /// `⋯` separator between hunks. Contributes an empty string to the
+    /// copied text so drag-selections span seamlessly across it.
+    Separator,
+    /// `@@ -1,5 +2,7 @@` hunk header. Copy includes the full header text.
+    Header(String),
+    /// Unified content row — left/right don't apply.
+    Unified(String),
+    /// SBS paired content row. Each half is its own selectable string,
+    /// picked by the selection's `side`.
+    Sbs { left: String, right: String },
+}
+
+impl DiffRowText {
+    pub fn text_for(&self, side: DiffSide) -> &str {
+        match self {
+            DiffRowText::Separator => "",
+            DiffRowText::Header(h) => h.as_str(),
+            DiffRowText::Unified(s) => s.as_str(),
+            DiffRowText::Sbs { left, right } => match side {
+                DiffSide::SbsLeft => left.as_str(),
+                // SBS content row requested through the unified side (rare —
+                // would mean a stale selection from a layout change): fall
+                // through to right like a context row.
+                DiffSide::SbsRight | DiffSide::Unified => right.as_str(),
+            },
+        }
+    }
+}
+
+/// Layout + per-frame snapshot needed to translate a terminal `(col, row)`
+/// hit inside the diff panel into `(side, display_row, byte_offset)`.
+/// Written on every render of `diff_panel::render_diff`; the mouse handler
+/// consults it on Down / Drag / Up to drive selection.
+///
+/// Storing the scroll values here (instead of looking them up on the live
+/// `App`) keeps the mouse handler panel-agnostic — both Git-tab Diff and
+/// Graph-tab 3-col diff write their own scroll fields into this struct.
+#[derive(Debug, Clone)]
+pub struct DiffHit {
+    pub layout: DiffLayout,
+    /// Panel-level rect, used for point-in-rect gating. Renderer caches
+    /// it separately too (`last_diff_rect`); kept here so a hit-test can
+    /// stay self-contained if needed.
+    pub panel: Rect,
+    /// First content row's absolute y. Rows above this are the file
+    /// header / separator line.
+    pub content_y: u16,
+    /// Last-rendered viewport height in rows. Used to clamp drag past the
+    /// bottom of the panel.
+    pub view_h: u16,
+
+    // Unified layout
+    pub content_x_unified: u16,
+
+    // SBS layout
+    pub content_x_left: u16,
+    pub content_x_right: u16,
+    pub right_start_x: u16,
+
+    // Scroll snapshot (for col → byte translation)
+    pub scroll: usize,
+    pub h_scroll: usize,
+    pub sbs_left_h_scroll: usize,
+    pub sbs_right_h_scroll: usize,
+
+    /// Flattened display rows in the same order `render_*` produces them.
+    /// Index into this vec is what `PreviewSelection.anchor.0` points at.
+    pub rows: Vec<DiffRowText>,
+}
+
+impl DiffHit {
+    /// Decide which side the hit column lands on in SBS layout. In Unified
+    /// it always returns `DiffSide::Unified`. The result is the side the
+    /// anchor binds to on a Down gesture; Drag keeps the side stable and
+    /// clamps the column to that side's range.
+    pub fn side_for_column(&self, col: u16) -> DiffSide {
+        match self.layout {
+            DiffLayout::Unified => DiffSide::Unified,
+            DiffLayout::SideBySide => {
+                if col >= self.right_start_x {
+                    DiffSide::SbsRight
+                } else {
+                    DiffSide::SbsLeft
+                }
+            }
+        }
+    }
+
+    /// Translate a terminal `(col, row)` hit into
+    /// `(display_row_index, byte_offset_in_row_text)` for the given side.
+    /// Returns `None` when the panel has no selectable rows (empty diff).
+    ///
+    /// `row` is clamped into `[0, rows.len()-1]` so dragging past the top
+    /// or bottom of the viewport extends the selection cleanly. Columns
+    /// left of the row's gutter collapse to byte 0; past end clamps to
+    /// `text.len()` — same "drag past line end" semantics as the text
+    /// preview's `mouse_to_file_coord`.
+    pub fn coord_for(&self, col: u16, row: u16, side: DiffSide) -> Option<(usize, usize)> {
+        if self.rows.is_empty() {
+            return None;
+        }
+        let visible_row = row.saturating_sub(self.content_y) as usize;
+        let row_idx = (self.scroll + visible_row).min(self.rows.len() - 1);
+        let text = self.rows[row_idx].text_for(side);
+        let (content_x, h_scroll) = match side {
+            DiffSide::Unified => (self.content_x_unified, self.h_scroll),
+            DiffSide::SbsLeft => (self.content_x_left, self.sbs_left_h_scroll),
+            DiffSide::SbsRight => (self.content_x_right, self.sbs_right_h_scroll),
+        };
+        let visible_col = (col.saturating_sub(content_x) as usize) + h_scroll;
+        let byte_offset = col_to_byte_offset(text, visible_col);
+        Some((row_idx, byte_offset))
+    }
+}
+
+/// Extract the selected text from a `DiffHit`'s cached rows using the
+/// selection's `side`. Separator rows contribute `""`, headers contribute
+/// their full text, content rows contribute the appropriate side. Lines
+/// joined with `\n`.
+pub fn collect_diff_selected_text(hit: &DiffHit, sel: &DiffSelection) -> String {
+    if sel.sel.is_empty() {
+        return String::new();
+    }
+    let (start, end) = sel.sel.normalized();
+    let last = end.0.min(hit.rows.len().saturating_sub(1));
+    let mut out = String::new();
+    for row in start.0..=last {
+        let Some(raw_text) = hit.rows.get(row) else {
+            continue;
+        };
+        let text = raw_text.text_for(sel.side);
+        let range = match sel.sel.line_byte_range(row, text) {
+            Some(r) => r,
+            None => continue,
+        };
+        if range.start < text.len() {
+            let end_clamped = range.end.min(text.len());
+            out.push_str(&text[range.start..end_clamped]);
+        }
+        if row < last {
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// 把选中范围从 `lines` 提取成一段纯文本。多行之间用 `\n` 连接。
@@ -398,5 +574,222 @@ mod tests {
     fn word_underscore_is_alnum() {
         let line = "_foo_bar";
         assert_eq!(word_at_byte(line, 0), 0..8); // whole "_foo_bar"
+    }
+
+    // ── DiffRowText / DiffHit / collect_diff_selected_text ───────────────
+
+    fn make_unified_hit(rows: Vec<DiffRowText>, scroll: usize) -> DiffHit {
+        DiffHit {
+            layout: DiffLayout::Unified,
+            panel: Rect::new(0, 0, 80, 20),
+            content_y: 2,
+            view_h: 18,
+            content_x_unified: 16,
+            content_x_left: 0,
+            content_x_right: 0,
+            right_start_x: 0,
+            scroll,
+            h_scroll: 0,
+            sbs_left_h_scroll: 0,
+            sbs_right_h_scroll: 0,
+            rows,
+        }
+    }
+
+    fn make_sbs_hit(rows: Vec<DiffRowText>) -> DiffHit {
+        // Half width 40, divider at col 40, right half content starts at 48.
+        DiffHit {
+            layout: DiffLayout::SideBySide,
+            panel: Rect::new(0, 0, 81, 20),
+            content_y: 2,
+            view_h: 18,
+            content_x_unified: 0,
+            content_x_left: 7,
+            content_x_right: 48,
+            right_start_x: 41,
+            scroll: 0,
+            h_scroll: 0,
+            sbs_left_h_scroll: 0,
+            sbs_right_h_scroll: 0,
+            rows,
+        }
+    }
+
+    #[test]
+    fn diff_row_text_unified_returns_body() {
+        let row = DiffRowText::Unified("hello".into());
+        assert_eq!(row.text_for(DiffSide::Unified), "hello");
+    }
+
+    #[test]
+    fn diff_row_text_sbs_picks_side() {
+        let row = DiffRowText::Sbs {
+            left: "old".into(),
+            right: "new".into(),
+        };
+        assert_eq!(row.text_for(DiffSide::SbsLeft), "old");
+        assert_eq!(row.text_for(DiffSide::SbsRight), "new");
+    }
+
+    #[test]
+    fn diff_row_text_header_ignores_side() {
+        let row = DiffRowText::Header("@@ -1 +1 @@".into());
+        assert_eq!(row.text_for(DiffSide::Unified), "@@ -1 +1 @@");
+        assert_eq!(row.text_for(DiffSide::SbsLeft), "@@ -1 +1 @@");
+        assert_eq!(row.text_for(DiffSide::SbsRight), "@@ -1 +1 @@");
+    }
+
+    #[test]
+    fn diff_hit_side_for_column_unified_is_always_unified() {
+        let hit = make_unified_hit(vec![DiffRowText::Unified("x".into())], 0);
+        assert_eq!(hit.side_for_column(0), DiffSide::Unified);
+        assert_eq!(hit.side_for_column(200), DiffSide::Unified);
+    }
+
+    #[test]
+    fn diff_hit_side_for_column_sbs_splits_on_right_start() {
+        let hit = make_sbs_hit(vec![DiffRowText::Sbs {
+            left: "l".into(),
+            right: "r".into(),
+        }]);
+        assert_eq!(hit.side_for_column(10), DiffSide::SbsLeft);
+        // right_start_x = 41 → col 40 is still left (divider), col 41 is right
+        assert_eq!(hit.side_for_column(40), DiffSide::SbsLeft);
+        assert_eq!(hit.side_for_column(41), DiffSide::SbsRight);
+        assert_eq!(hit.side_for_column(70), DiffSide::SbsRight);
+    }
+
+    #[test]
+    fn diff_hit_coord_for_unified_translates_col_to_byte() {
+        let rows = vec![DiffRowText::Unified("hello world".into())];
+        let hit = make_unified_hit(rows, 0);
+        // content_x_unified = 16, content_y = 2. Click at col 20 row 2 →
+        // visible_col = 4, byte_offset = 4 ('o' of "hello").
+        let (row_idx, byte_offset) =
+            hit.coord_for(20, 2, DiffSide::Unified).expect("coord");
+        assert_eq!(row_idx, 0);
+        assert_eq!(byte_offset, 4);
+    }
+
+    #[test]
+    fn diff_hit_coord_for_past_row_clamps_to_last() {
+        let rows = vec![DiffRowText::Unified("x".into()), DiffRowText::Unified("y".into())];
+        let hit = make_unified_hit(rows, 0);
+        // Row 50 way past end → clamps to last row (1).
+        let (row_idx, _byte) = hit.coord_for(16, 50, DiffSide::Unified).unwrap();
+        assert_eq!(row_idx, 1);
+    }
+
+    #[test]
+    fn diff_hit_coord_for_left_of_gutter_collapses_to_zero() {
+        let rows = vec![DiffRowText::Unified("hello".into())];
+        let hit = make_unified_hit(rows, 0);
+        // col 5 is inside gutter (< content_x_unified=16) → byte 0
+        let (_, byte) = hit.coord_for(5, 2, DiffSide::Unified).unwrap();
+        assert_eq!(byte, 0);
+    }
+
+    #[test]
+    fn diff_hit_coord_for_scrolled() {
+        let rows = vec![
+            DiffRowText::Unified("row0".into()),
+            DiffRowText::Unified("row1".into()),
+            DiffRowText::Unified("row2".into()),
+        ];
+        let hit = make_unified_hit(rows, 1);
+        // With scroll=1, visible row 0 is file row 1.
+        let (row_idx, _) = hit.coord_for(16, 2, DiffSide::Unified).unwrap();
+        assert_eq!(row_idx, 1);
+    }
+
+    #[test]
+    fn collect_diff_selected_text_unified_single_row() {
+        let rows = vec![DiffRowText::Unified("hello world".into())];
+        let hit = make_unified_hit(rows, 0);
+        let sel = DiffSelection {
+            sel: PreviewSelection {
+                anchor: (0, 6),
+                active: (0, 11),
+                dragging: false,
+            },
+            side: DiffSide::Unified,
+        };
+        assert_eq!(collect_diff_selected_text(&hit, &sel), "world");
+    }
+
+    #[test]
+    fn collect_diff_selected_text_unified_multi_row_includes_separator_as_blank() {
+        let rows = vec![
+            DiffRowText::Unified("first".into()),
+            DiffRowText::Separator,
+            DiffRowText::Unified("third".into()),
+        ];
+        let hit = make_unified_hit(rows, 0);
+        let sel = DiffSelection {
+            sel: PreviewSelection {
+                anchor: (0, 2),
+                active: (2, 3),
+                dragging: false,
+            },
+            side: DiffSide::Unified,
+        };
+        // "rst" + "\n" + "" + "\n" + "thi"
+        assert_eq!(collect_diff_selected_text(&hit, &sel), "rst\n\nthi");
+    }
+
+    #[test]
+    fn collect_diff_selected_text_unified_includes_header() {
+        let rows = vec![
+            DiffRowText::Unified("before".into()),
+            DiffRowText::Header("@@ -1 +1 @@".into()),
+            DiffRowText::Unified("after".into()),
+        ];
+        let hit = make_unified_hit(rows, 0);
+        let sel = DiffSelection {
+            sel: PreviewSelection {
+                anchor: (0, 0),
+                active: (2, 5),
+                dragging: false,
+            },
+            side: DiffSide::Unified,
+        };
+        assert_eq!(
+            collect_diff_selected_text(&hit, &sel),
+            "before\n@@ -1 +1 @@\nafter"
+        );
+    }
+
+    #[test]
+    fn collect_diff_selected_text_sbs_picks_side() {
+        let rows = vec![
+            DiffRowText::Sbs {
+                left: "old1".into(),
+                right: "new1".into(),
+            },
+            DiffRowText::Sbs {
+                left: "old2".into(),
+                right: "new2".into(),
+            },
+        ];
+        let hit = make_sbs_hit(rows);
+        let sel_left = DiffSelection {
+            sel: PreviewSelection {
+                anchor: (0, 0),
+                active: (1, 4),
+                dragging: false,
+            },
+            side: DiffSide::SbsLeft,
+        };
+        assert_eq!(collect_diff_selected_text(&hit, &sel_left), "old1\nold2");
+
+        let sel_right = DiffSelection {
+            sel: PreviewSelection {
+                anchor: (0, 0),
+                active: (1, 4),
+                dragging: false,
+            },
+            side: DiffSide::SbsRight,
+        };
+        assert_eq!(collect_diff_selected_text(&hit, &sel_right), "new1\nnew2");
     }
 }

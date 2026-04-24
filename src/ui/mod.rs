@@ -39,6 +39,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // handler would treat clicks on other panels as selection gestures.
     app.last_preview_rect = None;
     app.last_preview_content_origin = None;
+    // Same story for the diff panel — both Git tab Diff and Graph tab's
+    // 3-col diff column write into these slots during their own render.
+    // If the active tab renders neither, wiping here keeps a stale rect
+    // from steering mouse selection toward a hidden region.
+    app.last_diff_rect = None;
+    app.last_diff_hit = None;
 
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -264,6 +270,10 @@ fn render_graph_diff_column(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default().padding(Padding::new(1, 1, 0, 0));
     let inner = block.inner(area);
     f.render_widget(block, area);
+    // Cache the panel rect for mouse selection, parallel to the Git-tab
+    // wrapper. Both tabs write into the same `last_diff_rect` slot — only
+    // one of them renders Diff at a time.
+    app.last_diff_rect = Some(inner);
 
     let Some(d) = app.commit_detail.file_diff.take() else {
         // In 3-col mode this only fires when `commit_file_diff_load.loading`
@@ -279,6 +289,7 @@ fn render_graph_diff_column(f: &mut Frame, app: &mut App, area: Rect) {
         }
         return;
     };
+    let selection = app.diff_selection;
     diff_panel::render_diff(
         f,
         inner,
@@ -289,6 +300,7 @@ fn render_graph_diff_column(f: &mut Frame, app: &mut App, area: Rect) {
         app.theme,
         &app.search,
         crate::search::SearchTarget::GraphDiff,
+        selection.as_ref(),
         &mut diff_panel::DiffView {
             scroll: &mut app.commit_detail.file_diff_scroll,
             h_scroll: &mut app.commit_detail.file_diff_h_scroll,
@@ -296,6 +308,7 @@ fn render_graph_diff_column(f: &mut Frame, app: &mut App, area: Rect) {
             sbs_right_h_scroll: &mut app.commit_detail.file_diff_sbs_right_h_scroll,
             last_view_h: &mut app.last_diff_view_h,
         },
+        &mut app.last_diff_hit,
     );
     app.commit_detail.file_diff = Some(d);
 }

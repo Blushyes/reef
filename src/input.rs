@@ -1980,11 +1980,7 @@ fn handle_diff_selection(mouse: &MouseEvent, app: &mut App) -> bool {
 /// Clamp `col` into the content range of the given SBS side so drag-
 /// through-divider doesn't bleed the selection onto the other half.
 /// In Unified layout there's nothing to clamp and `col` passes through.
-fn clamp_col_to_side(
-    hit: &crate::ui::selection::DiffHit,
-    col: u16,
-    side: DiffSide,
-) -> u16 {
+fn clamp_col_to_side(hit: &crate::ui::selection::DiffHit, col: u16, side: DiffSide) -> u16 {
     match (hit.layout, side) {
         (crate::app::DiffLayout::Unified, _) => col,
         (crate::app::DiffLayout::SideBySide, DiffSide::Unified) => col,
@@ -1994,9 +1990,7 @@ fn clamp_col_to_side(
             // on the left half's last content column.
             col.min(hit.right_start_x.saturating_sub(1))
         }
-        (crate::app::DiffLayout::SideBySide, DiffSide::SbsRight) => {
-            col.max(hit.right_start_x)
-        }
+        (crate::app::DiffLayout::SideBySide, DiffSide::SbsRight) => col.max(hit.right_start_x),
     }
 }
 

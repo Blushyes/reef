@@ -653,15 +653,17 @@ mod tests {
         let hit = make_unified_hit(rows, 0);
         // content_x_unified = 16, content_y = 2. Click at col 20 row 2 →
         // visible_col = 4, byte_offset = 4 ('o' of "hello").
-        let (row_idx, byte_offset) =
-            hit.coord_for(20, 2, DiffSide::Unified).expect("coord");
+        let (row_idx, byte_offset) = hit.coord_for(20, 2, DiffSide::Unified).expect("coord");
         assert_eq!(row_idx, 0);
         assert_eq!(byte_offset, 4);
     }
 
     #[test]
     fn diff_hit_coord_for_past_row_clamps_to_last() {
-        let rows = vec![DiffRowText::Unified("x".into()), DiffRowText::Unified("y".into())];
+        let rows = vec![
+            DiffRowText::Unified("x".into()),
+            DiffRowText::Unified("y".into()),
+        ];
         let hit = make_unified_hit(rows, 0);
         // Row 50 way past end → clamps to last row (1).
         let (row_idx, _byte) = hit.coord_for(16, 50, DiffSide::Unified).unwrap();

@@ -2040,6 +2040,14 @@ fn mouse_to_file_coord(
     Some((file_line, byte_offset))
 }
 
+/// `true` when a cursor at `column` lands on the left half of an SBS panel
+/// spanning `[panel_start, panel_start + panel_w)`. Shared between the Git
+/// and Graph SBS routing so they can't drift apart.
+fn sbs_cursor_on_left(panel_start: u16, panel_w: u16, column: u16) -> bool {
+    let panel_mid = panel_start.saturating_add(panel_w / 2);
+    column < panel_mid
+}
+
 /// Apply a horizontal-scroll delta (in display columns) to whichever panel
 /// the cursor sits over. Routed from Shift+wheel, trackpad ScrollLeft/Right,
 /// and bare ← / → keys. Tab::Search is the only tab whose LEFT panel also
@@ -2062,10 +2070,8 @@ fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: 
             // line widths often diverge — rename, large rewrite). Route
             // to whichever side the cursor sits over.
             crate::app::DiffLayout::SideBySide => {
-                let panel_start = split_x;
-                let panel_w = total_width.saturating_sub(panel_start);
-                let panel_mid = panel_start.saturating_add(panel_w / 2);
-                if column < panel_mid {
+                let panel_w = total_width.saturating_sub(split_x);
+                if sbs_cursor_on_left(split_x, panel_w, column) {
                     Some(&mut app.sbs_left_h_scroll)
                 } else {
                     Some(&mut app.sbs_right_h_scroll)
@@ -2097,8 +2103,7 @@ fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: 
                             &mut app.commit_detail.file_diff_sbs_right_h_scroll,
                         )
                     } else {
-                        let panel_end = diff_start;
-                        let panel_w = panel_end.saturating_sub(split_x);
+                        let panel_w = diff_start.saturating_sub(split_x);
                         (
                             split_x,
                             panel_w,
@@ -2106,8 +2111,7 @@ fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: 
                             &mut app.commit_detail.sbs_right_h_scroll,
                         )
                     };
-                    let panel_mid = panel_start.saturating_add(panel_w / 2);
-                    if column < panel_mid {
+                    if sbs_cursor_on_left(panel_start, panel_w, column) {
                         Some(left_h)
                     } else {
                         Some(right_h)

@@ -921,6 +921,16 @@ impl App {
         )
     }
 
+    /// Drop the in-panel diff selection and its click counter. Called
+    /// whenever the underlying row list is about to shift out from under
+    /// the cached `(row_idx, byte_offset)` anchor — file swap, layout /
+    /// mode toggle, tab switch, 3-col→2-col transition. Keeping this in
+    /// one place means future reset sites can't miss the click counter.
+    pub fn clear_diff_selection(&mut self) {
+        self.diff_selection = None;
+        self.diff_click_state = None;
+    }
+
     /// Drop `Panel::Commit` back to a two-column-compatible panel when the
     /// layout no longer exposes a middle column (narrow terminal, diff
     /// unloaded, tab switched away). Prevents the user from being stuck
@@ -941,8 +951,7 @@ impl App {
             && self.diff_selection.is_some()
             && !self.graph_uses_three_col()
         {
-            self.diff_selection = None;
-            self.diff_click_state = None;
+            self.clear_diff_selection();
         }
     }
 
@@ -1657,8 +1666,7 @@ impl App {
         self.diff_h_scroll = 0;
         self.sbs_left_h_scroll = 0;
         self.sbs_right_h_scroll = 0;
-        self.diff_selection = None;
-        self.diff_click_state = None;
+        self.clear_diff_selection();
         self.load_diff();
     }
 
@@ -1697,8 +1705,7 @@ impl App {
         self.sbs_right_h_scroll = 0;
         // Unified↔SBS row counts differ (SBS pairs adjacent - / + lines),
         // so a selection anchored in one layout doesn't map into the other.
-        self.diff_selection = None;
-        self.diff_click_state = None;
+        self.clear_diff_selection();
         save_prefs(self.diff_layout, self.diff_mode);
     }
 
@@ -1711,8 +1718,7 @@ impl App {
         self.diff_h_scroll = 0;
         self.sbs_left_h_scroll = 0;
         self.sbs_right_h_scroll = 0;
-        self.diff_selection = None;
-        self.diff_click_state = None;
+        self.clear_diff_selection();
         self.load_diff();
         save_prefs(self.diff_layout, self.diff_mode);
     }
@@ -2030,8 +2036,7 @@ impl App {
             self.commit_detail.file_diff_h_scroll = 0;
             self.commit_detail.file_diff_sbs_left_h_scroll = 0;
             self.commit_detail.file_diff_sbs_right_h_scroll = 0;
-            self.diff_selection = None;
-            self.diff_click_state = None;
+            self.clear_diff_selection();
         }
         if self.git_graph.is_range() {
             let Some(range) = self.commit_detail.range_detail.as_ref() else {
@@ -2845,8 +2850,7 @@ impl App {
         // Same for diff-panel selection — the Git tab and the Graph tab
         // 3-col diff column share this state, and tab-switching between
         // them (or to Files/Search) should start fresh.
-        self.diff_selection = None;
-        self.diff_click_state = None;
+        self.clear_diff_selection();
         match tab {
             Tab::Git => self.git_status_load.mark_stale(),
             Tab::Graph => self.graph_load.mark_stale(),

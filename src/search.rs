@@ -23,6 +23,11 @@ pub enum SearchTarget {
     FilePreview,
     Diff,
     CommitDetail,
+    /// Graph tab 三列布局下右侧 diff 栏的 `/` 搜索目标。行索引对齐
+    /// `unified_display_rows(&file_diff.diff)`——和 Git tab 的
+    /// `SearchTarget::Diff` 同款 —— 这样渲染层的 `ranges_on_row` 直接拿
+    /// 到匹配区间,跟 `diff_panel::render_diff` 的行号系统无缝对接。
+    GraphDiff,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +44,8 @@ pub struct Snapshot {
     pub diff_scroll: usize,
     pub diff_h_scroll: usize,
     pub commit_detail_scroll: usize,
+    /// Pre-search scroll for the Graph-tab 3-col diff column (restored on Esc).
+    pub graph_diff_scroll: usize,
     pub file_tree_selected: usize,
     pub tree_scroll: usize,
     pub git_status_scroll: usize,
@@ -310,7 +317,25 @@ fn resolve_target(app: &App) -> Option<SearchTarget> {
         (Tab::Git, Panel::Files) => Some(SearchTarget::GitStatus),
         (Tab::Git, Panel::Diff) => Some(SearchTarget::Diff),
         (Tab::Graph, Panel::Files) => Some(SearchTarget::CommitGraph),
-        (Tab::Graph, Panel::Diff) => Some(SearchTarget::CommitDetail),
+        // Graph middle column (3-col only) = commit metadata + file tree.
+        // Same target as the 2-col fallback; `collect_rows` decides whether
+        // inline diff rows are included based on `app.graph_uses_three_col`.
+        (Tab::Graph, Panel::Commit) => Some(SearchTarget::CommitDetail),
+        (Tab::Graph, Panel::Diff) => {
+            // In 3-col mode, the diff owns its own column with its own
+            // row indexing (matches `unified_display_rows(&file_diff.diff)`).
+            // In 2-col fallback the diff is inline so we fall through to
+            // CommitDetail, which already covers it.
+            if app.graph_uses_three_col() {
+                Some(SearchTarget::GraphDiff)
+            } else {
+                Some(SearchTarget::CommitDetail)
+            }
+        }
+        // `Panel::Commit` outside Graph tab should never happen (only Graph
+        // sets it, and `normalize_active_panel` demotes it otherwise). Treat
+        // it defensively as "no search" rather than panicking.
+        (_, Panel::Commit) => None,
         // Left panel of the Search tab is already a search input — `/` there
         // would be ambiguous, so it's a no-op for now. Right panel mirrors
         // Files-tab preview.
@@ -365,10 +390,20 @@ fn collect_rows(app: &App, target: SearchTarget) -> Vec<String> {
             Some(d) => unified_display_rows(&d.diff),
             None => Vec::new(),
         },
+        SearchTarget::GraphDiff => match &app.commit_detail.file_diff {
+            // Graph tab 3-col diff column — same row layout as the Git tab's
+            // diff panel, just sourced from `commit_detail.file_diff` instead
+            // of `app.diff_content`.
+            Some(d) => unified_display_rows(&d.diff),
+            None => Vec::new(),
+        },
         SearchTarget::CommitDetail => {
             // Delegate to the panel so row indices line up 1:1 with what the
-            // panel renders (header rows, message lines, file rows, diff rows,
-            // …). This keeps scroll-jump and match-highlight coordinates in sync.
+            // panel renders (header rows, message lines, file rows, and — in
+            // 2-col fallback only — inline diff rows). The panel's
+            // `searchable_rows` consults `graph_uses_three_col` and skips
+            // inline diff rows in 3-col mode so match coordinates stay
+            // aligned with what's actually rendered under Panel::Commit.
             crate::ui::commit_detail_panel::searchable_rows(app)
         }
     }
@@ -495,6 +530,7 @@ fn baseline_row(target: SearchTarget, snap: &Snapshot) -> usize {
         SearchTarget::CommitGraph => snap.git_graph_selected_idx,
         SearchTarget::FilePreview => snap.preview_scroll,
         SearchTarget::Diff => snap.diff_scroll,
+        SearchTarget::GraphDiff => snap.graph_diff_scroll,
         SearchTarget::CommitDetail => snap.commit_detail_scroll,
     }
 }
@@ -508,6 +544,7 @@ fn take_snapshot(app: &App) -> Snapshot {
         diff_scroll: app.diff_scroll,
         diff_h_scroll: app.diff_h_scroll,
         commit_detail_scroll: app.commit_detail.scroll,
+        graph_diff_scroll: app.commit_detail.file_diff_scroll,
         file_tree_selected: app.file_tree.selected,
         tree_scroll: app.tree_scroll,
         git_status_scroll: app.git_status.scroll,
@@ -523,6 +560,7 @@ fn restore_snapshot(app: &mut App, snap: &Snapshot) {
     app.diff_scroll = snap.diff_scroll;
     app.diff_h_scroll = snap.diff_h_scroll;
     app.commit_detail.scroll = snap.commit_detail_scroll;
+    app.commit_detail.file_diff_scroll = snap.graph_diff_scroll;
     app.file_tree.selected = snap.file_tree_selected;
     app.tree_scroll = snap.tree_scroll;
     app.git_status.scroll = snap.git_status_scroll;
@@ -602,6 +640,13 @@ fn jump_to_current(app: &mut App) {
         SearchTarget::Diff => {
             let view_h = app.last_diff_view_h as usize;
             app.diff_scroll = center_scroll(m.row, view_h);
+        }
+        SearchTarget::GraphDiff => {
+            // The 3-col diff column writes its own view height to the shared
+            // `last_diff_view_h` slot at render time (same field the Git tab
+            // uses — only one of the two panels is visible at once).
+            let view_h = app.last_diff_view_h as usize;
+            app.commit_detail.file_diff_scroll = center_scroll(m.row, view_h);
         }
         SearchTarget::CommitDetail => {
             let view_h = app.last_commit_detail_view_h as usize;

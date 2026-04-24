@@ -68,8 +68,15 @@ impl Tab {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
-    Files, // left
-    Diff,  // right
+    /// 左列(或两列布局里的唯一左列)。Git/Files/Search tab 用作 tree /
+    /// 文件列表;Graph tab 用作 graph 侧栏。
+    Files,
+    /// Graph tab 三列布局里的"中间列"——commit 元数据 + 改动文件树。
+    /// 只在 Graph tab 三列模式下有效;其他 tab 不会切到这里。
+    Commit,
+    /// 右列,通常是 diff 或 preview。Graph tab 三列模式下指最右侧
+    /// 的 diff 栏;二列模式下是 commit detail(含内联 diff)。
+    Diff,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,21 +262,32 @@ pub struct CommitDetailState {
     pub diff_mode: DiffMode,
     pub files_tree_mode: bool,
     pub files_collapsed: HashSet<String>,
-    /// Vertical scroll for the entire panel (header + files + diff). One
-    /// offset covers the whole view — the commit detail is rendered as a
-    /// single list rather than split scroll regions.
+    /// Vertical scroll for the entire panel (header + files + diff in
+    /// 2-col fallback;header + files only in 3-col mode).
     pub scroll: usize,
-    /// Horizontal scroll for Unified layout. Shared across the header /
-    /// files list / diff rows — the panel renders as a single list, and
-    /// `clip_spans` applies this offset uniformly per row. SBS uses the
-    /// two fields below instead (each half scrolls independently).
+    /// Vertical scroll for the Graph 3-col diff column. Independent of
+    /// `scroll` so the user can pan the diff viewport without the commit
+    /// metadata / file tree jumping around. Unused in 2-col fallback —
+    /// there the diff is inline and pans via `scroll`.
+    pub file_diff_scroll: usize,
+    /// Horizontal scroll for Unified layout. In 2-col mode this applies
+    /// to the whole row list (metadata + files + inline diff). In 3-col
+    /// mode the inline diff is gone from this panel, so this field only
+    /// pans the metadata / file-tree rows; the standalone diff column
+    /// uses the `file_diff_*_h_scroll` triad below.
     pub diff_h_scroll: usize,
-    /// Horizontal scroll for the SBS left half (old version). Independent
-    /// of the right half and of `diff_h_scroll` — switching diff layouts
-    /// preserves all three.
+    /// SBS horizontal scrolls for the mid-panel view (only meaningful
+    /// in 2-col fallback, where the inline SBS diff is part of this
+    /// panel's row stream).
     pub sbs_left_h_scroll: usize,
-    /// Horizontal scroll for the SBS right half (new version).
     pub sbs_right_h_scroll: usize,
+    /// Horizontal scrolls for the 3-col diff column. Kept separate from
+    /// the mid-panel `diff_h_scroll`/`sbs_*` triad above so panning the
+    /// commit metadata doesn't shift the diff viewport and vice versa.
+    /// Unused in 2-col fallback.
+    pub file_diff_h_scroll: usize,
+    pub file_diff_sbs_left_h_scroll: usize,
+    pub file_diff_sbs_right_h_scroll: usize,
 }
 
 impl Default for CommitDetailState {
@@ -283,9 +301,13 @@ impl Default for CommitDetailState {
             files_tree_mode: false,
             files_collapsed: HashSet::new(),
             scroll: 0,
+            file_diff_scroll: 0,
             diff_h_scroll: 0,
             sbs_left_h_scroll: 0,
             sbs_right_h_scroll: 0,
+            file_diff_h_scroll: 0,
+            file_diff_sbs_left_h_scroll: 0,
+            file_diff_sbs_right_h_scroll: 0,
         }
     }
 }
@@ -412,6 +434,21 @@ pub struct App {
     // Layout
     pub split_percent: u16,
     pub dragging_split: bool,
+    /// Graph tab 三列布局下,中间 commit 列与右侧 diff 列的分割位置,用
+    /// "非 graph 区域的百分比" 表示,从左向右计:中间列占 `100 -
+    /// graph_diff_split_percent`%,右侧 diff 列占 `graph_diff_split_percent`%。
+    /// 默认 60 —— diff 比元数据略宽一些。只在 `graph_uses_three_col()`
+    /// 返回 true 时有效。
+    pub graph_diff_split_percent: u16,
+    /// 是否正在拖拽 Graph tab 中间|右侧分割线。跟 `dragging_split` 并列,
+    /// 互不影响。
+    pub dragging_graph_diff_split: bool,
+    /// Cache of the most recent rendered body width. `ui::render` writes
+    /// this every frame so that logic running outside the render path
+    /// (search target resolution, panel normalization, handlers that
+    /// need to know layout) can ask "are we in 3-col Graph right now"
+    /// without threading terminal size through every call site.
+    pub last_total_width: u16,
 
     // Mouse
     pub hit_registry: HitTestRegistry,
@@ -704,6 +741,9 @@ impl App {
             preview_click_state: None,
             split_percent: 30,
             dragging_split: false,
+            graph_diff_split_percent: 60,
+            dragging_graph_diff_split: false,
+            last_total_width: 0,
             hit_registry: HitTestRegistry::new(),
             hover_row: None,
             hover_col: None,
@@ -769,6 +809,39 @@ impl App {
         app.refresh_status();
         app.refresh_file_tree();
         app
+    }
+
+    /// Minimum total width for the Graph tab's 3-column layout. Below this
+    /// the panel falls back to the 2-column layout with the diff rendered
+    /// inline inside `commit_detail_panel` (the pre-split behaviour).
+    /// Chosen so the middle column still shows readable file names and the
+    /// diff column has at least ~40 cols for content after its gutter.
+    pub const GRAPH_THREE_COL_MIN_WIDTH: u16 = 100;
+
+    /// Whether the Graph tab should render with 3 columns right now —
+    /// graph | commit metadata+files | diff. True when a file diff is
+    /// loaded (or currently loading) AND the terminal is wide enough.
+    /// Other tabs and narrow terminals fall back to the existing 2-col
+    /// layout where the diff is inline under the file list.
+    ///
+    /// Callers that need this in non-render contexts (search target
+    /// resolution, panel normalization) should read `last_total_width`
+    /// — `ui::render` caches it every frame before any panel runs.
+    pub fn graph_uses_three_col(&self) -> bool {
+        self.active_tab == Tab::Graph
+            && self.last_total_width >= Self::GRAPH_THREE_COL_MIN_WIDTH
+            && (self.commit_detail.file_diff.is_some() || self.commit_file_diff_load.loading)
+    }
+
+    /// Drop `Panel::Commit` back to a two-column-compatible panel when the
+    /// layout no longer exposes a middle column (narrow terminal, diff
+    /// unloaded, tab switched away). Prevents the user from being stuck
+    /// focusing a column that isn't rendered. Called at the top of
+    /// `ui::render` alongside `last_total_width` update.
+    pub fn normalize_active_panel(&mut self) {
+        if self.active_panel == Panel::Commit && !self.graph_uses_three_col() {
+            self.active_panel = Panel::Diff;
+        }
     }
 
     pub fn refresh_status(&mut self) {
@@ -1809,7 +1882,19 @@ impl App {
     /// Load the inline diff for a file inside the currently-selected commit
     /// or commit range. Routes to range-file-diff plumbing when a range is
     /// active so the diff baseline matches the file list.
+    ///
+    /// In 3-col mode the right column owns the diff, so picking a file also
+    /// moves focus there — the user's next arrow-key pans the viewport
+    /// instead of scrolling the commit metadata they were already looking at.
     pub fn load_commit_file_diff(&mut self, path: &str) {
+        // Move focus to the diff column so scroll keys target it after the
+        // click. Only when we're actually on the Graph tab — some paths
+        // (search restore) call this while on other tabs.
+        if self.active_tab == Tab::Graph
+            && self.last_total_width >= Self::GRAPH_THREE_COL_MIN_WIDTH
+        {
+            self.active_panel = Panel::Diff;
+        }
         let context = match self.commit_detail.diff_mode {
             DiffMode::Compact => 3,
             DiffMode::FullFile => 9999,
@@ -1831,6 +1916,10 @@ impl App {
             self.commit_detail.diff_h_scroll = 0;
             self.commit_detail.sbs_left_h_scroll = 0;
             self.commit_detail.sbs_right_h_scroll = 0;
+            self.commit_detail.file_diff_scroll = 0;
+            self.commit_detail.file_diff_h_scroll = 0;
+            self.commit_detail.file_diff_sbs_left_h_scroll = 0;
+            self.commit_detail.file_diff_sbs_right_h_scroll = 0;
         }
         if self.git_graph.is_range() {
             let Some(range) = self.commit_detail.range_detail.as_ref() else {
@@ -2728,6 +2817,9 @@ impl App {
             }
             ClickAction::StartDragSplit => {
                 self.dragging_split = true;
+            }
+            ClickAction::StartDragGraphDiffSplit => {
+                self.dragging_graph_diff_split = true;
             }
             ClickAction::GitCommand { command, args, .. } => {
                 // Try each panel's dispatcher in turn. Unknown commands are

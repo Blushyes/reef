@@ -3,7 +3,10 @@ use crate::git::{DiffContent, DiffHunk, LineTag};
 use crate::i18n::{Msg, t};
 use crate::search::{SearchState, SearchTarget};
 use crate::ui::highlight::StyledToken;
-use crate::ui::text::{clip_spans, overlay_match_highlight, truncate_to_width};
+use crate::ui::selection::{DiffHit, DiffRowText, DiffSelection, DiffSide};
+use crate::ui::text::{
+    clip_spans, overlay_match_highlight, overlay_selection_highlight, truncate_to_width,
+};
 use crate::ui::theme::Theme;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -33,11 +36,18 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default().padding(Padding::new(1, 1, 0, 0));
     let inner = block.inner(area);
     f.render_widget(block, area);
+    // Cache the panel rect for the mouse-selection handler's point-in-rect
+    // gate. Both Git-tab Diff and Graph-tab 3-col Diff call `render_diff`,
+    // but only Git-tab enters through this wrapper; the Graph wrapper in
+    // `ui::mod.rs` caches its own rect the same way. One cache slot serves
+    // both since at most one tab renders Diff at a time.
+    app.last_diff_rect = Some(inner);
 
     let Some(d) = app.diff_content.take() else {
         render_empty(f, inner, &app.theme);
         return;
     };
+    let selection = app.diff_selection;
     render_diff(
         f,
         inner,
@@ -48,6 +58,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         app.theme,
         &app.search,
         SearchTarget::Diff,
+        selection.as_ref(),
         &mut DiffView {
             scroll: &mut app.diff_scroll,
             h_scroll: &mut app.diff_h_scroll,
@@ -55,6 +66,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
             sbs_right_h_scroll: &mut app.sbs_right_h_scroll,
             last_view_h: &mut app.last_diff_view_h,
         },
+        &mut app.last_diff_hit,
     );
     app.diff_content = Some(d);
 }
@@ -77,12 +89,24 @@ pub fn render_diff(
     theme: Theme,
     search: &SearchState,
     search_target: SearchTarget,
+    selection: Option<&DiffSelection>,
     view: &mut DiffView<'_>,
+    hit_slot: &mut Option<DiffHit>,
 ) {
     match layout {
-        DiffLayout::Unified => {
-            render_unified(f, area, diff, highlighted, mode, theme, search, search_target, view)
-        }
+        DiffLayout::Unified => render_unified(
+            f,
+            area,
+            diff,
+            highlighted,
+            mode,
+            theme,
+            search,
+            search_target,
+            selection,
+            view,
+            hit_slot,
+        ),
         DiffLayout::SideBySide => render_side_by_side(
             f,
             area,
@@ -92,7 +116,9 @@ pub fn render_diff(
             theme,
             search,
             search_target,
+            selection,
             view,
+            hit_slot,
         ),
     }
 }
@@ -122,7 +148,9 @@ fn render_unified(
     theme: Theme,
     search: &SearchState,
     search_target: SearchTarget,
+    selection: Option<&DiffSelection>,
     view: &mut DiffView<'_>,
+    hit_slot: &mut Option<DiffHit>,
 ) {
     let mut y = area.y;
     let max_y = area.y + area.height;
@@ -150,7 +178,12 @@ fn render_unified(
         }
     }
 
-    let gutter_width = 15usize; // " XXXXX  XXXXX  "
+    // ` XXXXX  XXXXX ` (14 cols line-number gutter) + `+ ` (2 cols prefix)
+    // = 16 cols before body. Constants here match the span math in
+    // `render_unified_line`; update both together if the gutter layout
+    // changes.
+    const GUTTER_AND_PREFIX: usize = 16;
+    let gutter_width = 15usize; // legacy clamp target (body starts 1 col earlier than math says — preserved)
     let content_w = (area.width as usize).saturating_sub(gutter_width);
     let visible_rows = max_y.saturating_sub(y) as usize;
     // Remember viewport height for search-jump centering.
@@ -177,6 +210,34 @@ fn render_unified(
     let max_h = max_visible_w.saturating_sub(content_w);
     *view.h_scroll = (*view.h_scroll).min(max_h);
     let h = *view.h_scroll;
+    let content_y = y;
+
+    // Snapshot rows + geometry so the mouse-selection handler can translate
+    // a terminal `(col, row)` hit into `(side, row_idx, byte_offset)` without
+    // touching the diff data structure. Rebuilt every frame.
+    let diff_rows: Vec<DiffRowText> = all_lines
+        .iter()
+        .map(|dl| match dl {
+            UnifiedLine::Separator => DiffRowText::Separator,
+            UnifiedLine::HunkHeader(h) => DiffRowText::Header(h.clone()),
+            UnifiedLine::Content { text, .. } => DiffRowText::Unified(text.clone()),
+        })
+        .collect();
+    *hit_slot = Some(DiffHit {
+        layout: DiffLayout::Unified,
+        panel: area,
+        content_y,
+        view_h: visible_rows as u16,
+        content_x_unified: area.x.saturating_add(GUTTER_AND_PREFIX as u16),
+        content_x_left: 0,
+        content_x_right: 0,
+        right_start_x: 0,
+        scroll: *view.scroll,
+        h_scroll: h,
+        sbs_left_h_scroll: 0,
+        sbs_right_h_scroll: 0,
+        rows: diff_rows,
+    });
 
     let scroll = *view.scroll;
     for (offset, dl) in all_lines.iter().skip(scroll).enumerate() {
@@ -187,7 +248,17 @@ fn render_unified(
         // `collect_rows(Diff)` in `search.rs` uses the exact same
         // `UnifiedLine` order, so row_idx matches 1:1 with match row indices.
         let (ranges, cur) = search.ranges_on_row(search_target, row_idx);
-        render_unified_line(f, area, y, dl, h, &theme, &ranges, cur);
+        let sel_range = selection
+            .filter(|s| s.side == DiffSide::Unified)
+            .and_then(|s| {
+                let txt = match dl {
+                    UnifiedLine::Separator => "",
+                    UnifiedLine::HunkHeader(h) => h.as_str(),
+                    UnifiedLine::Content { text, .. } => text.as_str(),
+                };
+                s.sel.line_byte_range(row_idx, txt)
+            });
+        render_unified_line(f, area, y, dl, h, &theme, &ranges, cur, sel_range);
         y += 1;
     }
 }
@@ -202,6 +273,7 @@ fn render_unified_line(
     theme: &Theme,
     match_ranges: &[Range<usize>],
     current_range: Option<Range<usize>>,
+    selection_range: Option<Range<usize>>,
 ) {
     match dl {
         UnifiedLine::Separator => {
@@ -230,6 +302,10 @@ fn render_unified_line(
                     theme.search_match,
                     theme.search_current,
                 )
+            };
+            let tokens = match selection_range {
+                Some(r) if r.start < r.end => overlay_selection_highlight(tokens, r),
+                _ => tokens,
             };
             let mut spans = vec![prefix];
             for (style, text) in tokens {
@@ -272,6 +348,13 @@ fn render_unified_line(
                     theme.search_match,
                     theme.search_current,
                 )
+            };
+            // Selection overlay stacks on top of search overlay — both use
+            // `overlay_selection_highlight`'s REVERSED trick so the colors
+            // compose cleanly with the per-tag background.
+            let tokens = match selection_range {
+                Some(r) if r.start < r.end => overlay_selection_highlight(tokens, r),
+                _ => tokens,
             };
             let body_spans = clip_spans(&tokens, h_scroll, max_text);
             let body_w: usize = body_spans
@@ -436,7 +519,9 @@ fn render_side_by_side(
     theme: Theme,
     search: &SearchState,
     _search_target: SearchTarget,
+    selection: Option<&DiffSelection>,
     view: &mut DiffView<'_>,
+    hit_slot: &mut Option<DiffHit>,
 ) {
     let mut y = area.y;
     let max_y = area.y + area.height;
@@ -512,12 +597,77 @@ fn render_side_by_side(
     *view.sbs_right_h_scroll = (*view.sbs_right_h_scroll).min(max_h_right);
     let h_left = *view.sbs_left_h_scroll;
     let h_right = *view.sbs_right_h_scroll;
+    let content_y = y;
+
+    // Snapshot rows + geometry for the selection handler. Each SBS row
+    // carries both halves so `DiffRowText::text_for(side)` can pick the
+    // right one at copy time. Separator + HunkHeader rows don't have a
+    // per-side split — the mouse handler treats them as neutral.
+    let diff_rows: Vec<DiffRowText> = all_lines
+        .iter()
+        .map(|dl| match dl {
+            SbsDisplayLine::Separator => DiffRowText::Separator,
+            SbsDisplayLine::HunkHeader(h) => DiffRowText::Header(h.clone()),
+            SbsDisplayLine::Row(r) => DiffRowText::Sbs {
+                left: r.left_text.clone(),
+                right: r.right_text.clone(),
+            },
+        })
+        .collect();
+    let gutter = 7u16;
+    *hit_slot = Some(DiffHit {
+        layout: DiffLayout::SideBySide,
+        panel: area,
+        content_y,
+        view_h: visible_rows as u16,
+        content_x_unified: 0,
+        content_x_left: area.x.saturating_add(gutter),
+        // Right half starts 1 col after the divider; content starts another
+        // gutter in. `right_start_x` marks the divider/right-half boundary
+        // for `DiffHit::side_for_column`.
+        right_start_x: area.x.saturating_add(half_w + 1),
+        content_x_right: area.x.saturating_add(half_w + 1 + gutter),
+        scroll: *view.scroll,
+        h_scroll: 0,
+        sbs_left_h_scroll: h_left,
+        sbs_right_h_scroll: h_right,
+        rows: diff_rows,
+    });
 
     let scroll = *view.scroll;
-    for dl in all_lines.iter().skip(scroll) {
+    for (offset, dl) in all_lines.iter().skip(scroll).enumerate() {
         if y >= max_y {
             break;
         }
+        let row_idx = scroll + offset;
+        // Per-half selection range: only light up the half that owns the
+        // selection's anchor side; the other half renders untouched.
+        let (sel_left, sel_right) = match selection {
+            Some(s) => match s.side {
+                DiffSide::SbsLeft => {
+                    if let SbsDisplayLine::Row(row) = dl {
+                        (
+                            s.sel.line_byte_range(row_idx, row.left_text.as_str()),
+                            None,
+                        )
+                    } else {
+                        (None, None)
+                    }
+                }
+                DiffSide::SbsRight => {
+                    if let SbsDisplayLine::Row(row) = dl {
+                        (
+                            None,
+                            s.sel.line_byte_range(row_idx, row.right_text.as_str()),
+                        )
+                    } else {
+                        (None, None)
+                    }
+                }
+                DiffSide::Unified => (None, None),
+            },
+            None => (None, None),
+        };
         match dl {
             SbsDisplayLine::Separator => {
                 let line = Line::from(Span::styled(
@@ -540,7 +690,9 @@ fn render_side_by_side(
                 f.render_widget(line, Rect::new(area.x, y, area.width, 1));
             }
             SbsDisplayLine::Row(row) => {
-                render_sbs_row(f, area, y, row, half_w, right_w, h_left, h_right, &theme);
+                render_sbs_row(
+                    f, area, y, row, half_w, right_w, h_left, h_right, &theme, sel_left, sel_right,
+                );
             }
         }
         y += 1;
@@ -558,6 +710,8 @@ fn render_sbs_row(
     h_scroll_left: usize,
     h_scroll_right: usize,
     theme: &Theme,
+    sel_left: Option<Range<usize>>,
+    sel_right: Option<Range<usize>>,
 ) {
     // Gutter: " XXXXX " = 7 cols
     let gutter = 7usize;
@@ -568,6 +722,10 @@ fn render_sbs_row(
     let left_no = fmt_lineno(row.left_no);
     let left_body =
         build_sbs_body_tokens(&row.left_text, row.left_tokens.as_ref(), left_fg, left_bg);
+    let left_body = match sel_left {
+        Some(r) if r.start < r.end => overlay_selection_highlight(left_body, r),
+        _ => left_body,
+    };
     let left_spans = clip_spans(&left_body, h_scroll_left, left_content_w);
     let left_used: usize = left_spans
         .iter()
@@ -601,6 +759,10 @@ fn render_sbs_row(
         right_fg,
         right_bg,
     );
+    let right_body = match sel_right {
+        Some(r) if r.start < r.end => overlay_selection_highlight(right_body, r),
+        _ => right_body,
+    };
     let right_spans = clip_spans(&right_body, h_scroll_right, right_content_w);
     let right_used: usize = right_spans
         .iter()

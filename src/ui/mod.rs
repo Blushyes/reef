@@ -29,6 +29,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
+/// Tab-bar sidebar-toggle button glyphs. `⊟` (squared minus) renders
+/// when the sidebar is visible; clicking collapses. `⊞` (squared plus)
+/// renders when hidden; clicking expands. Exposed `pub` so tests scan
+/// for the rendered glyph against this single source of truth.
+pub const SIDEBAR_TOGGLE_GLYPH_VISIBLE: &str = "⊟";
+pub const SIDEBAR_TOGGLE_GLYPH_HIDDEN: &str = "⊞";
+
 pub fn render(f: &mut Frame, app: &mut App) {
     let size = f.area();
     app.hit_registry.clear();
@@ -66,42 +73,68 @@ pub fn render(f: &mut Frame, app: &mut App) {
     app.last_total_width = main_layout[2].width;
     app.normalize_active_panel();
 
-    // Body: left + right (+ optional diff column for Graph tab 3-col mode).
+    // Body: left (+ optional commit column for Graph 3-col) + right.
     // Width math goes through `App::graph_sidebar_width` /
     // `graph_three_col_widths` so `input::*` and `ui::render` agree on
     // where column boundaries fall — important for hit-testing and
-    // h-scroll routing to land in the right column.
+    // h-scroll routing to land in the right column. When the sidebar is
+    // hidden, `graph_sidebar_width` returns 0 and the left column drops
+    // out of the layout entirely (no 0-width rect, no StartDragSplit zone
+    // anchored at the screen edge). Graph 3-col mode without sidebar
+    // degrades to [Commit | Diff] so the commit metadata column stays.
     let total_w = main_layout[2].width;
     let three_col = app.graph_uses_three_col();
+    let sidebar_w = app.graph_sidebar_width(total_w);
+    let has_sidebar = sidebar_w > 0;
     let body_layout = if three_col {
-        let (graph_w, commit_w, _) = app.graph_three_col_widths(total_w);
+        let (_, commit_w, _) = app.graph_three_col_widths(total_w);
+        if has_sidebar {
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(sidebar_w),
+                    Constraint::Length(commit_w),
+                    Constraint::Min(20),
+                ])
+                .split(main_layout[2])
+        } else {
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(commit_w), Constraint::Min(20)])
+                .split(main_layout[2])
+        }
+    } else if has_sidebar {
         Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(graph_w),
-                Constraint::Length(commit_w),
-                Constraint::Min(20),
-            ])
+            .constraints([Constraint::Length(sidebar_w), Constraint::Min(20)])
             .split(main_layout[2])
     } else {
-        let left_width = app.graph_sidebar_width(total_w);
         Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(left_width), Constraint::Min(20)])
+            .constraints([Constraint::Min(20)])
             .split(main_layout[2])
     };
 
-    // Drag zone on the graph | right split border
-    let split_x = body_layout[0].x + body_layout[0].width.saturating_sub(1);
-    app.hit_registry.register(
-        Rect::new(split_x, body_layout[0].y, 2, body_layout[0].height),
-        ClickAction::StartDragSplit,
-    );
-    // Second drag zone for the commit | diff boundary in 3-col mode.
-    if three_col && body_layout.len() >= 3 {
-        let mid_split_x = body_layout[1].x + body_layout[1].width.saturating_sub(1);
+    // Index of the editor column in `body_layout`. With sidebar hidden the
+    // sidebar slot is absent so the editor slides left by one.
+    let editor_idx = if has_sidebar { 1 } else { 0 };
+
+    // Drag zone on the sidebar | right split border — only meaningful when
+    // the sidebar actually occupies a column.
+    if has_sidebar {
+        let split_x = body_layout[0].x + body_layout[0].width.saturating_sub(1);
         app.hit_registry.register(
-            Rect::new(mid_split_x, body_layout[1].y, 2, body_layout[1].height),
+            Rect::new(split_x, body_layout[0].y, 2, body_layout[0].height),
+            ClickAction::StartDragSplit,
+        );
+    }
+    // Second drag zone for the commit | diff boundary in 3-col mode. The
+    // commit column sits right after the (optional) sidebar.
+    if three_col {
+        let commit_rect = body_layout[editor_idx];
+        let mid_split_x = commit_rect.x + commit_rect.width.saturating_sub(1);
+        app.hit_registry.register(
+            Rect::new(mid_split_x, commit_rect.y, 2, commit_rect.height),
             ClickAction::StartDragGraphDiffSplit,
         );
     }
@@ -111,26 +144,32 @@ pub fn render(f: &mut Frame, app: &mut App) {
             if !app.backend.has_repo() {
                 render_no_repo(f, app, body_layout[0]);
             } else {
-                render_git_sidebar(f, app, body_layout[0]);
-                render_git_editor(f, app, body_layout[1]);
+                if has_sidebar {
+                    render_git_sidebar(f, app, body_layout[0]);
+                }
+                render_git_editor(f, app, body_layout[editor_idx]);
             }
         }
         Tab::Files => {
-            file_tree_panel::render(f, app, body_layout[0]);
-            file_preview_panel::render(f, app, body_layout[1]);
+            if has_sidebar {
+                file_tree_panel::render(f, app, body_layout[0]);
+            }
+            file_preview_panel::render(f, app, body_layout[editor_idx]);
         }
         Tab::Graph => {
-            render_graph_sidebar(f, app, body_layout[0]);
+            if has_sidebar {
+                render_graph_sidebar(f, app, body_layout[0]);
+            }
+            render_graph_editor(f, app, body_layout[editor_idx]);
             if three_col {
-                render_graph_editor(f, app, body_layout[1]);
-                render_graph_diff_column(f, app, body_layout[2]);
-            } else {
-                render_graph_editor(f, app, body_layout[1]);
+                render_graph_diff_column(f, app, body_layout[editor_idx + 1]);
             }
         }
         Tab::Search => {
-            search_tab::render_sidebar(f, app, body_layout[0]);
-            file_preview_panel::render(f, app, body_layout[1]);
+            if has_sidebar {
+                search_tab::render_sidebar(f, app, body_layout[0]);
+            }
+            file_preview_panel::render(f, app, body_layout[editor_idx]);
         }
     }
 
@@ -346,11 +385,33 @@ fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
-    // Fill rest of row
-    let remaining = (area.width as usize).saturating_sub(x.saturating_sub(area.x) as usize);
+    // Glyph mirrors current state so the icon doubles as state readout
+    // (⊟ when visible, ⊞ when hidden). The click target is registered
+    // tight to the glyph's columns so clicks on the surrounding hint
+    // don't accidentally toggle.
     let keys_hint = t(Msg::TabBarHint);
-    let pad = remaining.saturating_sub(UnicodeWidthStr::width(keys_hint));
+    let button_text = if app.sidebar_visible {
+        " ⊟ "
+    } else {
+        " ⊞ "
+    };
+    let button_w = UnicodeWidthStr::width(button_text) as u16;
+    let consumed = x.saturating_sub(area.x) as usize;
+    let right_chrome = button_w as usize + UnicodeWidthStr::width(keys_hint);
+    let pad = (area.width as usize)
+        .saturating_sub(consumed)
+        .saturating_sub(right_chrome);
     spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bg)));
+    let button_x = x + pad as u16;
+    app.hit_registry
+        .register_row(button_x, area.y, button_w, ClickAction::ToggleSidebar);
+    spans.push(Span::styled(
+        button_text,
+        Style::default()
+            .fg(th.chrome_muted_fg)
+            .bg(bg)
+            .add_modifier(Modifier::BOLD),
+    ));
     spans.push(Span::styled(
         keys_hint,
         Style::default().fg(th.chrome_muted_fg).bg(bg),
@@ -684,6 +745,7 @@ fn render_help(f: &mut Frame, app: &App, screen: Rect) {
         ("r", t(Msg::HelpRefresh)),
         ("v", t(Msg::HelpSelectMode)),
         ("h", t(Msg::HelpShowHelp)),
+        ("Ctrl+B", t(Msg::HelpToggleSidebar)),
         ("Space p", t(Msg::HelpQuickOpen)),
         ("Space f", t(Msg::HelpGlobalSearch)),
         (t(Msg::HelpKeyDragDrop), t(Msg::HelpDragDrop)),

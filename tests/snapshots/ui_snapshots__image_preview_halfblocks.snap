@@ -3,7 +3,7 @@ source: tests/ui_snapshots.rs
 expression: output
 ---
  reef  [TMPDIR]  ⎇ (detached)
- 📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph           1:Files 2:Search 3:Git 4:Graph
+ 📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph        ⊟  1:Files 2:Search 3:Git 4:Graph
  +   📁    ↻   ⊟        │ striped.png
    striped.png U       │ ──────────────────────────────────────────────────────
                        │ 40×40 · PNG · 257 B

@@ -16,21 +16,11 @@ use reef::ui::theme::Theme;
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
-use test_support::{CwdGuard, HomeGuard, commit_file, tempdir_repo, write_file, write_striped_png};
+use test_support::{
+    CwdGuard, HomeGuard, commit_file, force_en_lang, tempdir_repo, write_file, write_striped_png,
+};
 
 static CWD_LOCK: Mutex<()> = Mutex::new(());
-
-/// Pin the UI language so the snapshot is stable regardless of the test
-/// host's system locale. Called under `CWD_LOCK`; the first call seeds
-/// i18n's OnceLock cache for the process so all three snapshot tests
-/// render in the same language.
-fn force_en_lang() {
-    // SAFETY: test-only; `CWD_LOCK` serialises the three snapshot tests
-    // and no other test in this binary touches env vars.
-    unsafe {
-        std::env::set_var("REEF_LANG", "en");
-    }
-}
 
 // `HomeGuard` and `CwdGuard` — redirect $HOME / cwd for the snapshot — live in `test-support`.
 // The local `CWD_LOCK` doubles as the HOME_LOCK here because every test in

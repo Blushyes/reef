@@ -16,6 +16,8 @@ pub enum ClickAction {
     /// Graph tab 3-col 布局下,中间 commit 列与右侧 diff 列之间的拖拽
     /// 分界。跟 `StartDragSplit` 互不干扰。
     StartDragGraphDiffSplit,
+    /// 标签栏右侧的侧边栏可见性切换按钮。等价于 Ctrl+B,但鼠标可点。
+    ToggleSidebar,
     SwitchTab(Tab),
     TreeClick(usize),
     /// Click on a row in the quick-open palette. The `usize` indexes

@@ -177,6 +177,8 @@ pub enum Msg {
     HelpDeleteEntry,
     HelpHardDeleteEntry,
     HelpRightClickMenu,
+    HelpToggleSidebar,
+    SidebarHiddenHint,
     HelpAnyKey,
 }
 
@@ -299,6 +301,8 @@ fn t_zh(m: Msg) -> &'static str {
         HelpDeleteEntry => "移动到废纸篓（带确认）",
         HelpHardDeleteEntry => "永久删除（不可撤销）",
         HelpRightClickMenu => "打开文件树右键菜单",
+        HelpToggleSidebar => "切换侧边栏显示",
+        SidebarHiddenHint => "侧边栏已隐藏 — Ctrl+B 可恢复",
         HelpAnyKey => "关闭帮助",
     }
 }
@@ -417,6 +421,8 @@ fn t_en(m: Msg) -> &'static str {
         HelpDeleteEntry => "Move to Trash (with confirm)",
         HelpHardDeleteEntry => "Delete permanently (cannot be undone)",
         HelpRightClickMenu => "Open file-tree context menu",
+        HelpToggleSidebar => "Toggle sidebar",
+        SidebarHiddenHint => "Sidebar hidden — Ctrl+B to restore",
         HelpAnyKey => "Close help",
     }
 }

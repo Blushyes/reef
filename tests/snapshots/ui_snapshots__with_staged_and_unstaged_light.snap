@@ -1,10 +1,9 @@
 ---
 source: tests/ui_snapshots.rs
-assertion_line: 454
 expression: output
 ---
  reef  [TMPDIR]  ⎇ master
- 📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph           1:Files 2:Search 3:Git 4:Graph
+ 📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph        ⊟  1:Files 2:Search 3:Git 4:Graph
   ┌ Message (commit sta│
   │                    │
   └                    │

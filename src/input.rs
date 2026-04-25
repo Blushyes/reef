@@ -184,15 +184,25 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // binding. Context: we're already past the palette / search / place
     // gates, so the leader is only in play during normal tab navigation.
     //
-    // Exception: when the Tab::Search search input is focused (modal
-    // `tab_input_focused`), bare Space is a literal separator in a
-    // multi-word query. We gate arming off so "foo bar" just types. An
-    // empty query is fine to arm anyway — there's no char to accidentally
-    // swallow yet.
-    let in_input_mode = app.active_tab == Tab::Search
+    // Exception: when a text input is focused — the Tab::Search query or
+    // the Tab::Git commit box — bare Space is a literal character the user
+    // is typing. We gate arming off so "foo bar" / "fix: the thing" just
+    // types. An empty buffer is fine to arm anyway — there's no char to
+    // accidentally swallow yet.
+    let search_input_focused = app.active_tab == Tab::Search
         && app.active_panel == Panel::Files
         && app.global_search.tab_input_focused;
-    let leader_allow_arm = !in_input_mode || app.global_search.query.is_empty();
+    let commit_input_focused = app.active_tab == Tab::Git
+        && app.active_panel == Panel::Files
+        && app.git_status.commit_editing;
+    let in_input_mode = search_input_focused || commit_input_focused;
+    let leader_allow_arm = if search_input_focused {
+        app.global_search.query.is_empty()
+    } else if commit_input_focused {
+        app.git_status.commit_message.is_empty()
+    } else {
+        true
+    };
     match leader_decision(
         &key,
         leader_allow_arm,
@@ -240,6 +250,14 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             app.open_hosts_picker();
             return;
         }
+        // Ctrl+B toggles the left sidebar — VSCode muscle memory. Sits in
+        // the always-on block so it works regardless of which tab or panel
+        // owns focus; overlays (quick-open, global-search, hosts picker)
+        // return earlier so they're unaffected.
+        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.toggle_sidebar();
+            return;
+        }
         KeyCode::Tab => {
             let tabs = Tab::ALL;
             let cur = tabs.iter().position(|&t| t == app.active_tab).unwrap_or(0);
@@ -269,11 +287,10 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         _ => {}
     }
 
-    // Bare-character global shortcuts — stolen from the query when the
-    // Tab::Search input is focused. Otherwise `h` = help, `q` = quit,
-    // `/` = in-panel search, `n`/`N` = step matches, `1`-`9` = jump tab —
-    // all of which the user is likely to want as literal chars inside a
-    // search query.
+    // Bare-character global shortcuts — suppressed whenever a text input
+    // is focused (Tab::Search query or Tab::Git commit box) so they don't
+    // steal literal keystrokes mid-typing. Otherwise `h` = help, `q` = quit,
+    // `/` = in-panel search, `n`/`N` = step matches, `1`-`9` = jump tab.
     //
     // `/` has a context-aware override: in Tab::Search list mode it focuses
     // the search input instead of firing in-panel search. The in-panel
@@ -1622,7 +1639,10 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
                 apply_horizontal_scroll(app, mouse.column, total_width, -3);
                 return;
             }
-            let split_x = total_width * app.split_percent / 100;
+            // Use the shared clamp + sidebar-hidden short-circuit so wheel
+            // routing lines up with hit-testing. With sidebar hidden
+            // `graph_sidebar_width` returns 0 and `is_left` never fires.
+            let split_x = app.graph_sidebar_width(total_width);
             let is_left = mouse.column < split_x;
             match app.active_tab {
                 Tab::Git => {
@@ -1671,7 +1691,7 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
                 apply_horizontal_scroll(app, mouse.column, total_width, 3);
                 return;
             }
-            let split_x = total_width * app.split_percent / 100;
+            let split_x = app.graph_sidebar_width(total_width);
             let is_left = mouse.column < split_x;
             match app.active_tab {
                 Tab::Git => {

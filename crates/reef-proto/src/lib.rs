@@ -60,7 +60,11 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 ///       from the staged index. A v5 agent would respond `Unknown op`
 ///       to the new request, so bumping surfaces the stale agent as a
 ///       toast rather than a silent no-op.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// - v7: adds `LoadDbInitial` / `LoadDbPage` for the SQLite preview
+///       card in the Files tab. A v6 agent would respond `Unknown op`
+///       so we bump to surface the stale agent as a toast rather than
+///       leaving the preview pane silently stuck on the loading card.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Encode a single envelope-level value to `writer` using the
 /// length-prefixed framing. The caller is expected to flush.
@@ -296,6 +300,32 @@ pub enum Request {
     /// stop walking and set `truncated = true`.
     SearchContent {
         request: ContentSearchRequestDto,
+    },
+
+    // ── M5: SQLite preview ────
+    /// Build the initial preview card for a SQLite file at `rel_path`:
+    /// list of tables (name + columns + row counts) and the first page
+    /// of rows for the smallest non-empty table. Response is
+    /// `Option<DatabaseInfoDto>` — `None` when the agent's magic-bytes
+    /// probe rejects the file as non-SQLite (so the client can fall
+    /// back to the standard binary card without a second round-trip).
+    /// Hard errors (encrypted DB, corrupt header, file too large)
+    /// propagate as `ErrorCode::Other` with a short reason string.
+    LoadDbInitial {
+        rel_path: String,
+        page_size: u32,
+    },
+    /// Page-flip / table-switch on an already-previewed SQLite file.
+    /// `offset` and `limit` map directly to `LIMIT N OFFSET M`. The
+    /// response is `DbPageDto`. Note that offset cost grows with M for
+    /// tables without a usable index — see the equivalent comment on
+    /// `reef_sqlite_preview::load_page` for the keyset-pagination
+    /// follow-up if this becomes a hotspot.
+    LoadDbPage {
+        rel_path: String,
+        table: String,
+        offset: u64,
+        limit: u32,
     },
 }
 
@@ -697,6 +727,72 @@ pub const CHUNK_TARGET_HITS: usize = 64;
 /// more files than this — the UI's quick-open index simply truncates,
 /// which is the same behaviour as bumping into the walker's own limit.
 pub const MAX_WALK_PATHS: u64 = 100_000;
+
+// ── M5: SQLite preview DTOs ────────────────────────────────────────────────
+
+/// Wire shape for `reef_sqlite_preview::DatabaseInfo`. Carries the table
+/// list (with columns + row counts), the index of the table whose first
+/// page is bundled in `initial_page`, and the on-disk byte size for the
+/// preview card's meta line.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseInfoDto {
+    pub tables: Vec<TableSummaryDto>,
+    pub selected_table: u32,
+    pub initial_page: DbPageDto,
+    pub bytes_on_disk: u64,
+}
+
+/// One table or view in the database. `columns` order matches a
+/// `SELECT *` against this table; `row_count` is `SELECT COUNT(*)`
+/// captured at preview-build time and not refreshed on page-flips.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableSummaryDto {
+    pub name: String,
+    pub columns: Vec<ColumnInfoDto>,
+    pub row_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnInfoDto {
+    pub name: String,
+    /// Declared type as it appears in `PRAGMA table_info` (may be
+    /// empty for typeless columns or non-standard like
+    /// `"VARCHAR(255)"`).
+    pub decl_type: String,
+}
+
+/// One page of rows from a table. Each inner Vec aligns positionally
+/// with the parent table's `columns` (length always equals
+/// `columns.len()` for every row).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbPageDto {
+    pub rows: Vec<Vec<SqliteValueDto>>,
+}
+
+/// One typed cell value. NULL is distinct from an empty TEXT so the
+/// renderer can italicise NULL. BLOB carries only its byte length —
+/// the bytes themselves are never shipped.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SqliteValueDto {
+    Null,
+    Integer {
+        value: i64,
+    },
+    Real {
+        value: f64,
+    },
+    /// `value` is the (possibly truncated) UTF-8 string. `truncated`
+    /// is `true` when the original cell was longer than
+    /// `MAX_TEXT_CELL_CHARS` and the renderer should append `…`.
+    Text {
+        value: String,
+        truncated: bool,
+    },
+    Blob {
+        len: u64,
+    },
+}
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 

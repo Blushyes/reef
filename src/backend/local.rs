@@ -308,6 +308,23 @@ impl Backend for LocalBackend {
         Ok(capped)
     }
 
+    fn db_load_page(
+        &self,
+        rel_path: &Path,
+        table: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<reef_sqlite_preview::DbPage, BackendError> {
+        // Symlink-escape gate, same as `read_file`. SQLite preview opens
+        // the file with `mode=ro&immutable=1`, so an attacker can't
+        // mutate state via this path — but they could still ship the
+        // contents of a sensitive DB outside the workdir if we followed
+        // a symlink without checking.
+        let full = canonical_child_within(self.canonical_workdir()?, rel_path)?;
+        reef_sqlite_preview::load_page(&full, table, offset, limit)
+            .map_err(|e| BackendError::Other(format!("sqlite: {e}")))
+    }
+
     fn git_status(&self) -> Result<StatusSnapshot, BackendError> {
         let repo = self.repo()?;
         let (staged, unstaged) = repo.get_status();

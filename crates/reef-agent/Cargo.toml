@@ -12,10 +12,11 @@ name = "reef-agent"
 path = "src/main.rs"
 
 [dependencies]
-reef        = { path = "../.." }
-reef-proto  = { path = "../reef-proto" }
-serde       = { workspace = true }
-serde_json  = { workspace = true }
+reef                = { path = "../.." }
+reef-proto          = { path = "../reef-proto" }
+reef-sqlite-preview = { path = "../reef-sqlite-preview" }
+serde               = { workspace = true }
+serde_json          = { workspace = true }
 
 [dev-dependencies]
 test-support = { path = "../test-support" }

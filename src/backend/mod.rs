@@ -285,6 +285,24 @@ pub trait Backend: Send + Sync {
     /// transports use it to bound response size.
     fn read_file(&self, rel_path: &Path, max_bytes: u64) -> Result<Vec<u8>, BackendError>;
 
+    /// Load one page of rows from a table inside a SQLite database at
+    /// `rel_path`. Used by the Files-tab preview pane's pagination
+    /// flow — `load_preview` builds the initial card with the first
+    /// page bundled in, then `[`/`]`/`PgUp`/`PgDn` route through here
+    /// to reissue with a fresh `(offset, limit)` window.
+    ///
+    /// `offset` and `limit` map directly to `LIMIT N OFFSET M`, with
+    /// the same caveat: cost grows with M for tables without a usable
+    /// index. The reef-sqlite-preview reader documents the keyset
+    /// pagination follow-up if this becomes a real hotspot.
+    fn db_load_page(
+        &self,
+        rel_path: &Path,
+        table: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<reef_sqlite_preview::DbPage, BackendError>;
+
     // ─── git: status / diff / stage ─────────────────────────────────────────
     fn git_status(&self) -> Result<StatusSnapshot, BackendError>;
 

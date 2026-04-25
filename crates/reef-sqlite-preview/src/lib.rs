@@ -628,14 +628,17 @@ mod tests {
     fn cell_types_round_trip() {
         let (_tmp, path) = setup_db(&[
             "CREATE TABLE t(i INTEGER, r REAL, s TEXT, b BLOB, n INTEGER)",
-            // explicit NULL in `n` so we cover all five ValueRef variants
-            "INSERT INTO t VALUES (42, 3.14, 'hello', x'deadbeef', NULL)",
+            // explicit NULL in `n` so we cover all five ValueRef variants.
+            // Real value is `1.5` (exactly representable in IEEE 754) rather
+            // than something like `3.14` — clippy's approx_constant lint
+            // otherwise nags about it being too close to π.
+            "INSERT INTO t VALUES (42, 1.5, 'hello', x'deadbeef', NULL)",
         ]);
 
         let page = load_page(&path, "t", 0, 10).unwrap();
         let row = &page.rows[0];
         assert_eq!(row[0], SqliteValue::Integer(42));
-        assert_eq!(row[1], SqliteValue::Real(3.14));
+        assert_eq!(row[1], SqliteValue::Real(1.5));
         assert_eq!(
             row[2],
             SqliteValue::Text {

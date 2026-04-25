@@ -18,9 +18,10 @@ pub fn truncate_to_width(s: &str, max_width: usize) -> &str {
 }
 
 /// 对 styled token 流先跳 `skip_cols` 显示列、再保留至多 `max_width` 显示
-/// 列。在跨越 skip 边界的宽字符会被整体丢弃（宁可多跳一列也不切半个字符，
-/// 与 [`truncate_to_width`] 的保守策略一致）；在右端超出 `max_width` 的
-/// 字符直接截断。
+/// 列。当宽字符（CJK 等 2 cell 字符）跨越 skip 边界时丢弃该字符并补
+/// 等量的 filler 空格，确保多行同一 `skip_cols` 下的输出保持竖向对齐
+/// —— 不补 filler 会让后续内容向左漂移 1 列，多行混合 CJK 时整列错位。
+/// 右端超出 `max_width` 的宽字符直接整体丢弃（不强行半切）。
 pub fn clip_spans<'a>(
     tokens: &'a [(Style, String)],
     skip_cols: usize,
@@ -47,7 +48,20 @@ pub fn clip_spans<'a>(
 
             if start.is_none() && skipped < skip_cols {
                 if skipped + cw > skip_cols {
-                    // 跨越 skip 边界的宽字符：整体丢弃，下一个字符起才开始保留。
+                    // 跨越 skip 边界的宽字符：丢弃字符本身，但要补
+                    // `(skipped + cw - skip_cols)` 个空格作为 filler，
+                    // 把它原本占据但落在 keep 区的那部分单元格补回来。
+                    // 不补的话，多行同一 skip_cols 的输出会按各自切点
+                    // 处的字符宽度产生不同的左漂移，竖向 │ 列就错位。
+                    let filler_w = skipped + cw - skip_cols;
+                    let render = filler_w.min(max_width.saturating_sub(kept_cols));
+                    if render > 0 {
+                        out.push(Span::styled(" ".repeat(render), *style));
+                        kept_cols += render;
+                        if kept_cols >= max_width {
+                            break 'outer;
+                        }
+                    }
                     skipped = skip_cols;
                     continue;
                 }
@@ -260,6 +274,7 @@ fn styled_selection_segment(base: Style, text: &str, selected: bool) -> (Style, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unicode_width::UnicodeWidthStr;
 
     // ── truncate_to_width ────────────────────────────────────────────────────
 
@@ -327,12 +342,41 @@ mod tests {
     }
 
     #[test]
-    fn clip_spans_skip_crosses_cjk_boundary_drops_wide_char() {
-        // 跳 1 列落在"你"中间 → 整个"你"被丢弃
+    fn clip_spans_skip_crosses_cjk_boundary_emits_filler() {
+        // skip=1 lands inside the second cell of '你' (a 2-cell CJK
+        // glyph). The glyph itself can't be half-rendered, so we
+        // emit a 1-cell filler space in its place — keeping rows
+        // clipped at the same `skip_cols` aligned vertically. Joined
+        // output is " 好" (1 cell filler + 2 cells from '好'),
+        // visible width 3.
         let tokens = vec![(sty(), "你好".to_string())];
         let out = clip_spans(&tokens, 1, 10);
         let joined: String = out.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(joined, "好");
+        assert_eq!(joined, " 好");
+    }
+
+    #[test]
+    fn clip_spans_alignment_across_mixed_rows() {
+        // Regression guard for the SQLite preview h-scroll
+        // misalignment: rows A (clean ASCII cut) and B (CJK
+        // straddle) clipped at the same `skip_cols` must produce
+        // outputs of identical visible width. Without filler in
+        // the straddle case, row B was 1 cell shorter and every
+        // following column visually shifted left.
+        let row_a = vec![(sty(), "abcdef".to_string())]; // skip=1 cuts after 'a'
+        let row_b = vec![(sty(), "你好啊".to_string())]; // skip=1 splits '你'
+
+        let out_a = clip_spans(&row_a, 1, 5);
+        let out_b = clip_spans(&row_b, 1, 5);
+
+        let str_a: String = out_a.iter().map(|s| s.content.as_ref()).collect();
+        let str_b: String = out_b.iter().map(|s| s.content.as_ref()).collect();
+
+        assert_eq!(str_a, "bcdef");
+        assert_eq!(str_b, " 好啊");
+        // The point of the test: equal visible widths.
+        assert_eq!(UnicodeWidthStr::width(str_a.as_str()), 5);
+        assert_eq!(UnicodeWidthStr::width(str_b.as_str()), 5);
     }
 
     #[test]

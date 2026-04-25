@@ -437,6 +437,18 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
                 "SearchContent must be routed through dispatch_search_content".to_string(),
             ))
         }
+
+        // ── M5: SQLite preview ────
+        Request::LoadDbInitial {
+            rel_path,
+            page_size,
+        } => load_db_initial_handler(workdir, &rel_path, page_size),
+        Request::LoadDbPage {
+            rel_path,
+            table,
+            offset,
+            limit,
+        } => load_db_page_handler(workdir, &rel_path, &table, offset, limit),
     };
 
     match result {
@@ -724,5 +736,123 @@ fn ref_label_to_dto(r: reef::git::RefLabel) -> RefLabelDto {
         RefLabel::Branch(s) => RefLabelDto::Branch(s),
         RefLabel::RemoteBranch(s) => RefLabelDto::RemoteBranch(s),
         RefLabel::Tag(s) => RefLabelDto::Tag(s),
+    }
+}
+
+// ── SQLite preview dispatch + domain → DTO helpers ──────────────────────
+
+/// Agent-side `LoadDbInitial` handler. Resolves the workdir-relative
+/// path, applies the same symlink-escape gate as `read_file_response`,
+/// then either returns a `DatabaseInfoDto` or `None` (file isn't a
+/// SQLite database — client falls back to the binary card path).
+///
+/// Hard errors (encrypted, corrupt, oversized) collapse into
+/// `ErrorCode::Other` with the reader's message verbatim — the client
+/// surfaces those as a toast / preview error.
+fn load_db_initial_handler(
+    workdir: &Path,
+    rel: &str,
+    page_size: u32,
+) -> Result<serde_json::Value, (ErrorCode, String)> {
+    use reef::backend::BackendError;
+    use reef::backend::local::canonical_child_within;
+    let none_value = || {
+        serde_json::to_value(None::<reef_proto::DatabaseInfoDto>)
+            .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}")))
+    };
+    let abs = match canonical_child_within(workdir, Path::new(rel)) {
+        Ok(p) => p,
+        Err(BackendError::NotFound) => return none_value(),
+        Err(e) => return Err(backend_err(e)),
+    };
+    if !abs.is_file() {
+        return none_value();
+    }
+    if !reef_sqlite_preview::has_sqlite_extension(Path::new(rel)) {
+        return none_value();
+    }
+    match reef_sqlite_preview::probe_magic(&abs) {
+        Ok(false) => return none_value(),
+        Err(e) => return Err((ErrorCode::Io, e.to_string())),
+        Ok(true) => {}
+    }
+    match reef_sqlite_preview::read_initial(&abs, page_size) {
+        Ok(info) => serde_json::to_value(Some(database_info_to_dto(info)))
+            .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
+        Err(e) => Err((ErrorCode::Other, format!("sqlite: {e}"))),
+    }
+}
+
+fn load_db_page_handler(
+    workdir: &Path,
+    rel: &str,
+    table: &str,
+    offset: u64,
+    limit: u32,
+) -> Result<serde_json::Value, (ErrorCode, String)> {
+    use reef::backend::BackendError;
+    use reef::backend::local::canonical_child_within;
+    let abs = match canonical_child_within(workdir, Path::new(rel)) {
+        Ok(p) => p,
+        Err(BackendError::NotFound) => return Err((ErrorCode::NotFound, "file not found".into())),
+        Err(e) => return Err(backend_err(e)),
+    };
+    if !abs.is_file() {
+        return Err((ErrorCode::NotFound, "not a regular file".into()));
+    }
+    match reef_sqlite_preview::load_page(&abs, table, offset, limit) {
+        Ok(page) => serde_json::to_value(db_page_to_dto(page))
+            .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
+        Err(e) => Err((ErrorCode::Other, format!("sqlite: {e}"))),
+    }
+}
+
+fn database_info_to_dto(d: reef_sqlite_preview::DatabaseInfo) -> reef_proto::DatabaseInfoDto {
+    reef_proto::DatabaseInfoDto {
+        tables: d.tables.into_iter().map(table_summary_to_dto).collect(),
+        selected_table: d.selected_table as u32,
+        initial_page: db_page_to_dto(d.initial_page),
+        bytes_on_disk: d.bytes_on_disk,
+    }
+}
+
+fn table_summary_to_dto(t: reef_sqlite_preview::TableSummary) -> reef_proto::TableSummaryDto {
+    reef_proto::TableSummaryDto {
+        name: t.name,
+        columns: t.columns.into_iter().map(column_info_to_dto).collect(),
+        row_count: t.row_count,
+    }
+}
+
+fn column_info_to_dto(c: reef_sqlite_preview::ColumnInfo) -> reef_proto::ColumnInfoDto {
+    reef_proto::ColumnInfoDto {
+        name: c.name,
+        decl_type: c.decl_type,
+    }
+}
+
+fn db_page_to_dto(p: reef_sqlite_preview::DbPage) -> reef_proto::DbPageDto {
+    reef_proto::DbPageDto {
+        rows: p
+            .rows
+            .into_iter()
+            .map(|cells| cells.into_iter().map(sqlite_value_to_dto).collect())
+            .collect(),
+    }
+}
+
+fn sqlite_value_to_dto(v: reef_sqlite_preview::SqliteValue) -> reef_proto::SqliteValueDto {
+    match v {
+        reef_sqlite_preview::SqliteValue::Null => reef_proto::SqliteValueDto::Null,
+        reef_sqlite_preview::SqliteValue::Integer(value) => {
+            reef_proto::SqliteValueDto::Integer { value }
+        }
+        reef_sqlite_preview::SqliteValue::Real(value) => reef_proto::SqliteValueDto::Real { value },
+        reef_sqlite_preview::SqliteValue::Text { value, truncated } => {
+            reef_proto::SqliteValueDto::Text { value, truncated }
+        }
+        reef_sqlite_preview::SqliteValue::Blob { len } => {
+            reef_proto::SqliteValueDto::Blob { len: len as u64 }
+        }
     }
 }

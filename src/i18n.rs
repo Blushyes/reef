@@ -114,6 +114,24 @@ pub enum Msg {
     PreviewBinaryTooLarge,
     PreviewBinaryDecodeError,
     PreviewBinaryEmpty,
+    /// SQLite preview: header for the left-side tables list column.
+    DbTablesHeader,
+    /// SQLite preview: shown when the database has zero user tables.
+    DbEmpty,
+    /// SQLite preview: shown for the currently-selected table when it
+    /// has zero rows (vs an empty database, which uses [`DbEmpty`]).
+    DbNoRows,
+    /// SQLite preview: short label inserted into the page footer
+    /// before the page-index pair, e.g. "page 2 / 5 · row …".
+    DbPageLabel,
+    /// SQLite preview: short label inserted into the page footer
+    /// before the row range pair, e.g. "… · row 11-20 / 100".
+    DbRowsLabel,
+    /// Page-jump input prompt label, shown in the footer while the
+    /// `g`-prefix goto-page input is active.
+    DbGotoPagePrompt,
+    /// Hint text shown alongside the goto-page prompt.
+    DbGotoPageHint,
     LayoutUnified,
     LayoutSideBySide,
     ModeCompact,
@@ -247,6 +265,13 @@ fn t_zh(m: Msg) -> &'static str {
         PreviewBinaryTooLarge => "文件过大，跳过解码",
         PreviewBinaryDecodeError => "解码失败",
         PreviewBinaryEmpty => "空文件",
+        DbTablesHeader => "表",
+        DbEmpty => "(空数据库)",
+        DbNoRows => "(无数据)",
+        DbPageLabel => "页",
+        DbRowsLabel => "行",
+        DbGotoPagePrompt => "跳到页",
+        DbGotoPageHint => "(Enter 确认 · Esc 取消)",
         LayoutUnified => "上下",
         LayoutSideBySide => "左右",
         ModeCompact => "局部",
@@ -365,6 +390,13 @@ fn t_en(m: Msg) -> &'static str {
         PreviewBinaryTooLarge => "file too large to decode",
         PreviewBinaryDecodeError => "decode failed",
         PreviewBinaryEmpty => "empty file",
+        DbTablesHeader => "tables",
+        DbEmpty => "(empty database)",
+        DbNoRows => "(no rows)",
+        DbPageLabel => "page",
+        DbRowsLabel => "row",
+        DbGotoPagePrompt => "go to page",
+        DbGotoPageHint => "(Enter to jump · Esc to cancel)",
         LayoutUnified => "unified",
         LayoutSideBySide => "split",
         ModeCompact => "compact",

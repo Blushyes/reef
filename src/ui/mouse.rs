@@ -73,6 +73,12 @@ pub enum ClickAction {
     /// entry). Clears the selection so a subsequent toolbar New
     /// File / Folder creates at the project root — VSCode behaviour.
     TreeClearSelection,
+    /// SQLite preview pagination chips in the footer.
+    DbPrevPage,
+    DbNextPage,
+    /// Jump directly to a 1-based page index. Clicking the `[5]` chip
+    /// dispatches `DbGotoPage(5)`.
+    DbGotoPage(u64),
 }
 
 #[derive(Debug, Clone)]

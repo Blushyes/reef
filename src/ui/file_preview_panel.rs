@@ -60,6 +60,9 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         PreviewBody::Text { .. } => render_text(f, app, inner, &preview),
         PreviewBody::Image(img) => render_image(f, app, inner, &preview.file_path, img),
         PreviewBody::Binary(info) => render_binary_info(f, app, inner, &preview.file_path, info),
+        PreviewBody::Database(info) => {
+            crate::ui::db_preview::render(f, app, inner, &preview.file_path, info)
+        }
     }
 
     app.preview_content = Some(preview);
@@ -105,11 +108,13 @@ fn render_empty(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Draw the shared "bold filename + horizontal separator" top used by
-/// every preview body variant (text / image / binary). Returns the next
-/// free y coordinate — callers continue rendering from there. Callers
-/// whose available height is `< 1` shouldn't call this; we clamp
-/// internally so a single-row panel shows at least the filename.
-fn render_card_header(
+/// every preview body variant (text / image / binary / database).
+/// Returns the next free y coordinate — callers continue rendering
+/// from there. Callers whose available height is `< 1` shouldn't
+/// call this; we clamp internally so a single-row panel shows at
+/// least the filename. Visible to the sibling `db_preview` module
+/// so it can share the same chrome.
+pub(in crate::ui) fn render_card_header(
     f: &mut Frame,
     area: Rect,
     path: &str,

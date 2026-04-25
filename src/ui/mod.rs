@@ -1,5 +1,6 @@
 pub mod commit_detail_panel;
 pub mod context_menu_panel;
+pub mod db_preview;
 pub mod diff_panel;
 pub mod file_preview_panel;
 pub mod file_tree_panel;

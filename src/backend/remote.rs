@@ -18,8 +18,8 @@ use std::thread;
 use std::time::Duration;
 
 use reef_proto::{
-    ContentSearchCompletedDto, ContentSearchRequestDto, DirEntryDto, Envelope, MatchHitDto,
-    Notification, ReadFileResponse, Request, Response, TrashResponseDto, WalkOptsDto,
+    ContentSearchCompletedDto, ContentSearchRequestDto, DatabaseInfoDto, DirEntryDto, Envelope,
+    MatchHitDto, Notification, ReadFileResponse, Request, Response, TrashResponseDto, WalkOptsDto,
     WalkResponseDto, decode_frame, encode_frame,
 };
 
@@ -485,6 +485,26 @@ impl Backend for RemoteBackend {
         // client-side decode; tracked in issue #31.
         use crate::file_tree::{BinaryInfo, BinaryReason, PreviewBody};
         let rel_str = rel_path.to_string_lossy().to_string();
+
+        // SQLite branch — client-side extension check, agent does the
+        // magic-bytes probe and the actual reading. Critical: a `.db`
+        // file can be hundreds of MB, and slurping it through ReadFile
+        // would blow `MAX_FRAME_SIZE` and stall the SSH pipe. The
+        // agent-side path opens the DB read-only and returns just the
+        // schema + first page of rows. On RPC failure or agent's
+        // "not actually sqlite" reply, fall through to the standard
+        // ReadFile path so the file still gets a binary card.
+        if reef_sqlite_preview::has_sqlite_extension(rel_path) {
+            if let Ok(Some(dto)) = self.request::<Option<DatabaseInfoDto>>(Request::LoadDbInitial {
+                rel_path: rel_str.clone(),
+                page_size: crate::file_tree::INITIAL_DB_PAGE_ROWS,
+            }) {
+                return Some(PreviewContent {
+                    file_path: rel_str,
+                    body: PreviewBody::Database(database_info_from_dto(dto)),
+                });
+            }
+        }
         let resp: ReadFileResponse = self
             .request(Request::ReadFile {
                 path: rel_str.clone(),
@@ -546,6 +566,23 @@ impl Backend for RemoteBackend {
             return Err(BackendError::NotFound);
         }
         Ok(resp.bytes)
+    }
+
+    fn db_load_page(
+        &self,
+        rel_path: &Path,
+        table: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<reef_sqlite_preview::DbPage, BackendError> {
+        let rel_str = rel_path.to_string_lossy().to_string();
+        let dto: reef_proto::DbPageDto = self.request(Request::LoadDbPage {
+            rel_path: rel_str,
+            table: table.to_string(),
+            offset,
+            limit,
+        })?;
+        Ok(db_page_from_dto(dto))
     }
 
     fn git_status(&self) -> Result<StatusSnapshot, BackendError> {
@@ -1175,6 +1212,63 @@ impl From<reef_proto::RefLabelDto> for RefLabel {
             reef_proto::RefLabelDto::Branch(s) => RefLabel::Branch(s),
             reef_proto::RefLabelDto::RemoteBranch(s) => RefLabel::RemoteBranch(s),
             reef_proto::RefLabelDto::Tag(s) => RefLabel::Tag(s),
+        }
+    }
+}
+
+// ── SQLite preview DTO -> domain conversions ────────────────────────────
+//
+// Both source and destination types are foreign to this crate (reef_proto
+// and reef_sqlite_preview), so the orphan rule blocks `impl From<...>`
+// here. Free functions instead — slightly noisier at the call site but
+// keeps reef-sqlite-preview wire-agnostic (no reef-proto dep).
+
+fn database_info_from_dto(v: reef_proto::DatabaseInfoDto) -> reef_sqlite_preview::DatabaseInfo {
+    reef_sqlite_preview::DatabaseInfo {
+        tables: v.tables.into_iter().map(table_summary_from_dto).collect(),
+        selected_table: v.selected_table as usize,
+        initial_page: db_page_from_dto(v.initial_page),
+        bytes_on_disk: v.bytes_on_disk,
+    }
+}
+
+fn table_summary_from_dto(v: reef_proto::TableSummaryDto) -> reef_sqlite_preview::TableSummary {
+    reef_sqlite_preview::TableSummary {
+        name: v.name,
+        columns: v.columns.into_iter().map(column_info_from_dto).collect(),
+        row_count: v.row_count,
+    }
+}
+
+fn column_info_from_dto(v: reef_proto::ColumnInfoDto) -> reef_sqlite_preview::ColumnInfo {
+    reef_sqlite_preview::ColumnInfo {
+        name: v.name,
+        decl_type: v.decl_type,
+    }
+}
+
+fn db_page_from_dto(v: reef_proto::DbPageDto) -> reef_sqlite_preview::DbPage {
+    reef_sqlite_preview::DbPage {
+        rows: v
+            .rows
+            .into_iter()
+            .map(|cells| cells.into_iter().map(sqlite_value_from_dto).collect())
+            .collect(),
+    }
+}
+
+fn sqlite_value_from_dto(v: reef_proto::SqliteValueDto) -> reef_sqlite_preview::SqliteValue {
+    match v {
+        reef_proto::SqliteValueDto::Null => reef_sqlite_preview::SqliteValue::Null,
+        reef_proto::SqliteValueDto::Integer { value } => {
+            reef_sqlite_preview::SqliteValue::Integer(value)
+        }
+        reef_proto::SqliteValueDto::Real { value } => reef_sqlite_preview::SqliteValue::Real(value),
+        reef_proto::SqliteValueDto::Text { value, truncated } => {
+            reef_sqlite_preview::SqliteValue::Text { value, truncated }
+        }
+        reef_proto::SqliteValueDto::Blob { len } => {
+            reef_sqlite_preview::SqliteValue::Blob { len: len as usize }
         }
     }
 }

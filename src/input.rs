@@ -8,7 +8,7 @@
 //! capture mode, and both are simple enough that splitting them out would
 //! just add indirection.
 
-use crate::app::{App, Panel, Tab};
+use crate::app::{App, DbNav, Panel, Tab};
 use crate::clipboard;
 use crate::global_search;
 use crate::i18n::{Msg, t};
@@ -104,6 +104,16 @@ pub fn leader_decision(
 // ─── Keyboard ────────────────────────────────────────────────────────────────
 
 pub fn handle_key(key: KeyEvent, app: &mut App) {
+    // SQLite goto-page input — fully owns input while active. Sits at
+    // the top of the gate stack because it's an inline prompt that
+    // can be invoked from inside the Files tab without crossing any
+    // other modal; the user expects "every keystroke goes into the
+    // page-number buffer" while it's up.
+    if app.db_goto_input.is_some() {
+        handle_key_db_goto(key, app);
+        return;
+    }
+
     // Hosts picker (Ctrl+O) — fully owns input while active, same contract
     // as the other overlays.
     if app.hosts_picker.active {
@@ -367,6 +377,54 @@ fn has_pending_confirm(app: &App) -> bool {
     app.git_status.confirm_discard.is_some()
         || app.git_status.confirm_push
         || app.git_status.confirm_force_push
+}
+
+/// SQLite preview page-jump input. While `app.db_goto_input` is
+/// `Some(_)`, this handler fully owns the keyboard. Digits append,
+/// Backspace pops, Enter parses and jumps via
+/// [`App::db_navigate_to_page`], Esc cancels. Anything else is
+/// silently ignored so a stray modifier doesn't accidentally commit
+/// a partial number.
+fn handle_key_db_goto(key: KeyEvent, app: &mut App) {
+    let buf = match app.db_goto_input.as_mut() {
+        Some(b) => b,
+        None => return,
+    };
+    match key.code {
+        crossterm::event::KeyCode::Char(c) if c.is_ascii_digit() => {
+            // Cap input length at 18 chars — that's beyond u64::MAX
+            // digit count, so anything longer is the user fat-
+            // fingering rather than a real page number. Silently
+            // dropping the extra keystroke is friendlier than
+            // rejecting the whole buffer.
+            if buf.len() < 18 {
+                buf.push(c);
+            }
+        }
+        crossterm::event::KeyCode::Backspace => {
+            buf.pop();
+        }
+        crossterm::event::KeyCode::Enter => {
+            // Empty input on Enter → treat as Esc (cancel) rather
+            // than parsing "" → 0 → page 0. Keeps the contract
+            // friendlier when the user opens the prompt by accident.
+            let parsed: Option<u64> = if buf.is_empty() {
+                None
+            } else {
+                buf.parse::<u64>().ok()
+            };
+            app.db_goto_input = None;
+            if let Some(page) = parsed {
+                if page > 0 {
+                    app.db_navigate_to_page(page);
+                }
+            }
+        }
+        crossterm::event::KeyCode::Esc => {
+            app.db_goto_input = None;
+        }
+        _ => {}
+    }
 }
 
 /// Tab::Search key dispatcher. Panel::Files is the search sidebar, which
@@ -1136,6 +1194,10 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
             // Files tab has no middle column — Panel::Commit should never
             // be set here, but fall back to Diff behaviour defensively.
             Panel::Diff | Panel::Commit => {
+                // For Database bodies preview_scroll is "row offset
+                // within current_rows" — same field, different
+                // semantics. The renderer reads this for either body
+                // shape, so a single decrement works for both.
                 app.preview_scroll = app.preview_scroll.saturating_sub(1);
             }
         },
@@ -1145,6 +1207,9 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 app.load_preview();
             }
             Panel::Diff | Panel::Commit => {
+                // Same dual-semantics as the Up arm. Render clamps the
+                // upper bound against the actual row count, so we
+                // don't need to know current_rows.len() here.
                 app.preview_scroll += 1;
             }
         },
@@ -1177,7 +1242,19 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 app.load_preview();
             }
             Panel::Diff | Panel::Commit => {
-                app.preview_scroll = app.preview_scroll.saturating_sub(20);
+                // SQLite preview hijacks PgUp/PgDn for page-flip;
+                // every other body shape keeps the regular scroll
+                // semantics so .txt / .png / binary cards aren't
+                // affected.
+                if app
+                    .preview_content
+                    .as_ref()
+                    .is_some_and(|p| p.is_database())
+                {
+                    app.db_navigate(DbNav::PrevPage);
+                } else {
+                    app.preview_scroll = app.preview_scroll.saturating_sub(20);
+                }
             }
         },
         KeyCode::PageDown => match app.active_panel {
@@ -1186,9 +1263,54 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 app.load_preview();
             }
             Panel::Diff | Panel::Commit => {
-                app.preview_scroll += 20;
+                if app
+                    .preview_content
+                    .as_ref()
+                    .is_some_and(|p| p.is_database())
+                {
+                    app.db_navigate(DbNav::NextPage);
+                } else {
+                    app.preview_scroll += 20;
+                }
             }
         },
+        // SQLite preview only — `[` / `]` cycle tables. Bare keys, no
+        // modifier guard beyond `!ctrl` (Ctrl+[ is the terminal Esc
+        // sequence on most terms; we don't want to swallow it).
+        KeyCode::Char('[')
+            if !ctrl
+                && app.active_panel == Panel::Diff
+                && app
+                    .preview_content
+                    .as_ref()
+                    .is_some_and(|p| p.is_database()) =>
+        {
+            app.db_navigate(DbNav::PrevTable);
+        }
+        KeyCode::Char(']')
+            if !ctrl
+                && app.active_panel == Panel::Diff
+                && app
+                    .preview_content
+                    .as_ref()
+                    .is_some_and(|p| p.is_database()) =>
+        {
+            app.db_navigate(DbNav::NextTable);
+        }
+        // SQLite preview only — `g` opens the page-jump input. Bare
+        // key (no Ctrl) so it doesn't conflict with terminal Ctrl+G
+        // (bell). Once the input is active, `handle_key_db_goto` at
+        // the top of the dispatcher takes over.
+        KeyCode::Char('g')
+            if !ctrl
+                && app.active_panel == Panel::Diff
+                && app
+                    .preview_content
+                    .as_ref()
+                    .is_some_and(|p| p.is_database()) =>
+        {
+            app.db_goto_input = Some(String::new());
+        }
         KeyCode::Left if app.active_panel == Panel::Diff => {
             let step = if key.modifiers.contains(KeyModifiers::SHIFT) {
                 10
@@ -1205,11 +1327,37 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
             };
             app.preview_h_scroll = app.preview_h_scroll.saturating_add(step);
         }
-        KeyCode::Home if app.active_panel == Panel::Diff => {
+        // `Home`/`End` keep their existing semantics for every body
+        // shape (h-scroll to the start / end of the row). Database
+        // body's first/last page jumps live on `Ctrl+Home` /
+        // `Ctrl+End` instead — overriding bare `Home`/`End` would
+        // strand the user with no quick way to reset h_scroll after
+        // an accidental drift.
+        KeyCode::Home if app.active_panel == Panel::Diff && !ctrl => {
             app.preview_h_scroll = 0;
         }
-        KeyCode::End if app.active_panel == Panel::Diff => {
+        KeyCode::End if app.active_panel == Panel::Diff && !ctrl => {
             app.preview_h_scroll = usize::MAX;
+        }
+        KeyCode::Home
+            if ctrl
+                && app.active_panel == Panel::Diff
+                && app
+                    .preview_content
+                    .as_ref()
+                    .is_some_and(|p| p.is_database()) =>
+        {
+            app.db_navigate(DbNav::FirstPage);
+        }
+        KeyCode::End
+            if ctrl
+                && app.active_panel == Panel::Diff
+                && app
+                    .preview_content
+                    .as_ref()
+                    .is_some_and(|p| p.is_database()) =>
+        {
+            app.db_navigate(DbNav::LastPage);
         }
         KeyCode::Enter => {
             let idx = app.file_tree.selected;
@@ -1436,6 +1584,22 @@ fn handle_key_tree_delete_confirm(key: KeyEvent, app: &mut App) {
 // ─── Mouse ───────────────────────────────────────────────────────────────────
 
 pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Terminal<B>) {
+    // SQLite goto-page input is modal: any mouse click outside the
+    // input cancels it (matches popup-style behavior on the web).
+    // Without this gate, clicking a pagination chip while the
+    // prompt is open would mutate `db_preview_state.page` while the
+    // prompt stayed visible — UI would say "go to page: 42" but the
+    // displayed page would already have changed.
+    if app.db_goto_input.is_some()
+        && matches!(
+            mouse.kind,
+            MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_)
+        )
+    {
+        app.db_goto_input = None;
+        return;
+    }
+
     // Palettes fully own mouse input while active (global-search first,
     // then quick-open): clicks must not leak through to hidden panels,
     // and scroll wheels inside the popup should move the selection.
@@ -1637,8 +1801,17 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
             // Shift + 滚轮 = 横向滚动（兼容不发 ScrollLeft/Right 的终端）
             if mouse.modifiers.contains(KeyModifiers::SHIFT) {
                 apply_horizontal_scroll(app, mouse.column, total_width, -3);
+                app.horizontal_scroll_lock.observe();
                 return;
             }
+            // Drop bare vertical events that arrive during the tail
+            // of an in-progress horizontal swipe (trackpad noise on
+            // the orthogonal axis). Streak-gated so a single
+            // horizontal noise event doesn't lock vertical out.
+            if app.horizontal_scroll_lock.locked() {
+                return;
+            }
+            app.vertical_scroll_lock.observe();
             // Use the shared clamp + sidebar-hidden short-circuit so wheel
             // routing lines up with hit-testing. With sidebar hidden
             // `graph_sidebar_width` returns 0 and `is_left` never fires.
@@ -1689,8 +1862,13 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
             let total_width = terminal.size().map(|s| s.width).unwrap_or(80);
             if mouse.modifiers.contains(KeyModifiers::SHIFT) {
                 apply_horizontal_scroll(app, mouse.column, total_width, 3);
+                app.horizontal_scroll_lock.observe();
                 return;
             }
+            if app.horizontal_scroll_lock.locked() {
+                return;
+            }
+            app.vertical_scroll_lock.observe();
             let split_x = app.graph_sidebar_width(total_width);
             let is_left = mouse.column < split_x;
             match app.active_tab {
@@ -1729,12 +1907,24 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
             }
         }
         MouseEventKind::ScrollLeft => {
+            // Axis lock: drop horizontal events that arrive during
+            // an active vertical swipe. Streak-gated so a single
+            // vertical noise event from a trackpad doesn't lock
+            // horizontal out.
+            if app.vertical_scroll_lock.locked() {
+                return;
+            }
             let total_width = terminal.size().map(|s| s.width).unwrap_or(80);
             apply_horizontal_scroll(app, mouse.column, total_width, -3);
+            app.horizontal_scroll_lock.observe();
         }
         MouseEventKind::ScrollRight => {
+            if app.vertical_scroll_lock.locked() {
+                return;
+            }
             let total_width = terminal.size().map(|s| s.width).unwrap_or(80);
             apply_horizontal_scroll(app, mouse.column, total_width, 3);
+            app.horizontal_scroll_lock.observe();
         }
         MouseEventKind::Moved => {
             app.hover_row = Some(mouse.row);
@@ -2060,6 +2250,81 @@ fn mouse_to_file_coord(
 fn sbs_cursor_on_left(panel_start: u16, panel_w: u16, column: u16) -> bool {
     let panel_mid = panel_start.saturating_add(panel_w / 2);
     column < panel_mid
+}
+
+/// Bidirectional axis-lock window. After a scroll dispatch on one
+/// axis, events on the orthogonal axis are dropped for this duration
+/// so trackpad noise during a primary swipe can't drift the view
+/// sideways/upward against the user's intent. Renewed on every event
+/// in the locked direction, so a continuous swipe holds the lock for
+/// its entire duration; an intentional axis change just needs a
+/// brief pause longer than this window.
+const AXIS_LOCK_WINDOW: Duration = Duration::from_millis(200);
+
+/// Time gap after which a streak counter resets to zero. Trackpad
+/// scrolling fires ~60-90 events per second during a sustained
+/// swipe (~12-16 ms inter-event), so 150 ms is comfortably long
+/// enough that the streak survives the entire swipe but short
+/// enough that an isolated noise event decays before the user's
+/// intended swipe on the orthogonal axis even starts.
+const AXIS_LOCK_STREAK_GAP: Duration = Duration::from_millis(150);
+
+/// Number of consecutive same-axis events required before the lock
+/// arms against the orthogonal axis. `2` means a single stray
+/// trackpad-noise event never gates anything out — the user has to
+/// be actually swiping on an axis (≥ 2 events in quick succession)
+/// before its lock takes effect.
+const AXIS_LOCK_STREAK_THRESHOLD: u32 = 2;
+
+/// Per-axis scroll lock state — timestamp of the last event plus
+/// the consecutive-event streak counter. Encapsulates the streak
+/// reset / arm-after-N-events logic so the input dispatcher can
+/// just call `observe()` on the firing axis and `locked()` on the
+/// orthogonal one. The time-injection variants (`observe_at` /
+/// `locked_at`) exist solely so the unit tests can drive synthetic
+/// time without sleeping; production paths use the wall-clock
+/// `observe()` / `locked()`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AxisLock {
+    last_at: Option<Instant>,
+    streak: u32,
+}
+
+impl AxisLock {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn observe(&mut self) {
+        self.observe_at(Instant::now());
+    }
+
+    pub fn locked(&self) -> bool {
+        self.locked_at(Instant::now())
+    }
+
+    fn observe_at(&mut self, now: Instant) {
+        let stale = self
+            .last_at
+            .map(|at| now.duration_since(at) > AXIS_LOCK_STREAK_GAP)
+            .unwrap_or(true);
+        self.streak = if stale {
+            1
+        } else {
+            self.streak.saturating_add(1)
+        };
+        self.last_at = Some(now);
+    }
+
+    fn locked_at(&self, now: Instant) -> bool {
+        match self.last_at {
+            Some(at) => {
+                now.duration_since(at) < AXIS_LOCK_WINDOW
+                    && self.streak >= AXIS_LOCK_STREAK_THRESHOLD
+            }
+            None => false,
+        }
+    }
 }
 
 /// Apply a horizontal-scroll delta (in display columns) to whichever panel
@@ -2402,6 +2667,94 @@ fn hex_digit(b: u8) -> Option<u8> {
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod axis_lock_tests {
+    use super::*;
+
+    fn at(ms: u64) -> Instant {
+        // Anchor every test on a single base instant so durations
+        // line up with the constants. `Instant::now()` once at the
+        // start gives a stable reference; `+ Duration` to advance.
+        // (Std doesn't expose an `Instant::ZERO`, hence the helper.)
+        static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        let base = *BASE.get_or_init(Instant::now);
+        base + Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn empty_lock_is_unlocked() {
+        let lock = AxisLock::new();
+        assert!(!lock.locked_at(at(0)));
+    }
+
+    #[test]
+    fn single_event_does_not_arm_lock() {
+        // Threshold is 2 — a single isolated trackpad-noise event
+        // must never gate out the orthogonal axis. This is the
+        // core property the streak refactor was introduced for.
+        let mut lock = AxisLock::new();
+        lock.observe_at(at(0));
+        assert_eq!(lock.streak, 1);
+        assert!(!lock.locked_at(at(0)));
+        assert!(!lock.locked_at(at(50)));
+    }
+
+    #[test]
+    fn two_events_within_gap_arm_lock() {
+        let mut lock = AxisLock::new();
+        lock.observe_at(at(0));
+        lock.observe_at(at(50)); // 50 ms < 150 ms gap
+        assert_eq!(lock.streak, 2);
+        assert!(lock.locked_at(at(50)));
+    }
+
+    #[test]
+    fn streak_resets_after_gap() {
+        // An event arriving after AXIS_LOCK_STREAK_GAP (150 ms)
+        // restarts the streak from 1 — even prior accumulation
+        // doesn't leak forward, so a stale `last_at` from minutes
+        // ago can't accidentally pre-arm the lock on a fresh swipe.
+        let mut lock = AxisLock::new();
+        lock.observe_at(at(0));
+        lock.observe_at(at(50));
+        assert_eq!(lock.streak, 2);
+        // 50 + 200 = 250 ms gap — well past the 150 ms reset.
+        lock.observe_at(at(250));
+        assert_eq!(lock.streak, 1);
+        assert!(!lock.locked_at(at(250)));
+    }
+
+    #[test]
+    fn lock_decays_after_window() {
+        // After arming, the lock holds for AXIS_LOCK_WINDOW (200 ms)
+        // past the most recent event. Beyond that, even with a high
+        // streak count, the lock is considered released.
+        let mut lock = AxisLock::new();
+        lock.observe_at(at(0));
+        lock.observe_at(at(50));
+        assert!(lock.locked_at(at(50)));
+        // 50 + 250 = 300 ms after last event; window is 200 ms.
+        assert!(!lock.locked_at(at(300)));
+    }
+
+    #[test]
+    fn sustained_swipe_holds_lock_continuously() {
+        // A real swipe fires events every ~12-16 ms; the lock must
+        // stay armed for the entire swipe via per-event renewal,
+        // not decay between them. Simulate 20 events at 15 ms apart.
+        let mut lock = AxisLock::new();
+        for i in 0..20 {
+            lock.observe_at(at(i * 15));
+        }
+        // After 19 events (offset 0..285 ms), lock should still be
+        // armed because each event renewed `last_at`.
+        assert!(lock.locked_at(at(285)));
+        // And after the swipe ends, the lock decays within
+        // AXIS_LOCK_WINDOW after the final event (285 + 200 = 485).
+        assert!(!lock.locked_at(at(490)));
+    }
+}
 
 #[cfg(test)]
 mod leader_tests {

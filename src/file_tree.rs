@@ -34,6 +34,11 @@ pub enum PreviewBody {
     },
     Image(ImagePreview),
     Binary(BinaryInfo),
+    /// SQLite read-only preview — a list of tables with row counts plus
+    /// the first page of rows for the smallest non-empty table. Built
+    /// by `reef-sqlite-preview` either locally (LocalBackend) or
+    /// agent-side (RemoteBackend's `LoadDbInitial` RPC).
+    Database(reef_sqlite_preview::DatabaseInfo),
 }
 
 impl PreviewContent {
@@ -42,6 +47,13 @@ impl PreviewContent {
     /// drag-select, copy). Keeps the `matches!(…)` churn out of call sites.
     pub fn is_text(&self) -> bool {
         matches!(self.body, PreviewBody::Text { .. })
+    }
+
+    /// Convenience used by the input-key dispatcher when deciding
+    /// whether `PgUp` / `PgDn` / `[` / `]` should run the SQLite
+    /// pagination flow vs the standard text-scroll flow.
+    pub fn is_database(&self) -> bool {
+        matches!(self.body, PreviewBody::Database(_))
     }
 }
 
@@ -158,7 +170,7 @@ fn image_format_name(f: image::ImageFormat) -> &'static str {
 /// Human-readable byte size: "512 B" / "2.4 KB" / "5.7 MB" / "1.2 GB".
 /// Single-precision is enough for the preview metadata card where
 /// users just need a rough sense of scale.
-fn human_bytes(bytes: u64) -> String {
+pub(crate) fn human_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * 1024;
     const GB: u64 = 1024 * 1024 * 1024;
@@ -571,6 +583,19 @@ pub const MAX_PIXELS: u64 = 50_000_000;
 /// we pass 8KB to match our existing null-byte probe window.
 const PROBE_BYTES: usize = 8192;
 
+/// Default page size for the *initial* SQLite preview the worker
+/// builds when the user selects a `.db` file. The render panel may
+/// re-request a different page size once it knows the panel height
+/// (via `db_load_page`); this is just enough to give the first paint
+/// some content. 50 rows × ~5 columns × ~30 bytes ≈ 7.5 KB on the
+/// wire — fine for SSH stdio.
+pub const INITIAL_DB_PAGE_ROWS: u32 = 50;
+
+/// MIME type we claim for SQLite databases on the binary fallback
+/// card (when `read_initial` failed and we degrade to the generic
+/// metadata view). Matches what `infer` emits for the magic bytes.
+const SQLITE_MIME: &str = "application/vnd.sqlite3";
+
 /// Largest file the fallback null-byte heuristic will slurp into memory
 /// when `infer` returned no magic-byte match. Anything bigger is
 /// classified `Binary(NullBytes)` on the spot: a 500 MB random-bytes
@@ -633,6 +658,53 @@ pub fn load_preview(
     probe.truncate(n);
 
     let mime: Option<&'static str> = infer::get(&probe).map(|k| k.mime_type());
+
+    // ── SQLite branch ───────────────────────────────────────────────
+    // Extension + magic-bytes match → hand the file to the
+    // reef-sqlite-preview reader for a structured table card. Comes
+    // before the MIME-based branches because `infer` classifies SQLite
+    // as `application/vnd.sqlite3` → would otherwise be intercepted by
+    // the non-image binary branch and shown as a generic "(database
+    // file · 4.1 MB)" stub instead of a useful card.
+    //
+    // Errors fall through to a binary card with a more specific
+    // reason: encrypted / corrupt → `DecodeError(...)`, oversized →
+    // `TooLarge`. We always claim `application/vnd.sqlite3` for the
+    // MIME on those fallback cards because we just verified the
+    // magic-bytes header, regardless of what `infer` thought.
+    if reef_sqlite_preview::has_sqlite_extension(rel_path)
+        && reef_sqlite_preview::has_sqlite_magic(&probe)
+    {
+        use reef_sqlite_preview::PreviewError as SqlitePreviewError;
+        match reef_sqlite_preview::read_initial(&full, INITIAL_DB_PAGE_ROWS) {
+            Ok(info) => {
+                return Some(PreviewContent {
+                    file_path: rel_str,
+                    body: PreviewBody::Database(info),
+                });
+            }
+            Err(SqlitePreviewError::TooLarge { .. }) => {
+                return Some(PreviewContent {
+                    file_path: rel_str,
+                    body: PreviewBody::Binary(BinaryInfo::new(
+                        file_size,
+                        Some(SQLITE_MIME),
+                        BinaryReason::TooLarge,
+                    )),
+                });
+            }
+            Err(e) => {
+                return Some(PreviewContent {
+                    file_path: rel_str,
+                    body: PreviewBody::Binary(BinaryInfo::new(
+                        file_size,
+                        Some(SQLITE_MIME),
+                        decode_error(format!("sqlite: {e}")),
+                    )),
+                });
+            }
+        }
+    }
 
     // ── Image branch ────────────────────────────────────────────────
     if let Some(m) = mime

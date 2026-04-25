@@ -1,10 +1,9 @@
 ---
 source: tests/ui_snapshots.rs
-assertion_line: 345
 expression: output
 ---
  reef  [TMPDIR]  ⎇ (detached)
- 📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph           1:Files 2:Search 3:Git 4:Graph
+ 📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph        ⊟  1:Files 2:Search 3:Git 4:Graph
  +   📁  Connect to · [user@]host[:path] ─────────────────────────────────┐
  (empt│ ➜ root@47.101.167.85:/tmp/work                                   │
       │ ──────────────────────────────────────────────────────────────── │

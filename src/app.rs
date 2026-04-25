@@ -450,6 +450,14 @@ pub struct App {
 
     // Layout
     pub split_percent: u16,
+    /// 侧边栏是否可见。关闭后左列(Panel::Files)不参与渲染,也不占宽度;
+    /// `graph_sidebar_width` 在 hidden 时短路返回 0,让所有共享宽度计算
+    /// (hit-testing、h-scroll 路由、drag zone 注册)自然跟随。Graph tab
+    /// 3-col 模式下关闭侧边栏会退化为 [Commit | Diff] 双列。
+    pub sidebar_visible: bool,
+    /// 第一次 hide 弹一条 Toast 帮用户找回入口,后续保持安静。不持久化:
+    /// Ctrl+B 在每个新会话里都允许让人迷茫一次。
+    pub sidebar_hide_hint_shown: bool,
     pub dragging_split: bool,
     /// Graph tab 三列布局下,中间 commit 列与右侧 diff 列的分割位置,用
     /// "非 graph 区域的百分比" 表示,从左向右计:中间列占 `100 -
@@ -671,20 +679,23 @@ pub(crate) fn compute_sidebar_width(total_width: u16, split_percent: u16) -> u16
 }
 
 /// Pure layout: 3-col widths `(graph, commit, diff)` summing to
-/// `total_width`. See `App::graph_three_col_widths` for caller rules.
+/// `total_width`. Callers pass an already-clamped `sidebar_w` (from
+/// `compute_sidebar_width` or `App::graph_sidebar_width`); when the
+/// sidebar is hidden it's 0 and the full width is redistributed
+/// between commit and diff using `graph_diff_split_percent`. See
+/// `App::graph_three_col_widths` for caller rules.
 pub(crate) fn compute_three_col_widths(
     total_width: u16,
-    split_percent: u16,
+    sidebar_w: u16,
     graph_diff_split_percent: u16,
 ) -> (u16, u16, u16) {
-    let graph_w = compute_sidebar_width(total_width, split_percent);
-    let remainder = total_width.saturating_sub(graph_w);
+    let remainder = total_width.saturating_sub(sidebar_w);
     let diff_w_raw = (remainder as u32 * graph_diff_split_percent as u32 / 100) as u16;
     // `.max(20)` + `.min(remainder - 20)` keeps both sub-columns usable
     // even when `graph_diff_split_percent` hits its drag clamp edges.
     let diff_w = diff_w_raw.max(20).min(remainder.saturating_sub(20));
     let commit_w = remainder.saturating_sub(diff_w);
-    (graph_w, commit_w, diff_w)
+    (sidebar_w, commit_w, diff_w)
 }
 
 impl App {
@@ -800,6 +811,8 @@ impl App {
             last_diff_hit: None,
             diff_click_state: None,
             split_percent: 30,
+            sidebar_visible: true,
+            sidebar_hide_hint_shown: false,
             dragging_split: false,
             graph_diff_split_percent: 60,
             dragging_graph_diff_split: false,
@@ -886,6 +899,9 @@ impl App {
     /// v0 — factored here so `input::*` and the render stay aligned
     /// even when `split_percent` lands near the extremes.
     pub fn graph_sidebar_width(&self, total_width: u16) -> u16 {
+        if !self.sidebar_visible {
+            return 0;
+        }
         compute_sidebar_width(total_width, self.split_percent)
     }
 
@@ -898,7 +914,7 @@ impl App {
     pub fn graph_three_col_widths(&self, total_width: u16) -> (u16, u16, u16) {
         compute_three_col_widths(
             total_width,
-            self.split_percent,
+            self.graph_sidebar_width(total_width),
             self.graph_diff_split_percent,
         )
     }
@@ -945,6 +961,13 @@ impl App {
         if self.active_panel == Panel::Commit && !self.graph_uses_three_col() {
             self.active_panel = Panel::Diff;
         }
+        // Sidebar hidden → Panel::Files has no rendered column. Demote here
+        // as a safety net even though `toggle_sidebar` already does it; a
+        // future code path that flips `sidebar_visible` without going through
+        // the toggle can't leave focus stranded.
+        if !self.sidebar_visible && self.active_panel == Panel::Files {
+            self.active_panel = Panel::Diff;
+        }
         // If we're on Graph and the 3-col diff column isn't visible anymore,
         // any selection was anchored into rows that no panel will render.
         if self.active_tab == Tab::Graph
@@ -952,6 +975,35 @@ impl App {
             && !self.graph_uses_three_col()
         {
             self.clear_diff_selection();
+        }
+    }
+
+    /// Toggle the left sidebar's visibility. Hiding collapses the left
+    /// column to 0 width (via `graph_sidebar_width`'s short-circuit); all
+    /// mouse hit-testing, h-scroll routing, and drag-zone registration key
+    /// off that same value so they stay consistent. Focus on `Panel::Files`
+    /// gets moved to `Panel::Diff` — the sidebar panel wouldn't render
+    /// otherwise and keyboard nav would aim at nothing. Any in-flight
+    /// column drag is cancelled so releasing the mouse after the hide
+    /// doesn't snap a phantom split_percent.
+    pub fn toggle_sidebar(&mut self) {
+        self.sidebar_visible = !self.sidebar_visible;
+        if !self.sidebar_visible {
+            if self.active_panel == Panel::Files {
+                self.active_panel = Panel::Diff;
+            }
+            self.dragging_split = false;
+            self.dragging_graph_diff_split = false;
+            // First-time-per-session hint so the user can find the way
+            // back without scanning the help popup. Subsequent hides
+            // stay quiet — the tab-bar button glyph already telegraphs
+            // the state.
+            if !self.sidebar_hide_hint_shown {
+                self.sidebar_hide_hint_shown = true;
+                self.toasts.push(Toast::info(crate::i18n::t(
+                    crate::i18n::Msg::SidebarHiddenHint,
+                )));
+            }
         }
     }
 
@@ -2908,6 +2960,9 @@ impl App {
             ClickAction::SwitchTab(tab) => {
                 self.set_active_tab(tab);
             }
+            ClickAction::ToggleSidebar => {
+                self.toggle_sidebar();
+            }
             ClickAction::TreeClick(index) => {
                 self.file_tree.selected = index;
                 if let Some(entry) = self.file_tree.entries.get(index) {
@@ -3593,7 +3648,7 @@ mod tests {
         // Regression guard: if the rounding ever changes, the assert below
         // pins the invariant `graph + commit + diff == total_width`. Hit-
         // testing + h-scroll routing rely on this exactly.
-        let (g, c, d) = compute_three_col_widths(200, 30, 60);
+        let (g, c, d) = compute_three_col_widths(200, 60, 60);
         assert_eq!(g + c + d, 200);
     }
 
@@ -3601,7 +3656,7 @@ mod tests {
     fn three_col_widths_diff_floor_20() {
         // graph_diff_split_percent = 0 shouldn't squeeze diff to 0 —
         // `.max(20)` keeps it usable.
-        let (_, _, d) = compute_three_col_widths(200, 30, 0);
+        let (_, _, d) = compute_three_col_widths(200, 60, 0);
         assert!(d >= 20, "diff col floored at 20, got {d}");
     }
 
@@ -3609,15 +3664,15 @@ mod tests {
     fn three_col_widths_commit_floor_20() {
         // graph_diff_split_percent = 100 shouldn't squeeze commit to 0 —
         // `.min(remainder - 20)` leaves commit at least 20 cols.
-        let (_, c, _) = compute_three_col_widths(200, 30, 100);
+        let (_, c, _) = compute_three_col_widths(200, 60, 100);
         assert!(c >= 20, "commit col floored at 20, got {c}");
     }
 
     #[test]
     fn three_col_widths_default_proportions() {
-        // Default tuning: split_percent=30, graph_diff_split_percent=60
+        // Default tuning: sidebar_w=60 (30% of 200), graph_diff_split_percent=60
         // on a 200-wide terminal. Sanity-check the split feels right.
-        let (g, c, d) = compute_three_col_widths(200, 30, 60);
+        let (g, c, d) = compute_three_col_widths(200, 60, 60);
         assert_eq!(g, 60);
         // remainder = 140, diff = 60% of 140 = 84, commit = 56.
         assert_eq!(d, 84);
@@ -3640,7 +3695,20 @@ mod tests {
         // width is the same value. `graph_diff_column_start` and
         // `focus_panel_under_cursor` depend on this.
         let sidebar_2 = compute_sidebar_width(150, 30);
-        let (graph_3, _, _) = compute_three_col_widths(150, 30, 60);
+        let (graph_3, _, _) = compute_three_col_widths(150, sidebar_2, 60);
         assert_eq!(sidebar_2, graph_3);
+    }
+
+    #[test]
+    fn three_col_widths_redistribute_when_sidebar_zero() {
+        // Sidebar hidden → sidebar_w=0; commit and diff fill the full
+        // width using `graph_diff_split_percent`. Diff stays 60% of 200
+        // and commit takes the rest, instead of inheriting the narrow
+        // commit_w computed off the (now nonexistent) sidebar slot.
+        let (g, c, d) = compute_three_col_widths(200, 0, 60);
+        assert_eq!(g, 0);
+        assert_eq!(g + c + d, 200);
+        assert_eq!(d, 120);
+        assert_eq!(c, 80);
     }
 }

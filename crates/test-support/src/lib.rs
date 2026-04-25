@@ -120,6 +120,26 @@ impl Drop for CwdGuard {
     }
 }
 
+/// Pin the UI language to English so test output stays deterministic
+/// across developer locales. i18n's `lang()` caches the choice in a
+/// process-wide `OnceLock` on first call, so callers should invoke this
+/// before any code path that reads `lang()`. Idempotent across calls
+/// within the same test binary.
+///
+/// Same serialisation warning as `HomeGuard`/`CwdGuard`: `set_var` is
+/// process-global, so callers must hold a test-file-local `Mutex<()>`.
+pub fn force_en_lang() {
+    if std::env::var_os("REEF_LANG").as_deref() == Some(std::ffi::OsStr::new("en")) {
+        return;
+    }
+    // SAFETY: callers hold a test-file-local mutex, and no other test
+    // touches `REEF_LANG` concurrently. Must precede any `t(Msg::*)` so
+    // the OnceLock seats with the English variant.
+    unsafe {
+        std::env::set_var("REEF_LANG", "en");
+    }
+}
+
 /// Initialize a real git repository in a temp directory. Sets the required
 /// `user.name` and `user.email` config so commits don't depend on the caller's
 /// global git config (critical for CI).

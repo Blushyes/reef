@@ -83,9 +83,6 @@ pub enum Msg {
     ConfirmPush,
     Cancel,
     YEscHint,
-    DiscardPromptPrefix,
-    DiscardPromptSuffix,
-    ConfirmDiscard,
     ViewModeTree,
     ViewModeList,
     StagedChanges,
@@ -238,9 +235,6 @@ fn t_zh(m: Msg) -> &'static str {
         ConfirmPush => " 确认推送 ",
         Cancel => " 取消 ",
         YEscHint => "(y / Esc)",
-        DiscardPromptPrefix => "  ⚠ 还原 ",
-        DiscardPromptSuffix => "？（不可撤销）",
-        ConfirmDiscard => " 确认还原 ",
         ViewModeTree => "视图: 树形",
         ViewModeList => "视图: 列表",
         StagedChanges => "暂存的更改",
@@ -363,9 +357,6 @@ fn t_en(m: Msg) -> &'static str {
         ConfirmPush => " Confirm push ",
         Cancel => " Cancel ",
         YEscHint => "(y / Esc)",
-        DiscardPromptPrefix => "  ⚠ Discard ",
-        DiscardPromptSuffix => "? (irreversible)",
-        ConfirmDiscard => " Confirm discard ",
         ViewModeTree => "View: tree",
         ViewModeList => "View: list",
         StagedChanges => "Staged changes",
@@ -527,45 +518,6 @@ pub fn diverged_force_push(ahead: usize, behind: usize) -> String {
     match lang() {
         Lang::Zh => format!(" ⚠ 已分叉 ↑{ahead} ↓{behind} — 强制推送 "),
         Lang::En => format!(" ⚠ Diverged ↑{ahead} ↓{behind} — force push "),
-    }
-}
-
-/// Yellow prefix on the discard-folder confirm banner. Mirrors the
-/// `DiscardPromptPrefix` wording but signals that the target is a whole
-/// directory — staged / unstaged wording distinguishes "reset to HEAD"
-/// from "restore from index".
-pub fn discard_folder_prefix(is_staged: bool) -> String {
-    match (lang(), is_staged) {
-        (Lang::Zh, true) => "  ⚠ 撤回已暂存文件夹 ".to_string(),
-        (Lang::En, true) => "  ⚠ Discard staged folder ".to_string(),
-        (Lang::Zh, false) => "  ⚠ 撤回文件夹 ".to_string(),
-        (Lang::En, false) => "  ⚠ Discard folder ".to_string(),
-    }
-}
-
-/// Banner parts for the "全部撤回" confirmation — returns the yellow prefix
-/// and the white-bold count highlight separately. Keeping them split lets
-/// the panel bold the file count for emphasis. Chinese avoids the
-/// `（N 个文件）` bracketing because the following `？（不可撤销）` would
-/// otherwise render as an awkward `）？（` double-bracket.
-pub fn discard_section_prefix_and_count(is_staged: bool, count: usize) -> (String, String) {
-    match (lang(), is_staged) {
-        (Lang::Zh, true) => (
-            "  ⚠ 撤回全部已暂存的 ".to_string(),
-            format!("{count} 个文件"),
-        ),
-        (Lang::Zh, false) => (
-            "  ⚠ 撤回全部未暂存的 ".to_string(),
-            format!("{count} 个文件"),
-        ),
-        (Lang::En, true) => (
-            "  ⚠ Discard all staged changes ".to_string(),
-            format!("({count} files)"),
-        ),
-        (Lang::En, false) => (
-            "  ⚠ Discard all changes ".to_string(),
-            format!("({count} files)"),
-        ),
     }
 }
 

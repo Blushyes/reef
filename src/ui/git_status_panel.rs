@@ -631,46 +631,6 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
         }
     }
 
-    // Discard confirmation banner
-    if let Some(ref target) = status.confirm_discard {
-        let (prefix_msg, highlight, suffix_msg) = discard_banner_parts(target, app, max_path);
-        rows.push(Row::new(vec![
-            RowSpan::styled(
-                prefix_msg,
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            RowSpan::styled(
-                highlight,
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            RowSpan::styled(suffix_msg, Style::default().fg(Color::Yellow)),
-        ]));
-        rows.push(Row::new(vec![
-            RowSpan::plain("  "),
-            RowSpan::styled(
-                t(Msg::ConfirmDiscard),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Red)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .on_click("git.discardConfirm", Value::Null),
-            RowSpan::plain("  "),
-            RowSpan::styled(
-                t(Msg::Cancel),
-                Style::default().fg(Color::White).bg(Color::DarkGray),
-            )
-            .on_click("git.discardCancel", Value::Null),
-            RowSpan::plain("  "),
-            RowSpan::styled(t(Msg::YEscHint), Style::default().fg(Color::DarkGray)),
-        ]));
-        rows.push(Row::blank());
-    }
-
     // Commit in-flight banner — while the worker is committing, the
     // input is read-only (commit_in_flight gates run_commit) and the
     // UI shows a spinner.
@@ -730,20 +690,27 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
 
     // Staged section
     if !app.staged_files.is_empty() {
-        let staged_actions = vec![
-            HeaderAction {
-                label: t(Msg::UnstageAll).to_string(),
-                cmd: "git.unstageAll".into(),
-                args: Value::Null,
-                color: Color::Red,
-            },
-            HeaderAction {
-                label: t(Msg::DiscardAll).to_string(),
-                cmd: "git.discardAllPrompt".into(),
-                args: serde_json::json!({ "staged": true }),
-                color: Color::Red,
-            },
-        ];
+        let staged_actions = if matches!(
+            status.confirm_discard,
+            Some(DiscardTarget::Section { is_staged: true })
+        ) {
+            section_confirm_actions(theme)
+        } else {
+            vec![
+                HeaderAction {
+                    label: t(Msg::UnstageAll).to_string(),
+                    cmd: "git.unstageAll".into(),
+                    args: Value::Null,
+                    color: Color::Red,
+                },
+                HeaderAction {
+                    label: t(Msg::DiscardAll).to_string(),
+                    cmd: "git.discardAllPrompt".into(),
+                    args: serde_json::json!({ "staged": true }),
+                    color: Color::Red,
+                },
+            ]
+        };
         rows.push(section_header(
             app.staged_collapsed,
             t(Msg::StagedChanges),
@@ -763,6 +730,11 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     // Unstaged section
     let unstaged_actions: Vec<HeaderAction> = if app.unstaged_files.is_empty() {
         Vec::new()
+    } else if matches!(
+        status.confirm_discard,
+        Some(DiscardTarget::Section { is_staged: false })
+    ) {
+        section_confirm_actions(theme)
     } else {
         vec![
             HeaderAction {
@@ -835,6 +807,7 @@ fn render_files(
 ) {
     let status = &app.git_status;
     let sel_path = selected_path_for(app, is_staged);
+    let pending_discard = status.confirm_discard.as_ref();
     if status.tree_mode {
         let tree = gtree::build(files);
         walk_tree(
@@ -848,12 +821,14 @@ fn render_files(
             theme,
             files,
             search_base,
+            pending_discard,
         );
     } else {
         let ctx = FileRowCtx {
             is_staged,
             max_path,
             theme,
+            pending_discard: status.confirm_discard.as_ref(),
         };
         for (i, file) in files.iter().enumerate() {
             let is_sel = sel_path.as_deref() == Some(file.path.as_str());
@@ -879,6 +854,7 @@ fn walk_tree(
     theme: &Theme,
     flat_files: &[FileEntry],
     search_base: usize,
+    pending_discard: Option<&DiscardTarget>,
 ) {
     let mut entries: Vec<(&String, &Node)> = tree.iter().collect();
     entries.sort_by(|a, b| {
@@ -896,7 +872,15 @@ fn walk_tree(
             Node::Dir { path, children } => {
                 let key = gtree::collapsed_key(is_staged, path);
                 let is_collapsed = collapsed.contains(&key);
-                rows.push(dir_row(name, path, is_staged, depth, is_collapsed, theme));
+                rows.push(dir_row(
+                    name,
+                    path,
+                    is_staged,
+                    depth,
+                    is_collapsed,
+                    theme,
+                    pending_discard,
+                ));
                 if !is_collapsed {
                     walk_tree(
                         rows,
@@ -909,6 +893,7 @@ fn walk_tree(
                         theme,
                         flat_files,
                         search_base,
+                        pending_discard,
                     );
                 }
             }
@@ -920,6 +905,7 @@ fn walk_tree(
                     is_staged,
                     max_path,
                     theme,
+                    pending_discard,
                 };
                 let mut row = file_row(entry, basename, &indent, is_sel, &ctx);
                 if let Some(pos) = flat_files.iter().position(|f| f.path == entry.path) {
@@ -938,6 +924,7 @@ fn dir_row(
     depth: usize,
     is_collapsed: bool,
     theme: &Theme,
+    pending_discard: Option<&DiscardTarget>,
 ) -> Row {
     let arrow = if is_collapsed { "›" } else { "⌄" };
     let (stage_btn, stage_color, stage_cmd) = if is_staged {
@@ -945,7 +932,12 @@ fn dir_row(
     } else {
         ("+", Color::Green, "git.stageFolder")
     };
-    let spans = vec![
+    let confirming = matches!(
+        pending_discard,
+        Some(DiscardTarget::Folder { is_staged: ps, path: pp })
+            if *ps == is_staged && pp == path
+    );
+    let mut spans = vec![
         RowSpan::plain("  ".repeat(depth)),
         RowSpan::styled(
             format!("{} ", arrow),
@@ -968,10 +960,14 @@ fn dir_row(
             click: Some((stage_cmd.into(), serde_json::json!({ "path": path }))),
             dbl: None,
         },
+        RowSpan::plain(" "),
+    ];
+    if confirming {
+        push_inline_confirm_spans(&mut spans, theme, None);
+    } else {
         // Per-folder revert button. Clicking this stages a Folder discard
         // target; the root-row click (below) still toggles expand/collapse.
-        RowSpan::plain(" "),
-        RowSpan {
+        spans.push(RowSpan {
             text: "↺".into(),
             style: Style::default().fg(Color::Red),
             click: Some((
@@ -979,8 +975,8 @@ fn dir_row(
                 serde_json::json!({ "path": path, "staged": is_staged }),
             )),
             dbl: None,
-        },
-    ];
+        });
+    }
     Row::new(spans).on_click(
         "git.toggleDir",
         serde_json::json!({ "path": path, "staged": is_staged }),
@@ -994,6 +990,10 @@ struct FileRowCtx<'a> {
     is_staged: bool,
     max_path: usize,
     theme: &'a Theme,
+    /// `Some` when a discard confirmation is awaiting acceptance — used by
+    /// `file_row` / `dir_row` to swap the row's `↺` button for inline
+    /// `✓`/`✕` buttons on the row whose target matches.
+    pending_discard: Option<&'a DiscardTarget>,
 }
 
 fn file_row(
@@ -1122,19 +1122,27 @@ fn file_row(
     ));
 
     if !ctx.is_staged {
-        spans.push(RowSpan {
-            text: "↺".into(),
-            style: apply_bg(Style::default().fg(Color::Red), base_bg),
-            click: Some((
-                "git.discardPrompt".to_string(),
-                serde_json::json!({ "path": file.path }),
-            )),
-            dbl: None,
-        });
-        spans.push(RowSpan::styled(
-            " ".to_string(),
-            apply_bg(Style::default(), base_bg),
-        ));
+        let confirming = matches!(
+            ctx.pending_discard,
+            Some(DiscardTarget::File(p)) if p == &file.path
+        );
+        if confirming {
+            push_inline_confirm_spans(&mut spans, ctx.theme, base_bg);
+        } else {
+            spans.push(RowSpan {
+                text: "↺".into(),
+                style: apply_bg(Style::default().fg(Color::Red), base_bg),
+                click: Some((
+                    "git.discardPrompt".to_string(),
+                    serde_json::json!({ "path": file.path }),
+                )),
+                dbl: None,
+            });
+            spans.push(RowSpan::styled(
+                " ".to_string(),
+                apply_bg(Style::default(), base_bg),
+            ));
+        }
     }
 
     Row::new(spans)
@@ -1474,44 +1482,59 @@ fn build_spans_with_path_overlay(
     out
 }
 
-/// Compute the three banner parts (yellow prefix, white-bold highlight,
-/// yellow suffix) for the discard confirmation. `max_path` trims long paths
-/// so the banner stays inside the sidebar width.
-fn discard_banner_parts(
-    target: &DiscardTarget,
-    app: &App,
-    max_path: usize,
-) -> (String, String, String) {
-    match target {
-        DiscardTarget::File(path) => {
-            let mut display = path.clone();
-            truncate_in_place(&mut display, max_path);
-            (
-                t(Msg::DiscardPromptPrefix).to_string(),
-                display,
-                t(Msg::DiscardPromptSuffix).to_string(),
-            )
-        }
-        DiscardTarget::Folder { is_staged, path } => {
-            let mut display = path.clone();
-            truncate_in_place(&mut display, max_path);
-            (
-                crate::i18n::discard_folder_prefix(*is_staged),
-                format!("{}/", display),
-                t(Msg::DiscardPromptSuffix).to_string(),
-            )
-        }
-        DiscardTarget::Section { is_staged } => {
-            let count = if *is_staged {
-                app.staged_files.len()
-            } else {
-                app.unstaged_files.len()
-            };
-            let (prefix, highlight) =
-                crate::i18n::discard_section_prefix_and_count(*is_staged, count);
-            (prefix, highlight, t(Msg::DiscardPromptSuffix).to_string())
-        }
-    }
+/// Append `✓` (confirm — destructive, red) and `✕` (cancel — subdued)
+/// inline-button spans for the pending discard. Used by `file_row` and
+/// `dir_row` to swap the row's `↺` for the two-button confirm widget
+/// without inserting a separate banner. `base_bg` mirrors the row's
+/// selection background so the buttons sit on the highlight when the
+/// row is selected.
+fn push_inline_confirm_spans(spans: &mut Vec<RowSpan>, theme: &Theme, base_bg: Option<Color>) {
+    spans.push(RowSpan {
+        text: "✓".into(),
+        style: apply_bg(
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            base_bg,
+        ),
+        click: Some(("git.discardConfirm".to_string(), Value::Null)),
+        dbl: None,
+    });
+    spans.push(RowSpan::styled(
+        " ".to_string(),
+        apply_bg(Style::default(), base_bg),
+    ));
+    spans.push(RowSpan {
+        text: "✕".into(),
+        style: apply_bg(
+            Style::default()
+                .fg(theme.fg_secondary)
+                .add_modifier(Modifier::BOLD),
+            base_bg,
+        ),
+        click: Some(("git.discardCancel".to_string(), Value::Null)),
+        dbl: None,
+    });
+}
+
+/// Section-header twin of `push_inline_confirm_spans`: when a
+/// `DiscardTarget::Section` is awaiting confirmation, the section's
+/// trailing actions ("Stage All" / "Discard All") are swapped for these
+/// two so the user accepts/rejects the operation in place. `Stage All`
+/// stays hidden during the pending state to keep the cluster unambiguous.
+fn section_confirm_actions(theme: &Theme) -> Vec<HeaderAction> {
+    vec![
+        HeaderAction {
+            label: "✓".to_string(),
+            cmd: "git.discardConfirm".into(),
+            args: Value::Null,
+            color: Color::Red,
+        },
+        HeaderAction {
+            label: "✕".to_string(),
+            cmd: "git.discardCancel".into(),
+            args: Value::Null,
+            color: theme.fg_secondary,
+        },
+    ]
 }
 
 fn truncate_in_place(s: &mut String, max: usize) {

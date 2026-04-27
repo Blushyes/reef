@@ -12,8 +12,8 @@ expression: output
  View: list            │
                        │
  ⌄ Changes  2 Stage all│
-   new.txt +1 U + ↺    │                 Select a file to view diff
-   ...txt +1 -1 M + ↺  │
+   new.txt +1 U ↗ + ↺  │                 Select a file to view diff
+   ...t +1 -1 M ↗ + ↺  │
                        │
                        │
                        │

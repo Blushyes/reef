@@ -1492,9 +1492,7 @@ fn push_inline_confirm_spans(spans: &mut Vec<RowSpan>, theme: &Theme, base_bg: O
     spans.push(RowSpan {
         text: "✓".into(),
         style: apply_bg(
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             base_bg,
         ),
         click: Some(("git.discardConfirm".to_string(), Value::Null)),

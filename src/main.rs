@@ -388,9 +388,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 // Pick up on-disk changes immediately rather than waiting for
-                // the fs-watcher debounce.
+                // the fs-watcher debounce. `reload_preview_now` bypasses the
+                // scrubbing debounce so the new file contents land on the
+                // first frame after the editor exits, not 80 ms later.
                 app.refresh_file_tree();
-                app.load_preview();
+                app.reload_preview_now();
             }
 
             if app.should_quit {

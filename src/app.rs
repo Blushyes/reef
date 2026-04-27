@@ -1686,6 +1686,25 @@ impl App {
         }
     }
 
+    /// Refresh the currently-selected file's preview *now*, bypassing the
+    /// `PREVIEW_DEBOUNCE` window. For "I just edited this file in
+    /// $EDITOR — show me the new contents" moments: the user is settled
+    /// on the file (no scrubbing in play), so the debounce that exists to
+    /// coalesce ↓-hold key-repeats just reads as noticeable lag before
+    /// the post-edit preview lands.
+    pub fn reload_preview_now(&mut self) {
+        let Some(entry) = self.file_tree.selected_entry() else {
+            return;
+        };
+        if entry.is_dir {
+            return;
+        }
+        let path = entry.path.clone();
+        self.preview_schedule = None;
+        self.prefetch_schedule = None;
+        self.dispatch_preview_load(path);
+    }
+
     /// Navigate the SQLite preview card. Called from the input
     /// dispatcher when the focused panel is the preview pane and
     /// `preview_content.body` is `Database`. Computes the new

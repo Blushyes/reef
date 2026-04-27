@@ -720,6 +720,18 @@ pub fn fs_mutation_success_toast(kind: &crate::tasks::FsMutationKind) -> String 
         (Lang::En, K::Trashed { name }) => format!("Moved to Trash: {name}"),
         (Lang::Zh, K::HardDeleted { name }) => format!("已永久删除: {name}"),
         (Lang::En, K::HardDeleted { name }) => format!("Deleted permanently: {name}"),
+        (Lang::Zh, K::Moved { old_name, new_name }) => {
+            format!("已移动 {old_name} → {new_name}")
+        }
+        (Lang::En, K::Moved { old_name, new_name }) => {
+            format!("Moved {old_name} → {new_name}")
+        }
+        (Lang::Zh, K::CopiedTo { name }) => format!("已复制到 {name}"),
+        (Lang::En, K::CopiedTo { name }) => format!("Copied to {name}"),
+        (Lang::Zh, K::MovedMulti { count }) => format!("已移动 {count} 项"),
+        (Lang::En, K::MovedMulti { count }) => format!("Moved {count} items"),
+        (Lang::Zh, K::CopiedMulti { count }) => format!("已复制 {count} 项"),
+        (Lang::En, K::CopiedMulti { count }) => format!("Copied {count} items"),
     }
 }
 
@@ -739,6 +751,10 @@ pub fn fs_mutation_error_toast(kind: &crate::tasks::FsMutationKind, error: &str)
         (Lang::En, K::Trashed { .. }) => "Move to Trash failed",
         (Lang::Zh, K::HardDeleted { .. }) => "删除失败",
         (Lang::En, K::HardDeleted { .. }) => "Delete failed",
+        (Lang::Zh, K::Moved { .. }) | (Lang::Zh, K::MovedMulti { .. }) => "移动失败",
+        (Lang::En, K::Moved { .. }) | (Lang::En, K::MovedMulti { .. }) => "Move failed",
+        (Lang::Zh, K::CopiedTo { .. }) | (Lang::Zh, K::CopiedMulti { .. }) => "复制失败",
+        (Lang::En, K::CopiedTo { .. }) | (Lang::En, K::CopiedMulti { .. }) => "Copy failed",
     };
     format!("{verb}: {error}")
 }
@@ -804,6 +820,83 @@ pub fn tree_op_blocked_by_in_flight() -> String {
     }
 }
 
+/// Toast when the user invokes Paste with an empty file_clipboard.
+pub fn paste_clipboard_empty() -> String {
+    match lang() {
+        Lang::Zh => "剪贴板为空".to_string(),
+        Lang::En => "Clipboard is empty".to_string(),
+    }
+}
+
+/// Toast when paste resolves to zero actionable items (everything
+/// got Skipped).
+pub fn paste_nothing_to_do() -> String {
+    match lang() {
+        Lang::Zh => "没有需要粘贴的项".to_string(),
+        Lang::En => "Nothing to paste".to_string(),
+    }
+}
+
+/// Toast when the user picks Cancel in the conflict prompt.
+pub fn paste_cancelled() -> String {
+    match lang() {
+        Lang::Zh => "已取消粘贴".to_string(),
+        Lang::En => "Paste cancelled".to_string(),
+    }
+}
+
+/// Toast when the user attempts to paste a folder into itself or a
+/// descendant of itself.
+pub fn paste_self_into_descendant() -> String {
+    match lang() {
+        Lang::Zh => "不能把目录粘贴到它自身内部".to_string(),
+        Lang::En => "Cannot paste a folder into itself".to_string(),
+    }
+}
+
+/// Toast after `Copy Path` succeeds.
+pub fn copy_path_done(count: usize) -> String {
+    match (lang(), count) {
+        (Lang::Zh, 1) => "已复制路径".to_string(),
+        (Lang::En, 1) => "Path copied".to_string(),
+        (Lang::Zh, n) => format!("已复制 {n} 条路径"),
+        (Lang::En, n) => format!("Copied {n} paths"),
+    }
+}
+
+/// Toast after `Copy Relative Path` succeeds.
+pub fn copy_relative_path_done(count: usize) -> String {
+    match (lang(), count) {
+        (Lang::Zh, 1) => "已复制相对路径".to_string(),
+        (Lang::En, 1) => "Relative path copied".to_string(),
+        (Lang::Zh, n) => format!("已复制 {n} 条相对路径"),
+        (Lang::En, n) => format!("Copied {n} relative paths"),
+    }
+}
+
+/// Warn the user that one or more paths contained non-UTF-8 bytes
+/// and were lossy-decoded for clipboard write.
+pub fn copy_path_lossy_utf8() -> String {
+    match lang() {
+        Lang::Zh => "路径含非 UTF-8 字符，已替换为 �".to_string(),
+        Lang::En => "Path contained non-UTF-8 bytes (replaced with �)".to_string(),
+    }
+}
+
+/// Status-bar text for the modal paste-conflict prompt. `name` is the
+/// existing destination's basename. Keys: R=Replace, S=Skip,
+/// K=Keep both, A=apply current (Replace/Skip) to all, C/Esc=Cancel.
+pub fn paste_conflict_prompt(name: &str, remaining: usize) -> String {
+    match lang() {
+        Lang::Zh => format!(
+            "  ⚠ `{name}` 已存在 ({remaining} 项待处理) [R]替换 [S]跳过 [K]两者保留 [A]全部应用 [C]取消  "
+        ),
+        Lang::En => format!(
+            "  ⚠ `{name}` already exists ({remaining} pending) [R]eplace [S]kip [K]eep both [A]pply-to-all [C]ancel  "
+        ),
+    }
+}
+
 /// Toast when "Reveal in Finder" fires on a platform we haven't wired
 /// up yet.
 pub fn tree_reveal_unsupported_platform() -> String {
@@ -818,6 +911,14 @@ pub fn tree_reveal_unsupported_platform() -> String {
 pub fn tree_context_menu_label(item: &crate::tree_context_menu::ContextMenuItem) -> &'static str {
     use crate::tree_context_menu::ContextMenuItem as I;
     match (lang(), item) {
+        (Lang::Zh, I::Cut) => "剪切",
+        (Lang::En, I::Cut) => "Cut",
+        (Lang::Zh, I::Copy) => "复制",
+        (Lang::En, I::Copy) => "Copy",
+        (Lang::Zh, I::Paste) => "粘贴",
+        (Lang::En, I::Paste) => "Paste",
+        (Lang::Zh, I::Duplicate) => "复制副本",
+        (Lang::En, I::Duplicate) => "Duplicate",
         (Lang::Zh, I::NewFile) => "新建文件",
         (Lang::En, I::NewFile) => "New File",
         (Lang::Zh, I::NewFolder) => "新建文件夹",
@@ -826,6 +927,10 @@ pub fn tree_context_menu_label(item: &crate::tree_context_menu::ContextMenuItem)
         (Lang::En, I::Rename) => "Rename",
         (Lang::Zh, I::Delete) => "删除",
         (Lang::En, I::Delete) => "Delete",
+        (Lang::Zh, I::CopyPath) => "复制路径",
+        (Lang::En, I::CopyPath) => "Copy Path",
+        (Lang::Zh, I::CopyRelativePath) => "复制相对路径",
+        (Lang::En, I::CopyRelativePath) => "Copy Relative Path",
         (Lang::Zh, I::RevealInFinder) => "在 Finder 中显示",
         (Lang::En, I::RevealInFinder) => "Reveal in Finder",
     }

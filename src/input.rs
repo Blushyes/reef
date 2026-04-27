@@ -168,6 +168,16 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         return;
     }
 
+    // Paste-conflict prompt: status-bar takeover with R/S/K/A/C +
+    // Shift+R/S for "apply to all". Sits above place-mode so a paste
+    // landing while place-mode is somehow also armed (defensive — the
+    // dispatcher gates them mutually exclusive) doesn't lose the
+    // conflict prompt.
+    if app.paste_conflict.is_some() {
+        handle_key_paste_conflict(key, app);
+        return;
+    }
+
     // Place mode (drag-and-drop destination picker) is mouse-first —
     // most keystrokes are ignored so a stray keypress can't accidentally
     // commit a copy. Exceptions: Esc cancels the mode, and the two
@@ -184,6 +194,26 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
                 app.should_quit = true;
             }
             _ => {}
+        }
+        return;
+    }
+
+    // Intra-tree drag in progress: Esc cancels, Ctrl+C / `q` still
+    // quit. Other keys are ignored — the actual move/copy commit
+    // happens on `Up(Left)`, not on a keystroke.
+    if app.tree_drag.active {
+        match key.code {
+            KeyCode::Esc => app.cancel_tree_drag(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.should_quit = true;
+            }
+            _ => {
+                // Live modifier tracking — user might press / release
+                // Alt mid-drag to flip move↔copy before releasing the
+                // mouse. Crossterm KeyEvent carries the current
+                // modifier set on every key event.
+                app.update_tree_drag_modifiers(key.modifiers);
+            }
         }
         return;
     }
@@ -206,12 +236,17 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         && app.active_panel == Panel::Files
         && app.git_status.commit_editing;
     let in_input_mode = search_input_focused || commit_input_focused;
+    // On the Files-tab tree panel bare Space is the multi-select
+    // toggle — leader arming would silently swallow it. Users can
+    // still reach the palettes from the preview panel (Tab-switch),
+    // or via Ctrl+P (defined elsewhere) / Ctrl+O hosts picker.
+    let on_files_tree_panel = app.active_tab == Tab::Files && app.active_panel == Panel::Files;
     let leader_allow_arm = if search_input_focused {
         app.global_search.query.is_empty()
     } else if commit_input_focused {
         app.git_status.commit_message.is_empty()
     } else {
-        true
+        !on_files_tree_panel
     };
     match leader_decision(
         &key,
@@ -248,8 +283,15 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // search input, these need to remain usable as the escape hatch.
     // `Ctrl+C` quits, `Tab` / `BackTab` move between tabs and panels so the
     // user can get out of any focus state.
+    //
+    // The `!SHIFT` guard reserves `Ctrl+Shift+C` for the file-tree
+    // copy alias (see `handle_key_files_clipboard`). Plain `Ctrl+C`
+    // still quits as before.
     match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('c')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
             app.should_quit = true;
             return;
         }
@@ -1185,6 +1227,16 @@ fn handle_key_git(key: KeyEvent, app: &mut App) {
 
 fn handle_key_files(key: KeyEvent, app: &mut App) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+    // VS Code-style clipboard / multi-select bindings — only on the
+    // tree panel itself. Bypassing the rest of `handle_key_files` for
+    // these keys keeps them from colliding with arrow / vim-nav arms
+    // below. Sub-handler returns `true` when it consumed the key.
+    if app.active_panel == Panel::Files && handle_key_files_clipboard(key, app, ctrl, shift) {
+        return;
+    }
+
     match key.code {
         KeyCode::Up | KeyCode::Char('k') if !ctrl => match app.active_panel {
             Panel::Files => {
@@ -1412,21 +1464,18 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
             let hard = key.modifiers.contains(KeyModifiers::SHIFT);
             prompt_delete_selected(app, hard);
         }
-        // Vim-style alias: `d` = Move to Trash, `D` (Shift+d) = hard
-        // delete. Parallels `dd` in Vim semantics (delete the current
-        // line/selection) — the tree has no motion to compose with, so
-        // the single-key form stands in for the chord. Scoped to the
-        // Files tab so Git-tab's `d → y` discard chord stays unambiguous.
-        // Ctrl / Alt modifiers are rejected so chord bindings like
-        // Ctrl+D aren't silently stolen.
-        KeyCode::Char(c)
-            if matches!(c, 'd' | 'D')
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        // Vim-style alias: bare `d` = Move to Trash. Hard delete is
+        // reachable via `Shift+Delete` / `Shift+Backspace` (handled
+        // above). The capital `D` slot is now reserved for Duplicate
+        // — see `handle_key_files_clipboard`. Ctrl / Alt modifiers
+        // are rejected so chord bindings like Ctrl+D aren't silently
+        // stolen.
+        KeyCode::Char('d')
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT) =>
         {
-            let hard = c == 'D' || key.modifiers.contains(KeyModifiers::SHIFT);
-            prompt_delete_selected(app, hard);
+            prompt_delete_selected(app, /*hard=*/ false);
         }
         _ => {}
     }
@@ -1581,6 +1630,153 @@ fn handle_key_tree_delete_confirm(key: KeyEvent, app: &mut App) {
     }
 }
 
+/// Status-bar takeover for the paste-conflict prompt.
+///
+/// Keys (case-insensitive primary letter):
+/// - `R` → Replace this item
+/// - `S` → Skip this item
+/// - `K` → Keep both (rename via `next_copy_name`)
+/// - `Shift+R` / `Shift+S` → Replace / Skip *all* remaining
+/// - `C` / `Esc` → Cancel the entire batch
+/// - other keys: ignored (don't accidentally close the prompt)
+fn handle_key_paste_conflict(key: KeyEvent, app: &mut App) {
+    use crate::paste_conflict::Resolution;
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => app.cancel_paste_conflict(),
+        // Plain `Ctrl+C` keeps its global "force quit" meaning even
+        // with the prompt up — same escape hatch as place-mode.
+        KeyCode::Char('c') if ctrl => app.should_quit = true,
+        // Bare / Shift-only `c|C` cancels the prompt — matches the
+        // `[C]ancel` letter advertised in the status-bar hint. Kept
+        // below the `ctrl` arm so the global force-quit still wins.
+        KeyCode::Char('c' | 'C') => app.cancel_paste_conflict(),
+        KeyCode::Char('r' | 'R') => {
+            app.resolve_paste_conflict(Resolution::Replace, shift);
+        }
+        KeyCode::Char('s' | 'S') => {
+            app.resolve_paste_conflict(Resolution::Skip, shift);
+        }
+        KeyCode::Char('k' | 'K') => {
+            // KeepBoth needs a fresh basename derived from the
+            // destination's existing names. Compute on-demand so the
+            // prompt doesn't have to keep a frozen snapshot in sync
+            // with concurrent fs activity.
+            let new_name = app
+                .keep_both_name_for_current_conflict()
+                .unwrap_or_else(|| "copy".to_string());
+            app.resolve_paste_conflict(Resolution::KeepBoth(new_name), false);
+        }
+        KeyCode::Char('a' | 'A') => {
+            // VS Code's "apply to all" defaults to Replace — the
+            // most common reason a user reaches for "all" is "yes,
+            // overwrite all my old files with the new ones". Skip
+            // is reachable via Shift+S; KeepBoth-all needs per-item
+            // renames so it isn't supported as a single key.
+            app.resolve_paste_conflict(Resolution::Replace, true);
+        }
+        // No-op for any other key — keeps the prompt up so the user
+        // doesn't accidentally cancel by pressing the wrong letter.
+        _ => {}
+    }
+}
+
+/// VS Code-style clipboard / multi-select bindings on the Files-tab
+/// tree panel. Returns `true` when the key was consumed; the caller
+/// (`handle_key_files`) routes the rest of the keys through its
+/// regular nav / scroll arms when this returns `false`.
+fn handle_key_files_clipboard(key: KeyEvent, app: &mut App, ctrl: bool, shift: bool) -> bool {
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        // ── primary clipboard bindings (vim-style) ────────────────
+        KeyCode::Char('y') if !ctrl && !alt && !shift => {
+            app.mark_copy(app.effective_action_paths());
+            true
+        }
+        KeyCode::Char('x') if !ctrl && !alt && !shift => {
+            app.mark_cut(app.effective_action_paths());
+            true
+        }
+        KeyCode::Char('p') if !ctrl && !alt && !shift => {
+            app.paste_into(app.paste_target_dir());
+            true
+        }
+        // ──副绑定: Ctrl+Shift+C/X/V ───────────────────────────────
+        // Available on terminals that report Shift+Ctrl letters
+        // separately (kitty kbd protocol, iTerm2 / WezTerm with
+        // CSI-u). Plain `Ctrl+C` still quits.
+        KeyCode::Char('c' | 'C') if ctrl && shift => {
+            app.mark_copy(app.effective_action_paths());
+            true
+        }
+        KeyCode::Char('x' | 'X') if ctrl && shift => {
+            app.mark_cut(app.effective_action_paths());
+            true
+        }
+        KeyCode::Char('v' | 'V') if ctrl && shift => {
+            app.paste_into(app.paste_target_dir());
+            true
+        }
+        // ── Duplicate (capital `D`, no Ctrl/Alt) ──────────────────
+        KeyCode::Char('D') if !ctrl && !alt => {
+            app.duplicate_selection();
+            true
+        }
+        // ── multi-select ──────────────────────────────────────────
+        KeyCode::Char(' ') if key.modifiers.is_empty() => {
+            if let Some(p) = app.file_tree.selected_path() {
+                app.file_selection.toggle(p);
+            }
+            true
+        }
+        KeyCode::Up if shift && !ctrl && !alt => {
+            // Move the cursor first, then extend the contiguous
+            // range to its new position. The selection's `anchor`
+            // (set by `replace_with_single` on a fresh single click,
+            // or by the first toggle) is the pivot.
+            if app.file_selection.is_empty()
+                && let Some(p) = app.file_tree.selected_path()
+            {
+                app.file_selection.replace_with_single(p);
+            }
+            app.file_tree.navigate(-1);
+            app.load_preview();
+            if let Some(target) = app.file_tree.selected_path() {
+                let entries = app.file_tree.entries.clone();
+                app.file_selection.extend_to(target, &entries);
+            }
+            true
+        }
+        KeyCode::Down if shift && !ctrl && !alt => {
+            if app.file_selection.is_empty()
+                && let Some(p) = app.file_tree.selected_path()
+            {
+                app.file_selection.replace_with_single(p);
+            }
+            app.file_tree.navigate(1);
+            app.load_preview();
+            if let Some(target) = app.file_tree.selected_path() {
+                let entries = app.file_tree.entries.clone();
+                app.file_selection.extend_to(target, &entries);
+            }
+            true
+        }
+        // Esc clears the selection ONLY if there's something to
+        // clear; otherwise fall through so the caller can do its
+        // normal Esc handling (currently no-op).
+        KeyCode::Esc => {
+            if !app.file_selection.is_empty() {
+                app.file_selection.clear();
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
 // ─── Mouse ───────────────────────────────────────────────────────────────────
 
 pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Terminal<B>) {
@@ -1619,6 +1815,45 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
     if app.place_mode.active {
         handle_mouse_place_mode(mouse, app);
         return;
+    }
+
+    // Paste-conflict prompt owns input via the keyboard handler. Mouse
+    // events must not race with the in-flight batch — clicking the
+    // toolbar's `+ File` while the prompt is up would call
+    // `fs_mutation_load.begin()`, bumping the generation and silently
+    // dropping whichever result arrives first when the prompt
+    // resolves. The prompt has no clickable elements of its own, so
+    // bailing early is the conservative move; mirrors place_mode's
+    // keyboard-only contract.
+    if app.paste_conflict.is_some() {
+        return;
+    }
+
+    // Intra-tree drag in progress: route Drag→hover-update,
+    // Up→commit, Right-click→cancel. Scroll wheel falls through so
+    // the user can scroll the tree to reach a deep destination
+    // mid-drag.
+    if app.tree_drag.active {
+        match mouse.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let idx = match app.hit_registry.hit_test(mouse.column, mouse.row) {
+                    Some(ui::mouse::ClickAction::TreeClick(i)) => Some(i),
+                    _ => None,
+                };
+                app.update_tree_drag_hover(idx);
+                app.update_tree_drag_modifiers(mouse.modifiers);
+                return;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                app.commit_tree_drag(mouse.modifiers);
+                return;
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                app.cancel_tree_drag();
+                return;
+            }
+            _ => {} // scroll, mid-button: pass through
+        }
     }
 
     // Mid-edit mouse-button press → cancel the inline editor. Then let
@@ -1760,6 +1995,57 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
                     };
                     return;
                 }
+                // Files-tab tree multi-select / drag-arm overlay.
+                // Modifier handling sits between the generic
+                // double-click swap and the standard `handle_action`
+                // dispatch:
+                //   Shift+Click → extend the selection range
+                //   Ctrl+Click  → toggle a single row in/out
+                //   plain click → arm a tree-drag press; clear any
+                //                 multi-selection that doesn't
+                //                 contain the clicked row, otherwise
+                //                 leave the selection alone so the
+                //                 drag (if it materialises) carries
+                //                 the multi.
+                if app.active_tab == Tab::Files
+                    && let ui::mouse::ClickAction::TreeClick(idx) = effective
+                    && let Some(entry_path) = app.file_tree.entries.get(idx).map(|e| e.path.clone())
+                {
+                    let shift_held = mouse.modifiers.contains(KeyModifiers::SHIFT);
+                    let ctrl_held = mouse.modifiers.contains(KeyModifiers::CONTROL);
+                    if shift_held {
+                        if app.file_selection.is_empty()
+                            && let Some(cur) = app.file_tree.selected_path()
+                        {
+                            app.file_selection.replace_with_single(cur);
+                        }
+                        let entries = app.file_tree.entries.clone();
+                        app.file_selection.extend_to(entry_path, &entries);
+                        app.file_tree.selected = idx;
+                        app.last_click = if is_double {
+                            None
+                        } else {
+                            Some((now, mouse.column, mouse.row))
+                        };
+                        return;
+                    }
+                    if ctrl_held {
+                        app.file_selection.toggle(entry_path);
+                        app.file_tree.selected = idx;
+                        app.last_click = if is_double {
+                            None
+                        } else {
+                            Some((now, mouse.column, mouse.row))
+                        };
+                        return;
+                    }
+                    // Plain left-click on a tree row.
+                    if !app.file_selection.is_empty() && !app.file_selection.contains(&entry_path) {
+                        app.file_selection.clear();
+                    }
+                    app.tree_drag
+                        .arm(mouse.column, mouse.row, idx, mouse.modifiers);
+                }
                 app.handle_action(effective);
             }
 
@@ -1773,8 +2059,30 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
         MouseEventKind::Up(MouseButton::Left) => {
             app.dragging_split = false;
             app.dragging_graph_diff_split = false;
+            // A press that never crossed the drag threshold is a
+            // plain click — disarm it so the next mouse interaction
+            // starts clean.
+            if !app.tree_drag.active && app.tree_drag.press.is_some() {
+                app.tree_drag.cancel();
+            }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            // Promote a Files-tab tree press to an active drag once
+            // the cursor moves past `DRAG_START_THRESHOLD`. Sources
+            // are snapshotted at promotion time — a mid-drag
+            // selection mutation can't change what's being carried.
+            if !app.tree_drag.active
+                && app.tree_drag.press.is_some()
+                && app.tree_drag.should_start_drag(mouse.column, mouse.row)
+            {
+                app.begin_tree_drag(mouse.modifiers);
+                let idx = match app.hit_registry.hit_test(mouse.column, mouse.row) {
+                    Some(ui::mouse::ClickAction::TreeClick(i)) => Some(i),
+                    _ => None,
+                };
+                app.update_tree_drag_hover(idx);
+                return;
+            }
             let total_width = terminal.size().map(|s| s.width).unwrap_or(80);
             if app.dragging_split {
                 if total_width > 0 {

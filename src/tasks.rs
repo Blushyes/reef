@@ -10,6 +10,7 @@ use crate::file_tree::{PreviewContent, TreeEntry};
 use crate::git::graph::GraphRow;
 use crate::git::{CommitDetail, DiffContent, FileEntry, RefLabel};
 use crate::global_search::MatchHit;
+use crate::paste_conflict::Resolution;
 use crate::ui::highlight;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -177,6 +178,18 @@ pub enum FsMutationKind {
     Trashed { name: String },
     /// Entry hard-deleted (Shift+Delete). `name` is the basename.
     HardDeleted { name: String },
+    /// Single-item paste-move (Cut + Paste). Display similarly to
+    /// `Renamed` but with cross-directory semantics in the toast.
+    Moved { old_name: String, new_name: String },
+    /// Single-item paste-copy / Duplicate / Alt-drag. `name` is the
+    /// final basename at the destination.
+    CopiedTo { name: String },
+    /// Multi-item paste-move. `count` is the number of top-level items
+    /// successfully placed (Skip / failed items not counted). Used by
+    /// the toast renderer.
+    MovedMulti { count: usize },
+    /// Multi-item paste-copy / Alt-drag with multi-selection.
+    CopiedMulti { count: usize },
 }
 
 enum FilesTask {
@@ -272,6 +285,44 @@ enum FilesTask {
         rels: Vec<PathBuf>,
         first_name: String,
     },
+    /// Cut + Paste: rename each source into `dest_dir` per the
+    /// per-item `Resolution`. Conflicts have already been resolved on
+    /// the App side, so the worker only consumes the decision list.
+    /// Items with `Resolution::Skip` / `Resolution::Cancel` are noops.
+    /// Distinct from `CopyFiles` because that task auto-renames on
+    /// any collision (place-mode / OS drop semantics) which would
+    /// silently override the user's pick here.
+    MovePaths {
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        items: Vec<PasteItem>,
+        /// Workdir-relative destination directory.
+        dest_dir: PathBuf,
+    },
+    /// Copy + Paste / Duplicate / Alt-drag-copy. Same shape as
+    /// `MovePaths` but uses `copy_file` / `copy_dir_recursive` instead
+    /// of `rename`. Source rows stay put.
+    CopyPaths {
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        items: Vec<PasteItem>,
+        dest_dir: PathBuf,
+    },
+}
+
+/// One source's contribution to a `MovePaths` / `CopyPaths` batch.
+#[derive(Debug, Clone)]
+pub struct PasteItem {
+    /// Workdir-relative source path.
+    pub source: PathBuf,
+    /// `true` for directories — the worker picks `copy_dir_recursive`
+    /// or `rename` semantics accordingly. Carried instead of probed
+    /// because remote backends can't cheaply stat from the worker
+    /// thread, and the App already knows from `TreeEntry.is_dir`.
+    pub is_dir: bool,
+    /// Decision recorded by the conflict prompt (or auto-decided as
+    /// Replace when the destination didn't exist).
+    pub resolution: Resolution,
 }
 
 enum GitTask {
@@ -517,6 +568,36 @@ impl TaskCoordinator {
             backend,
             rels,
             first_name,
+        });
+    }
+
+    pub fn move_paths(
+        &self,
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        items: Vec<PasteItem>,
+        dest_dir: PathBuf,
+    ) {
+        let _ = self.files_tx.send(FilesTask::MovePaths {
+            generation,
+            backend,
+            items,
+            dest_dir,
+        });
+    }
+
+    pub fn copy_paths(
+        &self,
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        items: Vec<PasteItem>,
+        dest_dir: PathBuf,
+    ) {
+        let _ = self.files_tx.send(FilesTask::CopyPaths {
+            generation,
+            backend,
+            items,
+            dest_dir,
         });
     }
 
@@ -778,6 +859,34 @@ fn spawn_files_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Fil
                             result,
                         });
                     }
+                    FilesTask::MovePaths {
+                        generation,
+                        backend,
+                        items,
+                        dest_dir,
+                    } => {
+                        let (kind, result) =
+                            run_paste_batch(backend.as_ref(), &items, &dest_dir, false);
+                        let _ = result_tx.send(WorkerResult::FsMutation {
+                            generation,
+                            kind,
+                            result,
+                        });
+                    }
+                    FilesTask::CopyPaths {
+                        generation,
+                        backend,
+                        items,
+                        dest_dir,
+                    } => {
+                        let (kind, result) =
+                            run_paste_batch(backend.as_ref(), &items, &dest_dir, true);
+                        let _ = result_tx.send(WorkerResult::FsMutation {
+                            generation,
+                            kind,
+                            result,
+                        });
+                    }
                     // Prefetch routes to the preview worker; this arm
                     // never fires in practice but exhaustiveness needs
                     // it.
@@ -1007,6 +1116,137 @@ fn copy_sources(
         count += 1;
     }
     Ok(count)
+}
+
+/// Drive a Cut/Copy paste batch — `items` is the per-source decision
+/// list, with conflict resolutions baked in by the App. Each item lands
+/// at `dest_dir/<basename>` (or `dest_dir/<keep-both-name>`); `Replace`
+/// pre-trashes the existing destination so the user can recover via OS
+/// Trash. `Skip` and `Cancel` are noops.
+///
+/// Fail-fast on the first error to match `copy_sources` semantics —
+/// callers prefer one clear error over a partial-completion riddle.
+/// `placed` counts items that successfully landed *before* any error,
+/// so the toast can still report progress.
+///
+/// Remote-backend cost: this loop issues one RPC per item (plus an
+/// extra `trash` RPC per `Replace`). A 50-item Replace paste over SSH
+/// = ~100 round-trips; on a 200ms-RTT link that's ~10s of latency
+/// dominating any actual transfer cost. Batching `trash` and
+/// `rename`/`copy` would need new `Backend::trash_multi` /
+/// `Backend::rename_multi` entry points and matching agent-side
+/// handlers — out of scope for v1, but the obvious follow-up if real-
+/// world reports surface it. Local-backend per-item cost is in the
+/// microseconds and not worth batching.
+fn run_paste_batch(
+    backend: &dyn Backend,
+    items: &[PasteItem],
+    dest_dir: &Path,
+    is_copy: bool,
+) -> (FsMutationKind, Result<(), String>) {
+    let mut placed: usize = 0;
+    let mut first_src_name: Option<String> = None;
+    let mut first_dest_name: Option<String> = None;
+    let mut first_err: Option<String> = None;
+
+    for item in items {
+        let dest_basename: String = match &item.resolution {
+            Resolution::Skip | Resolution::Cancel => continue,
+            Resolution::KeepBoth(name) => name.clone(),
+            Resolution::Replace => match item.source.file_name().and_then(|s| s.to_str()) {
+                Some(s) => s.to_string(),
+                None => {
+                    first_err.get_or_insert_with(|| {
+                        format!("invalid source filename: {:?}", item.source)
+                    });
+                    break;
+                }
+            },
+        };
+        let src_basename = item
+            .source
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(String::from)
+            .unwrap_or_else(|| dest_basename.clone());
+        let dest_rel = dest_dir.join(&dest_basename);
+
+        // Replace: pre-trash the existing destination so the operation
+        // stays undoable via OS Trash. `trash` is intentionally best-
+        // effort — three failure modes we silently tolerate:
+        //   1. Existing entry vanished (race with fs_watcher / external
+        //      delete between conflict detection and worker dispatch)
+        //      → `BackendError::NotFound`. The follow-up rename/copy
+        //      still succeeds at the now-empty slot.
+        //   2. No system trash available (Linux without `gio` or
+        //      `trash-cli`, sandboxed remote agent) → `Backend::trash`
+        //      already returns `TrashOutcome { used_trash: false }` on
+        //      success, but the err-path here lumps "permanent delete
+        //      done" with "couldn't trash". The follow-up copy/rename
+        //      will overwrite the dest unconditionally either way.
+        //   3. Permission denied → user gets the overwrite without the
+        //      Trash safety net. Semi-surprising, but flagging it
+        //      reliably needs a probe at startup; v1 trade-off.
+        // Follow-up worth doing if real-world reports surface: thread
+        // the trash result back into `FsMutationKind::Moved/CopiedTo`
+        // so the toast can warn "overwrote without trash".
+        if matches!(item.resolution, Resolution::Replace) {
+            let _ = backend.trash(std::slice::from_ref(&dest_rel));
+        }
+
+        let op_result: Result<(), String> = if is_copy {
+            if item.is_dir {
+                backend
+                    .copy_dir_recursive(&item.source, &dest_rel)
+                    .map_err(|e| format!("copy {src_basename:?} → {dest_basename:?}: {e}"))
+            } else {
+                backend
+                    .copy_file(&item.source, &dest_rel)
+                    .map_err(|e| format!("copy {src_basename:?} → {dest_basename:?}: {e}"))
+            }
+        } else {
+            backend
+                .rename(&item.source, &dest_rel)
+                .map_err(|e| format!("move {src_basename:?} → {dest_basename:?}: {e}"))
+        };
+
+        match op_result {
+            Ok(()) => {
+                if first_src_name.is_none() {
+                    first_src_name = Some(src_basename);
+                    first_dest_name = Some(dest_basename);
+                }
+                placed += 1;
+            }
+            Err(e) => {
+                first_err.get_or_insert(e);
+                break;
+            }
+        }
+    }
+
+    let kind = if placed == 1 {
+        if is_copy {
+            FsMutationKind::CopiedTo {
+                name: first_dest_name.clone().unwrap_or_default(),
+            }
+        } else {
+            FsMutationKind::Moved {
+                old_name: first_src_name.clone().unwrap_or_default(),
+                new_name: first_dest_name.clone().unwrap_or_default(),
+            }
+        }
+    } else if is_copy {
+        FsMutationKind::CopiedMulti { count: placed }
+    } else {
+        FsMutationKind::MovedMulti { count: placed }
+    };
+
+    let result = match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    };
+    (kind, result)
 }
 
 /// Find the first non-existing destination filename by appending
@@ -1706,5 +1946,227 @@ mod fs_mutation_tests {
         let missing = tmp.path().join("ghost.txt");
         let (_, res) = run_hard_delete(std::slice::from_ref(&missing));
         assert!(res.is_err());
+    }
+
+    // ── paste_batch (Cut/Copy + Paste) end-to-end ──────────────────
+
+    fn make_local(tmp: &TempDir) -> crate::backend::LocalBackend {
+        crate::backend::LocalBackend::open_at(tmp.path().to_path_buf())
+    }
+
+    fn item(rel: &str, is_dir: bool, r: Resolution) -> PasteItem {
+        PasteItem {
+            source: PathBuf::from(rel),
+            is_dir,
+            resolution: r,
+        }
+    }
+
+    #[test]
+    fn paste_batch_cut_cross_dir_moves_file() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("src")).unwrap();
+        fs::create_dir(tmp.path().join("dst")).unwrap();
+        fs::write(tmp.path().join("src/a.txt"), "data").unwrap();
+
+        let backend = make_local(&tmp);
+        let items = vec![item("src/a.txt", false, Resolution::Replace)];
+        let (kind, result) =
+            run_paste_batch(&backend, &items, Path::new("dst"), /*is_copy=*/ false);
+        assert!(result.is_ok(), "got error: {:?}", result);
+        assert!(matches!(kind, FsMutationKind::Moved { .. }));
+        assert!(
+            !tmp.path().join("src/a.txt").exists(),
+            "source should be gone after Cut"
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("dst/a.txt")).unwrap(),
+            "data"
+        );
+    }
+
+    #[test]
+    fn paste_batch_copy_cross_dir_keeps_source() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("src")).unwrap();
+        fs::create_dir(tmp.path().join("dst")).unwrap();
+        fs::write(tmp.path().join("src/a.txt"), "data").unwrap();
+
+        let backend = make_local(&tmp);
+        let items = vec![item("src/a.txt", false, Resolution::Replace)];
+        let (kind, result) =
+            run_paste_batch(&backend, &items, Path::new("dst"), /*is_copy=*/ true);
+        assert!(result.is_ok());
+        assert!(matches!(kind, FsMutationKind::CopiedTo { .. }));
+        assert!(
+            tmp.path().join("src/a.txt").exists(),
+            "source must stay on Copy"
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("dst/a.txt")).unwrap(),
+            "data"
+        );
+    }
+
+    #[test]
+    fn paste_batch_copy_recurses_into_directories() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("src")).unwrap();
+        fs::create_dir(tmp.path().join("src/pkg")).unwrap();
+        fs::write(tmp.path().join("src/pkg/a.txt"), "deep").unwrap();
+        fs::create_dir(tmp.path().join("dst")).unwrap();
+
+        let backend = make_local(&tmp);
+        let items = vec![item("src/pkg", true, Resolution::Replace)];
+        let (_, result) = run_paste_batch(&backend, &items, Path::new("dst"), true);
+        assert!(result.is_ok());
+        assert!(tmp.path().join("dst/pkg/a.txt").exists());
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("dst/pkg/a.txt")).unwrap(),
+            "deep"
+        );
+    }
+
+    #[test]
+    fn paste_batch_keep_both_uses_provided_basename() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("src")).unwrap();
+        fs::create_dir(tmp.path().join("dst")).unwrap();
+        fs::write(tmp.path().join("src/a.txt"), "new").unwrap();
+        fs::write(tmp.path().join("dst/a.txt"), "old").unwrap();
+
+        let backend = make_local(&tmp);
+        let items = vec![item(
+            "src/a.txt",
+            false,
+            Resolution::KeepBoth("a copy.txt".to_string()),
+        )];
+        let (_, result) = run_paste_batch(&backend, &items, Path::new("dst"), true);
+        assert!(result.is_ok());
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("dst/a.txt")).unwrap(),
+            "old"
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("dst/a copy.txt")).unwrap(),
+            "new"
+        );
+    }
+
+    #[test]
+    fn paste_batch_replace_overwrites_via_trash() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("src")).unwrap();
+        fs::create_dir(tmp.path().join("dst")).unwrap();
+        fs::write(tmp.path().join("src/a.txt"), "new").unwrap();
+        fs::write(tmp.path().join("dst/a.txt"), "old").unwrap();
+
+        let backend = make_local(&tmp);
+        let items = vec![item("src/a.txt", false, Resolution::Replace)];
+        let (_, result) = run_paste_batch(&backend, &items, Path::new("dst"), true);
+        assert!(result.is_ok());
+        // After Replace, the destination carries the source's content.
+        // (The `old` content was either moved to OS Trash or removed —
+        // both are acceptable; we only assert the post-state of dst/.)
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("dst/a.txt")).unwrap(),
+            "new"
+        );
+    }
+
+    #[test]
+    fn paste_batch_skip_is_a_noop() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("src")).unwrap();
+        fs::create_dir(tmp.path().join("dst")).unwrap();
+        fs::write(tmp.path().join("src/a.txt"), "new").unwrap();
+        fs::write(tmp.path().join("dst/a.txt"), "old").unwrap();
+
+        let backend = make_local(&tmp);
+        let items = vec![item("src/a.txt", false, Resolution::Skip)];
+        let (kind, result) = run_paste_batch(&backend, &items, Path::new("dst"), true);
+        assert!(result.is_ok());
+        // No item placed → MovedMulti/CopiedMulti with count = 0.
+        assert!(
+            matches!(kind, FsMutationKind::CopiedMulti { count: 0 }),
+            "kind = {:?}",
+            kind
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("dst/a.txt")).unwrap(),
+            "old",
+            "Skip must leave dest untouched"
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("src/a.txt")).unwrap(),
+            "new",
+            "Skip must leave source untouched"
+        );
+    }
+
+    #[test]
+    fn paste_batch_multi_item_count_in_kind() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("src")).unwrap();
+        fs::create_dir(tmp.path().join("dst")).unwrap();
+        fs::write(tmp.path().join("src/a.txt"), "a").unwrap();
+        fs::write(tmp.path().join("src/b.txt"), "b").unwrap();
+        fs::write(tmp.path().join("src/c.txt"), "c").unwrap();
+
+        let backend = make_local(&tmp);
+        let items = vec![
+            item("src/a.txt", false, Resolution::Replace),
+            item("src/b.txt", false, Resolution::Replace),
+            item("src/c.txt", false, Resolution::Replace),
+        ];
+        let (kind, result) = run_paste_batch(&backend, &items, Path::new("dst"), true);
+        assert!(result.is_ok());
+        assert!(
+            matches!(kind, FsMutationKind::CopiedMulti { count: 3 }),
+            "kind = {:?}",
+            kind
+        );
+        for f in ["a.txt", "b.txt", "c.txt"] {
+            assert!(tmp.path().join("dst").join(f).exists(), "missing dst/{f}");
+        }
+    }
+
+    #[test]
+    fn paste_batch_fail_fast_on_missing_source() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("dst")).unwrap();
+
+        let backend = make_local(&tmp);
+        let items = vec![item("ghost.txt", false, Resolution::Replace)];
+        let (_, result) = run_paste_batch(&backend, &items, Path::new("dst"), false);
+        assert!(result.is_err(), "missing source must surface as Err");
+    }
+
+    #[test]
+    fn paste_batch_lifts_nested_file_to_workspace_root() {
+        // dest_dir is the empty PathBuf — workspace root. Mirrors the
+        // "drop on tree empty space" path (commit_tree_drag, hover_idx
+        // == None) and the "right-click empty space → Paste" path
+        // (dispatch_context_menu_item, ALL_FOR_ROOT).
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/a.txt"), "data").unwrap();
+
+        let backend = make_local(&tmp);
+        let items = vec![item("src/a.txt", false, Resolution::Replace)];
+        // is_copy=false → Cut/Move semantics; an empty dest_dir
+        // resolves to `workdir.join("a.txt")` after the worker's
+        // `dest_dir.join(basename)`.
+        let (_, result) = run_paste_batch(&backend, &items, Path::new(""), false);
+        assert!(result.is_ok(), "got error: {:?}", result);
+        assert!(
+            !tmp.path().join("src/a.txt").exists(),
+            "source row should have moved out of src/"
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+            "data",
+            "moved file must land at workspace root, not anywhere else"
+        );
     }
 }

@@ -3,13 +3,14 @@
 //! Mirrors VSCode's Explorer context menu — the items that make sense
 //! in a terminal file manager. Not included (by design):
 //!
-//! - Cut / Copy / Paste — needs clipboard state, orthogonal to this
-//!   feature. The drag-and-drop flow (place mode) already covers the
-//!   common copy case.
-//! - Copy Path / Copy Relative Path — needs a clipboard crate
-//!   (`arboard` or similar). Follow-up.
 //! - Open in Integrated Terminal — reef doesn't embed a terminal.
 //! - Compare / Select for Compare — separate feature.
+//!
+//! Clipboard items (Cut / Copy / Paste / Duplicate / Copy Path /
+//! Copy Relative Path) are wired through `App::file_clipboard` and
+//! `crate::clipboard` (OSC 52). `Paste` reports `is_enabled = false`
+//! when the clipboard is empty — render greys it out, dispatch
+//! short-circuits.
 //!
 //! The menu is a cheap UI state + a renderer that overlays on top of
 //! the tree. Clicks inside dispatch a `ClickAction::TreeContextMenuItem`;
@@ -23,6 +24,19 @@
 /// placement so we keep it on `ContextMenuState`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextMenuItem {
+    /// "Cut" — mark the anchor entry (or active multi-selection) for
+    /// move on the next Paste. Always enabled when an entry is the
+    /// anchor; never offered for the root.
+    Cut,
+    /// "Copy" — mark for duplicate on Paste. Same eligibility as Cut.
+    Copy,
+    /// "Paste" — drop the file_clipboard contents under the anchor
+    /// folder (or its parent for file anchors / project root for
+    /// empty-space clicks). Disabled when the clipboard is empty.
+    Paste,
+    /// "Duplicate" — same-directory copy with auto-`name copy.ext`
+    /// rename. Bypasses the clipboard.
+    Duplicate,
     /// "New File" — creates under the anchor folder (or project root
     /// if the anchor is a file / is absent). Opens an inline edit row.
     NewFile,
@@ -34,6 +48,12 @@ pub enum ContextMenuItem {
     /// "Delete" — moves the anchor entry to the system Trash after
     /// confirmation (status bar prompt).
     Delete,
+    /// "Copy Path" — write the absolute path of the anchor entry to
+    /// the system clipboard (OSC 52). Multi-select copies all paths
+    /// joined by newlines.
+    CopyPath,
+    /// "Copy Relative Path" — same as `CopyPath` but workdir-relative.
+    CopyRelativePath,
     /// "Reveal in Finder / File Explorer" — shells out to the platform
     /// file manager. macOS only for now; other OSes get a toast
     /// pointing at the follow-up.
@@ -42,23 +62,43 @@ pub enum ContextMenuItem {
 
 impl ContextMenuItem {
     /// Fixed ordering for rendering — matches VSCode's menu grouping
-    /// (create actions, then modify, then reveal).
+    /// (clipboard ops first, then create, then modify, then path
+    /// helpers, then reveal).
     pub const ALL_FOR_ENTRY: &'static [ContextMenuItem] = &[
+        ContextMenuItem::Cut,
+        ContextMenuItem::Copy,
+        ContextMenuItem::Paste,
+        ContextMenuItem::Duplicate,
         ContextMenuItem::NewFile,
         ContextMenuItem::NewFolder,
         ContextMenuItem::Rename,
         ContextMenuItem::Delete,
+        ContextMenuItem::CopyPath,
+        ContextMenuItem::CopyRelativePath,
         ContextMenuItem::RevealInFinder,
     ];
 
     /// Menu items offered when the user right-clicks empty space or
-    /// the project root. No specific entry is anchored, so Rename /
-    /// Delete don't apply.
+    /// the project root. No specific entry is anchored, so per-entry
+    /// actions (Cut / Copy / Rename / Delete / Duplicate / paths) are
+    /// not offered. Paste *is* offered — clipboard contents drop into
+    /// the project root.
     pub const ALL_FOR_ROOT: &'static [ContextMenuItem] = &[
+        ContextMenuItem::Paste,
         ContextMenuItem::NewFile,
         ContextMenuItem::NewFolder,
         ContextMenuItem::RevealInFinder,
     ];
+
+    /// Whether this menu item is currently actionable. `Paste` is the
+    /// only conditional item — it greys out when the file clipboard
+    /// is empty so users see the option exists but isn't ready.
+    pub fn is_enabled(&self, clipboard_is_empty: bool) -> bool {
+        match self {
+            ContextMenuItem::Paste => !clipboard_is_empty,
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -151,7 +191,8 @@ mod tests {
         assert_eq!(m.anchor, (10, 5));
         assert_eq!(m.target_entry_idx, Some(3));
         assert_eq!(m.items.len(), ContextMenuItem::ALL_FOR_ENTRY.len());
-        assert_eq!(m.current(), Some(ContextMenuItem::NewFile));
+        // Cut comes first under the VSCode-style ordering.
+        assert_eq!(m.current(), Some(ContextMenuItem::Cut));
     }
 
     #[test]
@@ -159,9 +200,40 @@ mod tests {
         let mut m = ContextMenuState::default();
         m.open((0, 0), None);
         assert_eq!(m.items.len(), ContextMenuItem::ALL_FOR_ROOT.len());
-        // Rename/Delete must NOT be offered on the root context.
+        // Per-entry actions must NOT be offered on the root context.
         assert!(!m.items.contains(&ContextMenuItem::Rename));
         assert!(!m.items.contains(&ContextMenuItem::Delete));
+        assert!(!m.items.contains(&ContextMenuItem::Cut));
+        assert!(!m.items.contains(&ContextMenuItem::Copy));
+        assert!(!m.items.contains(&ContextMenuItem::Duplicate));
+        // Paste is offered at the root — clipboard targets project root.
+        assert!(m.items.contains(&ContextMenuItem::Paste));
+    }
+
+    #[test]
+    fn paste_disabled_when_clipboard_empty() {
+        assert!(!ContextMenuItem::Paste.is_enabled(true));
+        assert!(ContextMenuItem::Paste.is_enabled(false));
+        // Other items are always enabled.
+        assert!(ContextMenuItem::Cut.is_enabled(true));
+        assert!(ContextMenuItem::CopyPath.is_enabled(true));
+        assert!(ContextMenuItem::Delete.is_enabled(true));
+    }
+
+    #[test]
+    fn entry_menu_grouping_matches_vscode() {
+        // First four are clipboard ops; lock the order so a stray
+        // refactor that reorders the const surfaces here.
+        let entry = ContextMenuItem::ALL_FOR_ENTRY;
+        assert_eq!(entry[0], ContextMenuItem::Cut);
+        assert_eq!(entry[1], ContextMenuItem::Copy);
+        assert_eq!(entry[2], ContextMenuItem::Paste);
+        assert_eq!(entry[3], ContextMenuItem::Duplicate);
+        // Path-copy actions sit just before Reveal at the bottom.
+        let n = entry.len();
+        assert_eq!(entry[n - 1], ContextMenuItem::RevealInFinder);
+        assert_eq!(entry[n - 2], ContextMenuItem::CopyRelativePath);
+        assert_eq!(entry[n - 3], ContextMenuItem::CopyPath);
     }
 
     #[test]

@@ -535,6 +535,43 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    // Paste-conflict prompt: status bar becomes a yellow ⚠ prompt
+    // walking the user through Replace / Skip / Keep both / Cancel.
+    // Key routing lives in `input::handle_key_paste_conflict`.
+    if let Some(prompt) = app.paste_conflict.as_ref()
+        && let Some(item) = prompt.current()
+    {
+        let name = item
+            .existing_at_dest
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?")
+            .to_string();
+        let text = crate::i18n::paste_conflict_prompt(&name, prompt.pending_count());
+        let hint = Line::from(vec![
+            Span::styled(
+                " ⚠ PASTE ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(th.warn_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                text,
+                Style::default()
+                    .fg(th.fg_primary)
+                    .bg(th.chrome_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " ".repeat(area.width.saturating_sub(80) as usize),
+                Style::default().bg(th.chrome_bg),
+            ),
+        ]);
+        f.render_widget(hint, area);
+        return;
+    }
+
     // Tree delete-confirm: status bar becomes a red ⚠ prompt. Mirrors
     // the select/place mode takeover pattern. Confirm key routing
     // lives in `input::handle_key_tree_delete_confirm` — here we

@@ -100,6 +100,39 @@ fn render_normal(f: &mut Frame, app: &mut App, area: Rect) {
     let max_y = tree_area.y + tree_area.height;
     let mut visual_y = tree_area.y;
 
+    // Resolve the intra-tree drag's hover target once per frame (cheap
+    // — linear in tree size) so per-row lookups stay O(1). When the
+    // drag is active but the cursor is in tree empty space (or has
+    // strayed to the toolbar / off-panel), `hover_idx` is `None` —
+    // collapse that case to `HoverTarget::Root` so the renderer
+    // treats it identically to an explicit depth-0 hover. Per-row
+    // styling pulls "is this a root hover?" off this same value, so
+    // we don't pass it as a separate flag.
+    let drag_hover_target = if app.tree_drag.active {
+        Some(match app.tree_drag.hover_idx {
+            Some(idx) => crate::place_mode::resolve_hover_target(&app.file_tree.entries, idx),
+            None => crate::place_mode::HoverTarget::Root,
+        })
+    } else {
+        None
+    };
+
+    // Paint the whole tree area with `selection_bg` while the drop
+    // target is the workspace root. Mirrors `render_place_mode`'s
+    // RootHover backdrop — the user sees at a glance that releasing
+    // here lands files at the project root rather than guessing
+    // which row will absorb the drop. Rendered BEFORE rows so per-
+    // row bg styling layers on top.
+    if matches!(
+        drag_hover_target,
+        Some(crate::place_mode::HoverTarget::Root)
+    ) {
+        f.render_widget(
+            Block::default().style(Style::default().bg(th.selection_bg)),
+            tree_area,
+        );
+    }
+
     // VSCode-style "create at root" injection: when the user clicks
     // the toolbar `+ File` with no folder selected, anchor_idx is None
     // and we render the editable row right at the top of the tree.
@@ -155,6 +188,7 @@ fn render_normal(f: &mut Frame, app: &mut App, area: Rect) {
                 visual_y,
                 tree_area.width,
                 area,
+                drag_hover_target.as_ref(),
             );
             visual_y = visual_y.saturating_add(1);
         }
@@ -281,9 +315,11 @@ fn render_entry_row(
     y: u16,
     width: u16,
     panel_area: Rect,
+    drag_hover_target: Option<&crate::place_mode::HoverTarget>,
 ) {
     let th = app.theme;
     let is_selected = global_idx == app.file_tree.selected;
+    let in_multi_selection = app.file_selection.contains(&entry.path);
     // Suppress hover on tree rows while a context menu overlay is open.
     // The menu sits ABOVE the tree but narrower, and `hover_row` is a
     // single global coord — without this guard the tree row underneath
@@ -295,6 +331,20 @@ fn render_entry_row(
             .hover_col
             .map(|c| c >= panel_area.x && c < panel_area.x + panel_area.width)
             .unwrap_or(false);
+    // Highlight the drag-target folder block: every row inside the
+    // hovered folder's expanded range gets the accent bg so the user
+    // sees what the drop will land in. Mirrors `place_mode`'s
+    // RowMode::InBlock visual but applied to the regular tree path.
+    let in_drag_block = drag_hover_target
+        .map(|t| t.contains_row(global_idx))
+        .unwrap_or(false);
+    // `drag_hover_target == Some(Root)` means the drop will land at
+    // the workspace root; idle rows paint `selection_bg` so the
+    // whole panel reads as a single armed surface.
+    let drag_root_hover = matches!(
+        drag_hover_target,
+        Some(crate::place_mode::HoverTarget::Root)
+    );
 
     let indent = "  ".repeat(entry.depth);
     let icon = if entry.is_dir {
@@ -303,16 +353,34 @@ fn render_entry_row(
         "  "
     };
 
-    let name_style = if entry.is_dir {
+    let mut name_style = if entry.is_dir {
         Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(th.fg_primary)
     };
+    // Cut-clipboard rows render dimmed so the user sees at a glance
+    // which sources will move on the next Paste. Copy mode does not
+    // dim — the source stays in place. Computed directly off the
+    // clipboard rather than stamped onto entries up front; for the
+    // ~50 rows visible at a time × small clipboards this stays a
+    // few hundred path comparisons per frame.
+    if app.file_clipboard.is_cut() && app.file_clipboard.contains(&entry.path) {
+        name_style = name_style.add_modifier(Modifier::DIM);
+    }
 
-    let bg = if is_selected {
+    let bg = if in_drag_block {
+        th.accent
+    } else if is_selected || in_multi_selection {
         th.selection_bg
     } else if is_hovered {
         th.hover_bg
+    } else if drag_root_hover {
+        // Drop target is the workspace root — every idle row paints
+        // the same `selection_bg` as the backdrop so the panel reads
+        // as a single armed surface (matches `place_mode`'s RootHover
+        // visual). Without this, idle rows would `Color::Reset` over
+        // the backdrop and break the unified look.
+        th.selection_bg
     } else {
         Color::Reset
     };
@@ -321,11 +389,12 @@ fn render_entry_row(
         Span::styled(indent.clone(), Style::default().bg(bg)),
         Span::styled(icon, Style::default().fg(th.fg_secondary).bg(bg)),
     ];
-    let name_base_style = if is_selected || is_hovered {
-        name_style.bg(bg)
-    } else {
-        name_style
-    };
+    let name_base_style =
+        if is_selected || is_hovered || in_multi_selection || in_drag_block || drag_root_hover {
+            name_style.bg(bg)
+        } else {
+            name_style
+        };
     let (ranges, cur) = app.search.ranges_on_row(SearchTarget::FileTree, global_idx);
     if ranges.is_empty() {
         spans.push(Span::styled(entry.name.clone(), name_base_style));

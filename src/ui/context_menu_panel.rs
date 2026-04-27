@@ -75,12 +75,14 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     f.render_widget(block, area);
 
     // Render each item row with hover/selected highlight.
+    let clipboard_empty = app.file_clipboard.is_empty();
     for (i, item) in app.tree_context_menu.items.iter().enumerate() {
         let y = inner.y + i as u16;
         if y >= inner.y + inner.height {
             break;
         }
         let label = crate::i18n::tree_context_menu_label(item);
+        let enabled = item.is_enabled(clipboard_empty);
         let is_hovered = app.hover_row == Some(y)
             && app
                 .hover_col
@@ -92,7 +94,15 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
         } else {
             th.chrome_bg
         };
-        let fg_style = Style::default().fg(th.fg_primary).bg(bg);
+        let fg = if enabled {
+            th.fg_primary
+        } else {
+            th.fg_secondary
+        };
+        let mut fg_style = Style::default().fg(fg).bg(bg);
+        if !enabled {
+            fg_style = fg_style.add_modifier(Modifier::DIM);
+        }
         let padded_label = format!("  {}  ", label);
         let used = unicode_width::UnicodeWidthStr::width(padded_label.as_str());
         let mut s = padded_label;
@@ -111,6 +121,9 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
             Rect::new(inner.x, y, inner.width, 1),
         );
 
+        // Disabled items still register their hit zones — but
+        // dispatch checks `is_enabled` again on click and short-
+        // circuits, so the click is silently swallowed.
         app.hit_registry.register_row(
             inner.x,
             y,

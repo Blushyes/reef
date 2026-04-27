@@ -50,6 +50,12 @@ pub struct Theme {
     // banner stays visible when stacked over a diff).
     pub error_bg: Color,
 
+    // Warning banner background — paste-conflict status-bar prompt and
+    // similar "needs attention but not destructive" badges. Yellow-
+    // family across both presets so the meaning telegraphs without
+    // theme inversion.
+    pub warn_bg: Color,
+
     // Generic text.
     pub fg_primary: Color,
     pub fg_secondary: Color,
@@ -83,6 +89,7 @@ impl Theme {
             added_accent: Color::Green,
             removed_accent: Color::Red,
             error_bg: Color::Rgb(60, 0, 0),
+            warn_bg: Color::Rgb(180, 140, 40),
             fg_primary: Color::White,
             fg_secondary: Color::DarkGray,
             accent: Color::Cyan,
@@ -111,6 +118,7 @@ impl Theme {
             added_accent: Color::Rgb(26, 127, 55),
             removed_accent: Color::Rgb(207, 34, 46),
             error_bg: Color::Rgb(255, 235, 233),
+            warn_bg: Color::Rgb(255, 220, 120),
             fg_primary: Color::Rgb(36, 41, 47),
             fg_secondary: Color::Rgb(101, 109, 118),
             accent: Color::Rgb(9, 105, 218),

@@ -8,7 +8,7 @@ use crate::ui::mouse::{ClickAction, HitTestRegistry};
 use crate::ui::theme::Theme;
 use crate::ui::toast::Toast;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -702,6 +702,30 @@ pub struct App {
     /// `Some`. Cleared on confirm or cancel.
     pub tree_delete_confirm: Option<TreeDeletePending>,
 
+    /// VS Code-style internal file clipboard. Holds the paths and the
+    /// move-vs-copy intent set by the latest `Cut` / `Copy`. Consumed
+    /// (and cleared, for Cut) by `paste_into`.
+    pub file_clipboard: crate::file_clipboard::FileClipboard,
+
+    /// Multi-selection set for the Files-tab tree (Space toggle,
+    /// Shift+arrow range, Shift/Ctrl-click). All clipboard / drag /
+    /// delete operations operate on this set when it's non-empty AND
+    /// includes the current cursor row; otherwise they fall back to
+    /// the single cursor row.
+    pub file_selection: crate::file_selection::SelectionSet,
+
+    /// Intra-tree mouse drag state. Mutually exclusive with
+    /// `place_mode.active` (OS→TUI drag) — the input dispatcher gates
+    /// on the active flag.
+    pub tree_drag: crate::tree_drag::TreeDragState,
+
+    /// Modal paste-conflict prompt. `Some` while the user is stepping
+    /// through `[R]eplace [S]kip [K]eep both [A]pply to all [C]ancel`
+    /// decisions in the status bar. `paste_into` opens it; `input`
+    /// keys advance it; `complete_paste_resolution` dispatches the
+    /// final batch when it drains.
+    pub paste_conflict: Option<crate::paste_conflict::PasteConflictPrompt>,
+
     /// Timestamp of the most recent bare-Space keystroke in the global
     /// keymap. `Some(t)` means a Space leader is primed and waiting for a
     /// follow-up key within `input::LEADER_TIMEOUT`. The palette-side
@@ -988,6 +1012,10 @@ impl App {
             tree_edit: crate::tree_edit::TreeEditState::default(),
             tree_context_menu: crate::tree_context_menu::ContextMenuState::default(),
             tree_delete_confirm: None,
+            file_clipboard: crate::file_clipboard::FileClipboard::default(),
+            file_selection: crate::file_selection::SelectionSet::default(),
+            tree_drag: crate::tree_drag::TreeDragState::default(),
+            paste_conflict: None,
             space_leader_at: None,
             last_preview_view_h: 0,
             last_diff_view_h: 0,
@@ -1234,6 +1262,519 @@ impl App {
             .copy_files(generation, Arc::clone(&self.backend), sources, dest_dir);
     }
 
+    // ── VS Code-style file clipboard / paste / drag (intra-tree) ────────
+
+    /// Workdir-relative paths the next clipboard / drag / delete
+    /// operation should target. VS Code rule: if the multi-selection
+    /// contains the current cursor row, the whole selection is the
+    /// payload; otherwise the cursor alone wins. This keeps a stray
+    /// click from quietly losing a selection set the user built up.
+    pub fn effective_action_paths(&self) -> Vec<PathBuf> {
+        let cursor = self.file_tree.selected_path();
+        if let Some(cursor_path) = cursor.as_ref()
+            && !self.file_selection.is_empty()
+            && self.file_selection.contains(cursor_path)
+        {
+            return self.file_selection.to_vec();
+        }
+        cursor.into_iter().collect()
+    }
+
+    /// Workdir-relative directory the next Paste should drop into.
+    /// VS Code rule: cursor on a folder → into that folder; cursor on
+    /// a file → into its parent; nothing selected → project root.
+    pub fn paste_target_dir(&self) -> PathBuf {
+        match self.file_tree.selected_entry() {
+            Some(entry) if entry.is_dir => entry.path.clone(),
+            Some(entry) => entry.path.parent().map(PathBuf::from).unwrap_or_default(),
+            None => PathBuf::new(),
+        }
+    }
+
+    /// Mark `paths` as Cut. Replaces any prior clipboard. Render
+    /// reads `file_clipboard.is_cut()` + `contains` directly per
+    /// visible row so there's no eager stamping to do here.
+    pub fn mark_cut(&mut self, paths: Vec<PathBuf>) {
+        self.file_clipboard
+            .set(crate::file_clipboard::ClipMode::Cut, paths);
+    }
+
+    /// Mark `paths` as Copy. Copy mode does not visually mark source
+    /// rows (matches VS Code).
+    pub fn mark_copy(&mut self, paths: Vec<PathBuf>) {
+        self.file_clipboard
+            .set(crate::file_clipboard::ClipMode::Copy, paths);
+    }
+
+    pub fn clear_clipboard(&mut self) {
+        self.file_clipboard.clear();
+    }
+
+    /// Look up a path in the cached tree to determine its type. Falls
+    /// back to local filesystem probe when the tree doesn't have the
+    /// entry (path outside the visible/expanded subset). Returns
+    /// `None` when neither source can resolve the entry — caller
+    /// should bail with a warning.
+    fn entry_is_dir(&self, rel: &Path) -> Option<bool> {
+        if let Some(entry) = self.file_tree.entries.iter().find(|e| e.path == rel) {
+            return Some(entry.is_dir);
+        }
+        if !self.backend.is_remote() {
+            let abs = self.file_tree.root.join(rel);
+            return Some(abs.is_dir());
+        }
+        None
+    }
+
+    /// Existing basenames (single path component) in `dest_rel`. Used
+    /// for paste conflict detection and `next_copy_name`.
+    ///
+    /// Local backend: enumerates the directory directly via `std::fs`
+    /// for completeness — a hidden file we haven't expanded must still
+    /// surface as a conflict.
+    /// Remote backend: walks the cached tree (collapsed siblings stay
+    /// invisible; a real conflict at a non-listed path falls through
+    /// to the worker, which surfaces `BackendError::PathExists` as a
+    /// toast).
+    fn existing_basenames_in_dir(&self, dest_rel: &Path) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        if !self.backend.is_remote() {
+            let abs = self.file_tree.root.join(dest_rel);
+            if let Ok(rd) = std::fs::read_dir(&abs) {
+                for entry in rd.flatten() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        out.insert(name.to_string());
+                    }
+                }
+                return out;
+            }
+        }
+        // Remote (or local read_dir failed) — fall back to cached tree.
+        let dest_for_filter = dest_rel.to_path_buf();
+        for e in &self.file_tree.entries {
+            let parent = e.path.parent().map(PathBuf::from).unwrap_or_default();
+            if parent == dest_for_filter {
+                out.insert(e.name.clone());
+            }
+        }
+        out
+    }
+
+    /// Drop the file_clipboard contents into `dest_rel` per VS Code
+    /// semantics. Same-directory copies auto-rename via `next_copy_name`;
+    /// cross-directory conflicts open `paste_conflict` for resolution.
+    /// No-conflict items dispatch immediately on the worker; with
+    /// conflicts present, the prompt drives a second-stage dispatch
+    /// from `complete_paste_resolution`.
+    pub fn paste_into(&mut self, dest_rel: PathBuf) {
+        if self.file_clipboard.is_empty() {
+            self.toasts
+                .push(Toast::warn(crate::i18n::paste_clipboard_empty()));
+            return;
+        }
+        if self.fs_mutation_load.loading {
+            self.toasts
+                .push(Toast::warn(crate::i18n::tree_op_blocked_by_in_flight()));
+            return;
+        }
+        let op = match self.file_clipboard.mode {
+            Some(m) => m,
+            None => return,
+        };
+        let sources = self.file_clipboard.paths.clone();
+        self.dispatch_paste_op(op, dest_rel, sources);
+    }
+
+    /// Same-directory Copy shortcut for the keyboard `D` binding.
+    /// Drives off the active selection / cursor.
+    pub fn duplicate_selection(&mut self) {
+        self.duplicate_paths(self.effective_action_paths());
+    }
+
+    /// Same-directory Copy shortcut taking explicit paths. Used by
+    /// the right-click menu (which targets the menu's anchor row, not
+    /// `effective_action_paths()`) so the action operates on the
+    /// right-clicked file even when the cursor sits on a different
+    /// row. Pure path I/O — does not mutate `file_selection`.
+    fn duplicate_paths(&mut self, sources: Vec<PathBuf>) {
+        if sources.is_empty() {
+            return;
+        }
+        if self.fs_mutation_load.loading {
+            self.toasts
+                .push(Toast::warn(crate::i18n::tree_op_blocked_by_in_flight()));
+            return;
+        }
+        // Group by parent dir — duplicating a multi-selection that
+        // spans dirs is uncommon but should "just work" by treating
+        // each source as paste-into-its-own-parent. We implement the
+        // common case (one parent) directly; the uncommon case falls
+        // back to one batch per parent.
+        use std::collections::BTreeMap;
+        let mut by_parent: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+        for s in sources {
+            let parent = s.parent().map(PathBuf::from).unwrap_or_default();
+            by_parent.entry(parent).or_default().push(s);
+        }
+        for (parent, group) in by_parent {
+            self.dispatch_paste_op(crate::file_clipboard::ClipMode::Copy, parent, group);
+            // Multiple parents → multiple batches; but `fs_mutation_load`
+            // serialises them: we only fire the first, the rest get the
+            // "operation in flight" toast. Acceptable v1 behaviour —
+            // duplicating across parents is a corner case.
+            if self.fs_mutation_load.loading {
+                break;
+            }
+        }
+    }
+
+    /// Compute decisions for `(op, dest_rel, sources)` and either
+    /// dispatch directly (no conflicts) or open `paste_conflict`
+    /// (cross-dir conflicts present). Same-dir conflicts auto-rename
+    /// without prompting.
+    ///
+    /// The smart classification logic lives in
+    /// `paste_conflict::classify_paste` (pure, unit-tested). This
+    /// method is glue: snapshot the destination's existing names,
+    /// run classification, surface advisory toasts (self-descent
+    /// blocks, same-dir Cut no-ops), and dispatch.
+    fn dispatch_paste_op(
+        &mut self,
+        op: crate::file_clipboard::ClipMode,
+        dest_rel: PathBuf,
+        sources: Vec<PathBuf>,
+    ) {
+        // RACE: `existing` is a snapshot at decision-time. Between
+        // here and worker dispatch, `fs_watcher` events from the
+        // current process or external tools can add or remove names
+        // at the destination. Acceptable because:
+        //   - `Resolution::Replace` items pre-trash anyway, so a new
+        //     same-named entry that appeared mid-window is still
+        //     overwritten (matches the user's "no conflict" view).
+        //   - `KeepBoth(name)` falls through to `BackendError::PathExists`
+        //     if the chosen rename was claimed by another writer.
+        //   - Same-dir auto-rename uses the snapshot transiently;
+        //     intra-batch collisions are tracked by `classify_paste`.
+        let existing = self.existing_basenames_in_dir(&dest_rel);
+        let cls = crate::paste_conflict::classify_paste(op, &dest_rel, &sources, &existing);
+
+        // Advisory toast on blocked items — single toast for the
+        // whole batch rather than one per row, matches VS Code's
+        // single-line "1 file already exists / cannot drop into
+        // itself" message style.
+        if cls.self_descent_blocked > 0 {
+            self.toasts
+                .push(Toast::warn(crate::i18n::paste_self_into_descendant()));
+        }
+
+        if cls.pending.is_empty() {
+            self.dispatch_paste_resolved(op, dest_rel, cls.auto_decisions);
+        } else {
+            self.paste_conflict = Some(crate::paste_conflict::PasteConflictPrompt::new(
+                op,
+                dest_rel,
+                cls.auto_decisions,
+                cls.pending,
+            ));
+        }
+    }
+
+    /// Send a fully-resolved paste batch to the worker.
+    fn dispatch_paste_resolved(
+        &mut self,
+        op: crate::file_clipboard::ClipMode,
+        dest_rel: PathBuf,
+        decisions: Vec<(PathBuf, crate::paste_conflict::Resolution)>,
+    ) {
+        use crate::paste_conflict::Resolution;
+        // Filter Skip/Cancel so the worker doesn't see noops, but
+        // emit a "nothing to paste" toast if everything got skipped.
+        let actionable: Vec<_> = decisions
+            .into_iter()
+            .filter(|(_, r)| !matches!(r, Resolution::Skip | Resolution::Cancel))
+            .collect();
+        if actionable.is_empty() {
+            self.toasts
+                .push(Toast::info(crate::i18n::paste_nothing_to_do()));
+            return;
+        }
+
+        // Stash the post-paste cursor target — the first decision's
+        // landing path. Picking the first source preserves the user's
+        // mental model ("the thing I was looking at moves into here").
+        let post_target: Option<PathBuf> = actionable.first().map(|(src, r)| {
+            let basename = match r {
+                Resolution::KeepBoth(name) => name.clone(),
+                _ => src
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(String::from)
+                    .unwrap_or_default(),
+            };
+            dest_rel.join(basename)
+        });
+        self.fs_mutation_select_on_done = post_target;
+
+        // Build PasteItem list with is_dir resolved from the tree.
+        let items: Vec<crate::tasks::PasteItem> = actionable
+            .into_iter()
+            .map(|(source, resolution)| {
+                let is_dir = self.entry_is_dir(&source).unwrap_or(false);
+                crate::tasks::PasteItem {
+                    source,
+                    is_dir,
+                    resolution,
+                }
+            })
+            .collect();
+
+        let generation = self.fs_mutation_load.begin();
+        match op {
+            crate::file_clipboard::ClipMode::Cut => {
+                self.tasks
+                    .move_paths(generation, Arc::clone(&self.backend), items, dest_rel);
+                // Cut-paste consumes the clipboard. VS Code's
+                // semantics: a single Cut feeds one Paste.
+                self.clear_clipboard();
+            }
+            crate::file_clipboard::ClipMode::Copy => {
+                self.tasks
+                    .copy_paths(generation, Arc::clone(&self.backend), items, dest_rel);
+                // Copy-paste leaves the clipboard intact so a second
+                // Paste can replay the same sources.
+            }
+        }
+        // Selection drops after a successful operation — VS Code also
+        // doesn't preserve the source set across a paste; the new
+        // landing rows get focus instead.
+        self.file_selection.clear();
+    }
+
+    /// Process the user's response to the current `paste_conflict`
+    /// prompt. `r` is a one-item resolution; pass `apply_to_all =
+    /// true` to drain the rest of the queue with the same answer
+    /// (Replace / Skip only — KeepBoth needs per-item rename names,
+    /// Cancel is independent of apply-to-all).
+    pub fn resolve_paste_conflict(
+        &mut self,
+        r: crate::paste_conflict::Resolution,
+        apply_to_all: bool,
+    ) {
+        let Some(prompt) = self.paste_conflict.as_mut() else {
+            return;
+        };
+        if apply_to_all {
+            prompt.resolve_all_with(r);
+        } else {
+            prompt.resolve_one(r);
+        }
+        if prompt.is_done() {
+            // Drain the prompt; dispatch unless the user picked Cancel.
+            let prompt = self.paste_conflict.take().unwrap();
+            let cancelled = prompt.was_cancelled();
+            let op = prompt.op();
+            let dest = prompt.dest_dir().to_path_buf();
+            let decisions = prompt.into_decisions();
+            if cancelled {
+                self.toasts
+                    .push(Toast::info(crate::i18n::paste_cancelled()));
+            } else {
+                self.dispatch_paste_resolved(op, dest, decisions);
+            }
+        }
+    }
+
+    /// Cancel the prompt without committing any pending dispositions.
+    /// Auto-resolved (no-conflict) items are dropped too — VS Code's
+    /// Cancel halts the entire batch, not just the prompted item.
+    pub fn cancel_paste_conflict(&mut self) {
+        if self.paste_conflict.take().is_some() {
+            self.toasts
+                .push(Toast::info(crate::i18n::paste_cancelled()));
+        }
+    }
+
+    /// Compute a Keep-Both basename for the current prompt item using
+    /// the destination directory's existing names.
+    pub fn keep_both_name_for_current_conflict(&self) -> Option<String> {
+        let prompt = self.paste_conflict.as_ref()?;
+        let item = prompt.current()?;
+        let basename = item.source.file_name().and_then(|s| s.to_str())?;
+        let existing = self.existing_basenames_in_dir(prompt.dest_dir());
+        Some(crate::paste_conflict::next_copy_name(basename, &existing))
+    }
+
+    /// Write the absolute (or workdir-relative) paths of the active
+    /// selection / cursor row to the system clipboard via OSC 52.
+    /// Used by the keyboard binding; menu actions go through
+    /// `copy_paths_to_clipboard` directly with the menu's anchor.
+    pub fn copy_path_to_clipboard(&mut self, relative: bool) {
+        self.copy_paths_to_clipboard(self.effective_action_paths(), relative);
+    }
+
+    /// Write `paths` to the system clipboard via OSC 52 — absolute
+    /// paths when `relative = false`, workdir-relative otherwise.
+    /// Multi-input produces newline-separated paths (VS Code's
+    /// "Copy Path" / "Copy Relative Path" multi-row behaviour).
+    /// Pure path I/O — does not mutate `file_selection`.
+    fn copy_paths_to_clipboard(&mut self, paths: Vec<PathBuf>, relative: bool) {
+        if paths.is_empty() {
+            return;
+        }
+        let count = paths.len();
+        let workdir = self.file_tree.root.clone();
+        // Single contiguous String buffer — skips an intermediate
+        // `Vec<String>` and the N small allocations it'd require.
+        // `Path::to_string_lossy` is `Cow<str>`; `push_str(&cow)`
+        // dereferences to `&str` without forcing it `Owned`, so the
+        // happy-path UTF-8 case copies bytes once into `payload`.
+        let mut payload = String::new();
+        let mut had_lossy = false;
+        for rel in paths {
+            let target = if relative { rel } else { workdir.join(rel) };
+            let s = target.to_string_lossy();
+            if matches!(s, std::borrow::Cow::Owned(_)) {
+                had_lossy = true;
+            }
+            if !payload.is_empty() {
+                payload.push('\n');
+            }
+            payload.push_str(&s);
+        }
+        match crate::clipboard::copy_to_clipboard(&payload) {
+            Ok(()) => {
+                if had_lossy {
+                    self.toasts
+                        .push(Toast::warn(crate::i18n::copy_path_lossy_utf8()));
+                } else {
+                    let toast = if relative {
+                        crate::i18n::copy_relative_path_done(count)
+                    } else {
+                        crate::i18n::copy_path_done(count)
+                    };
+                    self.toasts.push(Toast::info(toast));
+                }
+            }
+            Err(e) => {
+                self.toasts
+                    .push(Toast::error(format!("Copy path failed: {e}")));
+            }
+        }
+    }
+
+    // ── Intra-tree mouse drag (VS Code-style move/copy on drop) ─────────
+
+    /// Promote the press recorded by `Down(Left)` to an active drag.
+    /// Snapshots `effective_action_paths()` *now* — a mid-drag
+    /// selection mutation can't change what's being carried.
+    pub fn begin_tree_drag(&mut self, mods: crossterm::event::KeyModifiers) {
+        if self.tree_drag.active {
+            return;
+        }
+        let sources = self.effective_action_paths();
+        if sources.is_empty() {
+            self.tree_drag.cancel();
+            return;
+        }
+        // Place mode is the OS→TUI flow; intra-tree drag overlays its
+        // hover affordances over the same tree, so the two are
+        // mutually exclusive at the active-flag level.
+        if self.place_mode.active {
+            return;
+        }
+        self.tree_drag.start(sources, mods);
+    }
+
+    pub fn update_tree_drag_hover(&mut self, idx: Option<usize>) {
+        self.tree_drag.update_hover(idx);
+    }
+
+    pub fn update_tree_drag_modifiers(&mut self, mods: crossterm::event::KeyModifiers) {
+        self.tree_drag.update_modifiers(mods);
+    }
+
+    /// Fire any due hover-auto-expand. Call once per tick from the
+    /// main loop while a drag is active. Safe to call when idle.
+    ///
+    /// Stale-index window: `tree_drag.hover_idx` is set on the most
+    /// recent `Drag(Left)` mouse event, against the entry list as
+    /// it stood then. Between Drag and tick (≤16 ms typically, plus
+    /// the 600 ms `HOVER_EXPAND_DELAY`), `fs_watcher` could fire and
+    /// trigger a tree rebuild — invalidating `idx`. The `is_dir` /
+    /// `!is_expanded` checks below double as the staleness guard:
+    /// a rebuilt tree where `idx` now points at a file (or out of
+    /// range) silently no-ops, and the next `Drag` event recomputes
+    /// `hover_idx` against the new list.
+    pub fn tick_tree_drag_auto_expand(&mut self) {
+        if !self.tree_drag.active {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if let Some(idx) = self.tree_drag.auto_expand_due(now) {
+            // Folder that's still collapsed → expand it. Mirrors
+            // `place_mode`'s identical block.
+            if let Some(entry) = self.file_tree.entries.get(idx).cloned()
+                && entry.is_dir
+                && !entry.is_expanded
+            {
+                self.file_tree.toggle_expand(idx);
+                self.refresh_file_tree_with_target(self.file_tree.selected_path());
+            }
+            self.tree_drag.clear_hover_timer();
+        }
+    }
+
+    /// Mouse `Up(Left)` while drag is active — translate the hovered
+    /// row to a destination folder and dispatch move (default) or
+    /// copy (Alt held).
+    pub fn commit_tree_drag(&mut self, release_mods: crossterm::event::KeyModifiers) {
+        if !self.tree_drag.active {
+            return;
+        }
+        self.tree_drag.update_modifiers(release_mods);
+        let is_copy = self.tree_drag.is_copy_op();
+        // Resolve dest via the same hover-target rule as place mode.
+        let dest_rel: PathBuf = match self.tree_drag.hover_idx {
+            Some(idx) => {
+                use crate::place_mode::HoverTarget;
+                match crate::place_mode::resolve_hover_target(&self.file_tree.entries, idx) {
+                    HoverTarget::Folder { folder_idx, .. } => self
+                        .file_tree
+                        .entries
+                        .get(folder_idx)
+                        .map(|e| e.path.clone())
+                        .unwrap_or_default(),
+                    HoverTarget::Root => PathBuf::new(),
+                }
+            }
+            None => {
+                // Released over no row (tree panel empty space, or
+                // off-tree). VS Code's Explorer drops here onto the
+                // workspace root — match that. The terminal can't
+                // distinguish "outside the tree panel" from "below
+                // the last row" cleanly, so we accept both as root.
+                PathBuf::new()
+            }
+        };
+        let sources = std::mem::take(&mut self.tree_drag.sources);
+        self.tree_drag.cancel();
+        let op = if is_copy {
+            crate::file_clipboard::ClipMode::Copy
+        } else {
+            crate::file_clipboard::ClipMode::Cut
+        };
+        if self.fs_mutation_load.loading {
+            self.toasts
+                .push(Toast::warn(crate::i18n::tree_op_blocked_by_in_flight()));
+            return;
+        }
+        self.dispatch_paste_op(op, dest_rel, sources);
+    }
+
+    pub fn cancel_tree_drag(&mut self) {
+        self.tree_drag.cancel();
+    }
+
     // ── Files-tab tree actions: New File / New Folder / Rename / Delete ──
 
     /// Open the inline editor for a new file / new folder under
@@ -1427,9 +1968,85 @@ impl App {
     /// on a menu row.
     pub fn dispatch_context_menu_item(&mut self, item: crate::tree_context_menu::ContextMenuItem) {
         use crate::tree_context_menu::ContextMenuItem as I;
+        // Disabled items (e.g. Paste when the clipboard is empty)
+        // close the menu but skip the action — the user clicked a
+        // greyed-out row, and silently doing nothing matches VS
+        // Code's behaviour.
+        if !item.is_enabled(self.file_clipboard.is_empty()) {
+            self.tree_context_menu.close();
+            return;
+        }
         let target_idx = self.tree_context_menu.target_entry_idx;
         self.tree_context_menu.close();
+        // The right-click menu stamps `target_entry_idx` independently
+        // of `file_tree.selected`. For clipboard / path actions we
+        // want them to operate on the right-clicked row, even if the
+        // selection cursor is elsewhere — temporarily seed a single-
+        // path action set from the menu's anchor when there's no
+        // active multi-selection containing the row.
+        let anchor_paths = |this: &Self| -> Vec<PathBuf> {
+            if let Some(idx) = target_idx
+                && let Some(entry) = this.file_tree.entries.get(idx)
+            {
+                let p = entry.path.clone();
+                if !this.file_selection.is_empty() && this.file_selection.contains(&p) {
+                    this.file_selection.to_vec()
+                } else {
+                    vec![p]
+                }
+            } else {
+                this.effective_action_paths()
+            }
+        };
         match item {
+            I::Cut => {
+                let paths = anchor_paths(self);
+                self.mark_cut(paths);
+            }
+            I::Copy => {
+                let paths = anchor_paths(self);
+                self.mark_copy(paths);
+            }
+            I::Paste => {
+                if !self.file_clipboard.is_empty() {
+                    // Right-click on a folder lands paste inside it;
+                    // on a file lands in its parent; on empty tree
+                    // space (ALL_FOR_ROOT, target_idx == None) lands
+                    // at the workspace root. We deliberately do NOT
+                    // fall through to `paste_target_dir()` for the
+                    // root case — that would pull the unrelated
+                    // cursor row's parent and hide the user's clear
+                    // intent ("paste at the root").
+                    let dest = target_idx
+                        .and_then(|idx| self.file_tree.entries.get(idx))
+                        .map(|entry| {
+                            if entry.is_dir {
+                                entry.path.clone()
+                            } else {
+                                entry.path.parent().map(PathBuf::from).unwrap_or_default()
+                            }
+                        })
+                        .unwrap_or_default();
+                    self.paste_into(dest);
+                }
+            }
+            I::Duplicate => {
+                // Menu actions take their target paths directly; the
+                // user's `file_selection` (and its anchor) stays
+                // untouched. `anchor_paths` already implements the
+                // "if menu row is part of the selection, act on the
+                // whole selection; otherwise just the menu row" rule.
+                let paths = anchor_paths(self);
+                self.duplicate_paths(paths);
+            }
+            I::CopyPath => {
+                let paths = anchor_paths(self);
+                self.copy_paths_to_clipboard(paths, false);
+            }
+            I::CopyRelativePath => {
+                let paths = anchor_paths(self);
+                self.copy_paths_to_clipboard(paths, true);
+            }
             I::NewFile => {
                 let (parent, anchor) = self.resolve_create_anchor(target_idx);
                 self.begin_tree_edit(
@@ -3563,6 +4180,7 @@ impl App {
         self.drain_commit_result();
         self.kick_active_tab_work();
         self.tick_place_mode_auto_expand();
+        self.tick_tree_drag_auto_expand();
         self.drain_task_results();
     }
 

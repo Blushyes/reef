@@ -6,7 +6,7 @@
 //! go through `App`'s methods (`stage_file`, `confirm_discard`, `run_push`,
 //! …) which keeps host side state coherent.
 
-use crate::app::{App, DiscardTarget, Panel, SelectedFile};
+use crate::app::{App, DiscardTarget, Panel, SelectedFile, Tab};
 use crate::git::tree::{self as gtree, Node};
 use crate::git::{FileEntry, FileStatus};
 use crate::i18n::{Msg, t};
@@ -418,6 +418,17 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             app.git_status.commit_error = None;
             true
         }
+        "git.revealInTree" => {
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            if !path.is_empty() {
+                let rel = std::path::PathBuf::from(path);
+                app.set_active_tab(Tab::Files);
+                app.file_tree.reveal(&rel);
+                app.refresh_file_tree_with_target(Some(rel.clone()));
+                app.load_preview_for_path(rel);
+            }
+            true
+        }
         _ => false,
     }
 }
@@ -505,8 +516,8 @@ impl Row {
 fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
     let status = &app.git_status;
-    // Slightly narrower budget to accommodate the ↺ discard button on unstaged rows.
-    let max_path = (width as usize).saturating_sub(10);
+    // Slightly narrower budget to accommodate the ↗ open and ↺ discard buttons.
+    let max_path = (width as usize).saturating_sub(12);
 
     // Push-in-flight banner — shown while the worker thread is running.
     // Non-interactive: user just waits for tick() to drain the result.
@@ -1077,6 +1088,19 @@ fn file_row(
     spans.push(RowSpan::styled(
         format!(" {} ", status_label),
         apply_bg(Style::default().fg(status_color), base_bg),
+    ));
+    spans.push(RowSpan {
+        text: "↗".into(),
+        style: apply_bg(Style::default().fg(Color::Blue), base_bg),
+        click: Some((
+            "git.revealInTree".to_string(),
+            serde_json::json!({ "path": file.path }),
+        )),
+        dbl: None,
+    });
+    spans.push(RowSpan::styled(
+        " ".to_string(),
+        apply_bg(Style::default(), base_bg),
     ));
     spans.push(RowSpan {
         text: button.into(),

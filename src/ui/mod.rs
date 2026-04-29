@@ -4,6 +4,7 @@ pub mod db_preview;
 pub mod diff_panel;
 pub mod file_preview_panel;
 pub mod file_tree_panel;
+pub mod focus;
 pub mod git_graph_panel;
 pub mod git_status_panel;
 pub mod global_search_panel;
@@ -153,9 +154,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
         }
         Tab::Files => {
             if has_sidebar {
-                file_tree_panel::render(f, app, body_layout[0]);
+                let focused = matches!(app.active_panel, crate::app::Panel::Files);
+                file_tree_panel::render(f, app, body_layout[0], focused);
             }
-            file_preview_panel::render(f, app, body_layout[editor_idx]);
+            let focused = matches!(app.active_panel, crate::app::Panel::Diff);
+            file_preview_panel::render(f, app, body_layout[editor_idx], focused);
         }
         Tab::Graph => {
             if has_sidebar {
@@ -170,7 +173,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
             if has_sidebar {
                 search_tab::render_sidebar(f, app, body_layout[0]);
             }
-            file_preview_panel::render(f, app, body_layout[editor_idx]);
+            let focused = matches!(app.active_panel, crate::app::Panel::Diff);
+            file_preview_panel::render(f, app, body_layout[editor_idx], focused);
         }
     }
 
@@ -656,18 +660,131 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         },
     };
 
+    // Right-aligned panel chip showing which pane currently owns focus.
+    // Always rendered in `accent` since it is by definition the focused
+    // panel — the visual cue is the chip's presence and color, not its
+    // change of state. Drops automatically when the row is too narrow.
+    let chip = format!(" [{}] ", panel_chip_text(app.active_tab, app.active_panel));
+    let chip_style = Style::default()
+        .fg(th.accent)
+        .bg(th.chrome_bg)
+        .add_modifier(Modifier::BOLD);
+
+    let hint_text = t(Msg::StatusBarHint);
+    let hint_w = UnicodeWidthStr::width(hint_text) as u16;
+    let chip_w = UnicodeWidthStr::width(chip.as_str()) as u16;
+    let notif_w = UnicodeWidthStr::width(notif.as_str()) as u16;
+
+    let pad_w = area
+        .width
+        .saturating_sub(notif_w)
+        .saturating_sub(hint_w)
+        .saturating_sub(chip_w);
+
     let status = Line::from(vec![
         Span::styled(notif, Style::default().fg(notif_color).bg(th.chrome_bg)),
         Span::styled(
-            " ".repeat(area.width.saturating_sub(60) as usize),
+            " ".repeat(pad_w as usize),
             Style::default().bg(th.chrome_bg),
         ),
         Span::styled(
-            t(Msg::StatusBarHint),
+            hint_text,
             Style::default().fg(th.chrome_muted_fg).bg(th.chrome_bg),
         ),
+        Span::styled(chip, chip_style),
     ]);
     f.render_widget(status, area);
+}
+
+/// i18n short label for the currently-focused panel — drives the
+/// status-bar chip. Derived from `(tab, panel)` so the label reflects
+/// what the panel actually shows in this tab (e.g., `Panel::Files` is
+/// "Files" in the Files/Git tabs but "Search" in the Search tab where
+/// the left column is the query input). Pulled out as a pure fn (no
+/// `&App` parameter) so the mapping is unit-testable.
+fn panel_chip_text(tab: crate::app::Tab, panel: crate::app::Panel) -> &'static str {
+    use crate::app::{Panel, Tab};
+    match (tab, panel) {
+        (Tab::Files, Panel::Files) => t(Msg::PanelFiles),
+        (Tab::Files, Panel::Diff | Panel::Commit) => t(Msg::PanelPreview),
+        (Tab::Search, Panel::Files) => t(Msg::PanelSearch),
+        (Tab::Search, Panel::Diff | Panel::Commit) => t(Msg::PanelPreview),
+        (Tab::Git, Panel::Files) => t(Msg::PanelFiles),
+        (Tab::Git, Panel::Diff | Panel::Commit) => t(Msg::PanelDiff),
+        (Tab::Graph, Panel::Files) => t(Msg::PanelGraph),
+        (Tab::Graph, Panel::Commit) => t(Msg::PanelCommit),
+        (Tab::Graph, Panel::Diff) => t(Msg::PanelDiff),
+    }
+}
+
+#[cfg(test)]
+mod panel_chip_tests {
+    use super::*;
+    use crate::app::{Panel, Tab};
+
+    // Files tab → file tree on the left, preview on the right.
+    #[test]
+    fn files_tab_panels_match_their_role() {
+        assert_eq!(panel_chip_text(Tab::Files, Panel::Files), t(Msg::PanelFiles));
+        assert_eq!(panel_chip_text(Tab::Files, Panel::Diff), t(Msg::PanelPreview));
+    }
+
+    // Search tab → query input on the left, preview on the right.
+    // Critical: Panel::Files in Search tab is NOT "Files" — it's the
+    // search query column.
+    #[test]
+    fn search_tab_left_panel_labels_as_search_not_files() {
+        assert_eq!(
+            panel_chip_text(Tab::Search, Panel::Files),
+            t(Msg::PanelSearch)
+        );
+        assert_eq!(
+            panel_chip_text(Tab::Search, Panel::Diff),
+            t(Msg::PanelPreview)
+        );
+    }
+
+    // Git tab → file list on the left, diff (not preview) on the right.
+    #[test]
+    fn git_tab_right_panel_labels_as_diff_not_preview() {
+        assert_eq!(panel_chip_text(Tab::Git, Panel::Files), t(Msg::PanelFiles));
+        assert_eq!(panel_chip_text(Tab::Git, Panel::Diff), t(Msg::PanelDiff));
+    }
+
+    // Graph tab in 3-col mode is the only place all three Panels are
+    // distinct — sidebar/middle/diff each get their own label.
+    #[test]
+    fn graph_tab_distinguishes_all_three_panels() {
+        let g = panel_chip_text(Tab::Graph, Panel::Files);
+        let c = panel_chip_text(Tab::Graph, Panel::Commit);
+        let d = panel_chip_text(Tab::Graph, Panel::Diff);
+        assert_eq!(g, t(Msg::PanelGraph));
+        assert_eq!(c, t(Msg::PanelCommit));
+        assert_eq!(d, t(Msg::PanelDiff));
+        // And those three labels must be pairwise distinct so the chip
+        // is actually informative across the cycle.
+        assert_ne!(g, c);
+        assert_ne!(c, d);
+        assert_ne!(g, d);
+    }
+
+    // Defensive: Panel::Commit only legitimately appears in Graph 3-col,
+    // but if it leaked into another tab via stale state, the label
+    // should still resolve sensibly without panicking.
+    #[test]
+    fn stale_commit_panel_falls_back_per_tab() {
+        // Files / Search treat it as preview (the right column).
+        assert_eq!(
+            panel_chip_text(Tab::Files, Panel::Commit),
+            t(Msg::PanelPreview)
+        );
+        assert_eq!(
+            panel_chip_text(Tab::Search, Panel::Commit),
+            t(Msg::PanelPreview)
+        );
+        // Git treats it as diff.
+        assert_eq!(panel_chip_text(Tab::Git, Panel::Commit), t(Msg::PanelDiff));
+    }
 }
 
 fn render_search_prompt(f: &mut Frame, app: &App, area: Rect) {
@@ -757,8 +874,9 @@ fn render_help(f: &mut Frame, app: &App, screen: Rect) {
     let th = app.theme;
     let core_entries: &[(&str, &str)] = &[
         ("q / Ctrl+C", t(Msg::HelpQuit)),
-        ("Tab", t(Msg::HelpSwitchTab)),
-        ("Shift+Tab", t(Msg::HelpSwitchPanel)),
+        ("Tab / Shift+Tab", t(Msg::HelpSwitchPanel)),
+        ("Ctrl+Tab", t(Msg::HelpSwitchTab)),
+        ("Esc", t(Msg::HelpEscBackOut)),
         ("1 … 9", t(Msg::HelpJumpTab)),
         ("↑ / k / Ctrl+P", t(Msg::HelpNavUp)),
         ("↓ / j / Ctrl+N", t(Msg::HelpNavDown)),
@@ -770,7 +888,7 @@ fn render_help(f: &mut Frame, app: &App, screen: Rect) {
         ("↑ / ↓ (visual)", t(Msg::HelpGraphRangeExtend)),
         ("PgUp / PgDn (visual)", t(Msg::HelpGraphRangeExtendFast)),
         ("Click (visual)", t(Msg::HelpGraphVisualClick)),
-        ("Esc", t(Msg::HelpGraphRangeClear)),
+        ("Esc (visual)", t(Msg::HelpGraphRangeClear)),
         ("Shift+↑ / Shift+↓", t(Msg::HelpGraphShiftExtend)),
         ("Shift+Click", t(Msg::HelpGraphShiftClick)),
         ("Home / End", t(Msg::HelpHomeEnd)),

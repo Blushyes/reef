@@ -310,29 +310,68 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             app.toggle_sidebar();
             return;
         }
-        KeyCode::Tab => {
+        // Ctrl+F: VSCode-style find-in-file. Forces focus onto the
+        // preview so `search::begin`'s `resolve_target` picks
+        // `SearchTarget::FilePreview` regardless of where focus was.
+        // Suppressed in text-input modes so it doesn't yank the user
+        // out of a half-typed commit message or global-search query.
+        KeyCode::Char('f')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && !in_input_mode
+                && matches!(app.active_tab, Tab::Files | Tab::Search) =>
+        {
+            if app.active_panel != Panel::Diff {
+                app.active_panel = Panel::Diff;
+            }
+            search::begin(app, false);
+            return;
+        }
+        // Ctrl+Tab: best-effort "next tab" alias. Many legacy terminals
+        // (Terminal.app) collapse Ctrl+Tab into plain Tab, in which
+        // case the bare-Tab arm below catches it and number keys
+        // remain the reliable tab-switch path.
+        KeyCode::Tab if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let tabs = Tab::ALL;
             let cur = tabs.iter().position(|&t| t == app.active_tab).unwrap_or(0);
             app.set_active_tab(tabs[(cur + 1) % tabs.len()]);
             app.search.clear();
             return;
         }
+        KeyCode::Tab => {
+            app.active_panel =
+                next_panel(app.active_panel, app.graph_uses_three_col(), /* reverse= */ false);
+            app.search.clear();
+            return;
+        }
         KeyCode::BackTab => {
-            // Graph tab 3-col cycles Files → Commit → Diff → Files so
-            // Shift+Tab reaches the new middle column. Other tabs (and the
-            // Graph 2-col fallback) keep the two-way toggle.
-            app.active_panel = if app.graph_uses_three_col() {
-                match app.active_panel {
-                    Panel::Files => Panel::Commit,
-                    Panel::Commit => Panel::Diff,
-                    Panel::Diff => Panel::Files,
-                }
-            } else {
-                match app.active_panel {
-                    Panel::Files | Panel::Commit => Panel::Diff,
-                    Panel::Diff => Panel::Files,
-                }
-            };
+            app.active_panel =
+                next_panel(app.active_panel, app.graph_uses_three_col(), /* reverse= */ true);
+            app.search.clear();
+            return;
+        }
+        // Esc back-out, two-step. Active search input and modal Esc
+        // handlers (place mode, tree-edit, paste-conflict, …) run
+        // earlier via top-of-`handle_key` early-returns, so this
+        // block only fires for the "no specific modal owns Esc" case.
+        //   1. Clear dormant `/` highlights — but only when the
+        //      current panel owns them. If the user Tab'd to a
+        //      different panel the highlights aren't on screen, so
+        //      Esc passes through to that panel's own handler
+        //      (commit-box exit, multi-select clear, …) instead of
+        //      being silently swallowed.
+        //   2. Otherwise, return panel focus to `Panel::Files`. Both
+        //      arms use guards so Graph visual-mode exit and other
+        //      per-tab Esc semantics still fall through when neither
+        //      applies.
+        KeyCode::Esc
+            if !app.search.matches.is_empty()
+                && search::resolve_target(app) == app.search.target =>
+        {
+            app.search.clear();
+            return;
+        }
+        KeyCode::Esc if app.active_panel != Panel::Files => {
+            app.active_panel = Panel::Files;
             app.search.clear();
             return;
         }
@@ -419,6 +458,32 @@ fn has_pending_confirm(app: &App) -> bool {
     app.git_status.confirm_discard.is_some()
         || app.git_status.confirm_push
         || app.git_status.confirm_force_push
+}
+
+/// Step a `Panel` one position forward (or backward if `reverse`). The
+/// 3-col Graph layout has its own ordering — Files → Commit → Diff —
+/// that the 2-col fallback collapses to a Files↔Diff toggle. Used by
+/// the bare-Tab and Shift+Tab handlers; pulled out as a pure fn (no
+/// `&App` parameter) so the state machine is unit-testable.
+fn next_panel(current: Panel, three_col: bool, reverse: bool) -> Panel {
+    if three_col {
+        match (current, reverse) {
+            (Panel::Files, false) => Panel::Commit,
+            (Panel::Commit, false) => Panel::Diff,
+            (Panel::Diff, false) => Panel::Files,
+            (Panel::Files, true) => Panel::Diff,
+            (Panel::Commit, true) => Panel::Files,
+            (Panel::Diff, true) => Panel::Commit,
+        }
+    } else {
+        // 2-col fallback. Reverse direction is a no-op (it's a toggle).
+        // `Panel::Commit` only appears in 3-col Graph, but normalise
+        // defensively in case state lingered across a layout switch.
+        match current {
+            Panel::Files | Panel::Commit => Panel::Diff,
+            Panel::Diff => Panel::Files,
+        }
+    }
 }
 
 /// SQLite preview page-jump input. While `app.db_goto_input` is
@@ -2264,6 +2329,12 @@ fn handle_preview_selection(mouse: &MouseEvent, app: &mut App) -> bool {
             if !point_in_rect(rect, mouse.column, mouse.row) {
                 return false;
             }
+            // Focus follows the click — this handler returns `true` and
+            // short-circuits the main dispatcher's `focus_panel_under_cursor`
+            // call, so we have to promote the panel ourselves. Mirror of
+            // the same line in `handle_diff_selection`.
+            app.active_panel = Panel::Diff;
+
             let Some(origin) = content_origin else {
                 return false;
             };
@@ -3365,5 +3436,60 @@ mod paste_parser_tests {
         let paste = format!("'{}'", file.to_string_lossy());
         let got = parse_dropped_paths(&paste);
         assert_eq!(got, vec![file]);
+    }
+}
+
+#[cfg(test)]
+mod next_panel_tests {
+    use super::*;
+
+    // 3-col Graph forward cycle: Files → Commit → Diff → Files.
+    #[test]
+    fn three_col_forward_cycles_through_all_three() {
+        assert_eq!(next_panel(Panel::Files, true, false), Panel::Commit);
+        assert_eq!(next_panel(Panel::Commit, true, false), Panel::Diff);
+        assert_eq!(next_panel(Panel::Diff, true, false), Panel::Files);
+    }
+
+    // Reverse direction in 3-col walks Files → Diff → Commit → Files.
+    #[test]
+    fn three_col_reverse_cycles_in_opposite_order() {
+        assert_eq!(next_panel(Panel::Files, true, true), Panel::Diff);
+        assert_eq!(next_panel(Panel::Diff, true, true), Panel::Commit);
+        assert_eq!(next_panel(Panel::Commit, true, true), Panel::Files);
+    }
+
+    // Forward + reverse must compose back to the original panel.
+    #[test]
+    fn three_col_round_trip_returns_origin() {
+        for &p in &[Panel::Files, Panel::Commit, Panel::Diff] {
+            let one_step = next_panel(p, true, false);
+            let back = next_panel(one_step, true, true);
+            assert_eq!(back, p, "round-trip from {:?} must return self", p);
+        }
+    }
+
+    // 2-col layout collapses to a Files↔Diff toggle. Commit (which only
+    // exists in 3-col Graph) is normalised onto Files.
+    #[test]
+    fn two_col_toggles_files_and_diff() {
+        assert_eq!(next_panel(Panel::Files, false, false), Panel::Diff);
+        assert_eq!(next_panel(Panel::Diff, false, false), Panel::Files);
+        // Defensive: stale Panel::Commit from a recent layout change
+        // routes to Diff instead of panicking or hanging.
+        assert_eq!(next_panel(Panel::Commit, false, false), Panel::Diff);
+    }
+
+    // 2-col reverse must match forward (it's a toggle either way).
+    #[test]
+    fn two_col_reverse_equals_forward() {
+        for &p in &[Panel::Files, Panel::Commit, Panel::Diff] {
+            assert_eq!(
+                next_panel(p, false, false),
+                next_panel(p, false, true),
+                "2-col toggle is direction-agnostic at {:?}",
+                p
+            );
+        }
     }
 }

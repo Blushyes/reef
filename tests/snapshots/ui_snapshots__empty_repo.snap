@@ -1,5 +1,6 @@
 ---
 source: tests/ui_snapshots.rs
+assertion_line: 104
 expression: output
 ---
  reef  [TMPDIR]  ⎇ (detached)
@@ -21,4 +22,4 @@ expression: output
                        │
                        │
                        │
-                     q:quit Tab:switch s:stage u:unstage r:refresh h:help
+                  q:quit Tab:switch s:stage u:unstage r:refresh h:help  [Files]

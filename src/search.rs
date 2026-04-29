@@ -310,7 +310,7 @@ pub fn step(app: &mut App, reverse: bool) {
 
 // ─── Target resolution ────────────────────────────────────────────────────────
 
-fn resolve_target(app: &App) -> Option<SearchTarget> {
+pub(crate) fn resolve_target(app: &App) -> Option<SearchTarget> {
     match (app.active_tab, app.active_panel) {
         (Tab::Files, Panel::Files) => Some(SearchTarget::FileTree),
         (Tab::Files, Panel::Diff) => Some(SearchTarget::FilePreview),

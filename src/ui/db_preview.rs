@@ -64,13 +64,15 @@ pub(in crate::ui) fn render(
     area: Rect,
     path: &str,
     info: &DatabaseInfo,
+    focused: bool,
 ) {
     if area.height < 1 {
         return;
     }
     let th = app.theme;
     let max_y = area.y + area.height;
-    let mut y = crate::ui::file_preview_panel::render_card_header(f, area, path, &th);
+    let mut y =
+        crate::ui::file_preview_panel::render_card_header(f, area, path, &th, focused, None);
 
     // Meta line — same shape as the binary card's `application/x · N B`
     // so the eye picks it up in the same place across formats.

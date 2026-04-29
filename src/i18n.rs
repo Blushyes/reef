@@ -193,8 +193,22 @@ pub enum Msg {
     HelpHardDeleteEntry,
     HelpRightClickMenu,
     HelpToggleSidebar,
+    /// `Esc` row in the help popup — describes the general two-step
+    /// back-out behaviour (clear dormant search, then return panel
+    /// focus to the list/tree column). The Graph-visual-mode row
+    /// keeps its own description because that Esc fires earlier.
+    HelpEscBackOut,
     SidebarHiddenHint,
     HelpAnyKey,
+
+    // Status bar panel-focus chip — short labels for the right-aligned
+    // indicator showing which panel currently owns focus.
+    PanelFiles,
+    PanelPreview,
+    PanelCommit,
+    PanelDiff,
+    PanelSearch,
+    PanelGraph,
 }
 
 pub fn t(m: Msg) -> &'static str {
@@ -321,8 +335,15 @@ fn t_zh(m: Msg) -> &'static str {
         HelpHardDeleteEntry => "永久删除（不可撤销）",
         HelpRightClickMenu => "打开文件树右键菜单",
         HelpToggleSidebar => "切换侧边栏显示",
+        HelpEscBackOut => "退出焦点 / 清除搜索",
         SidebarHiddenHint => "侧边栏已隐藏 — Ctrl+B 可恢复",
         HelpAnyKey => "关闭帮助",
+        PanelFiles => "文件",
+        PanelPreview => "预览",
+        PanelCommit => "提交",
+        PanelDiff => "Diff",
+        PanelSearch => "搜索",
+        PanelGraph => "图表",
     }
 }
 
@@ -445,8 +466,15 @@ fn t_en(m: Msg) -> &'static str {
         HelpHardDeleteEntry => "Delete permanently (cannot be undone)",
         HelpRightClickMenu => "Open file-tree context menu",
         HelpToggleSidebar => "Toggle sidebar",
+        HelpEscBackOut => "Exit focus / clear search",
         SidebarHiddenHint => "Sidebar hidden — Ctrl+B to restore",
         HelpAnyKey => "Close help",
+        PanelFiles => "Files",
+        PanelPreview => "Preview",
+        PanelCommit => "Commit",
+        PanelDiff => "Diff",
+        PanelSearch => "Search",
+        PanelGraph => "Graph",
     }
 }
 

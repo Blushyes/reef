@@ -2,6 +2,7 @@ use crate::app::App;
 use crate::file_tree::{BinaryInfo, BinaryReason, ImagePreview, PreviewBody, PreviewContent};
 use crate::i18n::{Msg, t};
 use crate::search::SearchTarget;
+use crate::ui::focus::header_title_style;
 use crate::ui::text::{clip_spans, overlay_match_highlight, overlay_selection_highlight};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -18,7 +19,7 @@ use unicode_width::UnicodeWidthStr;
 /// image row still fits.
 const MIN_META_HEIGHT: u16 = 5;
 
-pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
+pub fn render(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     let block = Block::default().padding(Padding::new(1, 1, 0, 0));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -44,7 +45,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         _ => false,
     };
     if show_loading {
-        render_loading(f, app, inner, loading_target.as_ref().unwrap());
+        render_loading(f, app, inner, loading_target.as_ref().unwrap(), focused);
         return;
     }
 
@@ -57,11 +58,13 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     };
 
     match &preview.body {
-        PreviewBody::Text { .. } => render_text(f, app, inner, &preview),
-        PreviewBody::Image(img) => render_image(f, app, inner, &preview.file_path, img),
-        PreviewBody::Binary(info) => render_binary_info(f, app, inner, &preview.file_path, info),
+        PreviewBody::Text { .. } => render_text(f, app, inner, &preview, focused),
+        PreviewBody::Image(img) => render_image(f, app, inner, &preview.file_path, img, focused),
+        PreviewBody::Binary(info) => {
+            render_binary_info(f, app, inner, &preview.file_path, info, focused)
+        }
         PreviewBody::Database(info) => {
-            crate::ui::db_preview::render(f, app, inner, &preview.file_path, info)
+            crate::ui::db_preview::render(f, app, inner, &preview.file_path, info, focused)
         }
     }
 
@@ -74,13 +77,13 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
 /// instead of the previous file's content. Body is a centred "loading…"
 /// label; we don't show a spinner because the typical decode window
 /// (~100-200 ms) is too short to animate meaningfully.
-fn render_loading(f: &mut Frame, app: &App, area: Rect, target: &Path) {
+fn render_loading(f: &mut Frame, app: &App, area: Rect, target: &Path, focused: bool) {
     if area.height < 1 {
         return;
     }
     let th = app.theme;
     let max_y = area.y + area.height;
-    let y = render_card_header(f, area, &target.to_string_lossy(), &th);
+    let y = render_card_header(f, area, &target.to_string_lossy(), &th, focused, None);
     if y >= max_y {
         return;
     }
@@ -114,32 +117,72 @@ fn render_empty(f: &mut Frame, app: &App, area: Rect) {
 /// call this; we clamp internally so a single-row panel shows at
 /// least the filename. Visible to the sibling `db_preview` module
 /// so it can share the same chrome.
+///
+/// `focused` decides accent vs. muted color for the title. `match_count`
+/// is `Some((current_1based, total))` when an in-panel `/` search has
+/// committed matches against this preview — it renders right-aligned in
+/// the title row as `[3/12]`. Pass `None` for body variants that don't
+/// participate in preview-content search (image / binary / database).
 pub(in crate::ui) fn render_card_header(
     f: &mut Frame,
     area: Rect,
     path: &str,
     theme: &crate::ui::theme::Theme,
+    focused: bool,
+    match_count: Option<(usize, usize)>,
 ) -> u16 {
     let mut y = area.y;
     let max_y = area.y + area.height;
     if y >= max_y {
         return y;
     }
-    f.render_widget(
-        Line::from(Span::styled(
-            path,
-            Style::default()
-                .fg(theme.fg_primary)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Rect::new(area.x, y, area.width, 1),
-    );
+
+    let title_style = header_title_style(theme, focused);
+    let count_text = match_count.map(|(cur, total)| format!("[{}/{}]", cur, total));
+    let count_style = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+
+    // Right-align the [i/N] counter when present and there's room. Falls
+    // back to a plain title when the panel is too narrow to fit both.
+    let path_w = UnicodeWidthStr::width(path) as u16;
+    let count_w = count_text
+        .as_deref()
+        .map(|c| UnicodeWidthStr::width(c) as u16)
+        .unwrap_or(0);
+    let fits_counter = count_text.is_some()
+        // 1-col gap between path and counter.
+        && path_w.saturating_add(1).saturating_add(count_w) <= area.width;
+
+    let title_rect = Rect::new(area.x, y, area.width, 1);
+    if fits_counter {
+        let count = count_text.as_deref().unwrap();
+        let pad_w = area.width.saturating_sub(path_w).saturating_sub(count_w);
+        let pad = " ".repeat(pad_w as usize);
+        f.render_widget(
+            Line::from(vec![
+                Span::styled(path, title_style),
+                Span::raw(pad),
+                Span::styled(count, count_style),
+            ]),
+            title_rect,
+        );
+    } else {
+        // Either no counter, or not enough room — drop the counter to keep
+        // the filename readable.
+        f.render_widget(Line::from(Span::styled(path, title_style)), title_rect);
+    }
     y += 1;
     if y < max_y {
+        let sep_color = if focused {
+            theme.accent
+        } else {
+            theme.fg_secondary
+        };
         f.render_widget(
             Line::from(Span::styled(
                 "─".repeat(area.width as usize),
-                Style::default().fg(theme.fg_secondary),
+                Style::default().fg(sep_color),
             )),
             Rect::new(area.x, y, area.width, 1),
         );
@@ -152,13 +195,20 @@ pub(in crate::ui) fn render_card_header(
 /// `StatefulProtocol` lives on `App` (not on `PreviewContent`) because it
 /// holds non-`Send` state and is constructed on the main thread when the
 /// worker's `DynamicImage` lands. See `App::apply_worker_result`.
-fn render_image(f: &mut Frame, app: &mut App, area: Rect, path: &str, img: &ImagePreview) {
+fn render_image(
+    f: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    path: &str,
+    img: &ImagePreview,
+    focused: bool,
+) {
     if area.height < 1 {
         return;
     }
     let th = app.theme;
     let max_y = area.y + area.height;
-    let mut y = render_card_header(f, area, path, &th);
+    let mut y = render_card_header(f, area, path, &th, focused, None);
 
     // Metadata line. Skipped when the panel is too short — in that case
     // we'd rather reclaim the row for actual pixels than spend it on text.
@@ -216,13 +266,20 @@ fn render_image(f: &mut Frame, app: &mut App, area: Rect, path: &str, img: &Imag
 /// formats (SVG/AVIF/HEIC), corrupt files, and the 0-byte case. The
 /// `reason` decides the one-line message; the header carries the filename
 /// and the metadata line carries MIME + size.
-fn render_binary_info(f: &mut Frame, app: &App, area: Rect, path: &str, info: &BinaryInfo) {
+fn render_binary_info(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    path: &str,
+    info: &BinaryInfo,
+    focused: bool,
+) {
     if area.height < 1 {
         return;
     }
     let th = app.theme;
     let max_y = area.y + area.height;
-    let mut y = render_card_header(f, area, path, &th);
+    let mut y = render_card_header(f, area, path, &th, focused, None);
 
     // MIME + size line (e.g. "application/pdf · 2.4 MB"). Pre-rendered
     // at load time on `BinaryInfo::new`; empty when we have neither a
@@ -268,14 +325,27 @@ fn binary_reason_text(info: &BinaryInfo) -> String {
     }
 }
 
-fn render_text(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewContent) {
+fn render_text(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewContent, focused: bool) {
     let (lines, highlighted) = match &preview.body {
         PreviewBody::Text { lines, highlighted } => (lines, highlighted),
         _ => return,
     };
     let th = app.theme;
     let max_y = area.y + area.height;
-    let y = render_card_header(f, area, &preview.file_path, &th);
+
+    // [i/N] match counter — shown only when an in-panel `/` search has
+    // committed matches against this preview. Cleared automatically on tab
+    // / panel switch by `SearchState::clear`, so cross-target leakage isn't
+    // possible here.
+    let match_count =
+        if app.search.target == Some(SearchTarget::FilePreview) && !app.search.matches.is_empty() {
+            let total = app.search.matches.len();
+            let cur = app.search.current.map(|i| i + 1).unwrap_or(0);
+            Some((cur, total))
+        } else {
+            None
+        };
+    let y = render_card_header(f, area, &preview.file_path, &th, focused, match_count);
 
     let content_height = (max_y - y) as usize;
     // Cache the content viewport height so search-jump can center matches.

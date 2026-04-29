@@ -10,19 +10,20 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders};
 
-pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
+pub fn render(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     if app.place_mode.active {
-        render_place_mode(f, app, area);
+        render_place_mode(f, app, area, focused);
     } else {
-        render_normal(f, app, area);
+        render_normal(f, app, area, focused);
     }
 }
 
-fn render_normal(f: &mut Frame, app: &mut App, area: Rect) {
+fn render_normal(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     let th = app.theme;
+    let border_color = if focused { th.accent } else { th.border };
     let block = Block::default()
         .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(th.border));
+        .border_style(Style::default().fg(border_color));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -568,7 +569,7 @@ fn render_edit_error(f: &mut Frame, app: &App, x: u16, y: u16, width: u16) {
 // returns the last-registered match, so folder rows shadow the root zone
 // cleanly.
 
-fn render_place_mode(f: &mut Frame, app: &mut App, area: Rect) {
+fn render_place_mode(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
     use crate::place_mode::{HoverTarget, resolve_hover_target};
     let th = app.theme;
 

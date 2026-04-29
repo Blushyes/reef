@@ -338,14 +338,20 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             return;
         }
         KeyCode::Tab => {
-            app.active_panel =
-                next_panel(app.active_panel, app.graph_uses_three_col(), /* reverse= */ false);
+            app.active_panel = next_panel(
+                app.active_panel,
+                app.graph_uses_three_col(),
+                /* reverse= */ false,
+            );
             app.search.clear();
             return;
         }
         KeyCode::BackTab => {
-            app.active_panel =
-                next_panel(app.active_panel, app.graph_uses_three_col(), /* reverse= */ true);
+            app.active_panel = next_panel(
+                app.active_panel,
+                app.graph_uses_three_col(),
+                /* reverse= */ true,
+            );
             app.search.clear();
             return;
         }

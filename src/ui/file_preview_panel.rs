@@ -59,9 +59,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
 
     match &preview.body {
         PreviewBody::Text { .. } => render_text(f, app, inner, &preview, focused),
-        PreviewBody::Image(img) => {
-            render_image(f, app, inner, &preview.file_path, img, focused)
-        }
+        PreviewBody::Image(img) => render_image(f, app, inner, &preview.file_path, img, focused),
         PreviewBody::Binary(info) => {
             render_binary_info(f, app, inner, &preview.file_path, info, focused)
         }
@@ -141,7 +139,9 @@ pub(in crate::ui) fn render_card_header(
 
     let title_style = header_title_style(theme, focused);
     let count_text = match_count.map(|(cur, total)| format!("[{}/{}]", cur, total));
-    let count_style = Style::default().fg(theme.accent).add_modifier(Modifier::BOLD);
+    let count_style = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
 
     // Right-align the [i/N] counter when present and there's room. Falls
     // back to a plain title when the panel is too narrow to fit both.
@@ -325,13 +325,7 @@ fn binary_reason_text(info: &BinaryInfo) -> String {
     }
 }
 
-fn render_text(
-    f: &mut Frame,
-    app: &mut App,
-    area: Rect,
-    preview: &PreviewContent,
-    focused: bool,
-) {
+fn render_text(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewContent, focused: bool) {
     let (lines, highlighted) = match &preview.body {
         PreviewBody::Text { lines, highlighted } => (lines, highlighted),
         _ => return,
@@ -343,15 +337,14 @@ fn render_text(
     // committed matches against this preview. Cleared automatically on tab
     // / panel switch by `SearchState::clear`, so cross-target leakage isn't
     // possible here.
-    let match_count = if app.search.target == Some(SearchTarget::FilePreview)
-        && !app.search.matches.is_empty()
-    {
-        let total = app.search.matches.len();
-        let cur = app.search.current.map(|i| i + 1).unwrap_or(0);
-        Some((cur, total))
-    } else {
-        None
-    };
+    let match_count =
+        if app.search.target == Some(SearchTarget::FilePreview) && !app.search.matches.is_empty() {
+            let total = app.search.matches.len();
+            let cur = app.search.current.map(|i| i + 1).unwrap_or(0);
+            Some((cur, total))
+        } else {
+            None
+        };
     let y = render_card_header(f, area, &preview.file_path, &th, focused, match_count);
 
     let content_height = (max_y - y) as usize;

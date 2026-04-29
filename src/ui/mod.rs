@@ -717,76 +717,6 @@ fn panel_chip_text(tab: crate::app::Tab, panel: crate::app::Panel) -> &'static s
     }
 }
 
-#[cfg(test)]
-mod panel_chip_tests {
-    use super::*;
-    use crate::app::{Panel, Tab};
-
-    // Files tab → file tree on the left, preview on the right.
-    #[test]
-    fn files_tab_panels_match_their_role() {
-        assert_eq!(panel_chip_text(Tab::Files, Panel::Files), t(Msg::PanelFiles));
-        assert_eq!(panel_chip_text(Tab::Files, Panel::Diff), t(Msg::PanelPreview));
-    }
-
-    // Search tab → query input on the left, preview on the right.
-    // Critical: Panel::Files in Search tab is NOT "Files" — it's the
-    // search query column.
-    #[test]
-    fn search_tab_left_panel_labels_as_search_not_files() {
-        assert_eq!(
-            panel_chip_text(Tab::Search, Panel::Files),
-            t(Msg::PanelSearch)
-        );
-        assert_eq!(
-            panel_chip_text(Tab::Search, Panel::Diff),
-            t(Msg::PanelPreview)
-        );
-    }
-
-    // Git tab → file list on the left, diff (not preview) on the right.
-    #[test]
-    fn git_tab_right_panel_labels_as_diff_not_preview() {
-        assert_eq!(panel_chip_text(Tab::Git, Panel::Files), t(Msg::PanelFiles));
-        assert_eq!(panel_chip_text(Tab::Git, Panel::Diff), t(Msg::PanelDiff));
-    }
-
-    // Graph tab in 3-col mode is the only place all three Panels are
-    // distinct — sidebar/middle/diff each get their own label.
-    #[test]
-    fn graph_tab_distinguishes_all_three_panels() {
-        let g = panel_chip_text(Tab::Graph, Panel::Files);
-        let c = panel_chip_text(Tab::Graph, Panel::Commit);
-        let d = panel_chip_text(Tab::Graph, Panel::Diff);
-        assert_eq!(g, t(Msg::PanelGraph));
-        assert_eq!(c, t(Msg::PanelCommit));
-        assert_eq!(d, t(Msg::PanelDiff));
-        // And those three labels must be pairwise distinct so the chip
-        // is actually informative across the cycle.
-        assert_ne!(g, c);
-        assert_ne!(c, d);
-        assert_ne!(g, d);
-    }
-
-    // Defensive: Panel::Commit only legitimately appears in Graph 3-col,
-    // but if it leaked into another tab via stale state, the label
-    // should still resolve sensibly without panicking.
-    #[test]
-    fn stale_commit_panel_falls_back_per_tab() {
-        // Files / Search treat it as preview (the right column).
-        assert_eq!(
-            panel_chip_text(Tab::Files, Panel::Commit),
-            t(Msg::PanelPreview)
-        );
-        assert_eq!(
-            panel_chip_text(Tab::Search, Panel::Commit),
-            t(Msg::PanelPreview)
-        );
-        // Git treats it as diff.
-        assert_eq!(panel_chip_text(Tab::Git, Panel::Commit), t(Msg::PanelDiff));
-    }
-}
-
 fn render_search_prompt(f: &mut Frame, app: &App, area: Rect) {
     let th = app.theme;
     let prefix = if app.search.backwards { '?' } else { '/' };
@@ -952,5 +882,81 @@ fn render_help(f: &mut Frame, app: &App, screen: Rect) {
         ]);
         f.render_widget(line, Rect::new(inner.x, row_y, inner.width, 1));
         row_y += 1;
+    }
+}
+
+#[cfg(test)]
+mod panel_chip_tests {
+    use super::*;
+    use crate::app::{Panel, Tab};
+
+    // Files tab → file tree on the left, preview on the right.
+    #[test]
+    fn files_tab_panels_match_their_role() {
+        assert_eq!(
+            panel_chip_text(Tab::Files, Panel::Files),
+            t(Msg::PanelFiles)
+        );
+        assert_eq!(
+            panel_chip_text(Tab::Files, Panel::Diff),
+            t(Msg::PanelPreview)
+        );
+    }
+
+    // Search tab → query input on the left, preview on the right.
+    // Critical: Panel::Files in Search tab is NOT "Files" — it's the
+    // search query column.
+    #[test]
+    fn search_tab_left_panel_labels_as_search_not_files() {
+        assert_eq!(
+            panel_chip_text(Tab::Search, Panel::Files),
+            t(Msg::PanelSearch)
+        );
+        assert_eq!(
+            panel_chip_text(Tab::Search, Panel::Diff),
+            t(Msg::PanelPreview)
+        );
+    }
+
+    // Git tab → file list on the left, diff (not preview) on the right.
+    #[test]
+    fn git_tab_right_panel_labels_as_diff_not_preview() {
+        assert_eq!(panel_chip_text(Tab::Git, Panel::Files), t(Msg::PanelFiles));
+        assert_eq!(panel_chip_text(Tab::Git, Panel::Diff), t(Msg::PanelDiff));
+    }
+
+    // Graph tab in 3-col mode is the only place all three Panels are
+    // distinct — sidebar/middle/diff each get their own label.
+    #[test]
+    fn graph_tab_distinguishes_all_three_panels() {
+        let g = panel_chip_text(Tab::Graph, Panel::Files);
+        let c = panel_chip_text(Tab::Graph, Panel::Commit);
+        let d = panel_chip_text(Tab::Graph, Panel::Diff);
+        assert_eq!(g, t(Msg::PanelGraph));
+        assert_eq!(c, t(Msg::PanelCommit));
+        assert_eq!(d, t(Msg::PanelDiff));
+        // And those three labels must be pairwise distinct so the chip
+        // is actually informative across the cycle.
+        assert_ne!(g, c);
+        assert_ne!(c, d);
+        assert_ne!(g, d);
+    }
+
+    // Defensive: Panel::Commit only legitimately appears in Graph 3-col,
+    // but if it leaked into another tab via stale state, the label
+    // should still resolve sensibly without panicking.
+    #[test]
+    fn stale_commit_panel_falls_back_per_tab() {
+        // Files / Search treat it as preview (the right column).
+        assert_eq!(
+            panel_chip_text(Tab::Files, Panel::Commit),
+            t(Msg::PanelPreview)
+        );
+        assert_eq!(
+            panel_chip_text(Tab::Search, Panel::Commit),
+            t(Msg::PanelPreview)
+        );
+        // Git treats it as diff.
+        assert_eq!(panel_chip_text(Tab::Git, Panel::Commit), t(Msg::PanelDiff));
     }
 }

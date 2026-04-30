@@ -707,7 +707,7 @@ pub struct App {
     /// (and cleared, for Cut) by `paste_into`.
     pub file_clipboard: crate::file_clipboard::FileClipboard,
 
-    /// Multi-selection set for the Files-tab tree (Space toggle,
+    /// Multi-selection set for the Files-tab tree (`s` toggle,
     /// Shift+arrow range, Shift/Ctrl-click). All clipboard / drag /
     /// delete operations operate on this set when it's non-empty AND
     /// includes the current cursor row; otherwise they fall back to

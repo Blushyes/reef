@@ -1,7 +1,7 @@
 //! Multi-selection state for the Files tab tree. Mirrors VS Code's
 //! Explorer multi-select model:
 //!
-//! - `Space` toggles the current row in/out of the set.
+//! - `s` toggles the current row in/out of the set.
 //! - `Shift+↑/↓` (and `Shift+Click`) extend a contiguous range from
 //!   the *anchor* — the path where the contiguous selection started.
 //! - `Ctrl+Click` toggles a single row without disturbing the rest.

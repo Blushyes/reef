@@ -21,21 +21,20 @@ fn space_key() -> KeyEvent {
     KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)
 }
 
+fn s_key() -> KeyEvent {
+    KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)
+}
+
 #[test]
 fn bare_space_arms_leader_in_normal_context() {
-    // Sanity check: when no text input is focused and the user is NOT
-    // on the Files-tab tree panel (where Space is reserved for the
-    // multi-select toggle), bare Space arms the leader as expected.
-    // Guards against a regression in the input-mode gate accidentally
-    // suppressing the normal path.
+    // Sanity check: when no text input is focused, bare Space arms the
+    // leader. Guards against a regression in the input-mode gate
+    // accidentally suppressing the normal path.
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = TempDir::new().unwrap();
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new(Theme::dark(), None);
-    // The default tab+panel is Files+Files — bare Space there is the
-    // file-selection toggle. Move focus to the preview pane so we're
-    // exercising the "no input focused, leader unblocked" branch.
     app.active_panel = Panel::Diff;
     assert!(app.space_leader_at.is_none());
     input::handle_key(space_key(), &mut app);
@@ -46,37 +45,53 @@ fn bare_space_arms_leader_in_normal_context() {
 }
 
 #[test]
-fn space_toggles_selection_on_files_tree_panel_instead_of_arming_leader() {
-    // VS Code-style multi-select: bare Space on Tab::Files +
-    // Panel::Files toggles the current row in/out of the selection
-    // set rather than arming the leader chord. Documents the
-    // intentional carve-out from the leader contract above.
+fn bare_space_arms_leader_on_files_tree_panel() {
+    // Files+Files used to be a carve-out where Space toggled multi-
+    // selection. Multi-select moved to `s`, so Space here now arms the
+    // leader uniformly with every other non-input context.
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = TempDir::new().unwrap();
-    // Plant a file so the tree has at least one row to select.
-    std::fs::write(tmp.path().join("a.txt"), "").unwrap();
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new(Theme::dark(), None);
-    // Default (Tab::Files + Panel::Files) is what we're testing.
     assert_eq!(app.active_tab, Tab::Files);
     assert_eq!(app.active_panel, Panel::Files);
-    assert!(app.file_selection.is_empty());
 
     input::handle_key(space_key(), &mut app);
 
     assert!(
-        app.space_leader_at.is_none(),
-        "Space on Files+Files panel must not arm the leader",
+        app.space_leader_at.is_some(),
+        "Space on Files+Files should arm the leader (multi-select moved to `s`)",
     );
-    // Selection toggled to include the cursor row (or stayed empty if
-    // the tree didn't have any entry — defensive). The contract is:
-    // leader didn't arm. If a row exists, selection contains it.
+    assert!(
+        app.file_selection.is_empty(),
+        "Space must not touch the multi-selection set anymore",
+    );
+}
+
+#[test]
+fn s_toggles_selection_on_files_tree_panel() {
+    // The new multi-select keybinding: bare `s` on Files+Files toggles
+    // the cursor row in/out of the selection set without arming the
+    // leader chord.
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("a.txt"), "").unwrap();
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    assert_eq!(app.active_tab, Tab::Files);
+    assert_eq!(app.active_panel, Panel::Files);
+    assert!(app.file_selection.is_empty());
+
+    input::handle_key(s_key(), &mut app);
+
+    assert!(app.space_leader_at.is_none(), "`s` must not arm the leader",);
     if app.file_tree.selected_path().is_some() {
         assert_eq!(
             app.file_selection.len(),
             1,
-            "Space should have toggled the cursor into the selection",
+            "`s` should have toggled the cursor into the selection",
         );
     }
 }

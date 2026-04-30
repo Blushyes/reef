@@ -236,17 +236,12 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         && app.active_panel == Panel::Files
         && app.git_status.commit_editing;
     let in_input_mode = search_input_focused || commit_input_focused;
-    // On the Files-tab tree panel bare Space is the multi-select
-    // toggle — leader arming would silently swallow it. Users can
-    // still reach the palettes from the preview panel (Tab-switch),
-    // or via Ctrl+P (defined elsewhere) / Ctrl+O hosts picker.
-    let on_files_tree_panel = app.active_tab == Tab::Files && app.active_panel == Panel::Files;
     let leader_allow_arm = if search_input_focused {
         app.global_search.query.is_empty()
     } else if commit_input_focused {
         app.git_status.commit_message.is_empty()
     } else {
-        !on_files_tree_panel
+        true
     };
     match leader_decision(
         &key,
@@ -1795,7 +1790,7 @@ fn handle_key_files_clipboard(key: KeyEvent, app: &mut App, ctrl: bool, shift: b
             true
         }
         // ── multi-select ──────────────────────────────────────────
-        KeyCode::Char(' ') if key.modifiers.is_empty() => {
+        KeyCode::Char('s') if !ctrl && !alt && !shift => {
             if let Some(p) = app.file_tree.selected_path() {
                 app.file_selection.toggle(p);
             }

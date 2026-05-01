@@ -8,6 +8,118 @@
 //! swallows the word (so `"src/ui/|"` → `"src/"` in one press), `clear`
 //! wipes the line. All operations respect UTF-8 char boundaries so the
 //! cursor never lands mid-codepoint.
+//!
+//! `dispatch_key` rolls the whole key-to-op map (cursor motion, deletion,
+//! readline aliases, plain-char insert) into one match so callers don't
+//! re-implement the same 80-line table per input field. Returns an
+//! `Outcome` so the caller can decide whether to fire edit-derived side
+//! effects (re-run search, mark dirty) or fall through (unhandled key).
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+/// Result of [`dispatch_key`]. `Edited` and `CursorOnly` both mean the
+/// key was consumed; `Unhandled` lets the caller try its own arms (for
+/// keys that aren't part of the text-input vocabulary, e.g. Esc, Tab,
+/// list navigation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Buffer content changed (insert, delete, clear, …).
+    Edited,
+    /// Recognized cursor-motion key; buffer untouched.
+    CursorOnly,
+    /// Not a text-input key. Caller should match it against its own
+    /// per-field handlers.
+    Unhandled,
+}
+
+/// Apply `key` to `text` / `cursor` using the readline / VSCode
+/// conventions documented above. Centralises the ~50-line key table
+/// previously inlined in `input::handle_key_search_find_input` and
+/// `input::handle_key_search_replace_input` (90% identical). Caller
+/// invokes any edit-derived side effect (e.g. `mark_query_edited`)
+/// when the result is `Outcome::Edited`.
+pub fn dispatch_key(key: &KeyEvent, text: &mut String, cursor: &mut usize) -> Outcome {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        // ── Cursor motion ──
+        KeyCode::Left if alt || ctrl => {
+            move_cursor_word_backward(text, cursor);
+            Outcome::CursorOnly
+        }
+        KeyCode::Right if alt || ctrl => {
+            move_cursor_word_forward(text, cursor);
+            Outcome::CursorOnly
+        }
+        KeyCode::Left => {
+            move_cursor(text, cursor, -1);
+            Outcome::CursorOnly
+        }
+        KeyCode::Right => {
+            move_cursor(text, cursor, 1);
+            Outcome::CursorOnly
+        }
+        KeyCode::Home => {
+            *cursor = 0;
+            Outcome::CursorOnly
+        }
+        KeyCode::End => {
+            *cursor = text.len();
+            Outcome::CursorOnly
+        }
+        KeyCode::Char('a') if ctrl => {
+            *cursor = 0;
+            Outcome::CursorOnly
+        }
+        KeyCode::Char('e') if ctrl => {
+            *cursor = text.len();
+            Outcome::CursorOnly
+        }
+        KeyCode::Char('b') if alt => {
+            move_cursor_word_backward(text, cursor);
+            Outcome::CursorOnly
+        }
+        KeyCode::Char('f') if alt => {
+            move_cursor_word_forward(text, cursor);
+            Outcome::CursorOnly
+        }
+
+        // ── Edit ──
+        KeyCode::Backspace if alt || ctrl => {
+            delete_word_backward(text, cursor);
+            Outcome::Edited
+        }
+        KeyCode::Char('w') if ctrl => {
+            delete_word_backward(text, cursor);
+            Outcome::Edited
+        }
+        KeyCode::Char('u') if ctrl => {
+            clear(text, cursor);
+            Outcome::Edited
+        }
+        KeyCode::Backspace => {
+            backspace(text, cursor);
+            Outcome::Edited
+        }
+        KeyCode::Delete if alt || ctrl => {
+            delete_word_forward(text, cursor);
+            Outcome::Edited
+        }
+        KeyCode::Delete => {
+            delete_char_forward(text, cursor);
+            Outcome::Edited
+        }
+        KeyCode::Char('d') if alt => {
+            delete_word_forward(text, cursor);
+            Outcome::Edited
+        }
+        KeyCode::Char(c) if !ctrl => {
+            insert_char(text, cursor, c);
+            Outcome::Edited
+        }
+        _ => Outcome::Unhandled,
+    }
+}
 
 pub fn insert_char(text: &mut String, cursor: &mut usize, c: char) {
     text.insert(*cursor, c);

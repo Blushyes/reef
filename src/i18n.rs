@@ -62,6 +62,25 @@ pub enum Msg {
 
     // Search
     SearchNoMatch,
+    /// Placeholder shown in the second input row of the Search tab when
+    /// replace mode is active and the user hasn't typed anything.
+    ReplaceWithPlaceholder,
+    /// Footer label for the per-match counter when replace mode is on,
+    /// e.g. "12 to replace".
+    ReplaceCountSuffix,
+    /// Footer button label that commits the replace batch.
+    ApplyReplace,
+    /// Replace-in-progress hint while a batch is in flight.
+    ReplacingHint,
+    /// Toast header for a successful replace summary, e.g.
+    /// "Replaced 12 lines in 3 files".
+    ReplaceSummaryToast,
+    /// Toast suffix when some lines drifted under the search snapshot.
+    ReplaceSkippedStaleSuffix,
+    /// Toast suffix when files exceeded `MAX_REPLACE_FILE_SIZE`.
+    ReplaceTooLargeSuffix,
+    /// Title used by the Search tab when replace mode is open.
+    SearchReplaceTitle,
 
     // Toasts
     PushSuccess,
@@ -232,6 +251,14 @@ fn t_zh(m: Msg) -> &'static str {
         NoRepoTitle => "不在 git 仓库中",
         NoRepoHint => "运行 `git init` 初始化，或在 git 仓库里打开 reef。",
         SearchNoMatch => "无匹配 ",
+        ReplaceWithPlaceholder => "替换为…",
+        ReplaceCountSuffix => "处待替换",
+        ApplyReplace => "应用",
+        ReplacingHint => "正在替换…",
+        ReplaceSummaryToast => "已替换",
+        ReplaceSkippedStaleSuffix => "处过期跳过",
+        ReplaceTooLargeSuffix => "个文件过大已跳过",
+        SearchReplaceTitle => " 🔎 查找与替换 ",
         PushSuccess => "推送成功",
         ForcePushSuccess => "强制推送成功",
         PushThreadCrashed => "推送线程异常退出，请重试",
@@ -361,6 +388,14 @@ fn t_en(m: Msg) -> &'static str {
         NoRepoTitle => "Not a git repository",
         NoRepoHint => "Run `git init` to initialise one, or open reef inside a git repo.",
         SearchNoMatch => "no match ",
+        ReplaceWithPlaceholder => "Replace with…",
+        ReplaceCountSuffix => "to replace",
+        ApplyReplace => "Apply",
+        ReplacingHint => "Replacing…",
+        ReplaceSummaryToast => "Replaced",
+        ReplaceSkippedStaleSuffix => "skipped (stale)",
+        ReplaceTooLargeSuffix => "file(s) too large to replace",
+        SearchReplaceTitle => " 🔎 Find & Replace ",
         PushSuccess => "Push succeeded",
         ForcePushSuccess => "Force push succeeded",
         PushThreadCrashed => "Push worker crashed, please retry",

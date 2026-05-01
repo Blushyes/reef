@@ -224,6 +224,113 @@ fn read_file_rejects_path_escape() {
 }
 
 #[test]
+fn write_file_parity() {
+    // WriteFile is replace-only (target must already exist) and atomic
+    // (temp + rename), with mode bits preserved. Drive the same pre-state
+    // through both backends, run write_file, compare snapshots, and on
+    // unix verify the perm bits round-trip.
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let l_tmp = TempDir::new().unwrap();
+    let r_tmp = TempDir::new().unwrap();
+    std::fs::write(l_tmp.path().join("doc.txt"), b"old contents").unwrap();
+    std::fs::write(r_tmp.path().join("doc.txt"), b"old contents").unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::Permissions::from_mode(0o644);
+        std::fs::set_permissions(l_tmp.path().join("doc.txt"), mode.clone()).unwrap();
+        std::fs::set_permissions(r_tmp.path().join("doc.txt"), mode).unwrap();
+    }
+
+    let l = LocalBackend::open_at(l_tmp.path().to_path_buf());
+    let r = spawn_remote(r_tmp.path());
+
+    let new_bytes = b"replaced contents (longer than the original)".to_vec();
+    l.write_file(Path::new("doc.txt"), &new_bytes).unwrap();
+    r.write_file(Path::new("doc.txt"), &new_bytes).unwrap();
+
+    assert_eq!(snapshot(l_tmp.path()), snapshot(r_tmp.path()));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for tmp in [&l_tmp, &r_tmp] {
+            let mode = std::fs::metadata(tmp.path().join("doc.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o644,
+                "tempfile-default 0600 leaked through after write_file"
+            );
+        }
+    }
+}
+
+#[test]
+fn write_file_round_trips_large_payload_without_json_array_blowup() {
+    // Regression for the bug where `Request::WriteFile.content`
+    // serialised as a per-byte JSON integer array — a 1 MB write
+    // ballooned into ~6 MB on the wire and choked decode time. With
+    // `#[serde(with = "serde_bytes")]` the same payload travels as a
+    // base64 string and round-trips verbatim. Test asserts both the
+    // bytes match and the operation completes inside a tight budget
+    // (300 ms is generous for 1 MB on any sane host; the buggy path
+    // routinely spent multiple seconds).
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let r_tmp = TempDir::new().unwrap();
+    std::fs::write(r_tmp.path().join("big.bin"), vec![0u8; 1]).unwrap();
+    let r = spawn_remote(r_tmp.path());
+
+    let mut payload = Vec::with_capacity(1024 * 1024);
+    for i in 0..(1024 * 1024) {
+        payload.push((i & 0xFF) as u8);
+    }
+    let start = std::time::Instant::now();
+    r.write_file(Path::new("big.bin"), &payload).unwrap();
+    let elapsed = start.elapsed();
+
+    let on_disk = std::fs::read(r_tmp.path().join("big.bin")).unwrap();
+    assert_eq!(on_disk.len(), payload.len(), "size mismatch");
+    assert_eq!(on_disk, payload, "byte content drifted across the wire");
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "1 MiB write_file took {:?} — likely the per-byte JSON array regression",
+        elapsed,
+    );
+}
+
+#[test]
+fn write_file_rejects_missing_target_and_path_escape() {
+    // Replace-only contract: writing to a non-existent path is NotFound
+    // (no auto-create), and `..` rejection is enforced before we ever
+    // reach the filesystem.
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let l_tmp = TempDir::new().unwrap();
+    let r_tmp = TempDir::new().unwrap();
+    let outside = l_tmp.path().parent().unwrap().join("outside.txt");
+    std::fs::write(&outside, b"untouched").unwrap();
+
+    let l = LocalBackend::open_at(l_tmp.path().to_path_buf());
+    let r = spawn_remote(r_tmp.path());
+
+    assert!(l.write_file(Path::new("missing.txt"), b"x").is_err());
+    assert!(r.write_file(Path::new("missing.txt"), b"x").is_err());
+
+    assert!(l.write_file(Path::new("../outside.txt"), b"x").is_err());
+    assert!(r.write_file(Path::new("../outside.txt"), b"x").is_err());
+
+    assert_eq!(
+        std::fs::read(&outside).unwrap(),
+        b"untouched",
+        "path-escape write must not touch the file outside workdir"
+    );
+    let _ = std::fs::remove_file(&outside);
+}
+
+#[test]
 fn hard_delete_parity() {
     let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let l_tmp = TempDir::new().unwrap();

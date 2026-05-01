@@ -153,12 +153,44 @@ fn space_does_not_arm_while_typing_in_search_query() {
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Search);
     app.active_panel = Panel::Files;
-    app.global_search.tab_input_focused = true;
+    app.global_search.focus = reef::global_search::SearchPanelFocus::FindInput;
     app.global_search.query = "foo".to_string();
 
     input::handle_key(space_key(), &mut app);
     assert!(
         app.space_leader_at.is_none(),
         "Space inside a non-empty search query must not arm the chord",
+    );
+}
+
+#[test]
+fn tab_in_search_input_cycles_focus_instead_of_switching_panel() {
+    // Regression for the bug where the global panel-switch arm in
+    // `handle_key` returned early on bare Tab, so the per-input
+    // focus-cycle in `handle_key_search_*_input_mode` never fired.
+    // Symptom: pressing Tab inside the find input switched to the
+    // Diff panel instead of moving focus to the Replace input.
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    app.set_active_tab(Tab::Search);
+    app.active_panel = Panel::Files;
+    app.global_search.replace_open = true;
+    app.global_search.focus = reef::global_search::SearchPanelFocus::FindInput;
+    let panel_before = app.active_panel;
+
+    let tab_key = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+    input::handle_key(tab_key, &mut app);
+
+    assert_eq!(
+        app.active_panel, panel_before,
+        "Tab in search FindInput must NOT switch panel"
+    );
+    assert_eq!(
+        app.global_search.focus,
+        reef::global_search::SearchPanelFocus::ReplaceInput,
+        "Tab in search FindInput should cycle focus to ReplaceInput"
     );
 }

@@ -1,0 +1,21 @@
+---
+source: tests/ui_snapshots.rs
+assertion_line: 631
+expression: output
+---
+ reef  [TMPDIR]  ⎇ master
+ 📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph                            ⊟  1:Files 2:Search 3:Git 4:Graph
+┌ 🔎  Find & Replace ─────────┐
+│▾ needle                    │
+│↪ thread                    │
+│────────────────────────────│
+│[✓]  alpha.txt:1            │
+│[ ]  beta.txt:1             │
+│                            │                         Select a file to preview
+│                            │
+│                            │
+│                            │
+│                            │
+│1 / 2 · 1 to replace ·  Apply
+└────────────────────────────┘
+                                     q:quit Tab:switch s:stage u:unstage r:refresh h:help  [Search]

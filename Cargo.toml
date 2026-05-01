@@ -49,9 +49,12 @@ infer         = { version = "0.16", default-features = false }
 # avoid system-libsqlite linkage so cross-builds and the npm-shipped binary
 # stay self-contained.
 reef-sqlite-preview = { path = "crates/reef-sqlite-preview" }
+# Atomic file writes (global find-and-replace path). Same crate the agent
+# uses; promoting from dev-dep to runtime so `LocalBackend::write_file`
+# can do the same temp+rename dance the agent does.
+tempfile     = "3"
 
 [dev-dependencies]
-tempfile     = "3"
 insta        = { version = "1", features = ["filters"] }
 criterion    = { version = "0.5", features = ["html_reports"] }
 proptest     = "1"

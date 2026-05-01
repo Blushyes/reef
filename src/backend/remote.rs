@@ -921,6 +921,25 @@ impl Backend for RemoteBackend {
         Ok(())
     }
 
+    fn write_file(&self, rel_path: &Path, content: &[u8]) -> Result<(), BackendError> {
+        let _: serde_json::Value = self.request(Request::WriteFile {
+            rel_path: rel_path.to_string_lossy().to_string(),
+            content: content.to_vec(),
+        })?;
+        Ok(())
+    }
+
+    fn file_size(&self, rel_path: &Path) -> Result<u64, BackendError> {
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            size: u64,
+        }
+        let resp: Resp = self.request(Request::FileSize {
+            rel_path: rel_path.to_string_lossy().to_string(),
+        })?;
+        Ok(resp.size)
+    }
+
     fn trash(&self, rel_paths: &[PathBuf]) -> Result<TrashOutcome, BackendError> {
         let paths = rel_paths
             .iter()

@@ -8,12 +8,13 @@
 //! capture mode, and both are simple enough that splitting them out would
 //! just add indirection.
 
-use crate::app::{App, DbNav, Panel, Tab};
+use crate::app::{App, DbNav, Panel, Tab, ViewMode};
 use crate::clipboard;
 use crate::global_search;
 use crate::i18n::{Msg, t};
 use crate::quick_open;
 use crate::search;
+use crate::settings;
 use crate::ui;
 use crate::ui::selection::{
     DiffSelection, DiffSide, PreviewSelection, col_to_byte_offset, collect_diff_selected_text,
@@ -223,6 +224,15 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         return;
     }
 
+    // Settings owns every key while open. Sits below the modal gates
+    // above so a half-typed filename / commit message isn't yanked
+    // away, and above the global keymap below so Ctrl+, can flip to
+    // Esc-returns semantics inside.
+    if app.view_mode == ViewMode::Settings {
+        handle_key_settings(key, app);
+        return;
+    }
+
     // Space-leader chord: bare Space primes, bare `p` opens the quick-open
     // palette, bare `f` opens the global-search palette. Bare Space has no
     // other global meaning, so the chord doesn't collide with any existing
@@ -325,6 +335,12 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         // return earlier so they're unaffected.
         KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.toggle_sidebar();
+            return;
+        }
+        // Suppressed in input mode so a literal comma in a commit
+        // message / search query isn't stolen by the chord.
+        KeyCode::Char(',') if key.modifiers.contains(KeyModifiers::CONTROL) && !in_input_mode => {
+            app.open_settings();
             return;
         }
         // Ctrl+F: VSCode-style find-in-file. Forces focus onto the
@@ -560,6 +576,67 @@ fn handle_key_db_goto(key: KeyEvent, app: &mut App) {
             app.db_goto_input = None;
         }
         _ => {}
+    }
+}
+
+/// Settings page key dispatcher. Two modes:
+///
+/// - **List mode** (default): ↑↓/k/j/Home/End/PageUp/PageDown move the
+///   selection cursor; Enter cycles the selected enum / toggles the
+///   selected bool, or opens the inline text editor for the
+///   `editor.command` row; Esc closes the page.
+/// - **Editor-command edit mode** (`app.settings.editor_edit.is_some()`):
+///   typing fills the buffer, Enter commits, Esc cancels and reverts.
+///
+/// Sits below the high-priority modal gates in `handle_key`, so a
+/// half-typed commit message / search query won't be yanked away by a
+/// stray Settings dispatch — but above the global keymap, so we own
+/// every key while the page is open.
+fn handle_key_settings(key: KeyEvent, app: &mut App) {
+    if app.settings.editor_edit.is_some() {
+        handle_key_settings_editor(key, app);
+        return;
+    }
+
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => app.close_settings(),
+        // Match the other modal-takeover panels (place mode, paste
+        // conflict): bare q / Ctrl+C always exit reef so a confused
+        // user can bail without first popping the modal.
+        KeyCode::Char('q') if !ctrl => app.should_quit = true,
+        KeyCode::Char('c') if ctrl => app.should_quit = true,
+        KeyCode::Up | KeyCode::Char('k') if !ctrl => app.settings.move_selection(-1),
+        KeyCode::Down | KeyCode::Char('j') if !ctrl => app.settings.move_selection(1),
+        KeyCode::Char('p') if ctrl => app.settings.move_selection(-1),
+        KeyCode::Char('n') if ctrl => app.settings.move_selection(1),
+        // The list is too short for a real "page" concept; PageUp /
+        // PageDown collapse to first / last to match user expectation.
+        KeyCode::PageUp | KeyCode::Home => app.settings.select(0),
+        KeyCode::PageDown | KeyCode::End => app
+            .settings
+            .select(crate::settings::SettingItem::ALL.len().saturating_sub(1)),
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            let item = app.settings.selected();
+            if matches!(item, crate::settings::SettingItem::EditorCommand) {
+                settings::begin_edit_editor_command(&mut app.settings);
+            } else {
+                settings::cycle(app, item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_key_settings_editor(key: KeyEvent, app: &mut App) {
+    match key.code {
+        KeyCode::Esc => settings::cancel_editor_command(&mut app.settings),
+        KeyCode::Enter => settings::commit_editor_command(&mut app.settings),
+        _ => {
+            if let Some(edit) = app.settings.editor_edit.as_mut() {
+                let _ = crate::input_edit::dispatch_key(&key, &mut edit.buffer, &mut edit.cursor);
+            }
+        }
     }
 }
 
@@ -1939,6 +2016,22 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
 
     if app.place_mode.active {
         handle_mouse_place_mode(mouse, app);
+        return;
+    }
+
+    // Mid-edit click cancels the inline editor before moving the row
+    // cursor (mirrors `cancel_tree_edit` on the file tree); otherwise
+    // the prompt + footer hint would point at a row the buffer no
+    // longer belongs to.
+    if app.view_mode == ViewMode::Settings {
+        if matches!(mouse.kind, MouseEventKind::Down(_)) && app.settings.editor_edit.is_some() {
+            crate::settings::cancel_editor_command(&mut app.settings);
+        }
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            if let Some(action) = app.hit_registry.hit_test(mouse.column, mouse.row) {
+                app.handle_action(action);
+            }
+        }
         return;
     }
 

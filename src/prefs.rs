@@ -87,6 +87,13 @@ pub fn set(key: &str, value: &str) {
     write_all(&map);
 }
 
+/// Pair of [`get_bool`]: writes `"true"` / `"false"` so the value
+/// round-trips. Callers should prefer this over building the literal
+/// string at every flip site.
+pub fn set_bool(key: &str, value: bool) {
+    set(key, if value { "true" } else { "false" });
+}
+
 /// Fold unprefixed legacy keys into the new prefixed namespace and delete the
 /// old `git.prefs` file. Safe to call repeatedly — already-migrated keys are
 /// left alone and never overwrite explicit values. Writes only when state
@@ -134,17 +141,12 @@ pub fn migrate_legacy_prefs() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
     use tempfile::TempDir;
-    use test_support::HomeGuard;
+    use test_support::{HOME_LOCK, HomeGuard};
 
-    // `set_var("HOME", ...)` is process-global; serialise to avoid races
-    // with any other test that touches HOME in this crate.
-    static HOME_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Grab HOME_LOCK, make a fresh tempdir, point `$HOME` at it, and return
-    /// the three guards to hold for the whole test. Drop order restores HOME
-    /// before the tempdir is removed.
+    /// Workspace-shared HOME_LOCK so this serialises against any other
+    /// test in the same `cargo test --lib` binary that touches HOME.
     fn isolated_home() -> (MutexGuard<'static, ()>, HomeGuard, TempDir) {
         let lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();

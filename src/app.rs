@@ -140,6 +140,15 @@ fn max_page_for(table: &reef_sqlite_preview::TableSummary, page_size: u32) -> u6
 /// prefetch at all.
 const PREFETCH_DELAY: Duration = Duration::from_millis(300);
 
+/// `Settings` is a full-screen takeover that hides the tab bar; the
+/// background work coordinator keeps running so the four-tab snapshots
+/// are fresh on return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Main,
+    Settings,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Git,
@@ -188,10 +197,47 @@ pub enum DiffLayout {
     SideBySide, // 左右对比视图
 }
 
+impl DiffLayout {
+    /// Stable string used in `~/.config/reef/prefs`. Must round-trip via
+    /// `from_pref_str` — every reader (`load_prefs`, `App::new`,
+    /// `settings::current_value`) and every writer (`save_prefs`,
+    /// `settings::cycle`) must go through these two methods so the spelling
+    /// stays consistent.
+    pub fn pref_str(self) -> &'static str {
+        match self {
+            DiffLayout::Unified => "unified",
+            DiffLayout::SideBySide => "side_by_side",
+        }
+    }
+
+    pub fn from_pref_str(s: &str) -> Self {
+        match s {
+            "side_by_side" => DiffLayout::SideBySide,
+            _ => DiffLayout::Unified,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffMode {
     Compact,  // 只显示变更区域 ± context
     FullFile, // 显示整个文件
+}
+
+impl DiffMode {
+    pub fn pref_str(self) -> &'static str {
+        match self {
+            DiffMode::Compact => "compact",
+            DiffMode::FullFile => "full_file",
+        }
+    }
+
+    pub fn from_pref_str(s: &str) -> Self {
+        match s {
+            "full_file" => DiffMode::FullFile,
+            _ => DiffMode::Compact,
+        }
+    }
 }
 
 /// What the user is about to discard when the confirmation banner is up.
@@ -432,6 +478,9 @@ pub struct App {
     // Tab
     pub active_tab: Tab,
     pub active_panel: Panel,
+
+    pub view_mode: ViewMode,
+    pub settings: crate::settings::SettingsState,
 
     // ── Git tab state ──
     pub staged_files: Vec<FileEntry>,
@@ -926,6 +975,8 @@ impl App {
             branch_name,
             active_tab: Tab::Files,
             active_panel: Panel::Files,
+            view_mode: ViewMode::Main,
+            settings: crate::settings::SettingsState::default(),
             staged_files: Vec::new(),
             unstaged_files: Vec::new(),
             selected_file: None,
@@ -984,14 +1035,14 @@ impl App {
             },
             git_graph: GitGraphState::default(),
             commit_detail: CommitDetailState {
-                diff_layout: match crate::prefs::get("commit.diff_layout").as_deref() {
-                    Some("side_by_side") => DiffLayout::SideBySide,
-                    _ => DiffLayout::Unified,
-                },
-                diff_mode: match crate::prefs::get("commit.diff_mode").as_deref() {
-                    Some("full_file") => DiffMode::FullFile,
-                    _ => DiffMode::Compact,
-                },
+                diff_layout: crate::prefs::get("commit.diff_layout")
+                    .as_deref()
+                    .map(DiffLayout::from_pref_str)
+                    .unwrap_or(DiffLayout::Unified),
+                diff_mode: crate::prefs::get("commit.diff_mode")
+                    .as_deref()
+                    .map(DiffMode::from_pref_str)
+                    .unwrap_or(DiffMode::Compact),
                 files_tree_mode: crate::prefs::get_bool("commit.files_tree_mode"),
                 ..CommitDetailState::default()
             },
@@ -2744,6 +2795,38 @@ impl App {
         save_prefs(self.diff_layout, self.diff_mode);
     }
 
+    pub fn toggle_status_tree_mode(&mut self) {
+        self.git_status.tree_mode = !self.git_status.tree_mode;
+        crate::prefs::set_bool("status.tree_mode", self.git_status.tree_mode);
+    }
+
+    pub fn toggle_commit_diff_layout(&mut self) {
+        self.commit_detail.diff_layout = match self.commit_detail.diff_layout {
+            DiffLayout::Unified => DiffLayout::SideBySide,
+            DiffLayout::SideBySide => DiffLayout::Unified,
+        };
+        crate::prefs::set(
+            "commit.diff_layout",
+            self.commit_detail.diff_layout.pref_str(),
+        );
+    }
+
+    pub fn toggle_commit_diff_mode(&mut self) {
+        self.commit_detail.diff_mode = match self.commit_detail.diff_mode {
+            DiffMode::Compact => DiffMode::FullFile,
+            DiffMode::FullFile => DiffMode::Compact,
+        };
+        crate::prefs::set("commit.diff_mode", self.commit_detail.diff_mode.pref_str());
+        // The compact↔full-file flip changes the context-lines argument the
+        // worker uses, so the cached diff is now wrong shape — refetch.
+        self.reload_commit_file_diff();
+    }
+
+    pub fn toggle_commit_files_tree_mode(&mut self) {
+        self.commit_detail.files_tree_mode = !self.commit_detail.files_tree_mode;
+        crate::prefs::set_bool("commit.files_tree_mode", self.commit_detail.files_tree_mode);
+    }
+
     pub fn stage_file(&mut self, path: &str) {
         let ok = self.backend.stage(path).is_ok();
         if ok {
@@ -3940,6 +4023,26 @@ impl App {
         }
     }
 
+    /// Open Settings. No-op when already open so a stray re-entry
+    /// can't silently discard an in-progress inline text edit. The
+    /// pref-cache refresh keeps the page reading from memory rather
+    /// than disk on every render.
+    pub fn open_settings(&mut self) {
+        if self.view_mode == ViewMode::Settings {
+            return;
+        }
+        self.view_mode = ViewMode::Settings;
+        self.settings.editor_edit = None;
+        crate::settings::refresh_pref_cache(&mut self.settings);
+    }
+
+    /// Esc semantics — uncommitted buffer discarded, Enter is the
+    /// explicit commit.
+    pub fn close_settings(&mut self) {
+        self.view_mode = ViewMode::Main;
+        self.settings.editor_edit = None;
+    }
+
     pub fn set_active_tab(&mut self, tab: Tab) {
         if self.active_tab == tab {
             return;
@@ -4210,6 +4313,11 @@ impl App {
             }
             ClickAction::SearchApplyReplace => {
                 self.commit_replace_in_files();
+            }
+            ClickAction::SettingsRow(idx) => {
+                if self.view_mode == ViewMode::Settings {
+                    self.settings.select(idx);
+                }
             }
         }
     }
@@ -4566,32 +4674,20 @@ fn folder_contains(folder_path: &str, file_path: &str) -> bool {
 /// unprefixed `layout=` / `mode=` entries have been renamed by the time
 /// we get here.
 fn load_prefs() -> (DiffLayout, DiffMode) {
-    let layout = match crate::prefs::get("diff.layout").as_deref() {
-        Some("side_by_side") => DiffLayout::SideBySide,
-        _ => DiffLayout::Unified,
-    };
-    let mode = match crate::prefs::get("diff.mode").as_deref() {
-        Some("full_file") => DiffMode::FullFile,
-        _ => DiffMode::Compact,
-    };
+    let layout = crate::prefs::get("diff.layout")
+        .as_deref()
+        .map(DiffLayout::from_pref_str)
+        .unwrap_or(DiffLayout::Unified);
+    let mode = crate::prefs::get("diff.mode")
+        .as_deref()
+        .map(DiffMode::from_pref_str)
+        .unwrap_or(DiffMode::Compact);
     (layout, mode)
 }
 
 fn save_prefs(layout: DiffLayout, mode: DiffMode) {
-    crate::prefs::set(
-        "diff.layout",
-        match layout {
-            DiffLayout::Unified => "unified",
-            DiffLayout::SideBySide => "side_by_side",
-        },
-    );
-    crate::prefs::set(
-        "diff.mode",
-        match mode {
-            DiffMode::Compact => "compact",
-            DiffMode::FullFile => "full_file",
-        },
-    );
+    crate::prefs::set("diff.layout", layout.pref_str());
+    crate::prefs::set("diff.mode", mode.pref_str());
 }
 
 #[cfg(test)]

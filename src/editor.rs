@@ -36,8 +36,15 @@ pub fn parse_editor_command(s: &str) -> Option<(String, Vec<String>)> {
     Some((prog, args))
 }
 
-/// Resolve `$VISUAL`, then `$EDITOR`, then a platform fallback.
+/// Priority: `editor.command` pref → `$VISUAL` → `$EDITOR` → `vi`. The
+/// pref is consulted first so a value chosen in the Settings page wins
+/// over an inherited shell environment.
 pub(crate) fn resolve_editor() -> Option<(String, Vec<String>)> {
+    if let Some(s) = crate::prefs::get("editor.command") {
+        if let Some(cmd) = parse_editor_command(&s) {
+            return Some(cmd);
+        }
+    }
     for var in ["VISUAL", "EDITOR"] {
         if let Ok(s) = std::env::var(var) {
             if let Some(cmd) = parse_editor_command(&s) {
@@ -144,6 +151,50 @@ pub fn launch_spec<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+    use test_support::{HOME_LOCK, HomeGuard};
+
+    /// `resolve_editor` reads from prefs (which lives under $HOME) and
+    /// from $VISUAL / $EDITOR. Tests that exercise the precedence
+    /// ladder must clear both env vars and set $HOME to an empty
+    /// tempdir so the user's real prefs / shell config don't leak in.
+    /// Shares `HOME_LOCK` with `prefs::tests` and `settings::tests` —
+    /// all three modules compile into the same `cargo test --lib`
+    /// binary and would race on $HOME otherwise.
+    fn isolated_env() -> (
+        std::sync::MutexGuard<'static, ()>,
+        HomeGuard,
+        TempDir,
+        Option<String>,
+        Option<String>,
+    ) {
+        let lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_visual = std::env::var("VISUAL").ok();
+        let prev_editor = std::env::var("EDITOR").ok();
+        // SAFETY: serialised by HOME_LOCK; no other test thread reads
+        // these for the duration of the test.
+        unsafe {
+            std::env::remove_var("VISUAL");
+            std::env::remove_var("EDITOR");
+        }
+        let tmp = TempDir::new().unwrap();
+        let home = HomeGuard::enter(tmp.path());
+        (lock, home, tmp, prev_visual, prev_editor)
+    }
+
+    fn restore_env(prev_visual: Option<String>, prev_editor: Option<String>) {
+        // SAFETY: caller holds HOME_LOCK.
+        unsafe {
+            match prev_visual {
+                Some(v) => std::env::set_var("VISUAL", v),
+                None => std::env::remove_var("VISUAL"),
+            }
+            match prev_editor {
+                Some(v) => std::env::set_var("EDITOR", v),
+                None => std::env::remove_var("EDITOR"),
+            }
+        }
+    }
 
     #[test]
     fn parse_empty_returns_none() {
@@ -170,5 +221,60 @@ mod tests {
         let (prog, args) = parse_editor_command("  nvim\t --clean ").unwrap();
         assert_eq!(prog, "nvim");
         assert_eq!(args, vec!["--clean"]);
+    }
+
+    #[test]
+    fn pref_wins_over_env_vars() {
+        let (_lock, _home, _tmp, prev_visual, prev_editor) = isolated_env();
+        // SAFETY: under EDITOR_LOCK.
+        unsafe {
+            std::env::set_var("VISUAL", "vim");
+            std::env::set_var("EDITOR", "vi");
+        }
+        crate::prefs::set("editor.command", "nvim --clean");
+        let (prog, args) = resolve_editor().unwrap();
+        assert_eq!(prog, "nvim");
+        assert_eq!(args, vec!["--clean"]);
+        restore_env(prev_visual, prev_editor);
+    }
+
+    #[test]
+    fn falls_back_to_visual_then_editor_then_vi() {
+        let (_lock, _home, _tmp, prev_visual, prev_editor) = isolated_env();
+        // No pref, no env: unix gets `vi`.
+        let (prog, _) = resolve_editor().unwrap();
+        assert_eq!(prog, "vi");
+        // EDITOR alone wins over the platform fallback.
+        // SAFETY: under EDITOR_LOCK.
+        unsafe {
+            std::env::set_var("EDITOR", "helix");
+        }
+        let (prog, _) = resolve_editor().unwrap();
+        assert_eq!(prog, "helix");
+        // VISUAL trumps EDITOR.
+        // SAFETY: under EDITOR_LOCK.
+        unsafe {
+            std::env::set_var("VISUAL", "code -w");
+        }
+        let (prog, args) = resolve_editor().unwrap();
+        assert_eq!(prog, "code");
+        assert_eq!(args, vec!["-w"]);
+        restore_env(prev_visual, prev_editor);
+    }
+
+    #[test]
+    fn whitespace_pref_is_ignored() {
+        // A pref of "   " parses to None; we should fall through to env
+        // vars rather than blow up later trying to spawn an empty
+        // program.
+        let (_lock, _home, _tmp, prev_visual, prev_editor) = isolated_env();
+        crate::prefs::set("editor.command", "   ");
+        // SAFETY: under EDITOR_LOCK.
+        unsafe {
+            std::env::set_var("EDITOR", "ed");
+        }
+        let (prog, _) = resolve_editor().unwrap();
+        assert_eq!(prog, "ed");
+        restore_env(prev_visual, prev_editor);
     }
 }

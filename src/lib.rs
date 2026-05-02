@@ -25,6 +25,7 @@ pub mod prefs;
 pub mod quick_open;
 pub mod reveal;
 pub mod search;
+pub mod settings;
 pub mod shell_integration;
 pub mod tasks;
 pub mod tree_context_menu;

@@ -198,6 +198,87 @@ pub fn canonical_child_within(canon_root: &Path, rel: &Path) -> Result<PathBuf, 
     Ok(canon_target)
 }
 
+/// Build a `grep_regex::RegexMatcher` configured the way reef's
+/// content search expects. Shared between `search_content_local`
+/// (the streaming search worker) and `tasks::replace_one_file` (the
+/// global-replace worker) so they're guaranteed to find the exact
+/// same matches — anything else risks a UI showing one set of hits
+/// and a replace touching a different set.
+///
+/// `case_sensitive` follows ripgrep's convention: `Some(true)` forces
+/// case-sensitive, `Some(false)` forces insensitive, `None` means
+/// smart-case (insensitive iff the pattern contains no uppercase).
+/// `fixed_strings = true` makes regex metacharacters (`.`, `*`, …)
+/// literal, matching VSCode's "match whole word off / regex off" mode.
+pub fn build_smart_case_matcher(
+    pattern: &str,
+    fixed_strings: bool,
+    case_sensitive: Option<bool>,
+) -> Result<grep_regex::RegexMatcher, grep_regex::Error> {
+    let mut builder = grep_regex::RegexMatcherBuilder::new();
+    match case_sensitive {
+        Some(true) => {
+            builder.case_insensitive(false).case_smart(false);
+        }
+        Some(false) => {
+            builder.case_insensitive(true).case_smart(false);
+        }
+        None => {
+            builder.case_smart(true);
+        }
+    }
+    builder.fixed_strings(fixed_strings);
+    builder.build(pattern)
+}
+
+/// Atomic file overwrite: write `content` to a tempfile in the same
+/// parent dir, then `persist` (rename) over `rel_path`. Shared between
+/// `LocalBackend::write_file` and the agent's `WriteFile` handler so
+/// both code paths keep identical guarantees.
+///
+/// Path validation goes through `canonical_child_within` — the target
+/// must already exist (we don't create files via this op), must be a
+/// regular file, and must not resolve outside `canon_root` even via
+/// symlink. The tempfile inherits its default mode (0600); we read the
+/// original's mode beforehand and re-apply it after `persist` so the
+/// replaced file keeps its original permissions.
+pub fn write_file_atomic(
+    canon_root: &Path,
+    rel_path: &Path,
+    content: &[u8],
+) -> Result<(), BackendError> {
+    let canon_target = canonical_child_within(canon_root, rel_path)?;
+    let meta = std::fs::metadata(&canon_target).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => BackendError::NotFound,
+        _ => BackendError::Io(format!("stat target: {e}")),
+    })?;
+    if !meta.is_file() {
+        return Err(BackendError::Io(format!(
+            "not a regular file: {}",
+            rel_path.display()
+        )));
+    }
+    let parent = canon_target
+        .parent()
+        .ok_or_else(|| BackendError::Io(format!("no parent dir for {}", rel_path.display())))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| BackendError::Io(format!("create tempfile: {e}")))?;
+    use std::io::Write;
+    tmp.write_all(content)
+        .map_err(|e| BackendError::Io(format!("write tempfile: {e}")))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| BackendError::Io(format!("fsync tempfile: {e}")))?;
+    tmp.persist(&canon_target)
+        .map_err(|e| BackendError::Io(format!("persist tempfile: {}", e.error)))?;
+    // `NamedTempFile` defaults to 0600 — restore the original mode so a
+    // replace doesn't silently chmod every touched file.
+    if let Err(e) = std::fs::set_permissions(&canon_target, meta.permissions()) {
+        return Err(BackendError::Io(format!("restore mode: {e}")));
+    }
+    Ok(())
+}
+
 impl Backend for LocalBackend {
     fn workdir_path(&self) -> PathBuf {
         self.workdir.clone()
@@ -287,6 +368,18 @@ impl Backend for LocalBackend {
             cache.put(key, fresh.clone());
         }
         Some(fresh)
+    }
+
+    fn file_size(&self, rel_path: &Path) -> Result<u64, BackendError> {
+        let full = canonical_child_within(self.canonical_workdir()?, rel_path)?;
+        let meta = std::fs::metadata(&full).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => BackendError::NotFound,
+            _ => BackendError::Io(format!("stat: {e}")),
+        })?;
+        if !meta.is_file() {
+            return Err(BackendError::NotFound);
+        }
+        Ok(meta.len())
     }
 
     fn read_file(&self, rel_path: &Path, max_bytes: u64) -> Result<Vec<u8>, BackendError> {
@@ -554,6 +647,10 @@ impl Backend for LocalBackend {
         std::fs::remove_dir_all(&abs).map_err(|e| BackendError::Io(e.to_string()))
     }
 
+    fn write_file(&self, rel_path: &Path, content: &[u8]) -> Result<(), BackendError> {
+        write_file_atomic(self.canonical_workdir()?, rel_path, content)
+    }
+
     fn trash(&self, rel_paths: &[PathBuf]) -> Result<TrashOutcome, BackendError> {
         // Resolve every path first so a `PathEscape` fails atomically
         // before any side-effects.
@@ -680,7 +777,6 @@ pub(crate) fn search_content_local(
     on_chunk: &mut SearchChunkSink<'_>,
 ) -> ContentSearchCompleted {
     use grep_matcher::Matcher;
-    use grep_regex::RegexMatcherBuilder;
     use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, SinkMatch};
     use ignore::WalkBuilder;
 
@@ -693,20 +789,11 @@ pub(crate) fn search_content_local(
         return ContentSearchCompleted::default();
     }
 
-    let mut builder = RegexMatcherBuilder::new();
-    match request.case_sensitive {
-        Some(true) => {
-            builder.case_insensitive(false).case_smart(false);
-        }
-        Some(false) => {
-            builder.case_insensitive(true).case_smart(false);
-        }
-        None => {
-            builder.case_smart(true);
-        }
-    }
-    builder.fixed_strings(request.fixed_strings);
-    let matcher = match builder.build(&request.pattern) {
+    let matcher = match build_smart_case_matcher(
+        &request.pattern,
+        request.fixed_strings,
+        request.case_sensitive,
+    ) {
         Ok(m) => m,
         Err(_) => return ContentSearchCompleted::default(),
     };

@@ -18,12 +18,16 @@ use ratatui::widgets::{Block, Borders};
 
 pub fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
-    let input_focused = app.global_search.tab_input_focused;
+    let input_focused = app.global_search.input_focused();
+    let replace_open = app.global_search.replace_open;
 
-    // Outer block with a mode-aware title: list mode surfaces the "press /
-    // to search" hint where the user is most likely to look first; input
+    // Outer block with a mode-aware title: replace mode wins (rarer
+    // state, want it telegraphed); list mode surfaces the "press / to
+    // search" hint where the user is most likely to look first; input
     // mode drops the hint so the title doesn't nag while typing.
-    let title_text = if input_focused {
+    let title_text = if replace_open {
+        crate::i18n::t(crate::i18n::Msg::SearchReplaceTitle).to_string()
+    } else if input_focused {
         " 🔎 Search ".to_string()
     } else {
         " 🔎 Search · / to search ".to_string()

@@ -15,6 +15,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use std::collections::HashSet;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -44,6 +45,16 @@ pub const MAX_H_SCROLL: usize = MAX_LINE_CHARS;
 /// Debounce window from the last keystroke to the kickoff of a new search.
 /// 300ms matches VSCode's default `search.searchOnTypeDebouncePeriod`.
 pub const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Three-state focus for the Tab::Search left panel. The middle variant
+/// (`ReplaceInput`) is only reachable when `replace_open` is true. See
+/// `GlobalSearchState::focus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchPanelFocus {
+    FindInput,
+    ReplaceInput,
+    List,
+}
 
 /// One search hit flattened for the UI. `line_text` is already truncated to
 /// [`MAX_LINE_CHARS`] chars, and `byte_range` has been clipped to fall
@@ -99,16 +110,58 @@ pub struct GlobalSearchState {
     /// is empty so "foo" containing a space works as a literal char.
     pub space_leader_at: Option<Instant>,
 
-    /// Modal flag for Tab::Search: `false` means list mode (global char
-    /// shortcuts work, ↑↓/j/k navigate, Enter opens), `true` means input
-    /// mode (typing goes into `query`, Esc exits back to list). Unused by
-    /// the overlay — the overlay is always implicitly "focused."
+    /// Where keyboard input lands inside the persistent Tab::Search view.
+    /// Three states because replace mode adds a second input row:
     ///
-    /// Transitions: `/` or `i` in list mode → focus; `Esc` in input mode →
-    /// blur; overlay pin (Alt/Ctrl+Enter) → focus. Preserved across
-    /// tab-switches so bouncing out to Files and back keeps you where you
-    /// were.
-    pub tab_input_focused: bool,
+    /// - `FindInput` — typing edits `query` (search pattern).
+    /// - `ReplaceInput` — typing edits `replace_text`. Only reachable
+    ///   when `replace_open` is true.
+    /// - `List` — typing is dispatched to per-tab list-mode shortcuts
+    ///   (`↑↓`, `Enter`, `Space` to toggle a checkbox in replace mode,
+    ///   etc.). Bare chars become tab-cycle / search-step shortcuts via
+    ///   the global handler in `input.rs`.
+    ///
+    /// Transitions: `/` or `i` in list mode → `FindInput`; `Esc` in input
+    /// mode → `List`; `Tab` in input mode cycles
+    /// `FindInput → ReplaceInput → List → FindInput` (skipping
+    /// `ReplaceInput` when `replace_open` is false); overlay pin
+    /// (Alt/Ctrl+Enter) → `FindInput`. Preserved across tab-switches so
+    /// bouncing out to Files and back keeps you where you were.
+    ///
+    /// Unused by the overlay — the overlay is always implicitly focused
+    /// on its single input row (= `FindInput`-like behaviour).
+    pub focus: SearchPanelFocus,
+
+    /// VSCode-style "Replace in Files" toggle. When false, Tab::Search
+    /// behaves exactly as before (single input, no checkboxes). When
+    /// true, a second `replace_text` input row appears below the find
+    /// input, each result row gets a checkbox, and `Ctrl/Alt+Enter`
+    /// commits the replace via `FilesTask::ReplaceInFiles`. Toggled by
+    /// the chevron click, the Space+H leader chord, or bare `r` in
+    /// list mode.
+    pub replace_open: bool,
+    /// Replacement string. Empty allowed (= delete the matched span).
+    pub replace_text: String,
+    /// Byte offset of the caret in `replace_text`. Always on a char
+    /// boundary; same invariant as `cursor` for `query`.
+    pub replace_cursor: usize,
+    /// Per-match opt-out set, keyed by `(path, line)`. A `(p, l)` pair
+    /// in this set means "do NOT replace this hit when Apply runs."
+    /// Default behaviour is to include every streamed match — toggling
+    /// a checkbox off inserts here; toggling back on removes. Cleared
+    /// only on user-initiated `mark_query_edited` (a fresh search), so
+    /// fs-watcher-driven re-runs preserve the user's per-row choices.
+    pub excluded: HashSet<(PathBuf, usize)>,
+    /// `Some((files_done, files_total))` while a replace batch is in
+    /// flight, fed by `WorkerResult::ReplaceProgress` events. Footer
+    /// renders this as `Replacing N/M…`. `None` between batches.
+    ///
+    /// In-flight state itself lives on `App.replace_load: AsyncState`
+    /// (the same generation gate every other async path uses); the
+    /// footer reads `app.replace_load.loading`. Keep the progress
+    /// counter here because it's UI presentation state and the
+    /// `AsyncState` contract doesn't carry payloads.
+    pub replace_progress: Option<(usize, usize)>,
 
     /// Uniform horizontal scroll offset applied to every result row's
     /// line-text column. When `0`, the renderer falls back to the
@@ -148,10 +201,96 @@ impl Default for GlobalSearchState {
             last_view_h: 0,
             last_popup_area: None,
             space_leader_at: None,
-            tab_input_focused: false,
+            focus: SearchPanelFocus::List,
+            replace_open: false,
+            replace_text: String::new(),
+            replace_cursor: 0,
+            excluded: HashSet::new(),
+            replace_progress: None,
             results_h_scroll: 0,
             preview_sync_at: None,
         }
+    }
+}
+
+impl GlobalSearchState {
+    /// True iff focus is on either input row. The Tab::Search input
+    /// gating in `input.rs` and the empty-state hint logic in the panel
+    /// renderer key off this — neither cares which of the two inputs
+    /// has focus.
+    pub fn input_focused(&self) -> bool {
+        matches!(
+            self.focus,
+            SearchPanelFocus::FindInput | SearchPanelFocus::ReplaceInput
+        )
+    }
+
+    /// `true` iff the streamed match at `idx` is currently included in
+    /// the replace batch. New matches default to included; the user
+    /// flips them off via the checkbox. Out-of-range indices answer
+    /// `false` defensively (avoids a panic if the results vector
+    /// shrinks under us between render and apply).
+    pub fn is_match_included(&self, idx: usize) -> bool {
+        let Some(hit) = self.results.get(idx) else {
+            return false;
+        };
+        !self.excluded.contains(&(hit.path.clone(), hit.line))
+    }
+
+    /// Toggle inclusion of the match at `idx`. No-op for out-of-range
+    /// indices.
+    pub fn toggle_match_excluded(&mut self, idx: usize) {
+        let Some(hit) = self.results.get(idx).cloned() else {
+            return;
+        };
+        let key = (hit.path.clone(), hit.line);
+        if !self.excluded.remove(&key) {
+            self.excluded.insert(key);
+        }
+    }
+
+    /// Number of currently-included matches (= results.len() minus
+    /// `excluded` entries that still match a current hit). Used by the
+    /// footer's "N to replace" counter and by the apply gate.
+    ///
+    /// Single-pass over `results` with `O(1)` hash probes into
+    /// `excluded`; stale exclusions (entries whose key has no current
+    /// hit) contribute zero to the count automatically. Beats the
+    /// naive `excluded.iter().filter(any-match-in-results)` which is
+    /// `O(results × excluded)` per render.
+    pub fn included_count(&self) -> usize {
+        if self.excluded.is_empty() {
+            return self.results.len();
+        }
+        self.results
+            .iter()
+            .filter(|h| !self.excluded.contains(&(h.path.clone(), h.line)))
+            .count()
+    }
+
+    /// Cycle keyboard focus forward: `FindInput → ReplaceInput → List →
+    /// FindInput`. Skips `ReplaceInput` when `replace_open` is false so
+    /// the cycle still works in plain search mode. Bound to bare `Tab`
+    /// inside Tab::Search input modes; the global Ctrl+Tab tab-cycle
+    /// handler runs earlier so this never overrides it.
+    pub fn cycle_focus_forward(&mut self) {
+        self.focus = match (self.focus, self.replace_open) {
+            (SearchPanelFocus::FindInput, true) => SearchPanelFocus::ReplaceInput,
+            (SearchPanelFocus::FindInput, false) => SearchPanelFocus::List,
+            (SearchPanelFocus::ReplaceInput, _) => SearchPanelFocus::List,
+            (SearchPanelFocus::List, _) => SearchPanelFocus::FindInput,
+        };
+    }
+
+    /// Reverse of `cycle_focus_forward`. Bound to BackTab.
+    pub fn cycle_focus_backward(&mut self) {
+        self.focus = match (self.focus, self.replace_open) {
+            (SearchPanelFocus::FindInput, true) => SearchPanelFocus::List,
+            (SearchPanelFocus::FindInput, false) => SearchPanelFocus::List,
+            (SearchPanelFocus::ReplaceInput, _) => SearchPanelFocus::FindInput,
+            (SearchPanelFocus::List, true) => SearchPanelFocus::ReplaceInput,
+            (SearchPanelFocus::List, false) => SearchPanelFocus::FindInput,
+        };
     }
 }
 
@@ -272,7 +411,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             // so keeping the input focused is the no-surprise hand-off.
             // From the other entry paths (digit key, Tab cycle) the tab
             // starts in list mode; see `handle_key_search`.
-            app.global_search.tab_input_focused = true;
+            app.global_search.focus = SearchPanelFocus::FindInput;
             app.set_active_tab(Tab::Search);
             // Sync preview_highlight to the current selection so the tab's
             // right panel lights up without waiting for another keystroke.
@@ -469,8 +608,15 @@ pub fn handle_mouse(mouse: MouseEvent, app: &mut App) {
 /// a new search for the updated query. Called on every edit (insert, delete,
 /// clear, delete-word). `pub(crate)` so both the overlay handler and the
 /// Tab::Search input handler in `input.rs` drive the same signal.
+///
+/// Also clears the per-match `excluded` set: a fresh query produces a
+/// fresh result list, and any `(path, line)` pair the user previously
+/// opted out of has no semantic carry-over to the new search. Without
+/// this, a stale exclusion on a coincidentally-reused `(path, line)` key
+/// would silently skip a match the user expects to replace.
 pub(crate) fn mark_query_edited(state: &mut GlobalSearchState) {
     state.last_keystroke_at = Some(Instant::now());
+    state.excluded.clear();
 }
 
 fn move_selection(state: &mut GlobalSearchState, delta: i32) {
@@ -638,13 +784,90 @@ mod tests {
     }
 
     #[test]
-    fn tab_input_focused_defaults_to_false() {
+    fn focus_defaults_to_list() {
         // Tab::Search enters list mode by default — pressing digit 2 or
         // cycling via Tab lands on the results, not the input. Pinning
         // from the Space+F overlay is the only path that auto-focuses the
         // input, and that's handled in `handle_key` explicitly.
         let s = GlobalSearchState::default();
-        assert!(!s.tab_input_focused);
+        assert_eq!(s.focus, SearchPanelFocus::List);
+        assert!(!s.input_focused());
+    }
+
+    #[test]
+    fn cycle_focus_skips_replace_when_closed() {
+        let mut s = GlobalSearchState {
+            focus: SearchPanelFocus::FindInput,
+            ..GlobalSearchState::default()
+        };
+        s.cycle_focus_forward();
+        // replace_open=false → FindInput jumps straight to List.
+        assert_eq!(s.focus, SearchPanelFocus::List);
+    }
+
+    #[test]
+    fn cycle_focus_visits_replace_when_open() {
+        let mut s = GlobalSearchState {
+            replace_open: true,
+            focus: SearchPanelFocus::FindInput,
+            ..GlobalSearchState::default()
+        };
+        s.cycle_focus_forward();
+        assert_eq!(s.focus, SearchPanelFocus::ReplaceInput);
+        s.cycle_focus_forward();
+        assert_eq!(s.focus, SearchPanelFocus::List);
+        s.cycle_focus_forward();
+        assert_eq!(s.focus, SearchPanelFocus::FindInput);
+    }
+
+    #[test]
+    fn toggle_match_excluded_round_trip() {
+        let mut s = GlobalSearchState {
+            results: vec![dummy_hit("a"), dummy_hit("b")],
+            ..GlobalSearchState::default()
+        };
+        assert!(s.is_match_included(0));
+        s.toggle_match_excluded(0);
+        assert!(!s.is_match_included(0));
+        assert!(s.is_match_included(1));
+        s.toggle_match_excluded(0);
+        assert!(s.is_match_included(0));
+    }
+
+    #[test]
+    fn mark_query_edited_clears_excluded_set() {
+        // Regression for the bug where editing the query (typing a new
+        // letter, deleting one, clearing) silently kept the previous
+        // search's per-match opt-outs around. A `(path, line)` key
+        // shared by the old and new result sets would then be skipped
+        // even though the user never opted out of the new one.
+        let mut s = GlobalSearchState {
+            results: vec![dummy_hit("a")],
+            ..GlobalSearchState::default()
+        };
+        s.toggle_match_excluded(0);
+        assert!(!s.excluded.is_empty());
+        mark_query_edited(&mut s);
+        assert!(
+            s.excluded.is_empty(),
+            "edit-driven query change must reset per-match opt-outs"
+        );
+    }
+
+    #[test]
+    fn included_count_ignores_stale_exclusions() {
+        // An entry in `excluded` that no longer corresponds to a current
+        // hit (e.g. the user toggled it off, then ran a fresh query that
+        // produced a different result set without that line) must not
+        // double-count or drag the counter below zero.
+        let mut s = GlobalSearchState {
+            results: vec![dummy_hit("a"), dummy_hit("b")],
+            ..GlobalSearchState::default()
+        };
+        s.excluded.insert((PathBuf::from("z-stale"), 99));
+        assert_eq!(s.included_count(), 2);
+        s.toggle_match_excluded(0);
+        assert_eq!(s.included_count(), 1);
     }
 
     #[test]

@@ -772,6 +772,11 @@ pub struct App {
     /// `None` for delete operations — selecting a just-trashed path
     /// would be nonsense.
     pub fs_mutation_select_on_done: Option<PathBuf>,
+    /// Tracks the in-flight `FilesTask::ReplaceInFiles` batch. The
+    /// generation is consumed by `WorkerResult::ReplaceProgress` /
+    /// `ReplaceDone` so a stale completion can't silently clear the
+    /// "replacing…" badge after the user starts a fresh batch.
+    pub replace_load: AsyncState,
     next_git_revalidate_at: Instant,
     next_graph_revalidate_at: Instant,
 }
@@ -1032,6 +1037,7 @@ impl App {
             file_copy_load: AsyncState::default(),
             fs_mutation_load: AsyncState::default(),
             fs_mutation_select_on_done: None,
+            replace_load: AsyncState::default(),
             next_git_revalidate_at: now + Duration::from_millis(800),
             next_graph_revalidate_at: now + Duration::from_millis(1200),
         };
@@ -1132,6 +1138,63 @@ impl App {
         {
             self.clear_diff_selection();
         }
+    }
+
+    /// Commit the current Tab::Search replace batch. Buckets the
+    /// currently-included matches by path into `ReplaceItem`s and
+    /// dispatches `FilesTask::ReplaceInFiles`. No-op when replace mode
+    /// is closed, a previous batch is still in flight, the result list
+    /// is empty, or every match has been opted out via the per-row
+    /// checkbox. Bound to `Ctrl/Alt+Enter`, plain `Enter` from the
+    /// replace input, and the `[Apply]` footer button.
+    pub fn commit_replace_in_files(&mut self) {
+        if !self.global_search.replace_open || self.replace_load.loading {
+            return;
+        }
+        if self.global_search.results.is_empty() {
+            return;
+        }
+        if self.global_search.included_count() == 0 {
+            return;
+        }
+        // Bucket included results by path so each file gets one
+        // worker dispatch with its line-list. `BTreeMap` orders by
+        // `PathBuf`, which happens to match the streaming results
+        // (the worker emits hits sorted by path) — same ordering
+        // either way, just made explicit here.
+        use std::collections::BTreeMap;
+        let mut buckets: BTreeMap<PathBuf, Vec<crate::tasks::ReplaceLine>> = BTreeMap::new();
+        for (idx, hit) in self.global_search.results.iter().enumerate() {
+            if !self.global_search.is_match_included(idx) {
+                continue;
+            }
+            buckets
+                .entry(hit.path.clone())
+                .or_default()
+                .push(crate::tasks::ReplaceLine {
+                    line_no: hit.line,
+                    expected_text: hit.line_text.clone(),
+                });
+        }
+        let items: Vec<crate::tasks::ReplaceItem> = buckets
+            .into_iter()
+            .map(|(path, lines)| crate::tasks::ReplaceItem { path, lines })
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        self.global_search.replace_progress = None;
+        // `replace_load.begin()` flips `loading=true` and bumps the
+        // generation; the footer reads `replace_load.loading` for the
+        // in-flight indicator.
+        let generation = self.replace_load.begin();
+        self.tasks.replace_in_files(
+            generation,
+            self.backend.clone(),
+            self.global_search.query.clone(),
+            self.global_search.replace_text.clone(),
+            items,
+        );
     }
 
     /// Toggle the left sidebar's visibility. Hiding collapses the left
@@ -3812,6 +3875,68 @@ impl App {
                     }
                 }
             },
+            WorkerResult::ReplaceProgress {
+                generation,
+                files_done,
+                files_total,
+            } => {
+                // Stale chunks (from a superseded batch) just no-op —
+                // the AsyncState gates the apply path so no UI state
+                // changes anyway. Keeping them quiet avoids a flicker
+                // where the progress text rewinds.
+                if generation != self.replace_load.generation {
+                    return;
+                }
+                self.global_search.replace_progress = Some((files_done, files_total));
+            }
+            WorkerResult::ReplaceDone { generation, result } => {
+                if !self.replace_load.complete_ok(generation) {
+                    return;
+                }
+                // `complete_ok` already flipped `loading=false`.
+                self.global_search.replace_progress = None;
+                match result {
+                    Ok(summary) => {
+                        let mut text = format!(
+                            "{} {} / {}",
+                            crate::i18n::t(crate::i18n::Msg::ReplaceSummaryToast),
+                            summary.lines_replaced,
+                            summary.files_changed,
+                        );
+                        if summary.skipped_stale > 0 {
+                            text.push_str(&format!(
+                                " · {} {}",
+                                summary.skipped_stale,
+                                crate::i18n::t(crate::i18n::Msg::ReplaceSkippedStaleSuffix),
+                            ));
+                        }
+                        if summary.skipped_too_large > 0 {
+                            text.push_str(&format!(
+                                " · {} {}",
+                                summary.skipped_too_large,
+                                crate::i18n::t(crate::i18n::Msg::ReplaceTooLargeSuffix),
+                            ));
+                        }
+                        if !summary.errors.is_empty() {
+                            text.push_str(&format!(" · {} error(s)", summary.errors.len()));
+                        }
+                        self.toasts.push(Toast::info(text));
+                        // Drop stale exclusions and rerun the search;
+                        // the file content changed under our feet, so
+                        // the on-screen results are about to be wrong.
+                        self.global_search.excluded.clear();
+                        crate::global_search::reload(self);
+                        // Git decorations on the file tree need a
+                        // refresh — replaced files now show as
+                        // modified in the status sidebar.
+                        self.refresh_status();
+                    }
+                    Err(e) => {
+                        self.toasts
+                            .push(Toast::error(format!("replace failed: {e}")));
+                    }
+                }
+            }
         }
     }
 
@@ -3965,7 +4090,7 @@ impl App {
             }
             ClickAction::GlobalSearchFocusInput => {
                 if self.active_tab == Tab::Search {
-                    self.global_search.tab_input_focused = true;
+                    self.global_search.focus = crate::global_search::SearchPanelFocus::FindInput;
                 }
             }
             ClickAction::PlaceModeFolder(index) => {
@@ -4060,6 +4185,31 @@ impl App {
             }
             ClickAction::DbGotoPage(page) => {
                 self.db_navigate_to_page(page);
+            }
+            ClickAction::SearchToggleReplace => {
+                if self.active_tab == Tab::Search {
+                    self.global_search.replace_open = !self.global_search.replace_open;
+                    if !self.global_search.replace_open
+                        && matches!(
+                            self.global_search.focus,
+                            crate::global_search::SearchPanelFocus::ReplaceInput
+                        )
+                    {
+                        self.global_search.focus =
+                            crate::global_search::SearchPanelFocus::FindInput;
+                    }
+                }
+            }
+            ClickAction::GlobalSearchFocusReplaceInput => {
+                if self.active_tab == Tab::Search && self.global_search.replace_open {
+                    self.global_search.focus = crate::global_search::SearchPanelFocus::ReplaceInput;
+                }
+            }
+            ClickAction::SearchToggleMatch(idx) => {
+                self.global_search.toggle_match_excluded(idx);
+            }
+            ClickAction::SearchApplyReplace => {
+                self.commit_replace_in_files();
             }
         }
     }

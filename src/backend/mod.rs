@@ -285,6 +285,13 @@ pub trait Backend: Send + Sync {
     /// transports use it to bound response size.
     fn read_file(&self, rel_path: &Path, max_bytes: u64) -> Result<Vec<u8>, BackendError>;
 
+    /// Size in bytes of the regular file at `rel_path`. Lets callers
+    /// short-circuit before paying for the bytes themselves — e.g. the
+    /// global-replace worker uses this to skip files over its 50 MB cap
+    /// without round-tripping a truncated copy. `NotFound` if the path
+    /// doesn't resolve to a regular file under the workdir.
+    fn file_size(&self, rel_path: &Path) -> Result<u64, BackendError>;
+
     /// Load one page of rows from a table inside a SQLite database at
     /// `rel_path`. Used by the Files-tab preview pane's pagination
     /// flow — `load_preview` builds the initial card with the first
@@ -422,6 +429,20 @@ pub trait Backend: Send + Sync {
     fn remove_file(&self, rel_path: &Path) -> Result<(), BackendError>;
     /// Recursive directory removal. `fs::remove_dir_all` semantics.
     fn remove_dir_all(&self, rel_path: &Path) -> Result<(), BackendError>;
+    /// Overwrite the regular file at `rel_path` with `content`. Used by
+    /// the global find-and-replace path. Atomic: implementations write to
+    /// a sibling tempfile and `rename` into place so a mid-write crash
+    /// leaves the original intact. The original file's mode bits are
+    /// preserved across the swap (without this every replaced file
+    /// silently chmods to the tempfile default of `0600`).
+    ///
+    /// The path must already exist and resolve to a regular file under
+    /// the workdir. Symlinks are followed during canonicalisation; if
+    /// the link target escapes the workdir, returns
+    /// `BackendError::PathEscape`. If the target doesn't exist, returns
+    /// `BackendError::NotFound` — replace is never used to create new
+    /// files.
+    fn write_file(&self, rel_path: &Path, content: &[u8]) -> Result<(), BackendError>;
     /// Move each path to the OS Trash. On hosts without a trash tool the
     /// backend falls back to `fs::remove_*` and reports
     /// `TrashOutcome { used_trash: false }` so the UI can phrase the

@@ -77,7 +77,12 @@ pub fn leader_decision(
     // so the verdict itself stays a unit variant.
     let is_chord_target = matches!(
         key.code,
-        KeyCode::Char('p') | KeyCode::Char('P') | KeyCode::Char('f') | KeyCode::Char('F')
+        KeyCode::Char('p')
+            | KeyCode::Char('P')
+            | KeyCode::Char('f')
+            | KeyCode::Char('F')
+            | KeyCode::Char('h')
+            | KeyCode::Char('H')
     ) && key.modifiers.is_empty();
 
     // Fresh-arm path: no leader pending, space pressed, context allows.
@@ -231,17 +236,24 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // accidentally swallow yet.
     let search_input_focused = app.active_tab == Tab::Search
         && app.active_panel == Panel::Files
-        && app.global_search.tab_input_focused;
+        && app.global_search.input_focused();
     let commit_input_focused = app.active_tab == Tab::Git
         && app.active_panel == Panel::Files
         && app.git_status.commit_editing;
     let in_input_mode = search_input_focused || commit_input_focused;
+    // In Tab::Search list mode + replace_open, bare `Space` is the
+    // per-match toggle — disarm the leader chord so a single tap of
+    // Space doesn't ambiguously prime a chord and never resolve.
+    let search_list_replace_mode = app.active_tab == Tab::Search
+        && app.active_panel == Panel::Files
+        && !app.global_search.input_focused()
+        && app.global_search.replace_open;
     let leader_allow_arm = if search_input_focused {
         app.global_search.query.is_empty()
     } else if commit_input_focused {
         app.git_status.commit_message.is_empty()
     } else {
-        true
+        !search_list_replace_mode
     };
     match leader_decision(
         &key,
@@ -263,6 +275,16 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             match key.code {
                 KeyCode::Char('p') | KeyCode::Char('P') => quick_open::begin(app),
                 KeyCode::Char('f') | KeyCode::Char('F') => global_search::begin(app),
+                KeyCode::Char('h') | KeyCode::Char('H') => {
+                    // Open Tab::Search with the replace input pre-expanded
+                    // and focused. Mirrors VSCode's Ctrl+Shift+H — the
+                    // user gets straight to the replace field. Existing
+                    // search state (query, results) is preserved.
+                    app.set_active_tab(crate::app::Tab::Search);
+                    app.active_panel = crate::app::Panel::Files;
+                    app.global_search.replace_open = true;
+                    app.global_search.focus = crate::global_search::SearchPanelFocus::ReplaceInput;
+                }
                 _ => {}
             }
             return;
@@ -332,7 +354,13 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             app.search.clear();
             return;
         }
-        KeyCode::Tab => {
+        // Bare Tab / BackTab cycle panels in most contexts. Exception:
+        // when a Tab::Search input row owns focus, Tab/BackTab cycle
+        // Find → Replace → List inside that panel — the per-tab
+        // handler down at `handle_key_search_*_input_mode` owns that
+        // dispatch. Without this guard the global panel-switch arm
+        // returns first and the per-input cycle never fires.
+        KeyCode::Tab if !search_input_focused => {
             app.active_panel = next_panel(
                 app.active_panel,
                 app.graph_uses_three_col(),
@@ -341,7 +369,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             app.search.clear();
             return;
         }
-        KeyCode::BackTab => {
+        KeyCode::BackTab if !search_input_focused => {
             app.active_panel = next_panel(
                 app.active_panel,
                 app.graph_uses_three_col(),
@@ -411,7 +439,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             }
             KeyCode::Char('/') => {
                 if app.active_tab == Tab::Search && app.active_panel == Panel::Files {
-                    app.global_search.tab_input_focused = true;
+                    app.global_search.focus = crate::global_search::SearchPanelFocus::FindInput;
                 } else {
                     search::begin(app, false);
                 }
@@ -536,14 +564,18 @@ fn handle_key_db_goto(key: KeyEvent, app: &mut App) {
 }
 
 /// Tab::Search key dispatcher. Panel::Files is the search sidebar, which
-/// runs in one of two modes tracked by `GlobalSearchState.tab_input_focused`:
+/// runs in one of three modes tracked by `GlobalSearchState.focus`:
 ///
 /// - **List mode** (default on tab entry): bare keys are either nav
 ///   (↑↓/j/k/Ctrl+N/P) or they fall back to global shortcuts (h = help,
-///   q = quit, etc.). `/` or `i` enters input mode. Enter opens the
-///   selected hit in `$EDITOR`.
-/// - **Input mode**: typing fills the query; same editing / navigation /
-///   accept keys as the overlay. Esc returns to list mode.
+///   q = quit, etc.). `/` or `i` enters Find input. Enter opens the
+///   selected hit in `$EDITOR`. In replace mode, `Space` toggles the
+///   current row's checkbox.
+/// - **FindInput mode**: typing fills the query; same editing /
+///   navigation / accept keys as the overlay. Esc returns to list mode.
+/// - **ReplaceInput mode**: typing fills `replace_text`; only reachable
+///   when `replace_open` is true. Tab cycles
+///   `Find → Replace → List → Find`.
 ///
 /// Panel::Diff is the file preview, same keys as the Files-tab Diff panel.
 ///
@@ -554,13 +586,17 @@ fn handle_key_search(key: KeyEvent, app: &mut App) {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     match app.active_panel {
-        Panel::Files => {
-            if app.global_search.tab_input_focused {
-                handle_key_search_input_mode(key, app, ctrl, alt);
-            } else {
+        Panel::Files => match app.global_search.focus {
+            crate::global_search::SearchPanelFocus::FindInput => {
+                handle_key_search_find_input(key, app, ctrl, alt);
+            }
+            crate::global_search::SearchPanelFocus::ReplaceInput => {
+                handle_key_search_replace_input(key, app, ctrl, alt);
+            }
+            crate::global_search::SearchPanelFocus::List => {
                 handle_key_search_list_mode(key, app, ctrl);
             }
-        }
+        },
         // Search tab has no middle column. `normalize_active_panel`
         // demotes Commit elsewhere, but guard here in case a key lands
         // mid-transition.
@@ -671,10 +707,10 @@ fn handle_key_search_list_mode(key: KeyEvent, app: &mut App, ctrl: bool) {
         // global keymap so it also lights up the input from other tabs;
         // dispatching it here too makes the in-tab behaviour obvious.
         KeyCode::Char('i') if key.modifiers.is_empty() => {
-            app.global_search.tab_input_focused = true;
+            app.global_search.focus = crate::global_search::SearchPanelFocus::FindInput;
         }
         KeyCode::Char('/') if key.modifiers.is_empty() => {
-            app.global_search.tab_input_focused = true;
+            app.global_search.focus = crate::global_search::SearchPanelFocus::FindInput;
         }
 
         // ── Reload ─────────────────────────────────────────────
@@ -683,6 +719,47 @@ fn handle_key_search_list_mode(key: KeyEvent, app: &mut App, ctrl: bool) {
         // literal char for the query.
         KeyCode::Char('r') if key.modifiers.is_empty() => {
             global_search::reload(app);
+        }
+        // ── Replace mode toggle ────────────────────────────────
+        // `R` (Shift+r) flips the chevron — the verbose `Space+H`
+        // chord is the primary entry; `R` is a quick in-tab way to
+        // toggle without leaving the keyboard.
+        KeyCode::Char('R') => {
+            app.global_search.replace_open = !app.global_search.replace_open;
+            if !app.global_search.replace_open
+                && matches!(
+                    app.global_search.focus,
+                    crate::global_search::SearchPanelFocus::ReplaceInput
+                )
+            {
+                app.global_search.focus = crate::global_search::SearchPanelFocus::List;
+            }
+        }
+        // ── Per-match include/exclude (replace mode) ───────────
+        // Space-leader is disarmed in this state (see `handle_key`);
+        // bare Space toggles the current row's checkbox.
+        KeyCode::Char(' ') if key.modifiers.is_empty() && app.global_search.replace_open => {
+            let idx = app.global_search.selected;
+            app.global_search.toggle_match_excluded(idx);
+        }
+
+        // ── Focus cycle into the inputs ────────────────────────
+        KeyCode::Tab if key.modifiers.is_empty() => {
+            app.global_search.cycle_focus_forward();
+        }
+        KeyCode::BackTab => {
+            app.global_search.cycle_focus_backward();
+        }
+
+        // ── Apply replace batch ────────────────────────────────
+        // Many terminals collapse Enter and Ctrl/Alt+Enter to the
+        // same byte sequence; bind both modifier paths so at least
+        // one fires on every host.
+        KeyCode::Enter
+            if app.global_search.replace_open
+                && (ctrl || key.modifiers.contains(KeyModifiers::ALT)) =>
+        {
+            app.commit_replace_in_files();
         }
 
         // ── Accept ─────────────────────────────────────────────
@@ -694,159 +771,141 @@ fn handle_key_search_list_mode(key: KeyEvent, app: &mut App, ctrl: bool) {
     }
 }
 
-/// Key dispatch for Tab::Search Panel::Files when input IS focused
-/// (input mode). Same bindings as the Space+F overlay — typing fills the
-/// query, Esc exits to list mode, Enter opens the selection.
-fn handle_key_search_input_mode(key: KeyEvent, app: &mut App, ctrl: bool, alt: bool) {
+/// Key dispatch for Tab::Search Panel::Files when the FIND input is
+/// focused. Same bindings as the Space+F overlay — typing fills the
+/// query, Esc exits to list mode, Enter opens the selection. Tab cycles
+/// to Replace (when open) or List.
+///
+/// Two-pass shape mirrors `handle_key_search_replace_input`: app-level
+/// keys (Esc/Tab/Enter/list-nav) need `&mut app` and run first with
+/// early-return; remaining keys go through the shared
+/// `input_edit::dispatch_key` helper which only borrows
+/// `&mut query / &mut cursor`. Edit outcomes fire `mark_query_edited`
+/// to kick the search-rerun debounce.
+fn handle_key_search_find_input(key: KeyEvent, app: &mut App, ctrl: bool, alt: bool) {
+    // Pass 1: app-level actions.
     match key.code {
-        // ── Exit to list mode ──────────────────────────────────
         KeyCode::Esc => {
-            app.global_search.tab_input_focused = false;
+            app.global_search.focus = crate::global_search::SearchPanelFocus::List;
+            return;
         }
-
-        // ── List navigation (works alongside typing) ───────────
-        KeyCode::Up => global_search::move_selection_by(app, -1),
-        KeyCode::Down => global_search::move_selection_by(app, 1),
-        KeyCode::Char('p') if ctrl => global_search::move_selection_by(app, -1),
-        KeyCode::Char('k') if ctrl => global_search::move_selection_by(app, -1),
-        KeyCode::Char('n') if ctrl => global_search::move_selection_by(app, 1),
-        KeyCode::Char('j') if ctrl => global_search::move_selection_by(app, 1),
+        KeyCode::Tab if key.modifiers.is_empty() => {
+            app.global_search.cycle_focus_forward();
+            return;
+        }
+        KeyCode::BackTab => {
+            app.global_search.cycle_focus_backward();
+            return;
+        }
+        // Ctrl/Alt+Enter commits the replace batch (when open).
+        KeyCode::Enter if app.global_search.replace_open && (ctrl || alt) => {
+            app.commit_replace_in_files();
+            return;
+        }
+        // Plain Enter accepts the selected hit.
+        KeyCode::Enter => {
+            global_search::accept(app);
+            return;
+        }
+        // List navigation (works alongside typing).
+        KeyCode::Up => {
+            global_search::move_selection_by(app, -1);
+            return;
+        }
+        KeyCode::Down => {
+            global_search::move_selection_by(app, 1);
+            return;
+        }
+        KeyCode::Char('p') | KeyCode::Char('k') if ctrl => {
+            global_search::move_selection_by(app, -1);
+            return;
+        }
+        KeyCode::Char('n') | KeyCode::Char('j') if ctrl => {
+            global_search::move_selection_by(app, 1);
+            return;
+        }
         KeyCode::PageUp => {
             let step = app.global_search.last_view_h.max(1) as i32;
             global_search::move_selection_by(app, -step);
+            return;
         }
         KeyCode::PageDown => {
             let step = app.global_search.last_view_h.max(1) as i32;
             global_search::move_selection_by(app, step);
-        }
-
-        // ── Cursor movement inside the query ───────────────────
-        // Alt/Ctrl + arrow = jump by word (readline / Option+Arrow /
-        // Ctrl+Arrow convention). Must come before plain-arrow arms so
-        // modifier combos win.
-        KeyCode::Left if alt || ctrl => {
-            crate::input_edit::move_cursor_word_backward(
-                &app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-        }
-        KeyCode::Right if alt || ctrl => {
-            crate::input_edit::move_cursor_word_forward(
-                &app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-        }
-        KeyCode::Left => {
-            crate::input_edit::move_cursor(
-                &app.global_search.query,
-                &mut app.global_search.cursor,
-                -1,
-            );
-        }
-        KeyCode::Right => {
-            crate::input_edit::move_cursor(
-                &app.global_search.query,
-                &mut app.global_search.cursor,
-                1,
-            );
-        }
-        KeyCode::Home => {
-            app.global_search.cursor = 0;
-        }
-        KeyCode::End => {
-            app.global_search.cursor = app.global_search.query.len();
-        }
-
-        // ── Forward-delete ─────────────────────────────────────
-        // Symmetric with Backspace: plain Delete kills a char,
-        // Alt/Ctrl+Delete kills a word. Both re-run the search.
-        KeyCode::Delete if alt || ctrl => {
-            crate::input_edit::delete_word_forward(
-                &mut app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-            global_search::mark_query_edited(&mut app.global_search);
-        }
-        KeyCode::Delete => {
-            crate::input_edit::delete_char_forward(
-                &mut app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-            global_search::mark_query_edited(&mut app.global_search);
-        }
-
-        // ── Readline aliases ────────────────────────────────────
-        // Reliable fallback for terminals that don't forward Alt/Ctrl+Arrow.
-        // Bash-readline muscle memory: Alt+b/f/d for word motion, Ctrl+A/E
-        // for line start/end.
-        KeyCode::Char('b') if alt => {
-            crate::input_edit::move_cursor_word_backward(
-                &app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-        }
-        KeyCode::Char('f') if alt => {
-            crate::input_edit::move_cursor_word_forward(
-                &app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-        }
-        KeyCode::Char('d') if alt => {
-            crate::input_edit::delete_word_forward(
-                &mut app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-            global_search::mark_query_edited(&mut app.global_search);
-        }
-        KeyCode::Char('a') if ctrl => {
-            app.global_search.cursor = 0;
-        }
-        KeyCode::Char('e') if ctrl => {
-            app.global_search.cursor = app.global_search.query.len();
-        }
-
-        // ── Accept ─────────────────────────────────────────────
-        KeyCode::Enter => global_search::accept(app),
-
-        // ── Edit query ─────────────────────────────────────────
-        KeyCode::Backspace if alt || ctrl => {
-            crate::input_edit::delete_word_backward(
-                &mut app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-            global_search::mark_query_edited(&mut app.global_search);
-        }
-        KeyCode::Char('w') if ctrl => {
-            crate::input_edit::delete_word_backward(
-                &mut app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-            global_search::mark_query_edited(&mut app.global_search);
-        }
-        KeyCode::Char('u') if ctrl => {
-            crate::input_edit::clear(&mut app.global_search.query, &mut app.global_search.cursor);
-            global_search::mark_query_edited(&mut app.global_search);
-        }
-        KeyCode::Backspace => {
-            crate::input_edit::backspace(
-                &mut app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-            global_search::mark_query_edited(&mut app.global_search);
-        }
-
-        // Any other Ctrl-combo is a no-op so Ctrl+A etc. don't leak as
-        // literal chars into the query.
-        KeyCode::Char(c) if !ctrl => {
-            crate::input_edit::insert_char(
-                &mut app.global_search.query,
-                &mut app.global_search.cursor,
-                c,
-            );
-            global_search::mark_query_edited(&mut app.global_search);
+            return;
         }
         _ => {}
     }
+
+    // Pass 2: text-buffer edits. Edit outcomes re-run the search via
+    // `mark_query_edited`; cursor-only and unhandled keys are silent.
+    let outcome = crate::input_edit::dispatch_key(
+        &key,
+        &mut app.global_search.query,
+        &mut app.global_search.cursor,
+    );
+    if outcome == crate::input_edit::Outcome::Edited {
+        global_search::mark_query_edited(&mut app.global_search);
+    }
+}
+
+/// Key dispatch for Tab::Search Panel::Files when the REPLACE input is
+/// focused. Mirrors the find-input handler but operates on
+/// `replace_text`/`replace_cursor` and skips the search-rerun side
+/// effect — editing the replacement string never changes the result
+/// list. Plain `Enter` commits the replace batch (the user finished
+/// typing the replacement); `Esc` returns to list mode.
+fn handle_key_search_replace_input(key: KeyEvent, app: &mut App, _ctrl: bool, _alt: bool) {
+    // Pass 1: app-level actions.
+    match key.code {
+        KeyCode::Esc => {
+            app.global_search.focus = crate::global_search::SearchPanelFocus::List;
+            return;
+        }
+        KeyCode::Tab if key.modifiers.is_empty() => {
+            app.global_search.cycle_focus_forward();
+            return;
+        }
+        KeyCode::BackTab => {
+            app.global_search.cycle_focus_backward();
+            return;
+        }
+        // Plain Enter, Ctrl+Enter, and Alt+Enter all commit. Plain
+        // Enter is OK here because there's no "accept the selected
+        // result" action competing for the key inside the replace
+        // input — the user is committing the replace, full stop.
+        KeyCode::Enter => {
+            app.commit_replace_in_files();
+            return;
+        }
+        KeyCode::Up => {
+            global_search::move_selection_by(app, -1);
+            return;
+        }
+        KeyCode::Down => {
+            global_search::move_selection_by(app, 1);
+            return;
+        }
+        KeyCode::PageUp => {
+            let step = app.global_search.last_view_h.max(1) as i32;
+            global_search::move_selection_by(app, -step);
+            return;
+        }
+        KeyCode::PageDown => {
+            let step = app.global_search.last_view_h.max(1) as i32;
+            global_search::move_selection_by(app, step);
+            return;
+        }
+        _ => {}
+    }
+
+    // Pass 2: text-buffer edits. No edit-derived side effect — typing
+    // in the replace field never re-runs the search.
+    let _ = crate::input_edit::dispatch_key(
+        &key,
+        &mut app.global_search.replace_text,
+        &mut app.global_search.replace_cursor,
+    );
 }
 
 /// Set `active_panel` based on which column the cursor hit. For tabs with

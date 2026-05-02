@@ -64,7 +64,12 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 ///       card in the Files tab. A v6 agent would respond `Unknown op`
 ///       so we bump to surface the stale agent as a toast rather than
 ///       leaving the preview pane silently stuck on the loading card.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// - v8: adds `WriteFile` for global find-and-replace, plus `FileSize`
+///       so the worker can skip oversized files without round-tripping
+///       their bytes. A v7 agent would respond `Unknown op` to either,
+///       so a hard bump surfaces the stale agent as a toast and
+///       triggers auto-redeploy.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Encode a single envelope-level value to `writer` using the
 /// length-prefixed framing. The caller is expected to flush.
@@ -274,6 +279,31 @@ pub enum Request {
     /// Recursively remove a directory tree.
     RemoveDirAll {
         rel_path: String,
+    },
+    /// Size in bytes of an existing regular file at `rel_path`.
+    /// Cheap probe used by callers (notably the global-replace worker)
+    /// that need to decide whether to bother fetching the bytes —
+    /// avoids round-tripping a truncated 50 MB copy of a file the
+    /// caller is about to skip anyway.
+    FileSize {
+        rel_path: String,
+    },
+
+    /// Atomically overwrite an existing regular file with `content`.
+    /// Used by global find-and-replace. Path validation rejects
+    /// absolute paths, `..` traversal, and symlinks whose canonical
+    /// target falls outside the workdir. Fails `NotFound` if the
+    /// target doesn't already exist — write-file is replace-only,
+    /// not create.
+    ///
+    /// `content` rides through the same `serde_bytes` base64 path as
+    /// `ReadFileResponse.bytes` — without it, serde_json would
+    /// expand each byte into a separate integer array element and a
+    /// 50 MB replacement would blow up to ~350 MB of JSON.
+    WriteFile {
+        rel_path: String,
+        #[serde(with = "serde_bytes")]
+        content: Vec<u8>,
     },
     /// Move one or more paths to the OS Trash, or fall back to permanent
     /// deletion when no trash is configured on the remote host.

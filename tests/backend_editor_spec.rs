@@ -10,7 +10,7 @@ use std::sync::Mutex;
 
 use reef::backend::{Backend, BackendError, LocalBackend, RemoteBackend};
 use tempfile::TempDir;
-use test_support::agent_bin;
+use test_support::{HOME_LOCK, HomeGuard, agent_bin};
 
 static BACKEND_LOCK: Mutex<()> = Mutex::new(());
 
@@ -24,18 +24,19 @@ fn spawn_remote(workdir: &Path) -> RemoteBackend {
     RemoteBackend::spawn(&argv).expect("spawn remote")
 }
 
-/// Env-var reads are process-wide, so this test serialises against
-/// anything else that mutates $VISUAL/$EDITOR. The existing loopback
-/// tests in the suite don't touch those, so a dedicated lock here is
-/// sufficient.
-static EDITOR_ENV_LOCK: Mutex<()> = Mutex::new(());
-
 #[test]
 fn local_editor_spec_uses_editor_env() {
-    let _lock = EDITOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: single-threaded env mutation protected by EDITOR_ENV_LOCK.
-    // Other tests in this binary can't race because cargo runs test cases
-    // within one binary sequentially by default (plus the mutex).
+    // `resolve_editor` now reads the `editor.command` pref before
+    // $VISUAL / $EDITOR (so the in-app Settings page can override the
+    // shell environment). Redirect $HOME to an empty tempdir so the
+    // developer's real `~/.config/reef/prefs` doesn't override the
+    // env-var contract this test is asserting. Shares the
+    // workspace-wide HOME_LOCK so we serialise against any future
+    // test in this binary that touches HOME.
+    let _lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home_tmp = TempDir::new().unwrap();
+    let _home = HomeGuard::enter(home_tmp.path());
+    // SAFETY: single-threaded env mutation protected by HOME_LOCK.
     unsafe {
         std::env::set_var("VISUAL", "");
         std::env::set_var("EDITOR", "true");
@@ -75,7 +76,13 @@ fn remote_spawn_variant_refuses_editor_spec() {
 
 #[test]
 fn local_editor_spec_rejects_path_escape() {
-    let _lock = EDITOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Same HOME isolation rationale as `local_editor_spec_uses_editor_env`
+    // — without it the dev's real `editor.command` pref leaks in. The
+    // PathEscape check happens before editor resolution though, so this
+    // is mostly defensive.
+    let _lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home_tmp = TempDir::new().unwrap();
+    let _home = HomeGuard::enter(home_tmp.path());
     unsafe {
         std::env::set_var("EDITOR", "true");
     }

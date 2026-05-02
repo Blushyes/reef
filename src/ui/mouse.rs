@@ -94,6 +94,12 @@ pub enum ClickAction {
     /// Jump directly to a 1-based page index. Clicking the `[5]` chip
     /// dispatches `DbGotoPage(5)`.
     DbGotoPage(u64),
+    /// Click on a row in the Settings page. The `usize` indexes into
+    /// `crate::settings::SettingItem::ALL`. Clicking just moves the
+    /// selection cursor — activation (toggle / open inline editor) is
+    /// keyboard-only, mirroring the file tree where double-click /
+    /// Enter is the deliberate-action gate.
+    SettingsRow(usize),
 }
 
 #[derive(Debug, Clone)]

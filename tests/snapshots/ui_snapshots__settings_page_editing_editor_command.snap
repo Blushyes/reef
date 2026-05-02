@@ -1,0 +1,29 @@
+---
+source: tests/ui_snapshots.rs
+assertion_line: 680
+expression: output
+---
+┌ ⚙ Settings ──────────────────────────────────────────────────────────────────┐
+│                                                                              │
+│  GENERAL                                                                     │
+│     Theme                                    [auto]                          │
+│                                                                              │
+│  EXTERNAL EDITOR                                                             │
+│   › Editor command                           (unset — uses $VISUAL / $EDITO  │
+│                                                                              │
+│  GIT DIFF                                                                    │
+│     Diff layout                              [unified]                       │
+│     Diff mode                                [compact]                       │
+│     Status sidebar — tree view               [off]                           │
+│                                                                              │
+│  COMMIT DETAIL                                                               │
+│     Commit diff layout                       [unified]                       │
+│     Commit diff mode                         [compact]                       │
+│     Commit files — tree view                 [off]                           │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│    › nvim --clean                                                            │
+│    Enter save · Esc cancel                                                   │
+└──────────────────────────────────────────────────────────────────────────────┘

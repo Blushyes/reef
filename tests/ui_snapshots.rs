@@ -631,3 +631,49 @@ fn snapshot_search_tab_replace_open_with_excluded_row() {
         insta::assert_snapshot!("search_tab_replace_open_with_excluded_row", output)
     });
 }
+
+#[test]
+fn snapshot_settings_page_default() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
+    let (tmp, _raw) = tempdir_repo();
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    wait_for_file_tree(&mut app);
+    app.open_settings();
+    let output = render_app(&mut app, 80, 24);
+    with_filters(&[], || {
+        insta::assert_snapshot!("settings_page_default", output)
+    });
+}
+
+#[test]
+fn snapshot_settings_page_editing_editor_command() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
+    let (tmp, _raw) = tempdir_repo();
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    wait_for_file_tree(&mut app);
+    app.open_settings();
+    let editor_idx = reef::settings::SettingItem::ALL
+        .iter()
+        .position(|i| matches!(i, reef::settings::SettingItem::EditorCommand))
+        .unwrap();
+    app.settings.select(editor_idx);
+    reef::settings::begin_edit_editor_command(&mut app.settings);
+    if let Some(edit) = app.settings.editor_edit.as_mut() {
+        edit.buffer = "nvim --clean".to_string();
+        edit.cursor = edit.buffer.len();
+    }
+    let output = render_app(&mut app, 80, 24);
+    with_filters(&[], || {
+        insta::assert_snapshot!("settings_page_editing_editor_command", output)
+    });
+}

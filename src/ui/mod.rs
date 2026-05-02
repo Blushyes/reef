@@ -15,11 +15,12 @@ pub mod mouse;
 pub mod quick_open_panel;
 pub mod search_tab;
 pub mod selection;
+pub mod settings_panel;
 pub mod text;
 pub mod theme;
 pub mod toast;
 
-use crate::app::{App, Tab};
+use crate::app::{App, Tab, ViewMode};
 use crate::i18n::{Msg, t};
 use crate::ui::mouse::ClickAction;
 use crate::ui::toast::ToastLevel;
@@ -54,6 +55,15 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // from steering mouse selection toward a hidden region.
     app.last_diff_rect = None;
     app.last_diff_hit = None;
+
+    // Settings page is a full-screen takeover — render it instead of
+    // the normal title/tab/body/status frame. The four-tab body still
+    // gets its async work scheduled in the background; we just don't
+    // draw it.
+    if app.view_mode == ViewMode::Settings {
+        settings_panel::render(f, app, size);
+        return;
+    }
 
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -832,6 +842,7 @@ fn render_help(f: &mut Frame, app: &App, screen: Rect) {
         ("v", t(Msg::HelpSelectMode)),
         ("h", t(Msg::HelpShowHelp)),
         ("Ctrl+B", t(Msg::HelpToggleSidebar)),
+        ("Ctrl+,", t(Msg::HelpOpenSettings)),
         ("Space p", t(Msg::HelpQuickOpen)),
         ("Space f", t(Msg::HelpGlobalSearch)),
         (t(Msg::HelpKeyDragDrop), t(Msg::HelpDragDrop)),

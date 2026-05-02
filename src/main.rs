@@ -10,7 +10,7 @@ use crossterm::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use reef::agent_deploy::{self, InstallPath, SshSession};
-use reef::app::App;
+use reef::app::{App, ViewMode};
 use reef::backend::{Backend, LocalBackend, RemoteBackend};
 use reef::i18n;
 use reef::images;
@@ -310,14 +310,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // because it's the only input that needs to poke the terminal
                         // backend mid-loop.
                         //
-                        // When any palette (quick-open or global-search) is active
-                        // it owns every key unconditionally — 'v' must land as a
-                        // literal in the query, and 'any key' must not dismiss
-                        // help — so route to handle_key first and let it delegate
-                        // to the palette.
+                        // When any palette (quick-open or global-search) is active,
+                        // or while the full-screen Settings page is up, it owns every
+                        // key unconditionally — 'v' must land as a literal in the
+                        // query / editor.command buffer, and 'any key' must not
+                        // dismiss help — so route to handle_key first and let it
+                        // delegate to the page.
                         if app.quick_open.active
                             || app.global_search.active
                             || app.hosts_picker.active
+                            || app.view_mode == ViewMode::Settings
                         {
                             input::handle_key(key, &mut app);
                         } else if key.code == KeyCode::Char('v') && key.modifiers.is_empty() {

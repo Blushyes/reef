@@ -3672,8 +3672,18 @@ impl App {
                     }
                 }
                 Err(error) => {
-                    self.preview_load.complete_err(generation, error);
-                    self.preview_in_flight_path = None;
+                    if self.preview_load.complete_err(generation, error) {
+                        // `complete_err` flips `stale = true`, which would
+                        // make `should_request()` re-fire the same load on
+                        // the next tick — and if the failure is a decoder
+                        // panic, we'd just panic again, sticking the UI in
+                        // a permanent "loading…" loop. Clear stale so the
+                        // panic'd file stays failed until something else
+                        // (file switch, fs-watcher kick) marks it dirty.
+                        self.preview_load.stale = false;
+                        self.preview_load.error = None;
+                        self.preview_in_flight_path = None;
+                    }
                 }
             },
             WorkerResult::GitStatus { generation, result } => match result {

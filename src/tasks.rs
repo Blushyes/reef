@@ -1446,6 +1446,28 @@ fn split_stem_ext(name: &str) -> (&str, Option<&str>) {
 /// slow preview decodes can't queue behind a big tree rebuild or a
 /// long-running copy. Non-preview tasks arriving here are silently
 /// ignored — they're never routed to `preview_tx` in practice.
+/// Run a preview decode under `catch_unwind`. A panic anywhere inside
+/// the backend codepath (image crate on a malformed PNG, syntect on a
+/// pathological file, sqlite reader on a corrupt DB, ...) becomes an
+/// `Err(String)` instead of unwinding past the worker's `while` loop
+/// and killing the thread — pre-fix, one bad file took the worker
+/// down, every later `LoadPreview` queued onto a dead channel, and
+/// the UI got stuck on "loading…" with no recovery short of restart.
+///
+/// `rel_path` is captured by reference for the error message rather
+/// than moved into the closure, so the caller can reuse it after the
+/// guard returns (the worker still needs it for the `WorkerResult`).
+fn run_preview_with_panic_guard<F>(
+    rel_path: &Path,
+    work: F,
+) -> Result<Option<PreviewContent>, String>
+where
+    F: FnOnce() -> Option<PreviewContent>,
+{
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+        .map_err(|_| format!("preview decoder panicked on {}", rel_path.display()))
+}
+
 fn spawn_preview_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<FilesTask> {
     let (tx, rx) = mpsc::channel();
     let _ = thread::Builder::new()
@@ -1460,7 +1482,9 @@ fn spawn_preview_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<F
                         dark,
                         wants_decoded_image,
                     } => {
-                        let result = Ok(backend.load_preview(&rel_path, dark, wants_decoded_image));
+                        let result = run_preview_with_panic_guard(&rel_path, || {
+                            backend.load_preview(&rel_path, dark, wants_decoded_image)
+                        });
                         let _ = result_tx.send(WorkerResult::Preview { generation, result });
                     }
                     FilesTask::PrefetchPreview {
@@ -1470,9 +1494,12 @@ fn spawn_preview_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<F
                         wants_decoded_image,
                     } => {
                         // Fire-and-forget: the backend's LRU cache
-                        // absorbs the result. No WorkerResult because
-                        // the main thread has nothing to apply here.
-                        let _ = backend.load_preview(&rel_path, dark, wants_decoded_image);
+                        // absorbs the result. Same panic guard as the
+                        // `LoadPreview` arm — a bad neighbor on
+                        // prefetch must not take the worker down.
+                        let _ = run_preview_with_panic_guard(&rel_path, || {
+                            backend.load_preview(&rel_path, dark, wants_decoded_image)
+                        });
                     }
                     _ => {}
                 }
@@ -2859,5 +2886,50 @@ mod replace_tests {
         assert_eq!(summary.skipped_stale, 1);
         let after = fs::read_to_string(tmp.path().join("a.txt")).unwrap();
         assert_eq!(after, "match OK here\nmiss axb\n");
+    }
+}
+
+#[cfg(test)]
+mod preview_panic_guard_tests {
+    //! Regression coverage for the preview-worker panic guard. The bug it
+    //! fixes is hard to reproduce by hand (needs a malformed file that
+    //! trips a decoder panic in the `image` / `syntect` / sqlite reader
+    //! crates), so the guard helper itself is exercised directly here —
+    //! every Backend impl in the workspace shares it via
+    //! `spawn_preview_worker`, so locking down its semantics protects
+    //! the worker loop from silently regressing back to the
+    //! "loading…-forever" failure mode.
+    use super::*;
+
+    #[test]
+    fn run_preview_with_panic_guard_translates_panic_to_err() {
+        let result = run_preview_with_panic_guard(Path::new("dir/oops.png"), || {
+            panic!("simulated decoder panic");
+        });
+        let err = result.expect_err("panic must surface as Err, not propagate");
+        assert!(
+            err.contains("dir/oops.png"),
+            "rel_path missing from message: {err}"
+        );
+    }
+
+    #[test]
+    fn run_preview_with_panic_guard_passes_through_none() {
+        let result = run_preview_with_panic_guard(Path::new("x.txt"), || None);
+        assert!(matches!(result, Ok(None)), "got {result:?}");
+    }
+
+    #[test]
+    fn run_preview_with_panic_guard_passes_through_some() {
+        let preview = PreviewContent {
+            file_path: "x.txt".into(),
+            body: crate::file_tree::PreviewBody::Text {
+                lines: vec!["hi".into()],
+                highlighted: None,
+            },
+        };
+        let result = run_preview_with_panic_guard(Path::new("x.txt"), move || Some(preview));
+        let got = result.expect("Ok").expect("Some");
+        assert_eq!(got.file_path, "x.txt");
     }
 }

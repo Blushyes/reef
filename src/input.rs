@@ -3055,6 +3055,13 @@ pub fn handle_paste(s: String, app: &mut App) {
         quick_open::handle_paste(&s, app);
     } else if app.search.active {
         search::handle_paste(&s, app);
+    } else if app.global_search.active {
+        global_search::handle_paste_overlay(&s, &mut app.global_search);
+    } else if app.active_tab == Tab::Search
+        && app.active_panel == Panel::Files
+        && app.global_search.input_focused()
+    {
+        global_search::handle_paste_search_tab(&s, &mut app.global_search);
     }
     // No focused input; intentionally dropped. A stray paste into the
     // global keymap has no defined meaning, and we don't want to

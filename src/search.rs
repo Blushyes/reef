@@ -261,15 +261,7 @@ pub fn handle_key_in_search_mode(key: KeyEvent, app: &mut App) {
 /// prompt model. Called from `input::handle_paste` after the drop-path
 /// parser has declined the payload.
 pub fn handle_paste(s: &str, app: &mut App) {
-    let mut added = false;
-    for c in s.chars() {
-        if c == '\n' || c == '\r' {
-            continue;
-        }
-        input_edit::insert_char(&mut app.search.query, &mut app.search.cursor, c);
-        added = true;
-    }
-    if added {
+    if input_edit::paste_single_line(s, &mut app.search.query, &mut app.search.cursor) {
         app.search.wrap_msg = None;
         recompute_and_jump(app, /*from_step=*/ false);
     }

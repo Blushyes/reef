@@ -302,14 +302,94 @@ pub const PREVIEW_SYNC_DEBOUNCE: std::time::Duration = std::time::Duration::from
 
 // ─── Entry points ────────────────────────────────────────────────────────────
 
-/// Open the palette. Keeps existing `query`/`results` so Esc-peek-and-return
-/// doesn't lose state.
+/// Open the palette. If the active tab has a non-empty text selection
+/// (file-preview drag-select on Tab::Files, diff drag-select on Tab::Git
+/// /Tab::Graph), seed the query with it — VSCode's "Find with Selection"
+/// shortcut. Otherwise keeps the existing `query`/`results` so Esc-peek-
+/// and-return doesn't lose state.
 pub fn begin(app: &mut App) {
-    app.global_search.active = true;
+    if let Some(seed) = current_text_selection(app)
+        && seed != app.global_search.query
+    {
+        // Skip the rerun + excluded-clear when the seed equals the
+        // existing query: the user might have ticked off hits in
+        // replace mode and we don't want a no-op chord to wipe that.
+        app.global_search.query = seed;
+        mark_query_edited(&mut app.global_search);
+    }
     app.global_search.cursor = app.global_search.query.len();
+    app.global_search.active = true;
     // Fresh leader slot — a stale timestamp from a prior session would make
     // the first Space-after-open surprisingly close the palette.
     app.global_search.space_leader_at = None;
+}
+
+/// Snapshot the user's current text selection as a one-line search seed.
+///
+/// Sources, in priority order:
+/// 1. File preview selection (`preview_selection` × `preview_content`'s
+///    text body) — covers Tab::Files and the Tab::Search preview pane.
+/// 2. Diff selection (`diff_selection` × `last_diff_hit`) — covers
+///    Tab::Git and the Tab::Graph 3-col diff column.
+///
+/// Multi-line selections collapse to the first non-empty line, then
+/// trim leading/trailing whitespace: the global-search prompt is
+/// single-line and feeding it raw indentation produces zero matches
+/// for anything but the first line of a function.
+fn current_text_selection(app: &App) -> Option<String> {
+    if let (Some(sel), Some(preview)) =
+        (app.preview_selection.as_ref(), app.preview_content.as_ref())
+        && !sel.is_empty()
+        && let crate::file_tree::PreviewBody::Text { lines, .. } = &preview.body
+    {
+        let text = crate::ui::selection::collect_selected_text(lines, sel);
+        if let Some(line) = first_nonempty_trimmed_line(&text) {
+            return Some(line);
+        }
+    }
+    if let (Some(sel), Some(hit)) = (app.diff_selection.as_ref(), app.last_diff_hit.as_ref())
+        && !sel.sel.is_empty()
+    {
+        let text = crate::ui::selection::collect_diff_selected_text(hit, sel);
+        if let Some(line) = first_nonempty_trimmed_line(&text) {
+            return Some(line);
+        }
+    }
+    None
+}
+
+fn first_nonempty_trimmed_line(s: &str) -> Option<String> {
+    s.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+}
+
+/// Bracketed-paste arrival while the Space+F overlay is active. Strips
+/// newlines and re-runs the search. Called from `input::handle_paste`
+/// after the drop-path parser has declined the payload.
+pub fn handle_paste_overlay(s: &str, state: &mut GlobalSearchState) {
+    if input_edit::paste_single_line(s, &mut state.query, &mut state.cursor) {
+        mark_query_edited(state);
+    }
+}
+
+/// Bracketed-paste arrival while a Tab::Search input row is focused.
+/// Routes to `query` (FindInput) or `replace_text` (ReplaceInput) based
+/// on `focus`; List focus is a no-op (no text input to receive the
+/// payload).
+pub fn handle_paste_search_tab(s: &str, state: &mut GlobalSearchState) {
+    match state.focus {
+        SearchPanelFocus::FindInput => {
+            if input_edit::paste_single_line(s, &mut state.query, &mut state.cursor) {
+                mark_query_edited(state);
+            }
+        }
+        SearchPanelFocus::ReplaceInput => {
+            input_edit::paste_single_line(s, &mut state.replace_text, &mut state.replace_cursor);
+        }
+        SearchPanelFocus::List => {}
+    }
 }
 
 /// Commit the selected hit: close the palette, switch to the Files tab,
@@ -891,5 +971,126 @@ mod tests {
             line_text: String::new(),
             byte_range: 0..0,
         }
+    }
+
+    // ── selection-seed plumbing ──────────────────────────────────────────
+
+    #[test]
+    fn first_nonempty_trimmed_line_returns_none_for_blank_input() {
+        assert_eq!(first_nonempty_trimmed_line(""), None);
+        assert_eq!(first_nonempty_trimmed_line("   \n  \t\n"), None);
+    }
+
+    #[test]
+    fn first_nonempty_trimmed_line_skips_leading_blanks() {
+        assert_eq!(
+            first_nonempty_trimmed_line("\n\n   first\nsecond"),
+            Some("first".to_string()),
+        );
+    }
+
+    #[test]
+    fn first_nonempty_trimmed_line_strips_indentation_and_trailing_ws() {
+        // The selection on a function body grabs the leading indent —
+        // feeding "    fn foo()" verbatim into ripgrep would miss every
+        // call site that isn't indented identically.
+        assert_eq!(
+            first_nonempty_trimmed_line("    fn foo()   "),
+            Some("fn foo()".to_string()),
+        );
+    }
+
+    // ── handle_paste_overlay ────────────────────────────────────────────
+
+    #[test]
+    fn handle_paste_overlay_inserts_and_marks_edited() {
+        let mut state = GlobalSearchState::default();
+        assert!(state.last_keystroke_at.is_none());
+        handle_paste_overlay("hello", &mut state);
+        assert_eq!(state.query, "hello");
+        assert_eq!(state.cursor, 5);
+        assert!(
+            state.last_keystroke_at.is_some(),
+            "non-empty paste must arm the search-rerun debounce",
+        );
+    }
+
+    #[test]
+    fn handle_paste_overlay_pure_newlines_do_not_trigger_rerun() {
+        let mut state = GlobalSearchState::default();
+        handle_paste_overlay("\n\r\n", &mut state);
+        assert_eq!(state.query, "");
+        assert!(
+            state.last_keystroke_at.is_none(),
+            "all-newline paste inserts nothing → search rerun must NOT fire",
+        );
+    }
+
+    #[test]
+    fn handle_paste_overlay_does_not_clear_unrelated_state() {
+        // Regression guard: the rerun debounce is the only side-effect
+        // the overlay paste should have. `selected` and `replace_text`
+        // must survive untouched.
+        let mut state = GlobalSearchState {
+            results: vec![dummy_hit("a"), dummy_hit("b"), dummy_hit("c")],
+            selected: 2,
+            replace_text: "kept".to_string(),
+            replace_cursor: 4,
+            ..GlobalSearchState::default()
+        };
+        handle_paste_overlay("foo", &mut state);
+        assert_eq!(state.selected, 2);
+        assert_eq!(state.replace_text, "kept");
+        assert_eq!(state.replace_cursor, 4);
+    }
+
+    // ── handle_paste_search_tab ─────────────────────────────────────────
+
+    #[test]
+    fn handle_paste_search_tab_routes_find_input_to_query() {
+        let mut state = GlobalSearchState {
+            focus: SearchPanelFocus::FindInput,
+            ..GlobalSearchState::default()
+        };
+        handle_paste_search_tab("abc", &mut state);
+        assert_eq!(state.query, "abc");
+        assert_eq!(state.cursor, 3);
+        assert!(state.last_keystroke_at.is_some());
+        assert_eq!(state.replace_text, "");
+    }
+
+    #[test]
+    fn handle_paste_search_tab_routes_replace_input_to_replace_text() {
+        let mut state = GlobalSearchState {
+            focus: SearchPanelFocus::ReplaceInput,
+            replace_open: true,
+            ..GlobalSearchState::default()
+        };
+        handle_paste_search_tab("xyz", &mut state);
+        assert_eq!(state.replace_text, "xyz");
+        assert_eq!(state.replace_cursor, 3);
+        assert_eq!(state.query, "");
+        assert!(
+            state.last_keystroke_at.is_none(),
+            "replace-input edits never re-run the search",
+        );
+    }
+
+    #[test]
+    fn handle_paste_search_tab_list_focus_is_noop() {
+        // List focus = no text input is selected → bracketed paste has
+        // nowhere to land. Must not silently leak into either field.
+        let mut state = GlobalSearchState {
+            focus: SearchPanelFocus::List,
+            query: "kept-query".to_string(),
+            cursor: 10,
+            replace_text: "kept-replace".to_string(),
+            replace_cursor: 12,
+            ..GlobalSearchState::default()
+        };
+        handle_paste_search_tab("LEAK", &mut state);
+        assert_eq!(state.query, "kept-query");
+        assert_eq!(state.replace_text, "kept-replace");
+        assert!(state.last_keystroke_at.is_none());
     }
 }

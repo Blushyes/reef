@@ -64,12 +64,22 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 ///       card in the Files tab. A v6 agent would respond `Unknown op`
 ///       so we bump to surface the stale agent as a toast rather than
 ///       leaving the preview pane silently stuck on the loading card.
-/// - v8: adds `WriteFile` for global find-and-replace, plus `FileSize`
+/// - v8: adds `DiscoverRepos` so a parent workdir can expose multiple
+///       child Git repositories before Git operations become repo-scoped.
+/// - v9: adds `WriteFile` for global find-and-replace, plus `FileSize`
 ///       so the worker can skip oversized files without round-tripping
 ///       their bytes. A v7 agent would respond `Unknown op` to either,
 ///       so a hard bump surfaces the stale agent as a toast and
 ///       triggers auto-redeploy.
-pub const PROTOCOL_VERSION: u32 = 8;
+/// - v10: adds `GitStatusFor` so status runs in the selected repo.
+/// - v11: adds repo-scoped diff requests.
+/// - v12: adds repo-scoped stage/unstage requests.
+/// - v13: adds `RevertPathFor` so discard/restore runs in the selected repo.
+/// - v14: adds `PushFor` / `CommitFor` so push/commit run in the selected repo.
+/// - v15: adds repo-scoped graph/history requests.
+/// - v16: adds repo-scoped branch checkout.
+/// - v17: adds repo-scoped pull.
+pub const PROTOCOL_VERSION: u32 = 17;
 
 /// Encode a single envelope-level value to `writer` using the
 /// length-prefixed framing. The caller is expected to flush.
@@ -166,9 +176,22 @@ pub enum Request {
         max_bytes: u64,
     },
 
+    // ── Workspace Git repositories ────
+    DiscoverRepos {
+        opts: RepoDiscoverOptsDto,
+    },
+
     // ── Git: status / diff ────
     GitStatus,
+    GitStatusFor {
+        repo_root_rel: String,
+    },
     StagedDiff {
+        path: String,
+        context_lines: u32,
+    },
+    StagedDiffFor {
+        repo_root_rel: String,
         path: String,
         context_lines: u32,
     },
@@ -176,14 +199,31 @@ pub enum Request {
         path: String,
         context_lines: u32,
     },
+    UnstagedDiffFor {
+        repo_root_rel: String,
+        path: String,
+        context_lines: u32,
+    },
     UntrackedDiff {
+        path: String,
+    },
+    UntrackedDiffFor {
+        repo_root_rel: String,
         path: String,
     },
 
     Stage {
         path: String,
     },
+    StageFor {
+        repo_root_rel: String,
+        path: String,
+    },
     Unstage {
+        path: String,
+    },
+    UnstageFor {
+        repo_root_rel: String,
         path: String,
     },
     Restore {
@@ -200,9 +240,29 @@ pub enum Request {
         path: String,
         is_staged: bool,
     },
+    RevertPathFor {
+        repo_root_rel: String,
+        path: String,
+        is_staged: bool,
+    },
 
     Push {
         force: bool,
+    },
+    PushFor {
+        repo_root_rel: String,
+        force: bool,
+    },
+    Pull,
+    PullFor {
+        repo_root_rel: String,
+    },
+    CheckoutBranch {
+        branch: String,
+    },
+    CheckoutBranchFor {
+        repo_root_rel: String,
+        branch: String,
     },
 
     /// Create a commit from the staged index with `message`. Agent-side
@@ -211,17 +271,41 @@ pub enum Request {
     Commit {
         message: String,
     },
+    CommitFor {
+        repo_root_rel: String,
+        message: String,
+    },
 
     // ── Git: history ────
     ListCommits {
         limit: u64,
     },
+    ListCommitsFor {
+        repo_root_rel: String,
+        limit: u64,
+    },
     ListRefs,
+    ListRefsFor {
+        repo_root_rel: String,
+    },
     HeadOid,
+    HeadOidFor {
+        repo_root_rel: String,
+    },
     CommitDetail {
         oid: String,
     },
+    CommitDetailFor {
+        repo_root_rel: String,
+        oid: String,
+    },
     CommitFileDiff {
+        oid: String,
+        path: String,
+        context_lines: u32,
+    },
+    CommitFileDiffFor {
+        repo_root_rel: String,
         oid: String,
         path: String,
         context_lines: u32,
@@ -232,10 +316,22 @@ pub enum Request {
         oldest_oid: String,
         newest_oid: String,
     },
+    RangeFilesFor {
+        repo_root_rel: String,
+        oldest_oid: String,
+        newest_oid: String,
+    },
     /// Single-file diff for the same range as `RangeFiles`. Wire format
     /// is `Option<DiffContentDto>` (None when the path isn't part of the
     /// range diff).
     RangeFileDiff {
+        oldest_oid: String,
+        newest_oid: String,
+        path: String,
+        context_lines: u32,
+    },
+    RangeFileDiffFor {
+        repo_root_rel: String,
         oldest_oid: String,
         newest_oid: String,
         path: String,
@@ -658,6 +754,27 @@ pub struct TrashResponseDto {
     /// `true` if the agent found a system trash tool (`gio trash` etc.);
     /// `false` if it had to fall through to `fs::remove_*`.
     pub used_trash: bool,
+}
+
+// ── Workspace Git repositories ─────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoDiscoverOptsDto {
+    pub max_depth: u64,
+    pub include_nested: bool,
+    pub max_repos: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceRepoMetaDto {
+    pub repo_root_rel: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoDiscoverResponseDto {
+    pub repos: Vec<WorkspaceRepoMetaDto>,
+    pub truncated: bool,
 }
 
 // ── M3 Track 2: walk + search ──────────────────────────────────────────────

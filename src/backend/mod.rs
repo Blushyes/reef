@@ -19,7 +19,7 @@
 use std::ffi::OsString;
 use std::io;
 use std::ops::{ControlFlow, Range};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc;
 
 use crate::file_tree::{PreviewContent, TreeEntry};
@@ -130,6 +130,89 @@ pub struct StatusSnapshot {
     pub unstaged: Vec<FileEntry>,
     pub branch_name: String,
     pub ahead_behind: Option<(usize, usize)>,
+}
+
+/// Options for discovering Git repositories under the backend workdir.
+#[derive(Debug, Clone)]
+pub struct RepoDiscoverOpts {
+    pub max_depth: usize,
+    pub include_nested: bool,
+    pub max_repos: Option<usize>,
+}
+
+impl Default for RepoDiscoverOpts {
+    fn default() -> Self {
+        Self {
+            max_depth: 2,
+            include_nested: false,
+            max_repos: Some(100),
+        }
+    }
+}
+
+/// One discovered Git repository. `repo_root_rel` is the canonical identity:
+/// workdir-relative, `.` for the workdir itself, never empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceRepoMeta {
+    pub repo_root_rel: PathBuf,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoDiscoverResponse {
+    pub repos: Vec<WorkspaceRepoMeta>,
+    pub truncated: bool,
+}
+
+/// Normalize a workdir-relative repository identity. Empty and `.` both
+/// canonicalize to `.`, absolute paths and parent traversal are rejected.
+pub fn normalize_repo_root_rel(rel: &Path) -> Result<PathBuf, BackendError> {
+    if rel.is_absolute() {
+        return Err(BackendError::PathEscape(format!(
+            "absolute repo path not allowed: {}",
+            rel.display()
+        )));
+    }
+
+    let mut out = PathBuf::new();
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(c) => out.push(c),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(BackendError::PathEscape(format!(
+                    "parent-dir traversal not allowed in repo path: {}",
+                    rel.display()
+                )));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(BackendError::PathEscape(format!(
+                    "rooted repo path not allowed: {}",
+                    rel.display()
+                )));
+            }
+        }
+    }
+
+    if out.as_os_str().is_empty() {
+        Ok(PathBuf::from("."))
+    } else {
+        Ok(out)
+    }
+}
+
+pub fn repo_key(rel: &Path) -> String {
+    if rel == Path::new(".") {
+        ".".to_string()
+    } else {
+        rel.components()
+            .filter_map(|c| match c {
+                Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
 }
 
 /// Simple graph payload returned by `list_commits` + `refs` + `ahead_behind`
@@ -252,6 +335,9 @@ pub trait Backend: Send + Sync {
         false
     }
 
+    fn discover_repos(&self, opts: &RepoDiscoverOpts)
+    -> Result<RepoDiscoverResponse, BackendError>;
+
     // ─── filesystem ─────────────────────────────────────────────────────────
     /// Build the flat tree of entries for the backend's workdir. `expanded`
     /// is the set of directory paths (relative) the UI wants to show as
@@ -312,9 +398,16 @@ pub trait Backend: Send + Sync {
 
     // ─── git: status / diff / stage ─────────────────────────────────────────
     fn git_status(&self) -> Result<StatusSnapshot, BackendError>;
+    fn git_status_for(&self, repo_root_rel: &Path) -> Result<StatusSnapshot, BackendError>;
 
     fn staged_diff(
         &self,
+        path: &str,
+        context_lines: u32,
+    ) -> Result<Option<DiffContent>, BackendError>;
+    fn staged_diff_for(
+        &self,
+        repo_root_rel: &Path,
         path: &str,
         context_lines: u32,
     ) -> Result<Option<DiffContent>, BackendError>;
@@ -323,10 +416,23 @@ pub trait Backend: Send + Sync {
         path: &str,
         context_lines: u32,
     ) -> Result<Option<DiffContent>, BackendError>;
+    fn unstaged_diff_for(
+        &self,
+        repo_root_rel: &Path,
+        path: &str,
+        context_lines: u32,
+    ) -> Result<Option<DiffContent>, BackendError>;
     fn untracked_diff(&self, path: &str) -> Result<Option<DiffContent>, BackendError>;
+    fn untracked_diff_for(
+        &self,
+        repo_root_rel: &Path,
+        path: &str,
+    ) -> Result<Option<DiffContent>, BackendError>;
 
     fn stage(&self, path: &str) -> Result<(), BackendError>;
+    fn stage_for(&self, repo_root_rel: &Path, path: &str) -> Result<(), BackendError>;
     fn unstage(&self, path: &str) -> Result<(), BackendError>;
+    fn unstage_for(&self, repo_root_rel: &Path, path: &str) -> Result<(), BackendError>;
     fn restore(&self, path: &str) -> Result<(), BackendError>;
     /// Combined "discard one path" op used by the Git tab's folder /
     /// section discard flows. Staged paths are first unstaged, then the
@@ -336,21 +442,55 @@ pub trait Backend: Send + Sync {
     /// `revert_path` helper in `app.rs` assumed a local repo handle and
     /// silently no-op'd on remote before M4).
     fn revert_path(&self, path: &str, is_staged: bool) -> Result<(), BackendError>;
+    fn revert_path_for(
+        &self,
+        repo_root_rel: &Path,
+        path: &str,
+        is_staged: bool,
+    ) -> Result<(), BackendError>;
 
     fn push(&self, force: bool) -> Result<(), BackendError>;
+    fn push_for(&self, repo_root_rel: &Path, force: bool) -> Result<(), BackendError>;
+    fn pull(&self) -> Result<(), BackendError>;
+    fn pull_for(&self, repo_root_rel: &Path) -> Result<(), BackendError>;
+    fn checkout_branch(&self, branch: &str) -> Result<(), BackendError>;
+    fn checkout_branch_for(&self, repo_root_rel: &Path, branch: &str) -> Result<(), BackendError>;
 
     /// Commit the staged index with `message`. Same shell-out rationale
     /// as `push` — respects hooks, signing, and the user's git config.
     /// Errors from `git commit` bubble up as `BackendError::Git`.
     fn commit(&self, message: &str) -> Result<(), BackendError>;
+    fn commit_for(&self, repo_root_rel: &Path, message: &str) -> Result<(), BackendError>;
 
     // ─── git: history ───────────────────────────────────────────────────────
     fn list_commits(&self, limit: usize) -> Result<Vec<CommitInfo>, BackendError>;
+    fn list_commits_for(
+        &self,
+        repo_root_rel: &Path,
+        limit: usize,
+    ) -> Result<Vec<CommitInfo>, BackendError>;
     fn list_refs(&self) -> Result<HashMap<String, Vec<RefLabel>>, BackendError>;
+    fn list_refs_for(
+        &self,
+        repo_root_rel: &Path,
+    ) -> Result<HashMap<String, Vec<RefLabel>>, BackendError>;
     fn head_oid(&self) -> Result<Option<String>, BackendError>;
+    fn head_oid_for(&self, repo_root_rel: &Path) -> Result<Option<String>, BackendError>;
     fn commit_detail(&self, oid: &str) -> Result<Option<CommitDetail>, BackendError>;
+    fn commit_detail_for(
+        &self,
+        repo_root_rel: &Path,
+        oid: &str,
+    ) -> Result<Option<CommitDetail>, BackendError>;
     fn commit_file_diff(
         &self,
+        oid: &str,
+        path: &str,
+        context_lines: u32,
+    ) -> Result<Option<DiffContent>, BackendError>;
+    fn commit_file_diff_for(
+        &self,
+        repo_root_rel: &Path,
         oid: &str,
         path: &str,
         context_lines: u32,
@@ -362,10 +502,24 @@ pub trait Backend: Send + Sync {
         oldest_oid: &str,
         newest_oid: &str,
     ) -> Result<Vec<FileEntry>, BackendError>;
+    fn range_files_for(
+        &self,
+        repo_root_rel: &Path,
+        oldest_oid: &str,
+        newest_oid: &str,
+    ) -> Result<Vec<FileEntry>, BackendError>;
 
     /// Single-file diff for a commit range (same tree baseline as `range_files`).
     fn range_file_diff(
         &self,
+        oldest_oid: &str,
+        newest_oid: &str,
+        path: &str,
+        context_lines: u32,
+    ) -> Result<Option<DiffContent>, BackendError>;
+    fn range_file_diff_for(
+        &self,
+        repo_root_rel: &Path,
         oldest_oid: &str,
         newest_oid: &str,
         path: &str,

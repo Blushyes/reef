@@ -19,13 +19,14 @@ use std::time::Duration;
 
 use reef_proto::{
     ContentSearchCompletedDto, ContentSearchRequestDto, DatabaseInfoDto, DirEntryDto, Envelope,
-    MatchHitDto, Notification, ReadFileResponse, Request, Response, TrashResponseDto, WalkOptsDto,
-    WalkResponseDto, decode_frame, encode_frame,
+    MatchHitDto, Notification, ReadFileResponse, RepoDiscoverOptsDto, RepoDiscoverResponseDto,
+    Request, Response, TrashResponseDto, WalkOptsDto, WalkResponseDto, decode_frame, encode_frame,
 };
 
 use super::{
     Backend, BackendError, ContentMatchHit, ContentSearchCompleted, ContentSearchRequest,
-    EditorLaunchSpec, SearchChunkSink, StatusSnapshot, TrashOutcome, WalkOpts, WalkResponse,
+    EditorLaunchSpec, RepoDiscoverOpts, RepoDiscoverResponse, SearchChunkSink, StatusSnapshot,
+    TrashOutcome, WalkOpts, WalkResponse, WorkspaceRepoMeta, normalize_repo_root_rel, repo_key,
 };
 use crate::file_tree::{PreviewContent, TreeEntry};
 use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, RefLabel};
@@ -461,6 +462,35 @@ impl Backend for RemoteBackend {
         !self.branch_name().is_empty()
     }
 
+    fn discover_repos(
+        &self,
+        opts: &RepoDiscoverOpts,
+    ) -> Result<RepoDiscoverResponse, BackendError> {
+        let dto = RepoDiscoverOptsDto {
+            max_depth: opts.max_depth as u64,
+            include_nested: opts.include_nested,
+            max_repos: opts.max_repos.map(|n| n as u64),
+        };
+        let resp: RepoDiscoverResponseDto = self.request(Request::DiscoverRepos { opts: dto })?;
+        let mut repos = Vec::with_capacity(resp.repos.len());
+        for r in resp.repos {
+            if r.repo_root_rel.is_empty() {
+                return Err(BackendError::PathEscape(
+                    "empty repo_root_rel in discover response".to_string(),
+                ));
+            }
+            let repo_root_rel = normalize_repo_root_rel(Path::new(&r.repo_root_rel))?;
+            repos.push(WorkspaceRepoMeta {
+                repo_root_rel,
+                display_name: r.display_name,
+            });
+        }
+        Ok(RepoDiscoverResponse {
+            repos,
+            truncated: resp.truncated,
+        })
+    }
+
     fn build_file_tree(
         &self,
         expanded: &HashSet<PathBuf>,
@@ -598,12 +628,46 @@ impl Backend for RemoteBackend {
         })
     }
 
+    fn git_status_for(&self, repo_root_rel: &Path) -> Result<StatusSnapshot, BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.git_status();
+        }
+        let snap: reef_proto::StatusSnapshotDto = self.request(Request::GitStatusFor {
+            repo_root_rel: repo_key(&repo_root_rel),
+        })?;
+        Ok(StatusSnapshot {
+            staged: snap.staged.into_iter().map(Into::into).collect(),
+            unstaged: snap.unstaged.into_iter().map(Into::into).collect(),
+            branch_name: snap.branch_name,
+            ahead_behind: snap.ahead_behind,
+        })
+    }
+
     fn staged_diff(
         &self,
         path: &str,
         context_lines: u32,
     ) -> Result<Option<DiffContent>, BackendError> {
         let resp: Option<reef_proto::DiffContentDto> = self.request(Request::StagedDiff {
+            path: path.to_string(),
+            context_lines,
+        })?;
+        Ok(resp.map(Into::into))
+    }
+
+    fn staged_diff_for(
+        &self,
+        repo_root_rel: &Path,
+        path: &str,
+        context_lines: u32,
+    ) -> Result<Option<DiffContent>, BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.staged_diff(path, context_lines);
+        }
+        let resp: Option<reef_proto::DiffContentDto> = self.request(Request::StagedDiffFor {
+            repo_root_rel: repo_key(&repo_root_rel),
             path: path.to_string(),
             context_lines,
         })?;
@@ -622,8 +686,42 @@ impl Backend for RemoteBackend {
         Ok(resp.map(Into::into))
     }
 
+    fn unstaged_diff_for(
+        &self,
+        repo_root_rel: &Path,
+        path: &str,
+        context_lines: u32,
+    ) -> Result<Option<DiffContent>, BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.unstaged_diff(path, context_lines);
+        }
+        let resp: Option<reef_proto::DiffContentDto> = self.request(Request::UnstagedDiffFor {
+            repo_root_rel: repo_key(&repo_root_rel),
+            path: path.to_string(),
+            context_lines,
+        })?;
+        Ok(resp.map(Into::into))
+    }
+
     fn untracked_diff(&self, path: &str) -> Result<Option<DiffContent>, BackendError> {
         let resp: Option<reef_proto::DiffContentDto> = self.request(Request::UntrackedDiff {
+            path: path.to_string(),
+        })?;
+        Ok(resp.map(Into::into))
+    }
+
+    fn untracked_diff_for(
+        &self,
+        repo_root_rel: &Path,
+        path: &str,
+    ) -> Result<Option<DiffContent>, BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.untracked_diff(path);
+        }
+        let resp: Option<reef_proto::DiffContentDto> = self.request(Request::UntrackedDiffFor {
+            repo_root_rel: repo_key(&repo_root_rel),
             path: path.to_string(),
         })?;
         Ok(resp.map(Into::into))
@@ -636,8 +734,32 @@ impl Backend for RemoteBackend {
         Ok(())
     }
 
+    fn stage_for(&self, repo_root_rel: &Path, path: &str) -> Result<(), BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.stage(path);
+        }
+        let _: serde_json::Value = self.request(Request::StageFor {
+            repo_root_rel: repo_key(&repo_root_rel),
+            path: path.to_string(),
+        })?;
+        Ok(())
+    }
+
     fn unstage(&self, path: &str) -> Result<(), BackendError> {
         let _: serde_json::Value = self.request(Request::Unstage {
+            path: path.to_string(),
+        })?;
+        Ok(())
+    }
+
+    fn unstage_for(&self, repo_root_rel: &Path, path: &str) -> Result<(), BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.unstage(path);
+        }
+        let _: serde_json::Value = self.request(Request::UnstageFor {
+            repo_root_rel: repo_key(&repo_root_rel),
             path: path.to_string(),
         })?;
         Ok(())
@@ -658,8 +780,73 @@ impl Backend for RemoteBackend {
         Ok(())
     }
 
+    fn revert_path_for(
+        &self,
+        repo_root_rel: &Path,
+        path: &str,
+        is_staged: bool,
+    ) -> Result<(), BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.revert_path(path, is_staged);
+        }
+        let _: serde_json::Value = self.request(Request::RevertPathFor {
+            repo_root_rel: repo_key(&repo_root_rel),
+            path: path.to_string(),
+            is_staged,
+        })?;
+        Ok(())
+    }
+
     fn push(&self, force: bool) -> Result<(), BackendError> {
         let _: serde_json::Value = self.request(Request::Push { force })?;
+        Ok(())
+    }
+
+    fn push_for(&self, repo_root_rel: &Path, force: bool) -> Result<(), BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.push(force);
+        }
+        let _: serde_json::Value = self.request(Request::PushFor {
+            repo_root_rel: repo_key(&repo_root_rel),
+            force,
+        })?;
+        Ok(())
+    }
+
+    fn pull(&self) -> Result<(), BackendError> {
+        let _: serde_json::Value = self.request(Request::Pull)?;
+        Ok(())
+    }
+
+    fn pull_for(&self, repo_root_rel: &Path) -> Result<(), BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.pull();
+        }
+        let _: serde_json::Value = self.request(Request::PullFor {
+            repo_root_rel: repo_key(&repo_root_rel),
+        })?;
+        Ok(())
+    }
+
+    fn checkout_branch(&self, branch: &str) -> Result<(), BackendError> {
+        let _: serde_json::Value = self.request(Request::CheckoutBranch {
+            branch: branch.to_string(),
+        })?;
+        Ok(())
+    }
+
+    fn checkout_branch_for(&self, repo_root_rel: &Path, branch: &str) -> Result<(), BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.checkout_branch(branch);
+        }
+        let _: serde_json::Value = self.request(Request::CheckoutBranchFor {
+            repo_root_rel: repo_key(&repo_root_rel),
+            branch: branch.to_string(),
+        })?;
         Ok(())
     }
 
@@ -670,8 +857,36 @@ impl Backend for RemoteBackend {
         Ok(())
     }
 
+    fn commit_for(&self, repo_root_rel: &Path, message: &str) -> Result<(), BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.commit(message);
+        }
+        let _: serde_json::Value = self.request(Request::CommitFor {
+            repo_root_rel: repo_key(&repo_root_rel),
+            message: message.to_string(),
+        })?;
+        Ok(())
+    }
+
     fn list_commits(&self, limit: usize) -> Result<Vec<CommitInfo>, BackendError> {
         let list: Vec<reef_proto::CommitInfoDto> = self.request(Request::ListCommits {
+            limit: limit as u64,
+        })?;
+        Ok(list.into_iter().map(Into::into).collect())
+    }
+
+    fn list_commits_for(
+        &self,
+        repo_root_rel: &Path,
+        limit: usize,
+    ) -> Result<Vec<CommitInfo>, BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.list_commits(limit);
+        }
+        let list: Vec<reef_proto::CommitInfoDto> = self.request(Request::ListCommitsFor {
+            repo_root_rel: repo_key(&repo_root_rel),
             limit: limit as u64,
         })?;
         Ok(list.into_iter().map(Into::into).collect())
@@ -685,12 +900,56 @@ impl Backend for RemoteBackend {
             .collect())
     }
 
+    fn list_refs_for(
+        &self,
+        repo_root_rel: &Path,
+    ) -> Result<HashMap<String, Vec<RefLabel>>, BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.list_refs();
+        }
+        let map: HashMap<String, Vec<reef_proto::RefLabelDto>> =
+            self.request(Request::ListRefsFor {
+                repo_root_rel: repo_key(&repo_root_rel),
+            })?;
+        Ok(map
+            .into_iter()
+            .map(|(k, v)| (k, v.into_iter().map(Into::into).collect()))
+            .collect())
+    }
+
     fn head_oid(&self) -> Result<Option<String>, BackendError> {
         self.request(Request::HeadOid)
     }
 
+    fn head_oid_for(&self, repo_root_rel: &Path) -> Result<Option<String>, BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.head_oid();
+        }
+        self.request(Request::HeadOidFor {
+            repo_root_rel: repo_key(&repo_root_rel),
+        })
+    }
+
     fn commit_detail(&self, oid: &str) -> Result<Option<CommitDetail>, BackendError> {
         let resp: Option<reef_proto::CommitDetailDto> = self.request(Request::CommitDetail {
+            oid: oid.to_string(),
+        })?;
+        Ok(resp.map(Into::into))
+    }
+
+    fn commit_detail_for(
+        &self,
+        repo_root_rel: &Path,
+        oid: &str,
+    ) -> Result<Option<CommitDetail>, BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.commit_detail(oid);
+        }
+        let resp: Option<reef_proto::CommitDetailDto> = self.request(Request::CommitDetailFor {
+            repo_root_rel: repo_key(&repo_root_rel),
             oid: oid.to_string(),
         })?;
         Ok(resp.map(Into::into))
@@ -710,12 +969,51 @@ impl Backend for RemoteBackend {
         Ok(resp.map(Into::into))
     }
 
+    fn commit_file_diff_for(
+        &self,
+        repo_root_rel: &Path,
+        oid: &str,
+        path: &str,
+        context_lines: u32,
+    ) -> Result<Option<DiffContent>, BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.commit_file_diff(oid, path, context_lines);
+        }
+        let resp: Option<reef_proto::DiffContentDto> =
+            self.request(Request::CommitFileDiffFor {
+                repo_root_rel: repo_key(&repo_root_rel),
+                oid: oid.to_string(),
+                path: path.to_string(),
+                context_lines,
+            })?;
+        Ok(resp.map(Into::into))
+    }
+
     fn range_files(
         &self,
         oldest_oid: &str,
         newest_oid: &str,
     ) -> Result<Vec<FileEntry>, BackendError> {
         let resp: Vec<reef_proto::FileEntryDto> = self.request(Request::RangeFiles {
+            oldest_oid: oldest_oid.to_string(),
+            newest_oid: newest_oid.to_string(),
+        })?;
+        Ok(resp.into_iter().map(Into::into).collect())
+    }
+
+    fn range_files_for(
+        &self,
+        repo_root_rel: &Path,
+        oldest_oid: &str,
+        newest_oid: &str,
+    ) -> Result<Vec<FileEntry>, BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.range_files(oldest_oid, newest_oid);
+        }
+        let resp: Vec<reef_proto::FileEntryDto> = self.request(Request::RangeFilesFor {
+            repo_root_rel: repo_key(&repo_root_rel),
             oldest_oid: oldest_oid.to_string(),
             newest_oid: newest_oid.to_string(),
         })?;
@@ -730,6 +1028,28 @@ impl Backend for RemoteBackend {
         context_lines: u32,
     ) -> Result<Option<DiffContent>, BackendError> {
         let resp: Option<reef_proto::DiffContentDto> = self.request(Request::RangeFileDiff {
+            oldest_oid: oldest_oid.to_string(),
+            newest_oid: newest_oid.to_string(),
+            path: path.to_string(),
+            context_lines,
+        })?;
+        Ok(resp.map(Into::into))
+    }
+
+    fn range_file_diff_for(
+        &self,
+        repo_root_rel: &Path,
+        oldest_oid: &str,
+        newest_oid: &str,
+        path: &str,
+        context_lines: u32,
+    ) -> Result<Option<DiffContent>, BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.range_file_diff(oldest_oid, newest_oid, path, context_lines);
+        }
+        let resp: Option<reef_proto::DiffContentDto> = self.request(Request::RangeFileDiffFor {
+            repo_root_rel: repo_key(&repo_root_rel),
             oldest_oid: oldest_oid.to_string(),
             newest_oid: newest_oid.to_string(),
             path: path.to_string(),

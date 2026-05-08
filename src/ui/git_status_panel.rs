@@ -7,6 +7,7 @@
 //! …) which keeps host side state coherent.
 
 use crate::app::{App, DiscardTarget, Panel, SelectedFile, Tab};
+use crate::backend::{normalize_repo_root_rel, repo_key};
 use crate::git::tree::{self as gtree, Node};
 use crate::git::{FileEntry, FileStatus};
 use crate::i18n::{Msg, t};
@@ -20,6 +21,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::path::Path;
 use unicode_width::UnicodeWidthStr;
 
 // ─── Public entry points ──────────────────────────────────────────────────────
@@ -116,6 +118,9 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
 pub fn handle_key(app: &mut App, key: &str) -> bool {
     match key {
         "s" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             if let Some(ref sel) = app.selected_file.clone() {
                 if !sel.is_staged {
                     app.stage_file(&sel.path);
@@ -124,6 +129,9 @@ pub fn handle_key(app: &mut App, key: &str) -> bool {
             true
         }
         "u" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             if let Some(ref sel) = app.selected_file.clone() {
                 if sel.is_staged {
                     app.unstage_file(&sel.path);
@@ -132,6 +140,9 @@ pub fn handle_key(app: &mut App, key: &str) -> bool {
             true
         }
         "d" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             let path = app
                 .selected_file
                 .as_ref()
@@ -149,13 +160,22 @@ pub fn handle_key(app: &mut App, key: &str) -> bool {
         }
         "y" => {
             if app.git_status.confirm_discard.is_some() {
+                if !can_perform_git_writes(app) {
+                    return true;
+                }
                 app.confirm_discard();
                 true
             } else if app.git_status.confirm_force_push {
+                if !can_perform_git_writes(app) {
+                    return true;
+                }
                 app.git_status.confirm_force_push = false;
                 app.run_push(true);
                 true
             } else if app.git_status.confirm_push {
+                if !can_perform_git_writes(app) {
+                    return true;
+                }
                 app.git_status.confirm_push = false;
                 app.run_push(false);
                 true
@@ -213,6 +233,53 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             app.load_diff();
             true
         }
+        "git.selectRepo" => {
+            let Some(raw) = args.get("repo").and_then(|v| v.as_str()) else {
+                return true;
+            };
+            let Ok(repo_root_rel) = normalize_repo_root_rel(Path::new(raw)) else {
+                return true;
+            };
+            let exists = app
+                .repo_catalog
+                .repos
+                .iter()
+                .any(|repo| repo.repo_root_rel == repo_root_rel);
+            if exists {
+                app.repo_catalog.selected_git_repo = Some(repo_root_rel.clone());
+                crate::prefs::set("status.selected_repo", &repo_key(&repo_root_rel));
+                app.selected_file = None;
+                app.diff_content = None;
+                app.diff_scroll = 0;
+                app.diff_h_scroll = 0;
+                app.git_status.confirm_discard = None;
+                app.staged_files.clear();
+                app.unstaged_files.clear();
+                app.git_status.ahead_behind = None;
+                app.git_graph.rows.clear();
+                app.git_graph.ref_map.clear();
+                app.git_graph.cache_key = None;
+                app.git_graph.selected_idx = 0;
+                app.git_graph.selected_commit = None;
+                app.git_graph.selection_anchor = None;
+                app.commit_detail.detail = None;
+                app.commit_detail.range_detail = None;
+                app.commit_detail.file_diff = None;
+                app.refresh_status();
+                app.graph_load.invalidate_stale();
+            }
+            true
+        }
+        "git.checkoutBranch" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
+            let branch = args.get("branch").and_then(|v| v.as_str()).unwrap_or("");
+            if !branch.is_empty() {
+                app.checkout_branch(branch);
+            }
+            true
+        }
         "git.toggleStaged" => {
             app.staged_collapsed = !app.staged_collapsed;
             true
@@ -240,6 +307,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.stage" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             let path = args
                 .get("path")
                 .and_then(|v| v.as_str())
@@ -256,6 +326,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.unstage" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             let path = args
                 .get("path")
                 .and_then(|v| v.as_str())
@@ -272,14 +345,23 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.stageAll" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             app.stage_all();
             true
         }
         "git.unstageAll" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             app.unstage_all();
             true
         }
         "git.discardPrompt" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             let path = args
                 .get("path")
                 .and_then(|v| v.as_str())
@@ -298,6 +380,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.discardFolderPrompt" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             let path = args
                 .get("path")
                 .and_then(|v| v.as_str())
@@ -313,6 +398,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.stageFolder" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             if !path.is_empty() {
                 app.stage_folder(path);
@@ -320,6 +408,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.unstageFolder" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             if !path.is_empty() {
                 app.unstage_folder(path);
@@ -327,6 +418,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.discardAllPrompt" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             let is_staged = args
                 .get("staged")
                 .and_then(|v| v.as_bool())
@@ -342,6 +436,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.discardConfirm" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             app.confirm_discard();
             true
         }
@@ -350,6 +447,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.pushPrompt" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             if app.push_in_flight {
                 return true;
             }
@@ -359,6 +459,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.pushConfirm" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             app.git_status.confirm_push = false;
             app.run_push(false);
             true
@@ -368,6 +471,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.forcePushPrompt" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             if app.push_in_flight {
                 return true;
             }
@@ -377,6 +483,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.forcePushConfirm" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             app.git_status.confirm_force_push = false;
             app.run_push(true);
             true
@@ -387,6 +496,18 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
         }
         "git.dismissPushError" => {
             app.git_status.push_error = None;
+            true
+        }
+        "git.dismissPullError" => {
+            app.git_status.pull_error = None;
+            true
+        }
+        "git.pull" => {
+            if !can_perform_git_writes(app) || app.pull_in_flight {
+                return true;
+            }
+            app.git_status.pull_error = None;
+            app.run_pull();
             true
         }
         "git.refresh" => {
@@ -403,6 +524,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.commitSubmit" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             app.run_commit();
             true
         }
@@ -511,9 +635,22 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     // Slightly narrower budget to accommodate the ↗ open and ↺ discard buttons.
     let max_path = (width as usize).saturating_sub(12);
 
+    push_repo_selector(&mut rows, app, max_path, theme);
+    push_branch_selector(&mut rows, app, max_path, theme);
+
+    let allow_stage_writes = can_perform_git_writes(app);
+    let allow_discard_writes = allow_stage_writes;
+    let allow_git_writes = allow_stage_writes;
+    if app.repo_catalog.selected_git_repo.is_none()
+        && !app.backend.has_repo()
+        && !app.repo_catalog.discover_load.loading
+    {
+        return rows;
+    }
+
     // Push-in-flight banner — shown while the worker thread is running.
     // Non-interactive: user just waits for tick() to drain the result.
-    if app.push_in_flight {
+    if allow_git_writes && app.push_in_flight {
         rows.push(Row::new(vec![RowSpan::styled(
             t(Msg::PushingHint),
             Style::default()
@@ -523,8 +660,18 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
         rows.push(Row::blank());
     }
 
+    if allow_git_writes && app.pull_in_flight {
+        rows.push(Row::new(vec![RowSpan::styled(
+            t(Msg::PullingHint),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        rows.push(Row::blank());
+    }
+
     // Push error banner
-    if let Some(ref err) = status.push_error {
+    if allow_git_writes && let Some(ref err) = status.push_error {
         let mut msg = err.clone();
         truncate_in_place(&mut msg, max_path);
         rows.push(
@@ -544,8 +691,28 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
         rows.push(Row::blank());
     }
 
+    if allow_git_writes && let Some(ref err) = status.pull_error {
+        let mut msg = err.clone();
+        truncate_in_place(&mut msg, max_path);
+        rows.push(
+            Row::new(vec![
+                RowSpan::styled(
+                    t(Msg::PullFailedPrefix),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                RowSpan::styled(msg, Style::default().fg(theme.fg_primary)),
+                RowSpan::styled(
+                    t(Msg::DismissClose),
+                    Style::default().fg(theme.fg_secondary),
+                ),
+            ])
+            .on_click("git.dismissPullError", Value::Null),
+        );
+        rows.push(Row::blank());
+    }
+
     // Push / force-push confirmation banner
-    if status.confirm_push || status.confirm_force_push {
+    if allow_git_writes && (status.confirm_push || status.confirm_force_push) {
         let force = status.confirm_force_push;
         let ahead = app.git_status.ahead_behind.map(|(a, _)| a).unwrap_or(0);
 
@@ -609,11 +776,13 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
 
     // Push indicator (only when tree is clean, no confirmation banner is
     // already shown, and no push is currently in flight).
-    if app.staged_files.is_empty()
+    if allow_git_writes
+        && app.staged_files.is_empty()
         && app.unstaged_files.is_empty()
         && !status.confirm_push
         && !status.confirm_force_push
         && !app.push_in_flight
+        && !app.pull_in_flight
     {
         if let Some((ahead, behind)) = app.git_status.ahead_behind {
             if let Some(row) = push_indicator_row(ahead, behind) {
@@ -626,7 +795,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     // Commit in-flight banner — while the worker is committing, the
     // input is read-only (commit_in_flight gates run_commit) and the
     // UI shows a spinner.
-    if app.commit_in_flight {
+    if allow_git_writes && app.commit_in_flight {
         rows.push(Row::new(vec![RowSpan::styled(
             t(Msg::CommittingHint),
             Style::default()
@@ -638,7 +807,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
 
     // Commit error banner — mirrors push_error. Sticks around until
     // the user clicks [dismiss] or starts a new commit attempt.
-    if let Some(ref err) = status.commit_error {
+    if allow_git_writes && let Some(ref err) = status.commit_error {
         let mut msg = err.clone();
         truncate_in_place(&mut msg, max_path);
         rows.push(
@@ -658,12 +827,14 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
         rows.push(Row::blank());
     }
 
-    // Commit message box + Commit button. Anchored just above the
-    // staged/unstaged sections to mirror VSCode's Source Control
-    // layout. Editing is routed through `git.commit*` commands so
-    // mouse and keyboard paths share the same buffer mutation code.
-    push_commit_box(&mut rows, app, max_path, theme);
-    rows.push(Row::blank());
+    if allow_git_writes {
+        // Commit message box + Commit button. Anchored just above the
+        // staged/unstaged sections to mirror VSCode's Source Control
+        // layout. Editing is routed through `git.commit*` commands so
+        // mouse and keyboard paths share the same buffer mutation code.
+        push_commit_box(&mut rows, app, max_path, theme);
+        rows.push(Row::blank());
+    }
 
     // View mode toggle
     let mode_label = if status.tree_mode {
@@ -682,26 +853,30 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
 
     // Staged section
     if !app.staged_files.is_empty() {
-        let staged_actions = if matches!(
+        let staged_actions = if !allow_stage_writes {
+            Vec::new()
+        } else if matches!(
             status.confirm_discard,
             Some(DiscardTarget::Section { is_staged: true })
-        ) {
+        ) && allow_discard_writes
+        {
             section_confirm_actions(theme)
         } else {
-            vec![
-                HeaderAction {
-                    label: t(Msg::UnstageAll).to_string(),
-                    cmd: "git.unstageAll".into(),
-                    args: Value::Null,
-                    color: Color::Red,
-                },
-                HeaderAction {
+            let mut actions = vec![HeaderAction {
+                label: t(Msg::UnstageAll).to_string(),
+                cmd: "git.unstageAll".into(),
+                args: Value::Null,
+                color: Color::Red,
+            }];
+            if allow_discard_writes {
+                actions.push(HeaderAction {
                     label: t(Msg::DiscardAll).to_string(),
                     cmd: "git.discardAllPrompt".into(),
                     args: serde_json::json!({ "staged": true }),
                     color: Color::Red,
-                },
-            ]
+                });
+            }
+            actions
         };
         rows.push(section_header(
             app.staged_collapsed,
@@ -714,35 +889,48 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
             theme,
         ));
         if !app.staged_collapsed {
-            render_files(&mut rows, app, &app.staged_files, true, max_path, theme, 0);
+            render_files(
+                &mut rows,
+                app,
+                &app.staged_files,
+                true,
+                max_path,
+                theme,
+                0,
+                allow_stage_writes,
+                allow_discard_writes,
+            );
         }
         rows.push(Row::blank());
     }
 
     // Unstaged section
-    let unstaged_actions: Vec<HeaderAction> = if app.unstaged_files.is_empty() {
-        Vec::new()
-    } else if matches!(
-        status.confirm_discard,
-        Some(DiscardTarget::Section { is_staged: false })
-    ) {
-        section_confirm_actions(theme)
-    } else {
-        vec![
-            HeaderAction {
+    let unstaged_actions: Vec<HeaderAction> =
+        if !allow_stage_writes || app.unstaged_files.is_empty() {
+            Vec::new()
+        } else if matches!(
+            status.confirm_discard,
+            Some(DiscardTarget::Section { is_staged: false })
+        ) && allow_discard_writes
+        {
+            section_confirm_actions(theme)
+        } else {
+            let mut actions = vec![HeaderAction {
                 label: t(Msg::StageAll).to_string(),
                 cmd: "git.stageAll".into(),
                 args: Value::Null,
                 color: Color::Green,
-            },
-            HeaderAction {
-                label: t(Msg::DiscardAll).to_string(),
-                cmd: "git.discardAllPrompt".into(),
-                args: serde_json::json!({ "staged": false }),
-                color: Color::Red,
-            },
-        ]
-    };
+            }];
+            if allow_discard_writes {
+                actions.push(HeaderAction {
+                    label: t(Msg::DiscardAll).to_string(),
+                    cmd: "git.discardAllPrompt".into(),
+                    args: serde_json::json!({ "staged": false }),
+                    color: Color::Red,
+                });
+            }
+            actions
+        };
     rows.push(section_header(
         app.unstaged_collapsed,
         t(Msg::Changes),
@@ -762,6 +950,8 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
             max_path,
             theme,
             app.staged_files.len(),
+            allow_stage_writes,
+            allow_discard_writes,
         );
         if app.unstaged_files.is_empty() {
             rows.push(Row::new(vec![RowSpan::styled(
@@ -772,6 +962,142 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     }
 
     rows
+}
+
+fn selected_repo_allows_legacy_writes(app: &App) -> bool {
+    if !app.backend.has_repo() {
+        return false;
+    }
+    app.repo_catalog.selected_git_repo.as_deref() == Some(Path::new("."))
+        || (app.repo_catalog.selected_git_repo.is_none()
+            && app.repo_catalog.repos.is_empty()
+            && !app.repo_catalog.discover_load.loading)
+}
+
+fn can_perform_git_writes(app: &App) -> bool {
+    selected_repo_allows_legacy_writes(app) || app.repo_catalog.selected_git_repo.is_some()
+}
+
+fn push_repo_selector(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Theme) {
+    rows.push(Row::new(vec![RowSpan::styled(
+        t(Msg::Repository),
+        Style::default()
+            .fg(theme.fg_primary)
+            .add_modifier(Modifier::BOLD),
+    )]));
+
+    if app.repo_catalog.discover_load.loading {
+        rows.push(Row::new(vec![RowSpan::styled(
+            t(Msg::RepoScanning),
+            Style::default().fg(theme.fg_secondary),
+        )]));
+        rows.push(Row::blank());
+        return;
+    }
+
+    if app.repo_catalog.repos.is_empty() {
+        rows.push(Row::new(vec![RowSpan::styled(
+            t(Msg::NoReposFound),
+            Style::default().fg(theme.fg_secondary),
+        )]));
+        rows.push(Row::blank());
+        return;
+    }
+
+    if app.repo_catalog.selected_git_repo.is_none() {
+        rows.push(Row::new(vec![RowSpan::styled(
+            t(Msg::RepoSelectPrompt),
+            Style::default().fg(Color::Yellow),
+        )]));
+    }
+
+    for repo in &app.repo_catalog.repos {
+        let key = repo_key(&repo.repo_root_rel);
+        let selected =
+            app.repo_catalog.selected_git_repo.as_deref() == Some(repo.repo_root_rel.as_path());
+        let marker = if selected { "* " } else { "  " };
+        let mut label = key.clone();
+        truncate_in_place(&mut label, max_path.saturating_sub(2));
+        let color = if selected {
+            theme.fg_primary
+        } else {
+            theme.fg_secondary
+        };
+        rows.push(
+            Row::new(vec![
+                RowSpan::styled(marker, Style::default().fg(Color::Green)),
+                RowSpan::styled(label, Style::default().fg(color)),
+            ])
+            .on_click("git.selectRepo", serde_json::json!({ "repo": key })),
+        );
+    }
+
+    if app.repo_catalog.truncated {
+        rows.push(Row::new(vec![RowSpan::styled(
+            "  …",
+            Style::default().fg(theme.fg_secondary),
+        )]));
+    }
+
+    rows.push(Row::blank());
+}
+
+fn push_branch_selector(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Theme) {
+    if app.repo_catalog.selected_git_repo.is_none() && !app.backend.has_repo() {
+        return;
+    }
+    if app.branch_name.is_empty() && app.git_status.branches.is_empty() {
+        return;
+    }
+
+    let spans = vec![
+        RowSpan::styled(
+            format!("{}: ", t(Msg::Branch)),
+            Style::default()
+                .fg(theme.fg_primary)
+                .add_modifier(Modifier::BOLD),
+        ),
+        RowSpan::styled(
+            app.branch_name.clone(),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    rows.push(Row::new(spans));
+
+    let branches: Vec<String> = app
+        .git_status
+        .branches
+        .iter()
+        .filter(|branch| branch.as_str() != app.branch_name)
+        .take(6)
+        .cloned()
+        .collect();
+    if !branches.is_empty() {
+        let mut line = Vec::new();
+        line.push(RowSpan::styled(
+            "  ",
+            Style::default().fg(theme.fg_secondary),
+        ));
+        for branch in branches {
+            let mut label = branch.clone();
+            truncate_in_place(&mut label, max_path.saturating_sub(4));
+            line.push(
+                RowSpan::styled(
+                    format!(" {} ", label),
+                    Style::default().fg(Color::Black).bg(theme.accent),
+                )
+                .on_click(
+                    "git.checkoutBranch",
+                    serde_json::json!({ "branch": branch }),
+                ),
+            );
+            line.push(RowSpan::plain(" "));
+        }
+        rows.push(Row::new(line));
+    }
+    rows.push(Row::blank());
 }
 
 /// Returns `Some(path)` when the app's current selection is for the matching
@@ -796,6 +1122,8 @@ fn render_files(
     max_path: usize,
     theme: &Theme,
     search_base: usize,
+    allow_stage_actions: bool,
+    allow_discard_actions: bool,
 ) {
     let status = &app.git_status;
     let sel_path = selected_path_for(app, is_staged);
@@ -814,6 +1142,8 @@ fn render_files(
             files,
             search_base,
             pending_discard,
+            allow_stage_actions,
+            allow_discard_actions,
         );
     } else {
         let ctx = FileRowCtx {
@@ -821,6 +1151,8 @@ fn render_files(
             max_path,
             theme,
             pending_discard: status.confirm_discard.as_ref(),
+            allow_stage_actions,
+            allow_discard_actions,
         };
         for (i, file) in files.iter().enumerate() {
             let is_sel = sel_path.as_deref() == Some(file.path.as_str());
@@ -847,6 +1179,8 @@ fn walk_tree(
     flat_files: &[FileEntry],
     search_base: usize,
     pending_discard: Option<&DiscardTarget>,
+    allow_stage_actions: bool,
+    allow_discard_actions: bool,
 ) {
     let mut entries: Vec<(&String, &Node)> = tree.iter().collect();
     entries.sort_by(|a, b| {
@@ -872,6 +1206,8 @@ fn walk_tree(
                     is_collapsed,
                     theme,
                     pending_discard,
+                    allow_stage_actions,
+                    allow_discard_actions,
                 ));
                 if !is_collapsed {
                     walk_tree(
@@ -886,6 +1222,8 @@ fn walk_tree(
                         flat_files,
                         search_base,
                         pending_discard,
+                        allow_stage_actions,
+                        allow_discard_actions,
                     );
                 }
             }
@@ -898,6 +1236,8 @@ fn walk_tree(
                     max_path,
                     theme,
                     pending_discard,
+                    allow_stage_actions,
+                    allow_discard_actions,
                 };
                 let mut row = file_row(entry, basename, &indent, is_sel, &ctx);
                 if let Some(pos) = flat_files.iter().position(|f| f.path == entry.path) {
@@ -917,6 +1257,8 @@ fn dir_row(
     is_collapsed: bool,
     theme: &Theme,
     pending_discard: Option<&DiscardTarget>,
+    allow_stage_actions: bool,
+    allow_discard_actions: bool,
 ) -> Row {
     let arrow = if is_collapsed { "›" } else { "⌄" };
     let (stage_btn, stage_color, stage_cmd) = if is_staged {
@@ -941,33 +1283,35 @@ fn dir_row(
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ),
+    ];
+    if allow_stage_actions {
         // Per-folder stage/unstage button. Mirrors the file-row `+`/`−`
         // semantics, scoped to every file under this directory prefix.
-        RowSpan::plain(" "),
-        RowSpan {
+        spans.push(RowSpan::plain(" "));
+        spans.push(RowSpan {
             text: stage_btn.into(),
             style: Style::default()
                 .fg(stage_color)
                 .add_modifier(Modifier::BOLD),
             click: Some((stage_cmd.into(), serde_json::json!({ "path": path }))),
             dbl: None,
-        },
-        RowSpan::plain(" "),
-    ];
-    if confirming {
-        push_inline_confirm_spans(&mut spans, theme, None);
-    } else {
-        // Per-folder revert button. Clicking this stages a Folder discard
-        // target; the root-row click (below) still toggles expand/collapse.
-        spans.push(RowSpan {
-            text: "↺".into(),
-            style: Style::default().fg(Color::Red),
-            click: Some((
-                "git.discardFolderPrompt".into(),
-                serde_json::json!({ "path": path, "staged": is_staged }),
-            )),
-            dbl: None,
         });
+        spans.push(RowSpan::plain(" "));
+        if allow_discard_actions && confirming {
+            push_inline_confirm_spans(&mut spans, theme, None);
+        } else if allow_discard_actions {
+            // Per-folder revert button. Clicking this stages a Folder discard
+            // target; the root-row click (below) still toggles expand/collapse.
+            spans.push(RowSpan {
+                text: "↺".into(),
+                style: Style::default().fg(Color::Red),
+                click: Some((
+                    "git.discardFolderPrompt".into(),
+                    serde_json::json!({ "path": path, "staged": is_staged }),
+                )),
+                dbl: None,
+            });
+        }
     }
     Row::new(spans).on_click(
         "git.toggleDir",
@@ -986,6 +1330,8 @@ struct FileRowCtx<'a> {
     /// `file_row` / `dir_row` to swap the row's `↺` button for inline
     /// `✓`/`✕` buttons on the row whose target matches.
     pending_discard: Option<&'a DiscardTarget>,
+    allow_stage_actions: bool,
+    allow_discard_actions: bool,
 }
 
 fn file_row(
@@ -1081,39 +1427,41 @@ fn file_row(
         format!(" {} ", status_label),
         apply_bg(Style::default().fg(status_color), base_bg),
     ));
-    spans.push(RowSpan {
-        text: "↗".into(),
-        style: apply_bg(Style::default().fg(Color::Blue), base_bg),
-        click: Some((
-            "git.revealInTree".to_string(),
-            serde_json::json!({ "path": file.path }),
-        )),
-        dbl: None,
-    });
-    spans.push(RowSpan::styled(
-        " ".to_string(),
-        apply_bg(Style::default(), base_bg),
-    ));
-    spans.push(RowSpan {
-        text: button.into(),
-        style: apply_bg(
-            Style::default()
-                .fg(button_color)
-                .add_modifier(Modifier::BOLD),
-            base_bg,
-        ),
-        click: Some((
-            button_cmd.to_string(),
-            serde_json::json!({ "path": file.path }),
-        )),
-        dbl: None,
-    });
-    spans.push(RowSpan::styled(
-        " ".to_string(),
-        apply_bg(Style::default(), base_bg),
-    ));
+    if ctx.allow_stage_actions {
+        spans.push(RowSpan {
+            text: "↗".into(),
+            style: apply_bg(Style::default().fg(Color::Blue), base_bg),
+            click: Some((
+                "git.revealInTree".to_string(),
+                serde_json::json!({ "path": file.path }),
+            )),
+            dbl: None,
+        });
+        spans.push(RowSpan::styled(
+            " ".to_string(),
+            apply_bg(Style::default(), base_bg),
+        ));
+        spans.push(RowSpan {
+            text: button.into(),
+            style: apply_bg(
+                Style::default()
+                    .fg(button_color)
+                    .add_modifier(Modifier::BOLD),
+                base_bg,
+            ),
+            click: Some((
+                button_cmd.to_string(),
+                serde_json::json!({ "path": file.path }),
+            )),
+            dbl: None,
+        });
+        spans.push(RowSpan::styled(
+            " ".to_string(),
+            apply_bg(Style::default(), base_bg),
+        ));
+    }
 
-    if !ctx.is_staged {
+    if ctx.allow_discard_actions && !ctx.is_staged {
         let confirming = matches!(
             ctx.pending_discard,
             Some(DiscardTarget::File(p)) if p == &file.path
@@ -1137,12 +1485,15 @@ fn file_row(
         }
     }
 
-    Row::new(spans)
-        .on_click(
-            "git.selectFile",
-            serde_json::json!({ "path": file.path, "staged": ctx.is_staged }),
-        )
-        .on_dbl_click(button_cmd, serde_json::json!({ "path": file.path }))
+    let row = Row::new(spans).on_click(
+        "git.selectFile",
+        serde_json::json!({ "path": file.path, "staged": ctx.is_staged }),
+    );
+    if ctx.allow_stage_actions {
+        row.on_dbl_click(button_cmd, serde_json::json!({ "path": file.path }))
+    } else {
+        row
+    }
 }
 
 fn apply_bg(style: Style, bg: Option<Color>) -> Style {
@@ -1417,10 +1768,16 @@ fn push_indicator_row(ahead: usize, behind: usize) -> Option<Row> {
                 dbl: None,
             },
         ])),
-        (0, b) => Some(Row::new(vec![RowSpan::styled(
-            crate::i18n::behind_remote(b),
-            Style::default().fg(Color::Yellow),
-        )])),
+        (0, b) => Some(Row::new(vec![
+            RowSpan::styled(
+                crate::i18n::pull_button(b),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .on_click("git.pull", Value::Null),
+        ])),
         (a, b) => Some(Row::new(vec![
             RowSpan::plain("  "),
             RowSpan {

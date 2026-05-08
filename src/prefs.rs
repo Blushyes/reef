@@ -8,6 +8,8 @@
 //!   - `diff.layout` / `diff.mode`             — Git tab right-side diff
 //!   - `commit.diff_layout` / `commit.diff_mode` — Graph tab commit-file diff
 //!   - `status.tree_mode`                       — Git tab left-side list/tree
+//!   - `status.selected_repo`                   — Git tab selected repository
+//!                                                root, workdir-relative (`.` for root).
 //!   - `commit.files_tree_mode`                 — Graph tab commit files list/tree
 //!   - `ui.theme`                               — `dark` | `light` | `auto` (default `auto`).
 //!                                                Read once in `main.rs` before raw-mode
@@ -85,6 +87,13 @@ pub fn set(key: &str, value: &str) {
     let mut map = read_all();
     map.insert(key.to_string(), value.to_string());
     write_all(&map);
+}
+
+pub fn remove(key: &str) {
+    let mut map = read_all();
+    if map.remove(key).is_some() {
+        write_all(&map);
+    }
 }
 
 /// Pair of [`get_bool`]: writes `"true"` / `"false"` so the value

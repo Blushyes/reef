@@ -153,7 +153,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     match app.active_tab {
         Tab::Git => {
-            if !app.backend.has_repo() {
+            let no_known_repo = !app.backend.has_repo()
+                && !app.repo_catalog.discover_load.loading
+                && app.repo_catalog.repos.is_empty();
+            if let Some(error) = app.repo_catalog.discover_load.error.as_ref() {
+                render_discover_error(f, app, body_layout[0], error);
+            } else if no_known_repo {
                 render_no_repo(f, app, body_layout[0]);
             } else {
                 if has_sidebar {
@@ -239,6 +244,28 @@ fn render_no_repo(f: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from(Span::styled(
             t(Msg::NoRepoHint),
+            Style::default().fg(th.fg_secondary),
+        )),
+    ]))
+    .alignment(ratatui::layout::Alignment::Center)
+    .block(block);
+    f.render_widget(msg, area);
+}
+
+fn render_discover_error(f: &mut Frame, app: &App, area: Rect, error: &str) {
+    let th = app.theme;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(th.border));
+    let msg = Paragraph::new(Text::from(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            t(Msg::RepoDiscoverFailed),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            error.to_string(),
             Style::default().fg(th.fg_secondary),
         )),
     ]))

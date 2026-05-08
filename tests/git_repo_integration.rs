@@ -1,7 +1,7 @@
 //! End-to-end tests for `GitRepo` exercising real `git2::Repository` instances
 //! in `TempDir` workdirs. Exercises the entire public API surface.
 
-use reef::git::{FileStatus, GitRepo, LineTag, RefLabel};
+use reef::git::{FileStatus, GitRepo, LineTag, RefLabel, checkout_branch_at};
 use std::fs;
 use test_support::{CwdGuard, commit_file, tempdir_repo, write_file};
 
@@ -427,6 +427,17 @@ fn push_without_upstream_returns_error_message() {
         .push(false)
         .expect_err("push must fail without a remote");
     assert!(!err.is_empty(), "error message should be non-empty");
+}
+
+#[test]
+fn checkout_branch_at_rejects_non_branch_path() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "a.txt", "v1", "init");
+
+    let err = checkout_branch_at(tmp.path(), "a.txt")
+        .expect_err("checkout must reject pathspecs that are not branches");
+    assert!(err.contains("branch not found"), "got {err:?}");
 }
 
 // ─── numstat + rename detection ─────────────────────────────────────────────

@@ -8,18 +8,18 @@ expression: output
  Repository            │
  * .                   │
                        │
+ Branch: master        │
+                       │
   ┌ Message (commit sta│
   │                    │
   └                    │
-    ✓ Commit   (Ctrl+En│
+    ✓ Commit   (Ctrl+En│                 Select a file to view diff
                        │
- View: list            │                 Select a file to view diff
+ View: list            │
                        │
  ⌄ Changes  2 Stage all│
    new.txt +1 U ↗ + ↺  │
    ...t +1 -1 M ↗ + ↺  │
-                       │
-                       │
                        │
                        │
                   q:quit Tab:switch s:stage u:unstage r:refresh h:help  [Files]

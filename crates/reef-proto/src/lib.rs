@@ -69,7 +69,8 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 /// - v12: adds `RevertPathFor` so discard/restore runs in the selected repo.
 /// - v13: adds `PushFor` / `CommitFor` so push/commit run in the selected repo.
 /// - v14: adds repo-scoped graph/history requests.
-pub const PROTOCOL_VERSION: u32 = 14;
+/// - v15: adds repo-scoped branch checkout.
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// Encode a single envelope-level value to `writer` using the
 /// length-prefixed framing. The caller is expected to flush.
@@ -242,6 +243,13 @@ pub enum Request {
     PushFor {
         repo_root_rel: String,
         force: bool,
+    },
+    CheckoutBranch {
+        branch: String,
+    },
+    CheckoutBranchFor {
+        repo_root_rel: String,
+        branch: String,
     },
 
     /// Create a commit from the staged index with `message`. Agent-side

@@ -224,6 +224,7 @@ pub struct GitStatusState {
     pub push_error: Option<String>,
     pub scroll: usize,
     pub ahead_behind: Option<(usize, usize)>,
+    pub branches: Vec<String>,
 
     // ─── Commit input (VSCode-style "Source Control" message box) ───
     /// Draft commit message buffer. Freeform UTF-8 — newlines are
@@ -316,7 +317,20 @@ impl RepoCatalogState {
         }
     }
 
-    fn reconcile_selected_repo(&mut self) {
+    fn reconcile_selected_repo(&mut self) -> Option<(PathBuf, Option<PathBuf>)> {
+        let previous = self.selected_git_repo.clone()?;
+        if self.repos.iter().any(|repo| repo.repo_root_rel == previous) {
+            return None;
+        }
+
+        self.selected_git_repo = match self.repos.as_slice() {
+            [only] => Some(only.repo_root_rel.clone()),
+            _ => None,
+        };
+        Some((previous, self.selected_git_repo.clone()))
+    }
+
+    fn auto_select_repo(&mut self) {
         if let Some(selected) = self.selected_git_repo.as_ref()
             && self
                 .repos
@@ -1255,6 +1269,7 @@ impl App {
         self.selected_file = None;
         self.diff_content = None;
         self.git_status.ahead_behind = None;
+        self.git_status.branches.clear();
         self.branch_name.clear();
         self.file_tree.refresh_git_statuses(&[], &[]);
     }
@@ -3362,6 +3377,30 @@ impl App {
         });
     }
 
+    pub fn checkout_branch(&mut self, branch: &str) {
+        let branch = branch.trim();
+        if branch.is_empty() || branch == self.branch_name {
+            return;
+        }
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
+            return;
+        };
+        match self.backend.checkout_branch_for(&repo_root_rel, branch) {
+            Ok(()) => {
+                self.selected_file = None;
+                self.diff_content = None;
+                self.git_status.confirm_discard = None;
+                self.clear_graph_snapshot();
+                self.refresh_status();
+                self.graph_load.invalidate_stale();
+            }
+            Err(e) => {
+                self.toasts
+                    .push(Toast::error(format!("Checkout failed: {e}")));
+            }
+        }
+    }
+
     /// Called from `tick()`. If the push worker has posted a result, fold
     /// it into App state (toast + push_error banner + graph-cache bust +
     /// status refresh) and drop the channel. If the worker dropped its
@@ -3431,13 +3470,31 @@ impl App {
                 Ok(resp) => {
                     if self.repo_catalog.discover_load.complete_ok(generation) {
                         let selected_before = self.repo_catalog.selected_git_repo.clone();
+                        let effective_before = selected_before
+                            .clone()
+                            .or_else(|| self.backend.has_repo().then(|| PathBuf::from(".")));
                         self.repo_catalog.repos = resp.repos;
                         self.repo_catalog.truncated = resp.truncated;
-                        self.repo_catalog.reconcile_selected_repo();
+                        let reconciled = self.repo_catalog.reconcile_selected_repo();
+                        if selected_before.is_none() {
+                            self.repo_catalog.auto_select_repo();
+                        }
+                        if let Some((previous, selected)) = reconciled {
+                            self.toasts.push(Toast::info(format!(
+                                "Saved repository selection '{}' is no longer available",
+                                crate::backend::repo_key(&previous)
+                            )));
+                            if let Some(selected) = selected.as_ref() {
+                                crate::prefs::set(
+                                    SELECTED_GIT_REPO_PREF,
+                                    &crate::backend::repo_key(selected),
+                                );
+                            } else {
+                                crate::prefs::remove(SELECTED_GIT_REPO_PREF);
+                            }
+                        }
                         if self.repo_catalog.selected_git_repo != selected_before {
-                            let selected_root = self.repo_catalog.selected_git_repo.as_deref()
-                                == Some(Path::new("."));
-                            if !selected_root || !self.backend.has_repo() {
+                            if self.status_repo_root_rel() != effective_before {
                                 self.clear_git_status_snapshot();
                             }
                             self.clear_graph_snapshot();
@@ -3699,6 +3756,7 @@ impl App {
                         self.staged_files = payload.staged;
                         self.unstaged_files = payload.unstaged;
                         self.git_status.ahead_behind = payload.ahead_behind;
+                        self.git_status.branches = payload.branches;
                         self.branch_name = payload.branch_name;
 
                         self.file_tree
@@ -4507,7 +4565,7 @@ impl App {
                 }
             }
             Tab::Git => {
-                let has_repo = self.backend.has_repo();
+                let has_repo = self.status_repo_root_rel().is_some();
                 let should_poll_git = has_repo && now >= self.next_git_revalidate_at;
                 if self.git_status_load.should_request()
                     || (should_poll_git && !self.git_status_load.loading)

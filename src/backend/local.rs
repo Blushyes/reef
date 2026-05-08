@@ -124,11 +124,7 @@ impl LocalBackend {
 
     fn workdir_at(&self, repo_root_rel: &Path) -> Result<PathBuf, BackendError> {
         let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
-        if repo_root_rel == Path::new(".") {
-            Ok(self.workdir.clone())
-        } else {
-            self.resolve_rel(&repo_root_rel)
-        }
+        canonical_child_within(self.canonical_workdir()?, &repo_root_rel)
     }
 
     /// Join a workdir-relative path to the backend's workdir root, rejecting
@@ -561,6 +557,15 @@ impl Backend for LocalBackend {
         // shells out to `git push` and is the same thing the foreground
         // App::run_push() uses on its worker thread.
         crate::git::push_at(&self.workdir_at(repo_root_rel)?, force).map_err(BackendError::Git)
+    }
+
+    fn checkout_branch(&self, branch: &str) -> Result<(), BackendError> {
+        self.checkout_branch_for(Path::new("."), branch)
+    }
+
+    fn checkout_branch_for(&self, repo_root_rel: &Path, branch: &str) -> Result<(), BackendError> {
+        crate::git::checkout_branch_at(&self.workdir_at(repo_root_rel)?, branch)
+            .map_err(BackendError::Git)
     }
 
     fn commit(&self, message: &str) -> Result<(), BackendError> {

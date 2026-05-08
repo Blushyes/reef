@@ -118,6 +118,9 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
 pub fn handle_key(app: &mut App, key: &str) -> bool {
     match key {
         "s" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             if let Some(ref sel) = app.selected_file.clone() {
                 if !sel.is_staged {
                     app.stage_file(&sel.path);
@@ -126,6 +129,9 @@ pub fn handle_key(app: &mut App, key: &str) -> bool {
             true
         }
         "u" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             if let Some(ref sel) = app.selected_file.clone() {
                 if sel.is_staged {
                     app.unstage_file(&sel.path);
@@ -134,6 +140,9 @@ pub fn handle_key(app: &mut App, key: &str) -> bool {
             true
         }
         "d" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             let path = app
                 .selected_file
                 .as_ref()
@@ -151,13 +160,22 @@ pub fn handle_key(app: &mut App, key: &str) -> bool {
         }
         "y" => {
             if app.git_status.confirm_discard.is_some() {
+                if !can_perform_git_writes(app) {
+                    return true;
+                }
                 app.confirm_discard();
                 true
             } else if app.git_status.confirm_force_push {
+                if !can_perform_git_writes(app) {
+                    return true;
+                }
                 app.git_status.confirm_force_push = false;
                 app.run_push(true);
                 true
             } else if app.git_status.confirm_push {
+                if !can_perform_git_writes(app) {
+                    return true;
+                }
                 app.git_status.confirm_push = false;
                 app.run_push(false);
                 true
@@ -260,6 +278,16 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             }
             true
         }
+        "git.checkoutBranch" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
+            let branch = args.get("branch").and_then(|v| v.as_str()).unwrap_or("");
+            if !branch.is_empty() {
+                app.checkout_branch(branch);
+            }
+            true
+        }
         "git.toggleStaged" => {
             app.staged_collapsed = !app.staged_collapsed;
             true
@@ -287,6 +315,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.stage" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             let path = args
                 .get("path")
                 .and_then(|v| v.as_str())
@@ -303,6 +334,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.unstage" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             let path = args
                 .get("path")
                 .and_then(|v| v.as_str())
@@ -319,14 +353,23 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.stageAll" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             app.stage_all();
             true
         }
         "git.unstageAll" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             app.unstage_all();
             true
         }
         "git.discardPrompt" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             let path = args
                 .get("path")
                 .and_then(|v| v.as_str())
@@ -345,6 +388,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.discardFolderPrompt" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             let path = args
                 .get("path")
                 .and_then(|v| v.as_str())
@@ -360,6 +406,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.stageFolder" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             if !path.is_empty() {
                 app.stage_folder(path);
@@ -367,6 +416,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.unstageFolder" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             if !path.is_empty() {
                 app.unstage_folder(path);
@@ -374,6 +426,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.discardAllPrompt" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             let is_staged = args
                 .get("staged")
                 .and_then(|v| v.as_bool())
@@ -389,6 +444,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.discardConfirm" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             app.confirm_discard();
             true
         }
@@ -397,6 +455,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.pushPrompt" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             if app.push_in_flight {
                 return true;
             }
@@ -406,6 +467,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.pushConfirm" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             app.git_status.confirm_push = false;
             app.run_push(false);
             true
@@ -415,6 +479,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.forcePushPrompt" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             if app.push_in_flight {
                 return true;
             }
@@ -424,6 +491,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.forcePushConfirm" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             app.git_status.confirm_force_push = false;
             app.run_push(true);
             true
@@ -450,6 +520,9 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.commitSubmit" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
             app.run_commit();
             true
         }
@@ -559,9 +632,9 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     let max_path = (width as usize).saturating_sub(12);
 
     push_repo_selector(&mut rows, app, max_path, theme);
+    push_branch_selector(&mut rows, app, max_path, theme);
 
-    let allow_danger_writes = selected_repo_allows_legacy_writes(app);
-    let allow_stage_writes = allow_danger_writes || app.repo_catalog.selected_git_repo.is_some();
+    let allow_stage_writes = can_perform_git_writes(app);
     let allow_discard_writes = allow_stage_writes;
     let allow_git_writes = allow_stage_writes;
     if app.repo_catalog.selected_git_repo.is_none()
@@ -866,6 +939,10 @@ fn selected_repo_allows_legacy_writes(app: &App) -> bool {
             && !app.repo_catalog.discover_load.loading)
 }
 
+fn can_perform_git_writes(app: &App) -> bool {
+    selected_repo_allows_legacy_writes(app) || app.repo_catalog.selected_git_repo.is_some()
+}
+
 fn push_repo_selector(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Theme) {
     rows.push(Row::new(vec![RowSpan::styled(
         t(Msg::Repository),
@@ -885,7 +962,7 @@ fn push_repo_selector(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &T
 
     if app.repo_catalog.repos.is_empty() {
         rows.push(Row::new(vec![RowSpan::styled(
-            t(Msg::NoFiles),
+            t(Msg::NoReposFound),
             Style::default().fg(theme.fg_secondary),
         )]));
         rows.push(Row::blank());
@@ -927,6 +1004,64 @@ fn push_repo_selector(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &T
         )]));
     }
 
+    rows.push(Row::blank());
+}
+
+fn push_branch_selector(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Theme) {
+    if app.repo_catalog.selected_git_repo.is_none() && !app.backend.has_repo() {
+        return;
+    }
+    if app.branch_name.is_empty() && app.git_status.branches.is_empty() {
+        return;
+    }
+
+    let spans = vec![
+        RowSpan::styled(
+            format!("{}: ", t(Msg::Branch)),
+            Style::default()
+                .fg(theme.fg_primary)
+                .add_modifier(Modifier::BOLD),
+        ),
+        RowSpan::styled(
+            app.branch_name.clone(),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    rows.push(Row::new(spans));
+
+    let branches: Vec<String> = app
+        .git_status
+        .branches
+        .iter()
+        .filter(|branch| branch.as_str() != app.branch_name)
+        .take(6)
+        .cloned()
+        .collect();
+    if !branches.is_empty() {
+        let mut line = Vec::new();
+        line.push(RowSpan::styled(
+            "  ",
+            Style::default().fg(theme.fg_secondary),
+        ));
+        for branch in branches {
+            let mut label = branch.clone();
+            truncate_in_place(&mut label, max_path.saturating_sub(4));
+            line.push(
+                RowSpan::styled(
+                    format!(" {} ", label),
+                    Style::default().fg(Color::Black).bg(theme.accent),
+                )
+                .on_click(
+                    "git.checkoutBranch",
+                    serde_json::json!({ "branch": branch }),
+                ),
+            );
+            line.push(RowSpan::plain(" "));
+        }
+        rows.push(Row::new(line));
+    }
     rows.push(Row::blank());
 }
 

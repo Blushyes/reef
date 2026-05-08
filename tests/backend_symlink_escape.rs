@@ -96,3 +96,20 @@ fn remote_read_file_rejects_symlink_escape() {
         "expected PathEscape over RPC, got {err:?}"
     );
 }
+
+#[test]
+fn local_repo_scoped_git_ops_reject_symlink_escape() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let outside = TempDir::new().expect("outside tempdir");
+    git2::Repository::init(outside.path()).unwrap();
+
+    let workdir = TempDir::new().expect("workdir tempdir");
+    symlink(outside.path(), workdir.path().join("linked-repo")).unwrap();
+
+    let b = LocalBackend::open_at(workdir.path().to_path_buf());
+    let err = b.git_status_for(Path::new("linked-repo")).unwrap_err();
+    assert!(
+        matches!(err, BackendError::PathEscape(_)),
+        "expected PathEscape for repo symlink escape, got {err:?}"
+    );
+}

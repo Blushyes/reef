@@ -45,6 +45,12 @@ fn commit_all(path: &Path, message: &str) {
         .unwrap();
 }
 
+fn create_branch(path: &Path, branch: &str) {
+    let repo = git2::Repository::open(path).unwrap();
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch(branch, &head, false).unwrap();
+}
+
 fn app_for(root: &Path) -> App {
     let backend = Arc::new(LocalBackend::open_at(root.to_path_buf()));
     App::new_with_backend(Theme::dark(), backend, None)
@@ -387,4 +393,30 @@ fn app_graph_loads_selected_child_repo() {
 
     assert_eq!(app.git_graph.rows.len(), 1);
     assert_eq!(app.git_graph.rows[0].commit.subject, "beta commit");
+}
+
+#[test]
+fn app_switches_branch_for_selected_child_repo() {
+    let _lock = APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let _home = HomeGuard::enter(tmp.path());
+    init_repo(&tmp.path().join("only"));
+    write_file(&tmp.path().join("only/a.txt"), "alpha\n");
+    commit_all(&tmp.path().join("only"), "base commit");
+    create_branch(&tmp.path().join("only"), "feature");
+
+    let mut app = app_for(tmp.path());
+    wait_for_repo_catalog(&mut app);
+    wait_for_git_status(&mut app);
+    assert_eq!(app.branch_name, "master");
+    assert!(app.git_status.branches.iter().any(|b| b == "feature"));
+
+    assert!(git_status_panel::handle_command(
+        &mut app,
+        "git.checkoutBranch",
+        &serde_json::json!({ "branch": "feature" }),
+    ));
+    wait_for_git_status(&mut app);
+
+    assert_eq!(app.branch_name, "feature");
 }

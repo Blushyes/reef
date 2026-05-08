@@ -472,15 +472,21 @@ impl Backend for RemoteBackend {
             max_repos: opts.max_repos.map(|n| n as u64),
         };
         let resp: RepoDiscoverResponseDto = self.request(Request::DiscoverRepos { opts: dto })?;
+        let mut repos = Vec::with_capacity(resp.repos.len());
+        for r in resp.repos {
+            if r.repo_root_rel.is_empty() {
+                return Err(BackendError::PathEscape(
+                    "empty repo_root_rel in discover response".to_string(),
+                ));
+            }
+            let repo_root_rel = normalize_repo_root_rel(Path::new(&r.repo_root_rel))?;
+            repos.push(WorkspaceRepoMeta {
+                repo_root_rel,
+                display_name: r.display_name,
+            });
+        }
         Ok(RepoDiscoverResponse {
-            repos: resp
-                .repos
-                .into_iter()
-                .map(|r| WorkspaceRepoMeta {
-                    repo_root_rel: PathBuf::from(r.repo_root_rel),
-                    display_name: r.display_name,
-                })
-                .collect(),
+            repos,
             truncated: resp.truncated,
         })
     }
@@ -805,6 +811,25 @@ impl Backend for RemoteBackend {
         let _: serde_json::Value = self.request(Request::PushFor {
             repo_root_rel: repo_key(&repo_root_rel),
             force,
+        })?;
+        Ok(())
+    }
+
+    fn checkout_branch(&self, branch: &str) -> Result<(), BackendError> {
+        let _: serde_json::Value = self.request(Request::CheckoutBranch {
+            branch: branch.to_string(),
+        })?;
+        Ok(())
+    }
+
+    fn checkout_branch_for(&self, repo_root_rel: &Path, branch: &str) -> Result<(), BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.checkout_branch(branch);
+        }
+        let _: serde_json::Value = self.request(Request::CheckoutBranchFor {
+            repo_root_rel: repo_key(&repo_root_rel),
+            branch: branch.to_string(),
         })?;
         Ok(())
     }

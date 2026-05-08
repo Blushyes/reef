@@ -89,6 +89,13 @@ pub fn set(key: &str, value: &str) {
     write_all(&map);
 }
 
+pub fn remove(key: &str) {
+    let mut map = read_all();
+    if map.remove(key).is_some() {
+        write_all(&map);
+    }
+}
+
 /// Fold unprefixed legacy keys into the new prefixed namespace and delete the
 /// old `git.prefs` file. Safe to call repeatedly — already-migrated keys are
 /// left alone and never overwrite explicit values. Writes only when state

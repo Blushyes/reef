@@ -444,6 +444,8 @@ pub trait Backend: Send + Sync {
 
     fn push(&self, force: bool) -> Result<(), BackendError>;
     fn push_for(&self, repo_root_rel: &Path, force: bool) -> Result<(), BackendError>;
+    fn checkout_branch(&self, branch: &str) -> Result<(), BackendError>;
+    fn checkout_branch_for(&self, repo_root_rel: &Path, branch: &str) -> Result<(), BackendError>;
 
     /// Commit the staged index with `message`. Same shell-out rationale
     /// as `push` — respects hooks, signing, and the user's git config.

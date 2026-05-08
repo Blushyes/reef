@@ -774,6 +774,45 @@ pub fn commit_at(workdir: &Path, message: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Switch the repository at `workdir` to an existing local branch. Shells out
+/// so the behaviour matches a user running `git checkout <branch>` manually.
+pub fn checkout_branch_at(workdir: &Path, branch: &str) -> Result<(), String> {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return Err("empty branch name".to_string());
+    }
+    if branch.starts_with('-') || branch.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err("invalid branch name".to_string());
+    }
+    let repo = Repository::discover(workdir).map_err(|e| e.message().to_string())?;
+    repo.find_branch(branch, git2::BranchType::Local)
+        .map_err(|_| format!("branch not found: {branch}"))?;
+    let output = std::process::Command::new("git")
+        .current_dir(workdir)
+        .args(["checkout", branch])
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "git executable not found on PATH — branch switching requires a `git` binary"
+                    .to_string()
+            } else {
+                format!("failed to run git: {e}")
+            }
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Err(if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            "checkout failed".to_string()
+        });
+    }
+    Ok(())
+}
+
 impl GitRepo {
     // ── commit history / refs ──────────────────────────────────────────────
 

@@ -54,6 +54,12 @@ fn configure_upstream(path: &Path, remote_path: &Path) -> String {
     branch
 }
 
+fn create_branch(path: &Path, branch: &str) {
+    let repo = git2::Repository::open(path).unwrap();
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch(branch, &head, false).unwrap();
+}
+
 fn write_file(path: &Path, contents: &str) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).unwrap();
@@ -431,4 +437,41 @@ fn graph_history_for_child_repo_remote_matches_local() {
     assert_eq!(remote_commits.len(), 1);
     assert_eq!(local_commits[0].subject, "beta commit");
     assert_eq!(remote_commits[0].subject, "beta commit");
+}
+
+#[test]
+fn checkout_branch_for_child_repo_remote_matches_local() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    init_repo(&tmp.path().join("alpha"));
+    write_file(&tmp.path().join("alpha/a.txt"), "alpha\n");
+    commit_all(&tmp.path().join("alpha"), "alpha commit");
+    create_branch(&tmp.path().join("alpha"), "feature");
+
+    let local = LocalBackend::open_at(tmp.path().to_path_buf());
+    local
+        .checkout_branch_for(Path::new("alpha"), "feature")
+        .unwrap();
+    assert_eq!(
+        local
+            .git_status_for(Path::new("alpha"))
+            .unwrap()
+            .branch_name,
+        "feature"
+    );
+
+    local
+        .checkout_branch_for(Path::new("alpha"), "master")
+        .unwrap();
+    let remote = spawn_remote(tmp.path());
+    remote
+        .checkout_branch_for(Path::new("alpha"), "feature")
+        .unwrap();
+    assert_eq!(
+        remote
+            .git_status_for(Path::new("alpha"))
+            .unwrap()
+            .branch_name,
+        "feature"
+    );
 }

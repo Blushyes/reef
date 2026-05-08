@@ -78,6 +78,7 @@ pub struct GitStatusPayload {
     pub unstaged: Vec<FileEntry>,
     pub ahead_behind: Option<(usize, usize)>,
     pub branch_name: String,
+    pub branches: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -1423,15 +1424,21 @@ fn spawn_git_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<GitTa
                         backend,
                         repo_root_rel,
                     } => {
-                        let result = backend
-                            .git_status_for(&repo_root_rel)
-                            .map(|snap| GitStatusPayload {
+                        let result = (|| -> Result<GitStatusPayload, String> {
+                            let snap = backend
+                                .git_status_for(&repo_root_rel)
+                                .map_err(|e| e.to_string())?;
+                            let ref_map = backend
+                                .list_refs_for(&repo_root_rel)
+                                .map_err(|e| e.to_string())?;
+                            Ok(GitStatusPayload {
                                 staged: snap.staged,
                                 unstaged: snap.unstaged,
                                 ahead_behind: snap.ahead_behind,
                                 branch_name: snap.branch_name,
+                                branches: branch_names_from_refs(&ref_map),
                             })
-                            .map_err(|e| e.to_string());
+                        })();
                         let _ = result_tx.send(WorkerResult::GitStatus { generation, result });
                     }
                     GitTask::LoadDiff {
@@ -1660,6 +1667,20 @@ fn hash_ref_map(map: &HashMap<String, Vec<RefLabel>>) -> u64 {
         }
     }
     hasher.finish()
+}
+
+fn branch_names_from_refs(map: &HashMap<String, Vec<RefLabel>>) -> Vec<String> {
+    let mut branches: Vec<String> = map
+        .values()
+        .flat_map(|labels| labels.iter())
+        .filter_map(|label| match label {
+            RefLabel::Branch(name) => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    branches.sort();
+    branches.dedup();
+    branches
 }
 
 // ─── Global-search worker ───────────────────────────────────────────────────

@@ -377,6 +377,17 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
             Ok(()) => Ok(serde_json::json!({"ok": true})),
             Err(e) => Err(backend_err(e)),
         },
+        Request::CheckoutBranch { branch } => match backend.checkout_branch(&branch) {
+            Ok(()) => Ok(serde_json::json!({"ok": true})),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::CheckoutBranchFor {
+            repo_root_rel,
+            branch,
+        } => match backend.checkout_branch_for(&PathBuf::from(repo_root_rel), &branch) {
+            Ok(()) => Ok(serde_json::json!({"ok": true})),
+            Err(e) => Err(backend_err(e)),
+        },
         Request::Commit { message } => match backend.commit(&message) {
             Ok(()) => Ok(serde_json::json!({"ok": true})),
             Err(e) => Err(backend_err(e)),

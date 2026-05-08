@@ -289,6 +289,31 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             app.git_status.branch_dropdown_open = !app.git_status.branch_dropdown_open;
             true
         }
+        "git.openBranchCreate" => {
+            app.open_branch_create_dialog();
+            true
+        }
+        "git.branchCreateFromCurrent" => {
+            app.start_branch_create_from_current();
+            true
+        }
+        "git.branchCreateChooseBase" => {
+            app.start_branch_create_choose_base();
+            true
+        }
+        "git.branchCreateBase" => {
+            let idx = args.get("idx").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            app.select_branch_create_base(idx);
+            true
+        }
+        "git.branchCreateSubmit" => {
+            app.submit_branch_create_dialog();
+            true
+        }
+        "git.branchCreateCancel" => {
+            app.cancel_branch_create_dialog();
+            true
+        }
         "git.toggleStaged" => {
             app.staged_collapsed = !app.staged_collapsed;
             true
@@ -1065,7 +1090,7 @@ fn push_branch_selector(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: 
         .take(6)
         .cloned()
         .collect();
-    let has_choices = !branches.is_empty();
+    let has_choices = app.branch_name != "(detached)";
     let arrow = if app.git_status.branch_dropdown_open {
         " ▴"
     } else {
@@ -1102,7 +1127,20 @@ fn push_branch_selector(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: 
         row
     });
 
-    if app.git_status.branch_dropdown_open && !branches.is_empty() {
+    if app.git_status.branch_dropdown_open && has_choices {
+        rows.push(
+            Row::new(vec![
+                RowSpan::plain(" ".repeat(branch_prefix_width)),
+                RowSpan::styled("+ ", Style::default().fg(Color::Green)),
+                RowSpan::styled(
+                    crate::i18n::branch_create_menu_item(),
+                    Style::default()
+                        .fg(theme.fg_primary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ])
+            .on_click("git.openBranchCreate", Value::Null),
+        );
         for branch in branches {
             let mut label = branch.clone();
             truncate_in_place(&mut label, max_path.saturating_sub(2).max(1));

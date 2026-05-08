@@ -727,6 +727,95 @@ pub fn pull_failed_toast(e: &str) -> String {
     }
 }
 
+pub fn branch_create_menu_item() -> String {
+    match lang() {
+        Lang::Zh => "新建分支...".to_string(),
+        Lang::En => "New branch...".to_string(),
+    }
+}
+
+pub fn branch_create_title() -> String {
+    match lang() {
+        Lang::Zh => "创建分支".to_string(),
+        Lang::En => "Create Branch".to_string(),
+    }
+}
+
+pub fn branch_create_from_current() -> String {
+    match lang() {
+        Lang::Zh => "创建新分支".to_string(),
+        Lang::En => "Create new branch".to_string(),
+    }
+}
+
+pub fn branch_create_from_base() -> String {
+    match lang() {
+        Lang::Zh => "基于...创建分支".to_string(),
+        Lang::En => "Create from...".to_string(),
+    }
+}
+
+pub fn branch_create_base_prompt() -> String {
+    match lang() {
+        Lang::Zh => "选择基于哪个分支:".to_string(),
+        Lang::En => "Choose base branch:".to_string(),
+    }
+}
+
+pub fn branch_create_name_prompt() -> String {
+    match lang() {
+        Lang::Zh => "输入新分支名:".to_string(),
+        Lang::En => "Enter new branch name:".to_string(),
+    }
+}
+
+pub fn branch_create_name_from_prompt(base: &str) -> String {
+    match lang() {
+        Lang::Zh => format!("基于 {base} 输入新分支名:"),
+        Lang::En => format!("Enter new branch name from {base}:"),
+    }
+}
+
+pub fn branch_create_esc_hint() -> String {
+    match lang() {
+        Lang::Zh => "Esc 取消".to_string(),
+        Lang::En => "Esc to cancel".to_string(),
+    }
+}
+
+pub fn branch_create_enter_hint() -> String {
+    match lang() {
+        Lang::Zh => "Enter 创建 · Esc 取消".to_string(),
+        Lang::En => "Enter to create · Esc to cancel".to_string(),
+    }
+}
+
+pub fn branch_create_empty_name() -> String {
+    match lang() {
+        Lang::Zh => "分支名不能为空".to_string(),
+        Lang::En => "Branch name cannot be empty".to_string(),
+    }
+}
+
+pub fn branch_create_failed(e: &str) -> String {
+    let first = e
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or(e);
+    match lang() {
+        Lang::Zh => format!("创建失败: {first}"),
+        Lang::En => format!("Create failed: {first}"),
+    }
+}
+
+pub fn branch_created_toast(branch: &str) -> String {
+    match lang() {
+        Lang::Zh => format!("已创建并切换到 {branch}"),
+        Lang::En => format!("Created and switched to {branch}"),
+    }
+}
+
 pub fn behind_remote(behind: usize) -> String {
     match lang() {
         Lang::Zh => format!("  ↓ 落后远端 {behind} 次提交 — 请先 fetch/pull"),

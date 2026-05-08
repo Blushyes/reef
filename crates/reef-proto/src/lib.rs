@@ -79,7 +79,8 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 /// - v15: adds repo-scoped graph/history requests.
 /// - v16: adds repo-scoped branch checkout.
 /// - v17: adds repo-scoped pull.
-pub const PROTOCOL_VERSION: u32 = 17;
+/// - v18: adds repo-scoped branch creation.
+pub const PROTOCOL_VERSION: u32 = 18;
 
 /// Encode a single envelope-level value to `writer` using the
 /// length-prefixed framing. The caller is expected to flush.
@@ -263,6 +264,15 @@ pub enum Request {
     CheckoutBranchFor {
         repo_root_rel: String,
         branch: String,
+    },
+    CreateBranch {
+        branch: String,
+        base: Option<String>,
+    },
+    CreateBranchFor {
+        repo_root_rel: String,
+        branch: String,
+        base: Option<String>,
     },
 
     /// Create a commit from the staged index with `message`. Agent-side

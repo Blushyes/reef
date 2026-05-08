@@ -20,7 +20,7 @@ pub mod text;
 pub mod theme;
 pub mod toast;
 
-use crate::app::{App, Tab, ViewMode};
+use crate::app::{App, BranchCreateStep, Tab, ViewMode};
 use crate::i18n::{Msg, t};
 use crate::ui::mouse::ClickAction;
 use crate::ui::toast::ToastLevel;
@@ -224,6 +224,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // check only looks at `tree_context_menu.active`.
     if app.tree_context_menu.active {
         context_menu_panel::render(f, app, size);
+    }
+    if app.git_status.branch_create_dialog.is_some() {
+        render_branch_create_dialog(f, app, size);
     }
 }
 
@@ -921,6 +924,169 @@ fn render_help(f: &mut Frame, app: &App, screen: Rect) {
         f.render_widget(line, Rect::new(inner.x, row_y, inner.width, 1));
         row_y += 1;
     }
+}
+
+fn render_branch_create_dialog(f: &mut Frame, app: &mut App, screen: Rect) {
+    let th = app.theme;
+    let Some(dialog) = app.git_status.branch_create_dialog.clone() else {
+        return;
+    };
+    let choices = app.branch_create_base_choices();
+    let popup_w = 56u16.min(screen.width.saturating_sub(2).max(24));
+    let content_h = match &dialog.step {
+        BranchCreateStep::ChooseMode => 5,
+        BranchCreateStep::ChooseBase => choices.len().min(8) as u16 + 3,
+        BranchCreateStep::EnterName { .. } => 6,
+    };
+    let popup_h = content_h.min(screen.height.saturating_sub(2).max(6));
+    let area = Rect::new(
+        screen.x + screen.width.saturating_sub(popup_w) / 2,
+        screen.y + screen.height.saturating_sub(popup_h) / 2,
+        popup_w,
+        popup_h,
+    );
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(th.accent))
+        .title(Span::styled(
+            crate::i18n::branch_create_title(),
+            Style::default()
+                .fg(th.fg_primary)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .padding(Padding::new(1, 1, 0, 0));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    match &dialog.step {
+        BranchCreateStep::ChooseMode => {
+            let selected_idx = dialog.selected_base_idx.min(1);
+            render_branch_dialog_row(
+                f,
+                app,
+                inner,
+                0,
+                crate::i18n::branch_create_from_current(),
+                "git.branchCreateFromCurrent",
+                serde_json::Value::Null,
+                selected_idx == 0,
+            );
+            render_branch_dialog_row(
+                f,
+                app,
+                inner,
+                1,
+                crate::i18n::branch_create_from_base(),
+                "git.branchCreateChooseBase",
+                serde_json::Value::Null,
+                selected_idx == 1,
+            );
+            render_dialog_hint(f, inner, 3, crate::i18n::branch_create_esc_hint(), th);
+        }
+        BranchCreateStep::ChooseBase => {
+            render_dialog_hint(f, inner, 0, crate::i18n::branch_create_base_prompt(), th);
+            for (idx, branch) in choices.iter().take(8).enumerate() {
+                render_branch_dialog_row(
+                    f,
+                    app,
+                    inner,
+                    (idx + 1) as u16,
+                    branch.clone(),
+                    "git.branchCreateBase",
+                    serde_json::json!({ "idx": idx }),
+                    idx == dialog.selected_base_idx,
+                );
+            }
+        }
+        BranchCreateStep::EnterName { base } => {
+            let prompt = match base {
+                Some(base) => crate::i18n::branch_create_name_from_prompt(base),
+                None => crate::i18n::branch_create_name_prompt(),
+            };
+            render_dialog_hint(f, inner, 0, prompt, th);
+            let mut display = dialog.input.clone();
+            let cursor = dialog.cursor.min(display.len());
+            display.insert(cursor, '█');
+            let input_line = Line::from(vec![
+                Span::styled("  ", Style::default().fg(th.fg_secondary)),
+                Span::styled(display, Style::default().fg(th.fg_primary)),
+            ]);
+            let input_area = Rect::new(inner.x, inner.y + 1, inner.width, 1);
+            f.render_widget(input_line, input_area);
+            app.hit_registry.register(
+                input_area,
+                ClickAction::GitCommand {
+                    command: "git.branchCreateSubmit".into(),
+                    args: serde_json::Value::Null,
+                    dbl_command: None,
+                    dbl_args: None,
+                },
+            );
+            if let Some(error) = dialog.error.as_ref() {
+                render_dialog_hint(f, inner, 3, error.clone(), th);
+            }
+            render_dialog_hint(f, inner, 4, crate::i18n::branch_create_enter_hint(), th);
+        }
+    }
+}
+
+fn render_branch_dialog_row(
+    f: &mut Frame,
+    app: &mut App,
+    inner: Rect,
+    offset: u16,
+    label: String,
+    command: &str,
+    args: serde_json::Value,
+    selected: bool,
+) {
+    let th = app.theme;
+    let y = inner.y + offset;
+    if y >= inner.y + inner.height {
+        return;
+    }
+    let style = if selected {
+        Style::default()
+            .fg(th.fg_primary)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(th.fg_secondary)
+    };
+    let marker = if selected { "› " } else { "  " };
+    f.render_widget(
+        Line::from(vec![
+            Span::styled(marker, style),
+            Span::styled(label, style),
+        ]),
+        Rect::new(inner.x, y, inner.width, 1),
+    );
+    app.hit_registry.register(
+        Rect::new(inner.x, y, inner.width, 1),
+        ClickAction::GitCommand {
+            command: command.to_string(),
+            args,
+            dbl_command: None,
+            dbl_args: None,
+        },
+    );
+}
+
+fn render_dialog_hint(
+    f: &mut Frame,
+    area: Rect,
+    offset: u16,
+    text: String,
+    th: crate::ui::theme::Theme,
+) {
+    let y = area.y + offset;
+    if y >= area.y + area.height {
+        return;
+    }
+    f.render_widget(
+        Line::from(Span::styled(text, Style::default().fg(th.fg_secondary))),
+        Rect::new(area.x, y, area.width, 1),
+    );
 }
 
 #[cfg(test)]

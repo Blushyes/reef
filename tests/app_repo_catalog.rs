@@ -3,8 +3,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use reef::app::{App, Tab};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use reef::app::{App, BranchCreateStep, Tab};
 use reef::backend::{Backend, LocalBackend, repo_key};
+use reef::input;
 use reef::ui::git_status_panel;
 use reef::ui::theme::Theme;
 use tempfile::TempDir;
@@ -493,6 +495,76 @@ fn app_switches_branch_for_selected_child_repo() {
     wait_for_git_status(&mut app);
 
     assert_eq!(app.branch_name, "feature");
+}
+
+#[test]
+fn app_creates_branch_for_selected_child_repo() {
+    let _lock = APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let _home = HomeGuard::enter(tmp.path());
+    init_repo(&tmp.path().join("only"));
+    write_file(&tmp.path().join("only/a.txt"), "alpha\n");
+    commit_all(&tmp.path().join("only"), "base commit");
+    create_branch(&tmp.path().join("only"), "base-feature");
+
+    let mut app = app_for(tmp.path());
+    wait_for_repo_catalog(&mut app);
+    wait_for_git_status(&mut app);
+
+    app.open_branch_create_dialog();
+    app.start_branch_create_choose_base();
+    let base_idx = app
+        .branch_create_base_choices()
+        .iter()
+        .position(|branch| branch == "base-feature")
+        .unwrap();
+    app.select_branch_create_base(base_idx);
+    let dialog = app.git_status.branch_create_dialog.as_mut().unwrap();
+    dialog.input = "new-child".to_string();
+    dialog.cursor = dialog.input.len();
+    app.submit_branch_create_dialog();
+    wait_for_git_status(&mut app);
+
+    assert_eq!(app.branch_name, "new-child");
+    assert!(app.git_status.branch_create_dialog.is_none());
+}
+
+#[test]
+fn branch_create_mode_picker_moves_selection() {
+    let _lock = APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let _home = HomeGuard::enter(tmp.path());
+    init_repo(&tmp.path().join("only"));
+    write_file(&tmp.path().join("only/a.txt"), "alpha\n");
+    commit_all(&tmp.path().join("only"), "base commit");
+
+    let mut app = app_for(tmp.path());
+    wait_for_repo_catalog(&mut app);
+    wait_for_git_status(&mut app);
+    app.open_branch_create_dialog();
+
+    assert_eq!(
+        app.git_status
+            .branch_create_dialog
+            .as_ref()
+            .unwrap()
+            .selected_base_idx,
+        0
+    );
+    input::handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app);
+    assert_eq!(
+        app.git_status
+            .branch_create_dialog
+            .as_ref()
+            .unwrap()
+            .selected_base_idx,
+        1
+    );
+    input::handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+    assert!(matches!(
+        app.git_status.branch_create_dialog.as_ref().unwrap().step,
+        BranchCreateStep::ChooseBase
+    ));
 }
 
 #[test]

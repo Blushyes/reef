@@ -850,6 +850,32 @@ impl Backend for RemoteBackend {
         Ok(())
     }
 
+    fn create_branch(&self, branch: &str, base: Option<&str>) -> Result<(), BackendError> {
+        let _: serde_json::Value = self.request(Request::CreateBranch {
+            branch: branch.to_string(),
+            base: base.map(str::to_string),
+        })?;
+        Ok(())
+    }
+
+    fn create_branch_for(
+        &self,
+        repo_root_rel: &Path,
+        branch: &str,
+        base: Option<&str>,
+    ) -> Result<(), BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.create_branch(branch, base);
+        }
+        let _: serde_json::Value = self.request(Request::CreateBranchFor {
+            repo_root_rel: repo_key(&repo_root_rel),
+            branch: branch.to_string(),
+            base: base.map(str::to_string),
+        })?;
+        Ok(())
+    }
+
     fn commit(&self, message: &str) -> Result<(), BackendError> {
         let _: serde_json::Value = self.request(Request::Commit {
             message: message.to_string(),

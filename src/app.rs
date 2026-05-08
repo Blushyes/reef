@@ -255,6 +255,34 @@ pub enum DiscardTarget {
     Section { is_staged: bool },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchCreateStep {
+    ChooseMode,
+    ChooseBase,
+    EnterName { base: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchCreateDialog {
+    pub step: BranchCreateStep,
+    pub input: String,
+    pub cursor: usize,
+    pub selected_base_idx: usize,
+    pub error: Option<String>,
+}
+
+impl BranchCreateDialog {
+    pub fn choose_mode() -> Self {
+        Self {
+            step: BranchCreateStep::ChooseMode,
+            input: String::new(),
+            cursor: 0,
+            selected_base_idx: 0,
+            error: None,
+        }
+    }
+}
+
 /// State for the inline Git status sidebar.
 #[derive(Debug, Default)]
 pub struct GitStatusState {
@@ -273,6 +301,7 @@ pub struct GitStatusState {
     pub ahead_behind: Option<(usize, usize)>,
     pub branches: Vec<String>,
     pub branch_dropdown_open: bool,
+    pub branch_create_dialog: Option<BranchCreateDialog>,
 
     // ─── Commit input (VSCode-style "Source Control" message box) ───
     /// Draft commit message buffer. Freeform UTF-8 — newlines are
@@ -3567,6 +3596,98 @@ impl App {
             Err(e) => {
                 self.toasts
                     .push(Toast::error(format!("Checkout failed: {e}")));
+            }
+        }
+    }
+
+    pub fn branch_create_base_choices(&self) -> Vec<String> {
+        let mut choices = Vec::new();
+        if !self.branch_name.is_empty() && self.branch_name != "(detached)" {
+            choices.push(self.branch_name.clone());
+        }
+        for branch in &self.git_status.branches {
+            if !choices.iter().any(|existing| existing == branch) {
+                choices.push(branch.clone());
+            }
+        }
+        choices
+    }
+
+    pub fn open_branch_create_dialog(&mut self) {
+        self.git_status.branch_dropdown_open = false;
+        self.git_status.branch_create_dialog = Some(BranchCreateDialog::choose_mode());
+    }
+
+    pub fn cancel_branch_create_dialog(&mut self) {
+        self.git_status.branch_create_dialog = None;
+    }
+
+    pub fn start_branch_create_from_current(&mut self) {
+        if let Some(dialog) = self.git_status.branch_create_dialog.as_mut() {
+            dialog.step = BranchCreateStep::EnterName { base: None };
+            dialog.input.clear();
+            dialog.cursor = 0;
+            dialog.error = None;
+        }
+    }
+
+    pub fn start_branch_create_choose_base(&mut self) {
+        if let Some(dialog) = self.git_status.branch_create_dialog.as_mut() {
+            dialog.step = BranchCreateStep::ChooseBase;
+            dialog.selected_base_idx = 0;
+            dialog.error = None;
+        }
+    }
+
+    pub fn select_branch_create_base(&mut self, idx: usize) {
+        let Some(base) = self.branch_create_base_choices().get(idx).cloned() else {
+            return;
+        };
+        if let Some(dialog) = self.git_status.branch_create_dialog.as_mut() {
+            dialog.step = BranchCreateStep::EnterName { base: Some(base) };
+            dialog.input.clear();
+            dialog.cursor = 0;
+            dialog.error = None;
+        }
+    }
+
+    pub fn submit_branch_create_dialog(&mut self) {
+        let Some(dialog) = self.git_status.branch_create_dialog.as_ref() else {
+            return;
+        };
+        let branch = dialog.input.trim().to_string();
+        if branch.is_empty() {
+            if let Some(dialog) = self.git_status.branch_create_dialog.as_mut() {
+                dialog.error = Some(crate::i18n::branch_create_empty_name());
+            }
+            return;
+        }
+        let base = match &dialog.step {
+            BranchCreateStep::EnterName { base } => base.clone(),
+            _ => return,
+        };
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
+            return;
+        };
+        match self
+            .backend
+            .create_branch_for(&repo_root_rel, &branch, base.as_deref())
+        {
+            Ok(()) => {
+                self.git_status.branch_create_dialog = None;
+                self.selected_file = None;
+                self.diff_content = None;
+                self.git_status.confirm_discard = None;
+                self.clear_graph_snapshot();
+                self.refresh_status();
+                self.graph_load.invalidate_stale();
+                self.toasts
+                    .push(Toast::info(crate::i18n::branch_created_toast(&branch)));
+            }
+            Err(e) => {
+                if let Some(dialog) = self.git_status.branch_create_dialog.as_mut() {
+                    dialog.error = Some(crate::i18n::branch_create_failed(&e.to_string()));
+                }
             }
         }
     }

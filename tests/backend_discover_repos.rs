@@ -572,3 +572,42 @@ fn checkout_branch_for_child_repo_remote_matches_local() {
         "feature"
     );
 }
+
+#[test]
+fn create_branch_for_child_repo_remote_matches_local() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    init_repo(tmp.path());
+    init_repo(&tmp.path().join("alpha"));
+    write_file(&tmp.path().join("alpha/a.txt"), "alpha\n");
+    commit_all(&tmp.path().join("alpha"), "alpha commit");
+    create_branch(&tmp.path().join("alpha"), "base-feature");
+
+    let local = LocalBackend::open_at(tmp.path().to_path_buf());
+    local
+        .create_branch_for(Path::new("alpha"), "local-new", None)
+        .unwrap();
+    assert_eq!(
+        local
+            .git_status_for(Path::new("alpha"))
+            .unwrap()
+            .branch_name,
+        "local-new"
+    );
+
+    local
+        .checkout_branch_for(Path::new("alpha"), "master")
+        .unwrap();
+    let remote = spawn_remote(tmp.path());
+    remote
+        .create_branch_for(Path::new("alpha"), "remote-new", Some("base-feature"))
+        .unwrap();
+    assert_eq!(
+        remote
+            .git_status_for(Path::new("alpha"))
+            .unwrap()
+            .branch_name,
+        "remote-new"
+    );
+    assert!(git2::Repository::open(tmp.path()).unwrap().head().is_err());
+}

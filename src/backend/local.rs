@@ -669,6 +669,20 @@ impl Backend for LocalBackend {
             .map_err(BackendError::Git)
     }
 
+    fn create_branch(&self, branch: &str, base: Option<&str>) -> Result<(), BackendError> {
+        self.create_branch_for(Path::new("."), branch, base)
+    }
+
+    fn create_branch_for(
+        &self,
+        repo_root_rel: &Path,
+        branch: &str,
+        base: Option<&str>,
+    ) -> Result<(), BackendError> {
+        crate::git::create_branch_at(&self.workdir_at(repo_root_rel)?, branch, base)
+            .map_err(BackendError::Git)
+    }
+
     fn commit(&self, message: &str) -> Result<(), BackendError> {
         self.commit_for(Path::new("."), message)
     }

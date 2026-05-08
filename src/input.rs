@@ -8,7 +8,7 @@
 //! capture mode, and both are simple enough that splitting them out would
 //! just add indirection.
 
-use crate::app::{App, DbNav, Panel, Tab, ViewMode};
+use crate::app::{App, BranchCreateStep, DbNav, Panel, Tab, ViewMode};
 use crate::clipboard;
 use crate::global_search;
 use crate::i18n::{Msg, t};
@@ -144,6 +144,11 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // input (character append, Backspace, Enter/Esc) while active.
     if app.search.active {
         search::handle_key_in_search_mode(key, app);
+        return;
+    }
+
+    if app.git_status.branch_create_dialog.is_some() {
+        handle_key_branch_create_dialog(key, app);
         return;
     }
 
@@ -494,6 +499,81 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         Tab::Files => handle_key_files(key, app),
         Tab::Search => handle_key_search(key, app),
         Tab::Graph => handle_key_graph(key, app),
+    }
+}
+
+fn handle_key_branch_create_dialog(key: KeyEvent, app: &mut App) {
+    let Some(step) = app
+        .git_status
+        .branch_create_dialog
+        .as_ref()
+        .map(|dialog| dialog.step.clone())
+    else {
+        return;
+    };
+    match step {
+        BranchCreateStep::ChooseMode => match key.code {
+            KeyCode::Esc => app.cancel_branch_create_dialog(),
+            KeyCode::Up | KeyCode::Down => {
+                if let Some(dialog) = app.git_status.branch_create_dialog.as_mut() {
+                    dialog.selected_base_idx = if dialog.selected_base_idx == 0 { 1 } else { 0 };
+                }
+            }
+            KeyCode::Enter => {
+                let selected = app
+                    .git_status
+                    .branch_create_dialog
+                    .as_ref()
+                    .map(|dialog| dialog.selected_base_idx)
+                    .unwrap_or(0);
+                if selected == 0 {
+                    app.start_branch_create_from_current();
+                } else {
+                    app.start_branch_create_choose_base();
+                }
+            }
+            _ => {}
+        },
+        BranchCreateStep::ChooseBase => match key.code {
+            KeyCode::Esc => app.cancel_branch_create_dialog(),
+            KeyCode::Up => {
+                if let Some(dialog) = app.git_status.branch_create_dialog.as_mut() {
+                    dialog.selected_base_idx = dialog.selected_base_idx.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                let max = app.branch_create_base_choices().len().saturating_sub(1);
+                if let Some(dialog) = app.git_status.branch_create_dialog.as_mut() {
+                    dialog.selected_base_idx = (dialog.selected_base_idx + 1).min(max);
+                }
+            }
+            KeyCode::Enter => {
+                let selected = app
+                    .git_status
+                    .branch_create_dialog
+                    .as_ref()
+                    .map(|dialog| dialog.selected_base_idx)
+                    .unwrap_or(0);
+                app.select_branch_create_base(selected);
+            }
+            _ => {}
+        },
+        BranchCreateStep::EnterName { .. } => match key.code {
+            KeyCode::Esc => app.cancel_branch_create_dialog(),
+            KeyCode::Enter => app.submit_branch_create_dialog(),
+            _ => {
+                if let Some(dialog) = app.git_status.branch_create_dialog.as_mut() {
+                    let outcome = crate::input_edit::dispatch_key(
+                        &key,
+                        &mut dialog.input,
+                        &mut dialog.cursor,
+                    );
+                    if matches!(outcome, crate::input_edit::Outcome::Edited) {
+                        dialog.error = None;
+                    }
+                }
+            }
+        },
     }
 }
 

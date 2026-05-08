@@ -841,6 +841,70 @@ pub fn checkout_branch_at(workdir: &Path, branch: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Create and switch to a new local branch at `workdir`. `base = None` means
+/// current HEAD; otherwise the base must be an existing local branch selected
+/// by the UI. Shells out so checkout semantics match normal Git.
+pub fn create_branch_at(workdir: &Path, branch: &str, base: Option<&str>) -> Result<(), String> {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return Err("empty branch name".to_string());
+    }
+    if branch.starts_with('-') || branch.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err("invalid branch name".to_string());
+    }
+    let repo = Repository::discover(workdir).map_err(|e| e.message().to_string())?;
+    if repo.find_branch(branch, git2::BranchType::Local).is_ok() {
+        return Err(format!("branch already exists: {branch}"));
+    }
+    let check = std::process::Command::new("git")
+        .current_dir(workdir)
+        .args(["check-ref-format", "--branch", branch])
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "git executable not found on PATH — branch creation requires a `git` binary"
+                    .to_string()
+            } else {
+                format!("failed to run git: {e}")
+            }
+        })?;
+    if !check.status.success() {
+        return Err("invalid branch name".to_string());
+    }
+    let base = base.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(base) = base {
+        if base.starts_with('-') || base.bytes().any(|b| b < 0x20 || b == 0x7f) {
+            return Err("invalid base branch".to_string());
+        }
+        repo.find_branch(base, git2::BranchType::Local)
+            .map_err(|_| format!("base branch not found: {base}"))?;
+    }
+    let mut cmd = std::process::Command::new("git");
+    cmd.current_dir(workdir).args(["checkout", "-b", branch]);
+    if let Some(base) = base {
+        cmd.arg(base);
+    }
+    let output = cmd.output().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "git executable not found on PATH — branch creation requires a `git` binary".to_string()
+        } else {
+            format!("failed to run git: {e}")
+        }
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Err(if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            "branch creation failed".to_string()
+        });
+    }
+    Ok(())
+}
+
 impl GitRepo {
     // ── commit history / refs ──────────────────────────────────────────────
 

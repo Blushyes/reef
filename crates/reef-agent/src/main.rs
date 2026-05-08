@@ -398,6 +398,23 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
             Ok(()) => Ok(serde_json::json!({"ok": true})),
             Err(e) => Err(backend_err(e)),
         },
+        Request::CreateBranch { branch, base } => {
+            match backend.create_branch(&branch, base.as_deref()) {
+                Ok(()) => Ok(serde_json::json!({"ok": true})),
+                Err(e) => Err(backend_err(e)),
+            }
+        }
+        Request::CreateBranchFor {
+            repo_root_rel,
+            branch,
+            base,
+        } => {
+            match backend.create_branch_for(&PathBuf::from(repo_root_rel), &branch, base.as_deref())
+            {
+                Ok(()) => Ok(serde_json::json!({"ok": true})),
+                Err(e) => Err(backend_err(e)),
+            }
+        }
         Request::Commit { message } => match backend.commit(&message) {
             Ok(()) => Ok(serde_json::json!({"ok": true})),
             Err(e) => Err(backend_err(e)),

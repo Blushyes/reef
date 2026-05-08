@@ -455,6 +455,13 @@ pub trait Backend: Send + Sync {
     fn pull_for(&self, repo_root_rel: &Path) -> Result<(), BackendError>;
     fn checkout_branch(&self, branch: &str) -> Result<(), BackendError>;
     fn checkout_branch_for(&self, repo_root_rel: &Path, branch: &str) -> Result<(), BackendError>;
+    fn create_branch(&self, branch: &str, base: Option<&str>) -> Result<(), BackendError>;
+    fn create_branch_for(
+        &self,
+        repo_root_rel: &Path,
+        branch: &str,
+        base: Option<&str>,
+    ) -> Result<(), BackendError>;
 
     /// Commit the staged index with `message`. Same shell-out rationale
     /// as `push` — respects hooks, signing, and the user's git config.

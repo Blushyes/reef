@@ -815,6 +815,22 @@ impl Backend for RemoteBackend {
         Ok(())
     }
 
+    fn pull(&self) -> Result<(), BackendError> {
+        let _: serde_json::Value = self.request(Request::Pull)?;
+        Ok(())
+    }
+
+    fn pull_for(&self, repo_root_rel: &Path) -> Result<(), BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.pull();
+        }
+        let _: serde_json::Value = self.request(Request::PullFor {
+            repo_root_rel: repo_key(&repo_root_rel),
+        })?;
+        Ok(())
+    }
+
     fn checkout_branch(&self, branch: &str) -> Result<(), BackendError> {
         let _: serde_json::Value = self.request(Request::CheckoutBranch {
             branch: branch.to_string(),

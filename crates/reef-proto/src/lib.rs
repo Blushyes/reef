@@ -70,7 +70,8 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 /// - v13: adds `PushFor` / `CommitFor` so push/commit run in the selected repo.
 /// - v14: adds repo-scoped graph/history requests.
 /// - v15: adds repo-scoped branch checkout.
-pub const PROTOCOL_VERSION: u32 = 15;
+/// - v16: adds repo-scoped pull.
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// Encode a single envelope-level value to `writer` using the
 /// length-prefixed framing. The caller is expected to flush.
@@ -243,6 +244,10 @@ pub enum Request {
     PushFor {
         repo_root_rel: String,
         force: bool,
+    },
+    Pull,
+    PullFor {
+        repo_root_rel: String,
     },
     CheckoutBranch {
         branch: String,

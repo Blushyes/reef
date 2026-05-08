@@ -4,7 +4,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use reef::app::{App, Tab};
-use reef::backend::{LocalBackend, repo_key};
+use reef::backend::{Backend, LocalBackend, repo_key};
 use reef::ui::git_status_panel;
 use reef::ui::theme::Theme;
 use tempfile::TempDir;
@@ -41,7 +41,9 @@ fn commit_all(path: &Path, message: &str) {
     let tree_oid = index.write_tree().unwrap();
     let tree = repo.find_tree(tree_oid).unwrap();
     let sig = git2::Signature::now("Reef Test", "reef@example.com").unwrap();
-    repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[])
+    let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
+    let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
+    repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
         .unwrap();
 }
 
@@ -49,6 +51,66 @@ fn create_branch(path: &Path, branch: &str) {
     let repo = git2::Repository::open(path).unwrap();
     let head = repo.head().unwrap().peel_to_commit().unwrap();
     repo.branch(branch, &head, false).unwrap();
+}
+
+fn init_bare_repo(path: &Path) {
+    std::fs::create_dir_all(path).unwrap();
+    git2::Repository::init_bare(path).unwrap();
+}
+
+fn configure_upstream(path: &Path, remote_path: &Path) {
+    let repo = git2::Repository::open(path).unwrap();
+    repo.remote("origin", remote_path.to_str().unwrap())
+        .unwrap();
+    let branch = repo.head().unwrap().shorthand().unwrap().to_string();
+    let mut config = repo.config().unwrap();
+    config
+        .set_str(&format!("branch.{branch}.remote"), "origin")
+        .unwrap();
+    config
+        .set_str(
+            &format!("branch.{branch}.merge"),
+            &format!("refs/heads/{branch}"),
+        )
+        .unwrap();
+}
+
+fn push_remote_commit(remote_path: &Path, file: &str, contents: &str, message: &str) {
+    let updater = TempDir::new().unwrap();
+    std::process::Command::new("git")
+        .args([
+            "clone",
+            remote_path.to_str().unwrap(),
+            updater.path().to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    std::process::Command::new("git")
+        .current_dir(updater.path())
+        .args(["config", "user.name", "Reef Test"])
+        .status()
+        .unwrap();
+    std::process::Command::new("git")
+        .current_dir(updater.path())
+        .args(["config", "user.email", "reef@example.com"])
+        .status()
+        .unwrap();
+    write_file(&updater.path().join(file), contents);
+    std::process::Command::new("git")
+        .current_dir(updater.path())
+        .args(["add", "."])
+        .status()
+        .unwrap();
+    std::process::Command::new("git")
+        .current_dir(updater.path())
+        .args(["commit", "-m", message])
+        .status()
+        .unwrap();
+    std::process::Command::new("git")
+        .current_dir(updater.path())
+        .arg("push")
+        .status()
+        .unwrap();
 }
 
 fn app_for(root: &Path) -> App {
@@ -78,6 +140,18 @@ fn wait_for_git_status(app: &mut App) {
         thread::sleep(Duration::from_millis(10));
     }
     panic!("timed out waiting for git status");
+}
+
+fn wait_for_pull(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        app.tick();
+        if !app.pull_in_flight {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for pull");
 }
 
 fn wait_for_diff(app: &mut App) {
@@ -419,4 +493,42 @@ fn app_switches_branch_for_selected_child_repo() {
     wait_for_git_status(&mut app);
 
     assert_eq!(app.branch_name, "feature");
+}
+
+#[test]
+fn app_pulls_selected_child_repo() {
+    let _lock = APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let _home = HomeGuard::enter(tmp.path());
+    init_bare_repo(&tmp.path().join("remote.git"));
+    init_repo(&tmp.path().join("only"));
+    configure_identity(&tmp.path().join("only"));
+    write_file(&tmp.path().join("only/base.txt"), "base\n");
+    commit_all(&tmp.path().join("only"), "base commit");
+    configure_upstream(&tmp.path().join("only"), &tmp.path().join("remote.git"));
+    LocalBackend::open_at(tmp.path().to_path_buf())
+        .push_for(Path::new("only"), false)
+        .unwrap();
+
+    push_remote_commit(
+        &tmp.path().join("remote.git"),
+        "remote.txt",
+        "remote\n",
+        "remote commit",
+    );
+
+    let mut app = app_for(tmp.path());
+    wait_for_repo_catalog(&mut app);
+    wait_for_git_status(&mut app);
+    assert!(git_status_panel::handle_command(
+        &mut app,
+        "git.pull",
+        &serde_json::json!({})
+    ));
+    wait_for_pull(&mut app);
+
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("only/remote.txt")).unwrap(),
+        "remote\n"
+    );
 }

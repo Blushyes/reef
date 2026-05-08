@@ -506,6 +506,18 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             app.git_status.push_error = None;
             true
         }
+        "git.dismissPullError" => {
+            app.git_status.pull_error = None;
+            true
+        }
+        "git.pull" => {
+            if !can_perform_git_writes(app) || app.pull_in_flight {
+                return true;
+            }
+            app.git_status.pull_error = None;
+            app.run_pull();
+            true
+        }
         "git.refresh" => {
             app.refresh_status();
             app.load_diff();
@@ -656,6 +668,16 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
         rows.push(Row::blank());
     }
 
+    if allow_git_writes && app.pull_in_flight {
+        rows.push(Row::new(vec![RowSpan::styled(
+            t(Msg::PullingHint),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        rows.push(Row::blank());
+    }
+
     // Push error banner
     if allow_git_writes && let Some(ref err) = status.push_error {
         let mut msg = err.clone();
@@ -673,6 +695,26 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
                 ),
             ])
             .on_click("git.dismissPushError", Value::Null),
+        );
+        rows.push(Row::blank());
+    }
+
+    if allow_git_writes && let Some(ref err) = status.pull_error {
+        let mut msg = err.clone();
+        truncate_in_place(&mut msg, max_path);
+        rows.push(
+            Row::new(vec![
+                RowSpan::styled(
+                    t(Msg::PullFailedPrefix),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                RowSpan::styled(msg, Style::default().fg(theme.fg_primary)),
+                RowSpan::styled(
+                    t(Msg::DismissClose),
+                    Style::default().fg(theme.fg_secondary),
+                ),
+            ])
+            .on_click("git.dismissPullError", Value::Null),
         );
         rows.push(Row::blank());
     }
@@ -748,6 +790,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
         && !status.confirm_push
         && !status.confirm_force_push
         && !app.push_in_flight
+        && !app.pull_in_flight
     {
         if let Some((ahead, behind)) = app.git_status.ahead_behind {
             if let Some(row) = push_indicator_row(ahead, behind) {
@@ -1733,10 +1776,16 @@ fn push_indicator_row(ahead: usize, behind: usize) -> Option<Row> {
                 dbl: None,
             },
         ])),
-        (0, b) => Some(Row::new(vec![RowSpan::styled(
-            crate::i18n::behind_remote(b),
-            Style::default().fg(Color::Yellow),
-        )])),
+        (0, b) => Some(Row::new(vec![
+            RowSpan::styled(
+                crate::i18n::pull_button(b),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .on_click("git.pull", Value::Null),
+        ])),
         (a, b) => Some(Row::new(vec![
             RowSpan::plain("  "),
             RowSpan {

@@ -66,6 +66,8 @@ pub enum Msg {
     // Toasts
     PushSuccess,
     ForcePushSuccess,
+    PullSuccess,
+    PullThreadCrashed,
     PushThreadCrashed,
     CommitSuccess,
     CommitThreadCrashed,
@@ -80,6 +82,8 @@ pub enum Msg {
     NoReposFound,
     RepoSelectPrompt,
     PushingHint,
+    PullingHint,
+    PullFailedPrefix,
     PushFailedPrefix,
     DismissClose,
     ForcePushPrompt,
@@ -240,6 +244,8 @@ fn t_zh(m: Msg) -> &'static str {
         SearchNoMatch => "无匹配 ",
         PushSuccess => "推送成功",
         ForcePushSuccess => "强制推送成功",
+        PullSuccess => "拉取成功",
+        PullThreadCrashed => "拉取线程异常退出，请重试",
         PushThreadCrashed => "推送线程异常退出，请重试",
         CommitSuccess => "提交成功",
         CommitThreadCrashed => "提交线程异常退出，请重试",
@@ -252,6 +258,8 @@ fn t_zh(m: Msg) -> &'static str {
         NoReposFound => "  未发现仓库",
         RepoSelectPrompt => "  选择一个仓库",
         PushingHint => "  ⋯ 推送中…",
+        PullingHint => "  ⋯ 拉取中…",
+        PullFailedPrefix => "  ✖ 拉取失败: ",
         PushFailedPrefix => "  ✖ 推送失败: ",
         DismissClose => "  [关闭]",
         ForcePushPrompt => "  ⚠ 强制推送？",
@@ -375,6 +383,8 @@ fn t_en(m: Msg) -> &'static str {
         SearchNoMatch => "no match ",
         PushSuccess => "Push succeeded",
         ForcePushSuccess => "Force push succeeded",
+        PullSuccess => "Pull succeeded",
+        PullThreadCrashed => "Pull worker crashed, please retry",
         PushThreadCrashed => "Push worker crashed, please retry",
         CommitSuccess => "Commit succeeded",
         CommitThreadCrashed => "Commit worker crashed, please retry",
@@ -387,6 +397,8 @@ fn t_en(m: Msg) -> &'static str {
         NoReposFound => "  no repositories found",
         RepoSelectPrompt => "  select a repository",
         PushingHint => "  ⋯ Pushing…",
+        PullingHint => "  ⋯ Pulling…",
+        PullFailedPrefix => "  ✖ Pull failed: ",
         PushFailedPrefix => "  ✖ Push failed: ",
         DismissClose => "  [dismiss]",
         ForcePushPrompt => "  ⚠ Force push?",
@@ -550,6 +562,25 @@ pub fn push_button(ahead: usize) -> String {
     match lang() {
         Lang::Zh => format!(" ↑ 推送 ({ahead}) "),
         Lang::En => format!(" ↑ Push ({ahead}) "),
+    }
+}
+
+pub fn pull_button(behind: usize) -> String {
+    match lang() {
+        Lang::Zh => format!(" ↓ 拉取 ({behind}) "),
+        Lang::En => format!(" ↓ Pull ({behind}) "),
+    }
+}
+
+pub fn pull_failed_toast(e: &str) -> String {
+    let first = e
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or(e);
+    match lang() {
+        Lang::Zh => format!("拉取失败: {first}"),
+        Lang::En => format!("Pull failed: {first}"),
     }
 }
 

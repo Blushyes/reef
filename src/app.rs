@@ -222,6 +222,7 @@ pub struct GitStatusState {
     /// because the banner stays visible across re-renders whereas toasts are
     /// ephemeral.
     pub push_error: Option<String>,
+    pub pull_error: Option<String>,
     pub scroll: usize,
     pub ahead_behind: Option<(usize, usize)>,
     pub branches: Vec<String>,
@@ -700,6 +701,9 @@ pub struct App {
     /// `App::tick`; once the result is consumed we drop the channel.
     pub push_rx: Option<mpsc::Receiver<(bool, Result<(), String>)>>,
 
+    pub pull_in_flight: bool,
+    pub pull_rx: Option<mpsc::Receiver<Result<(), String>>>,
+
     /// `true` while a background `git commit` is in flight. Blocks
     /// additional commit attempts and lets the status panel render a
     /// "提交中…" indicator.
@@ -1073,6 +1077,8 @@ impl App {
             toasts: Vec::new(),
             push_in_flight: false,
             push_rx: None,
+            pull_in_flight: false,
+            pull_rx: None,
             commit_in_flight: false,
             commit_rx: None,
             fs_watcher_rx,
@@ -3377,6 +3383,23 @@ impl App {
         });
     }
 
+    pub fn run_pull(&mut self) {
+        if self.pull_in_flight {
+            return;
+        }
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
+            return;
+        };
+        let backend = Arc::clone(&self.backend);
+        let (tx, rx) = mpsc::channel();
+        self.pull_rx = Some(rx);
+        self.pull_in_flight = true;
+        std::thread::spawn(move || {
+            let result = backend.pull_for(&repo_root_rel).map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+    }
+
     pub fn checkout_branch(&mut self, branch: &str) {
         let branch = branch.trim();
         if branch.is_empty() || branch == self.branch_name {
@@ -3448,6 +3471,45 @@ impl App {
                 self.push_rx = None;
                 self.toasts.push(Toast::error(crate::i18n::t(
                     crate::i18n::Msg::PushThreadCrashed,
+                )));
+            }
+        }
+    }
+
+    fn drain_pull_result(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let Some(rx) = self.pull_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.pull_in_flight = false;
+                self.pull_rx = None;
+                match result {
+                    Ok(()) => {
+                        self.git_status.pull_error = None;
+                        self.toasts
+                            .push(Toast::info(crate::i18n::t(crate::i18n::Msg::PullSuccess)));
+                    }
+                    Err(e) => {
+                        self.git_status.pull_error = Some(e.clone());
+                        self.toasts
+                            .push(Toast::error(crate::i18n::pull_failed_toast(&e)));
+                    }
+                }
+                self.selected_file = None;
+                self.diff_content = None;
+                self.git_graph.cache_key = None;
+                self.git_status_load.mark_stale();
+                self.diff_load.mark_stale();
+                self.graph_load.mark_stale();
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.pull_in_flight = false;
+                self.pull_rx = None;
+                self.toasts.push(Toast::error(crate::i18n::t(
+                    crate::i18n::Msg::PullThreadCrashed,
                 )));
             }
         }
@@ -4398,6 +4460,7 @@ impl App {
         self.drain_preview_resize_responses();
         self.drain_preview_protocol_builds();
         self.drain_push_result();
+        self.drain_pull_result();
         self.drain_commit_result();
         self.kick_active_tab_work();
         self.tick_place_mode_auto_expand();

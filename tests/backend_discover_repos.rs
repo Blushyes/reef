@@ -60,6 +60,44 @@ fn create_branch(path: &Path, branch: &str) {
     repo.branch(branch, &head, false).unwrap();
 }
 
+fn push_remote_commit(remote_path: &Path, file: &str, contents: &str, message: &str) {
+    let updater = TempDir::new().unwrap();
+    std::process::Command::new("git")
+        .args([
+            "clone",
+            remote_path.to_str().unwrap(),
+            updater.path().to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    std::process::Command::new("git")
+        .current_dir(updater.path())
+        .args(["config", "user.name", "Reef Test"])
+        .status()
+        .unwrap();
+    std::process::Command::new("git")
+        .current_dir(updater.path())
+        .args(["config", "user.email", "reef@example.com"])
+        .status()
+        .unwrap();
+    write_file(&updater.path().join(file), contents);
+    std::process::Command::new("git")
+        .current_dir(updater.path())
+        .args(["add", "."])
+        .status()
+        .unwrap();
+    std::process::Command::new("git")
+        .current_dir(updater.path())
+        .args(["commit", "-m", message])
+        .status()
+        .unwrap();
+    std::process::Command::new("git")
+        .current_dir(updater.path())
+        .arg("push")
+        .status()
+        .unwrap();
+}
+
 fn write_file(path: &Path, contents: &str) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).unwrap();
@@ -77,7 +115,9 @@ fn commit_all(path: &Path, message: &str) {
     let tree_oid = index.write_tree().unwrap();
     let tree = repo.find_tree(tree_oid).unwrap();
     let sig = git2::Signature::now("Reef Test", "reef@example.com").unwrap();
-    repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[])
+    let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
+    let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
+    repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
         .unwrap();
 }
 
@@ -411,6 +451,63 @@ fn push_for_child_repo_pushes_child_upstream() {
         .target()
         .unwrap();
     assert_ne!(first_oid, second_oid);
+}
+
+#[test]
+fn pull_for_child_repo_remote_matches_local() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    init_repo(tmp.path());
+    init_bare_repo(&tmp.path().join("remote-alpha.git"));
+    init_bare_repo(&tmp.path().join("remote-beta.git"));
+
+    init_repo(&tmp.path().join("alpha"));
+    configure_identity(&tmp.path().join("alpha"));
+    write_file(&tmp.path().join("alpha/base.txt"), "base\n");
+    commit_all(&tmp.path().join("alpha"), "alpha base");
+    configure_upstream(
+        &tmp.path().join("alpha"),
+        &tmp.path().join("remote-alpha.git"),
+    );
+
+    init_repo(&tmp.path().join("beta"));
+    configure_identity(&tmp.path().join("beta"));
+    write_file(&tmp.path().join("beta/base.txt"), "base\n");
+    commit_all(&tmp.path().join("beta"), "beta base");
+    configure_upstream(
+        &tmp.path().join("beta"),
+        &tmp.path().join("remote-beta.git"),
+    );
+
+    let local = LocalBackend::open_at(tmp.path().to_path_buf());
+    local.push_for(Path::new("alpha"), false).unwrap();
+    local.push_for(Path::new("beta"), false).unwrap();
+
+    push_remote_commit(
+        &tmp.path().join("remote-alpha.git"),
+        "remote.txt",
+        "alpha remote\n",
+        "alpha remote",
+    );
+    local.pull_for(Path::new("alpha")).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("alpha/remote.txt")).unwrap(),
+        "alpha remote\n"
+    );
+    assert!(!tmp.path().join("beta/remote.txt").exists());
+
+    push_remote_commit(
+        &tmp.path().join("remote-beta.git"),
+        "remote.txt",
+        "beta remote\n",
+        "beta remote",
+    );
+    let remote = spawn_remote(tmp.path());
+    remote.pull_for(Path::new("beta")).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("beta/remote.txt")).unwrap(),
+        "beta remote\n"
+    );
 }
 
 #[test]

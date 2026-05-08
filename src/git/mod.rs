@@ -710,6 +710,34 @@ pub fn push_at(workdir: &Path, force: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Fast-forward the current branch from its upstream. Uses `--ff-only` so the
+/// TUI never triggers an interactive merge commit editor.
+pub fn pull_at(workdir: &Path) -> Result<(), String> {
+    let output = std::process::Command::new("git")
+        .current_dir(workdir)
+        .args(["pull", "--ff-only"])
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "git executable not found on PATH — pull requires a `git` binary".to_string()
+            } else {
+                format!("failed to run git: {e}")
+            }
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Err(if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            "pull failed".to_string()
+        });
+    }
+    Ok(())
+}
+
 /// Commit the staged index at `workdir` with `message`. Shells out to
 /// `git commit -F -` (message via stdin) for the same reason `push_at`
 /// does: respects the user's pre-commit / commit-msg hooks, GPG signing

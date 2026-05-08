@@ -559,6 +559,14 @@ impl Backend for LocalBackend {
         crate::git::push_at(&self.workdir_at(repo_root_rel)?, force).map_err(BackendError::Git)
     }
 
+    fn pull(&self) -> Result<(), BackendError> {
+        self.pull_for(Path::new("."))
+    }
+
+    fn pull_for(&self, repo_root_rel: &Path) -> Result<(), BackendError> {
+        crate::git::pull_at(&self.workdir_at(repo_root_rel)?).map_err(BackendError::Git)
+    }
+
     fn checkout_branch(&self, branch: &str) -> Result<(), BackendError> {
         self.checkout_branch_for(Path::new("."), branch)
     }

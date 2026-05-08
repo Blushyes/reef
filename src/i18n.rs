@@ -62,6 +62,25 @@ pub enum Msg {
 
     // Search
     SearchNoMatch,
+    /// Placeholder shown in the second input row of the Search tab when
+    /// replace mode is active and the user hasn't typed anything.
+    ReplaceWithPlaceholder,
+    /// Footer label for the per-match counter when replace mode is on,
+    /// e.g. "12 to replace".
+    ReplaceCountSuffix,
+    /// Footer button label that commits the replace batch.
+    ApplyReplace,
+    /// Replace-in-progress hint while a batch is in flight.
+    ReplacingHint,
+    /// Toast header for a successful replace summary, e.g.
+    /// "Replaced 12 lines in 3 files".
+    ReplaceSummaryToast,
+    /// Toast suffix when some lines drifted under the search snapshot.
+    ReplaceSkippedStaleSuffix,
+    /// Toast suffix when files exceeded `MAX_REPLACE_FILE_SIZE`.
+    ReplaceTooLargeSuffix,
+    /// Title used by the Search tab when replace mode is open.
+    SearchReplaceTitle,
 
     // Toasts
     PushSuccess,
@@ -203,6 +222,7 @@ pub enum Msg {
     HelpHardDeleteEntry,
     HelpRightClickMenu,
     HelpToggleSidebar,
+    HelpOpenSettings,
     /// `Esc` row in the help popup — describes the general two-step
     /// back-out behaviour (clear dormant search, then return panel
     /// focus to the list/tree column). The Graph-visual-mode row
@@ -219,6 +239,41 @@ pub enum Msg {
     PanelDiff,
     PanelSearch,
     PanelGraph,
+
+    // Settings page
+    SettingsTitle,
+    SettingsFooterHint,
+    SettingsEditorEditHint,
+    SettingsSectionGeneral,
+    SettingsSectionEditor,
+    SettingsSectionGit,
+    SettingsSectionGraph,
+    SettingsItemTheme,
+    SettingsItemEditor,
+    SettingsItemDiffLayout,
+    SettingsItemDiffMode,
+    SettingsItemStatusTreeMode,
+    SettingsItemCommitDiffLayout,
+    SettingsItemCommitDiffMode,
+    SettingsItemCommitFilesTreeMode,
+    SettingsDescTheme,
+    SettingsDescEditor,
+    SettingsDescDiffLayout,
+    SettingsDescDiffMode,
+    SettingsDescStatusTreeMode,
+    SettingsDescCommitDiffLayout,
+    SettingsDescCommitDiffMode,
+    SettingsDescCommitFilesTreeMode,
+    SettingsValueThemeAuto,
+    SettingsValueThemeDark,
+    SettingsValueThemeLight,
+    SettingsValueOn,
+    SettingsValueOff,
+    SettingsEditorPlaceholder,
+    /// Toast for cycling `ui.theme` to `auto` — the OSC 11 probe only
+    /// runs at startup before raw mode, so the live theme keeps its
+    /// current preset until next launch.
+    SettingsAutoThemeOnNextLaunch,
 }
 
 pub fn t(m: Msg) -> &'static str {
@@ -242,6 +297,14 @@ fn t_zh(m: Msg) -> &'static str {
         NoRepoTitle => "不在 git 仓库中",
         NoRepoHint => "运行 `git init` 初始化，或在 git 仓库里打开 reef。",
         SearchNoMatch => "无匹配 ",
+        ReplaceWithPlaceholder => "替换为…",
+        ReplaceCountSuffix => "处待替换",
+        ApplyReplace => "应用",
+        ReplacingHint => "正在替换…",
+        ReplaceSummaryToast => "已替换",
+        ReplaceSkippedStaleSuffix => "处过期跳过",
+        ReplaceTooLargeSuffix => "个文件过大已跳过",
+        SearchReplaceTitle => " 🔎 查找与替换 ",
         PushSuccess => "推送成功",
         ForcePushSuccess => "强制推送成功",
         PullSuccess => "拉取成功",
@@ -355,6 +418,9 @@ fn t_zh(m: Msg) -> &'static str {
         HelpHardDeleteEntry => "永久删除（不可撤销）",
         HelpRightClickMenu => "打开文件树右键菜单",
         HelpToggleSidebar => "切换侧边栏显示",
+        HelpOpenSettings => {
+            "打开设置页（部分终端不转发 Ctrl+, ，可在 Settings 内手动通过 Esc 退出）"
+        }
         HelpEscBackOut => "退出焦点 / 清除搜索",
         SidebarHiddenHint => "侧边栏已隐藏 — Ctrl+B 可恢复",
         HelpAnyKey => "关闭帮助",
@@ -364,6 +430,38 @@ fn t_zh(m: Msg) -> &'static str {
         PanelDiff => "Diff",
         PanelSearch => "搜索",
         PanelGraph => "图表",
+        SettingsTitle => " ⚙ 设置 ",
+        SettingsFooterHint => "  ↑↓ 选择 · Enter 切换/编辑 · Esc 返回",
+        SettingsEditorEditHint => "  Enter 保存 · Esc 取消",
+        SettingsSectionGeneral => "通用",
+        SettingsSectionEditor => "外部编辑器",
+        SettingsSectionGit => "Git Diff",
+        SettingsSectionGraph => "提交详情",
+        SettingsItemTheme => "主题",
+        SettingsItemEditor => "编辑器命令",
+        SettingsItemDiffLayout => "Diff 布局",
+        SettingsItemDiffMode => "Diff 模式",
+        SettingsItemStatusTreeMode => "状态侧栏树形视图",
+        SettingsItemCommitDiffLayout => "提交 Diff 布局",
+        SettingsItemCommitDiffMode => "提交 Diff 模式",
+        SettingsItemCommitFilesTreeMode => "提交文件列表树形视图",
+        SettingsDescTheme => "auto 自动检测终端背景；显式指定可避免误判（重启后生效一次）",
+        SettingsDescEditor => {
+            "Enter 打开文件时调用的命令；留空则按 $VISUAL → $EDITOR → vi 顺序回退"
+        }
+        SettingsDescDiffLayout => "Git tab 右侧 diff 显示方式：上下统一 / 左右对比",
+        SettingsDescDiffMode => "Git tab diff 显示范围：仅变更块 / 整个文件",
+        SettingsDescStatusTreeMode => "Git tab 文件列表用树形或列表呈现",
+        SettingsDescCommitDiffLayout => "图表 tab commit 详情中的 diff 显示方式",
+        SettingsDescCommitDiffMode => "图表 tab commit 详情中的 diff 显示范围",
+        SettingsDescCommitFilesTreeMode => "图表 tab commit 变更文件用树形或列表呈现",
+        SettingsValueThemeAuto => "自动",
+        SettingsValueThemeDark => "深色",
+        SettingsValueThemeLight => "浅色",
+        SettingsValueOn => "开",
+        SettingsValueOff => "关",
+        SettingsEditorPlaceholder => "(未设置 — 使用 $VISUAL / $EDITOR / vi)",
+        SettingsAutoThemeOnNextLaunch => "已切换到 auto 主题，下次启动生效",
     }
 }
 
@@ -381,6 +479,14 @@ fn t_en(m: Msg) -> &'static str {
         NoRepoTitle => "Not a git repository",
         NoRepoHint => "Run `git init` to initialise one, or open reef inside a git repo.",
         SearchNoMatch => "no match ",
+        ReplaceWithPlaceholder => "Replace with…",
+        ReplaceCountSuffix => "to replace",
+        ApplyReplace => "Apply",
+        ReplacingHint => "Replacing…",
+        ReplaceSummaryToast => "Replaced",
+        ReplaceSkippedStaleSuffix => "skipped (stale)",
+        ReplaceTooLargeSuffix => "file(s) too large to replace",
+        SearchReplaceTitle => " 🔎 Find & Replace ",
         PushSuccess => "Push succeeded",
         ForcePushSuccess => "Force push succeeded",
         PullSuccess => "Pull succeeded",
@@ -496,6 +602,7 @@ fn t_en(m: Msg) -> &'static str {
         HelpHardDeleteEntry => "Delete permanently (cannot be undone)",
         HelpRightClickMenu => "Open file-tree context menu",
         HelpToggleSidebar => "Toggle sidebar",
+        HelpOpenSettings => "Open settings page (some terminals don't forward Ctrl+,)",
         HelpEscBackOut => "Exit focus / clear search",
         SidebarHiddenHint => "Sidebar hidden — Ctrl+B to restore",
         HelpAnyKey => "Close help",
@@ -505,6 +612,40 @@ fn t_en(m: Msg) -> &'static str {
         PanelDiff => "Diff",
         PanelSearch => "Search",
         PanelGraph => "Graph",
+        SettingsTitle => " ⚙ Settings ",
+        SettingsFooterHint => "  ↑↓ select · Enter toggle/edit · Esc back",
+        SettingsEditorEditHint => "  Enter save · Esc cancel",
+        SettingsSectionGeneral => "General",
+        SettingsSectionEditor => "External editor",
+        SettingsSectionGit => "Git diff",
+        SettingsSectionGraph => "Commit detail",
+        SettingsItemTheme => "Theme",
+        SettingsItemEditor => "Editor command",
+        SettingsItemDiffLayout => "Diff layout",
+        SettingsItemDiffMode => "Diff mode",
+        SettingsItemStatusTreeMode => "Status sidebar — tree view",
+        SettingsItemCommitDiffLayout => "Commit diff layout",
+        SettingsItemCommitDiffMode => "Commit diff mode",
+        SettingsItemCommitFilesTreeMode => "Commit files — tree view",
+        SettingsDescTheme => {
+            "auto detects terminal background; pick dark / light to override (takes effect on next launch)"
+        }
+        SettingsDescEditor => {
+            "Command launched when you press Enter on a file; empty falls back to $VISUAL → $EDITOR → vi"
+        }
+        SettingsDescDiffLayout => "Git tab right-side diff layout — unified / side-by-side",
+        SettingsDescDiffMode => "Git tab diff body — compact (changed hunks) / full file",
+        SettingsDescStatusTreeMode => "Git tab file list — tree or flat list",
+        SettingsDescCommitDiffLayout => "Graph tab commit-detail diff layout",
+        SettingsDescCommitDiffMode => "Graph tab commit-detail diff body",
+        SettingsDescCommitFilesTreeMode => "Graph tab commit changed files — tree or flat list",
+        SettingsValueThemeAuto => "auto",
+        SettingsValueThemeDark => "dark",
+        SettingsValueThemeLight => "light",
+        SettingsValueOn => "on",
+        SettingsValueOff => "off",
+        SettingsEditorPlaceholder => "(unset — uses $VISUAL / $EDITOR / vi)",
+        SettingsAutoThemeOnNextLaunch => "Theme set to auto — takes effect on next launch",
     }
 }
 

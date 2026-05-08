@@ -206,15 +206,7 @@ pub fn handle_key(app: &mut App, key: &str) -> bool {
             true
         }
         "t" => {
-            app.git_status.tree_mode = !app.git_status.tree_mode;
-            crate::prefs::set(
-                "status.tree_mode",
-                if app.git_status.tree_mode {
-                    "true"
-                } else {
-                    "false"
-                },
-            );
+            app.toggle_status_tree_mode();
             true
         }
         _ => false,

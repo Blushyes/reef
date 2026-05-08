@@ -593,6 +593,16 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
             Ok(()) => Ok(serde_json::json!({"ok": true})),
             Err(e) => Err(backend_err(e)),
         },
+        Request::FileSize { rel_path } => match backend.file_size(Path::new(&rel_path)) {
+            Ok(size) => Ok(serde_json::json!({ "size": size })),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::WriteFile { rel_path, content } => {
+            match backend.write_file(Path::new(&rel_path), &content) {
+                Ok(()) => Ok(serde_json::json!({"ok": true})),
+                Err(e) => Err(backend_err(e)),
+            }
+        }
         Request::Trash { rel_paths } => {
             let abs_paths: Vec<PathBuf> = rel_paths.iter().map(PathBuf::from).collect();
             // Try `gio trash` for headless Linux parity with the GNOME

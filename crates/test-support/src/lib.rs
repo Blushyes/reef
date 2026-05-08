@@ -48,18 +48,32 @@ pub fn agent_bin() -> PathBuf {
     );
 }
 
+/// Process-wide lock for HOME mutations. Multiple `#[cfg(test)] mod tests`
+/// in different `src/*.rs` files compile into the SAME `cargo test --lib`
+/// binary, so they share the global env-var space. A per-file lock works
+/// only when one file owns every HOME-touching test in its binary; the
+/// moment a second file is added, the two locks no longer serialise
+/// against each other and `HomeGuard` mid-restore can be observed by the
+/// other test as a corrupt $HOME.
+///
+/// All lib-side tests that touch HOME (and any integration test that
+/// doesn't already use its own per-file lock) should grab THIS lock for
+/// the lifetime of the `HomeGuard`. Each integration test (`tests/*.rs`)
+/// is its own binary, so they could in principle keep per-file locks —
+/// but pointing them at the shared lock costs nothing and removes a
+/// footgun for the next contributor.
+pub static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Redirect `$HOME` to a path for the lifetime of the guard, then restore
 /// whatever value was there before (or remove it if HOME was unset).
 ///
 /// `std::env::set_var` is process-global, so callers MUST serialise HOME
-/// mutations through a `static Mutex<()>` in their test file. This helper
-/// is the "do the unsafe set/restore correctly" part; the lock is yours.
+/// mutations. Use [`HOME_LOCK`] above unless you have a specific reason
+/// to keep a per-file lock.
 ///
 /// Typical use:
 /// ```no_run
-/// use std::sync::Mutex;
-/// use test_support::{tempdir_repo, HomeGuard};
-/// static HOME_LOCK: Mutex<()> = Mutex::new(());
+/// use test_support::{HOME_LOCK, HomeGuard, tempdir_repo};
 ///
 /// # fn body() {
 /// let _lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());

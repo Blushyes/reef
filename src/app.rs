@@ -143,6 +143,15 @@ fn max_page_for(table: &reef_sqlite_preview::TableSummary, page_size: u32) -> u6
 /// prefetch at all.
 const PREFETCH_DELAY: Duration = Duration::from_millis(300);
 
+/// `Settings` is a full-screen takeover that hides the tab bar; the
+/// background work coordinator keeps running so the four-tab snapshots
+/// are fresh on return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Main,
+    Settings,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Git,
@@ -191,10 +200,47 @@ pub enum DiffLayout {
     SideBySide, // 左右对比视图
 }
 
+impl DiffLayout {
+    /// Stable string used in `~/.config/reef/prefs`. Must round-trip via
+    /// `from_pref_str` — every reader (`load_prefs`, `App::new`,
+    /// `settings::current_value`) and every writer (`save_prefs`,
+    /// `settings::cycle`) must go through these two methods so the spelling
+    /// stays consistent.
+    pub fn pref_str(self) -> &'static str {
+        match self {
+            DiffLayout::Unified => "unified",
+            DiffLayout::SideBySide => "side_by_side",
+        }
+    }
+
+    pub fn from_pref_str(s: &str) -> Self {
+        match s {
+            "side_by_side" => DiffLayout::SideBySide,
+            _ => DiffLayout::Unified,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffMode {
     Compact,  // 只显示变更区域 ± context
     FullFile, // 显示整个文件
+}
+
+impl DiffMode {
+    pub fn pref_str(self) -> &'static str {
+        match self {
+            DiffMode::Compact => "compact",
+            DiffMode::FullFile => "full_file",
+        }
+    }
+
+    pub fn from_pref_str(s: &str) -> Self {
+        match s {
+            "full_file" => DiffMode::FullFile,
+            _ => DiffMode::Compact,
+        }
+    }
 }
 
 /// What the user is about to discard when the confirmation banner is up.
@@ -512,6 +558,9 @@ pub struct App {
     // Tab
     pub active_tab: Tab,
     pub active_panel: Panel,
+
+    pub view_mode: ViewMode,
+    pub settings: crate::settings::SettingsState,
 
     // ── Git tab state ──
     pub staged_files: Vec<FileEntry>,
@@ -855,6 +904,11 @@ pub struct App {
     /// `None` for delete operations — selecting a just-trashed path
     /// would be nonsense.
     pub fs_mutation_select_on_done: Option<PathBuf>,
+    /// Tracks the in-flight `FilesTask::ReplaceInFiles` batch. The
+    /// generation is consumed by `WorkerResult::ReplaceProgress` /
+    /// `ReplaceDone` so a stale completion can't silently clear the
+    /// "replacing…" badge after the user starts a fresh batch.
+    pub replace_load: AsyncState,
     next_git_revalidate_at: Instant,
     next_graph_revalidate_at: Instant,
 }
@@ -1005,6 +1059,8 @@ impl App {
             repo_catalog: RepoCatalogState::from_prefs(),
             active_tab: Tab::Files,
             active_panel: Panel::Files,
+            view_mode: ViewMode::Main,
+            settings: crate::settings::SettingsState::default(),
             staged_files: Vec::new(),
             unstaged_files: Vec::new(),
             selected_file: None,
@@ -1063,14 +1119,14 @@ impl App {
             },
             git_graph: GitGraphState::default(),
             commit_detail: CommitDetailState {
-                diff_layout: match crate::prefs::get("commit.diff_layout").as_deref() {
-                    Some("side_by_side") => DiffLayout::SideBySide,
-                    _ => DiffLayout::Unified,
-                },
-                diff_mode: match crate::prefs::get("commit.diff_mode").as_deref() {
-                    Some("full_file") => DiffMode::FullFile,
-                    _ => DiffMode::Compact,
-                },
+                diff_layout: crate::prefs::get("commit.diff_layout")
+                    .as_deref()
+                    .map(DiffLayout::from_pref_str)
+                    .unwrap_or(DiffLayout::Unified),
+                diff_mode: crate::prefs::get("commit.diff_mode")
+                    .as_deref()
+                    .map(DiffMode::from_pref_str)
+                    .unwrap_or(DiffMode::Compact),
                 files_tree_mode: crate::prefs::get_bool("commit.files_tree_mode"),
                 ..CommitDetailState::default()
             },
@@ -1118,6 +1174,7 @@ impl App {
             file_copy_load: AsyncState::default(),
             fs_mutation_load: AsyncState::default(),
             fs_mutation_select_on_done: None,
+            replace_load: AsyncState::default(),
             next_git_revalidate_at: now + Duration::from_millis(800),
             next_graph_revalidate_at: now + Duration::from_millis(1200),
         };
@@ -1219,6 +1276,63 @@ impl App {
         {
             self.clear_diff_selection();
         }
+    }
+
+    /// Commit the current Tab::Search replace batch. Buckets the
+    /// currently-included matches by path into `ReplaceItem`s and
+    /// dispatches `FilesTask::ReplaceInFiles`. No-op when replace mode
+    /// is closed, a previous batch is still in flight, the result list
+    /// is empty, or every match has been opted out via the per-row
+    /// checkbox. Bound to `Ctrl/Alt+Enter`, plain `Enter` from the
+    /// replace input, and the `[Apply]` footer button.
+    pub fn commit_replace_in_files(&mut self) {
+        if !self.global_search.replace_open || self.replace_load.loading {
+            return;
+        }
+        if self.global_search.results.is_empty() {
+            return;
+        }
+        if self.global_search.included_count() == 0 {
+            return;
+        }
+        // Bucket included results by path so each file gets one
+        // worker dispatch with its line-list. `BTreeMap` orders by
+        // `PathBuf`, which happens to match the streaming results
+        // (the worker emits hits sorted by path) — same ordering
+        // either way, just made explicit here.
+        use std::collections::BTreeMap;
+        let mut buckets: BTreeMap<PathBuf, Vec<crate::tasks::ReplaceLine>> = BTreeMap::new();
+        for (idx, hit) in self.global_search.results.iter().enumerate() {
+            if !self.global_search.is_match_included(idx) {
+                continue;
+            }
+            buckets
+                .entry(hit.path.clone())
+                .or_default()
+                .push(crate::tasks::ReplaceLine {
+                    line_no: hit.line,
+                    expected_text: hit.line_text.clone(),
+                });
+        }
+        let items: Vec<crate::tasks::ReplaceItem> = buckets
+            .into_iter()
+            .map(|(path, lines)| crate::tasks::ReplaceItem { path, lines })
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        self.global_search.replace_progress = None;
+        // `replace_load.begin()` flips `loading=true` and bumps the
+        // generation; the footer reads `replace_load.loading` for the
+        // in-flight indicator.
+        let generation = self.replace_load.begin();
+        self.tasks.replace_in_files(
+            generation,
+            self.backend.clone(),
+            self.global_search.query.clone(),
+            self.global_search.replace_text.clone(),
+            items,
+        );
     }
 
     /// Toggle the left sidebar's visibility. Hiding collapses the left
@@ -2809,6 +2923,38 @@ impl App {
         save_prefs(self.diff_layout, self.diff_mode);
     }
 
+    pub fn toggle_status_tree_mode(&mut self) {
+        self.git_status.tree_mode = !self.git_status.tree_mode;
+        crate::prefs::set_bool("status.tree_mode", self.git_status.tree_mode);
+    }
+
+    pub fn toggle_commit_diff_layout(&mut self) {
+        self.commit_detail.diff_layout = match self.commit_detail.diff_layout {
+            DiffLayout::Unified => DiffLayout::SideBySide,
+            DiffLayout::SideBySide => DiffLayout::Unified,
+        };
+        crate::prefs::set(
+            "commit.diff_layout",
+            self.commit_detail.diff_layout.pref_str(),
+        );
+    }
+
+    pub fn toggle_commit_diff_mode(&mut self) {
+        self.commit_detail.diff_mode = match self.commit_detail.diff_mode {
+            DiffMode::Compact => DiffMode::FullFile,
+            DiffMode::FullFile => DiffMode::Compact,
+        };
+        crate::prefs::set("commit.diff_mode", self.commit_detail.diff_mode.pref_str());
+        // The compact↔full-file flip changes the context-lines argument the
+        // worker uses, so the cached diff is now wrong shape — refetch.
+        self.reload_commit_file_diff();
+    }
+
+    pub fn toggle_commit_files_tree_mode(&mut self) {
+        self.commit_detail.files_tree_mode = !self.commit_detail.files_tree_mode;
+        crate::prefs::set_bool("commit.files_tree_mode", self.commit_detail.files_tree_mode);
+    }
+
     pub fn stage_file(&mut self, path: &str) {
         let Some(repo_root_rel) = self.status_repo_root_rel() else {
             return;
@@ -3807,8 +3953,18 @@ impl App {
                     }
                 }
                 Err(error) => {
-                    self.preview_load.complete_err(generation, error);
-                    self.preview_in_flight_path = None;
+                    if self.preview_load.complete_err(generation, error) {
+                        // `complete_err` flips `stale = true`, which would
+                        // make `should_request()` re-fire the same load on
+                        // the next tick — and if the failure is a decoder
+                        // panic, we'd just panic again, sticking the UI in
+                        // a permanent "loading…" loop. Clear stale so the
+                        // panic'd file stays failed until something else
+                        // (file switch, fs-watcher kick) marks it dirty.
+                        self.preview_load.stale = false;
+                        self.preview_load.error = None;
+                        self.preview_in_flight_path = None;
+                    }
                 }
             },
             WorkerResult::GitStatus { generation, result } => match result {
@@ -4094,7 +4250,89 @@ impl App {
                     }
                 }
             },
+            WorkerResult::ReplaceProgress {
+                generation,
+                files_done,
+                files_total,
+            } => {
+                // Stale chunks (from a superseded batch) just no-op —
+                // the AsyncState gates the apply path so no UI state
+                // changes anyway. Keeping them quiet avoids a flicker
+                // where the progress text rewinds.
+                if generation != self.replace_load.generation {
+                    return;
+                }
+                self.global_search.replace_progress = Some((files_done, files_total));
+            }
+            WorkerResult::ReplaceDone { generation, result } => {
+                if !self.replace_load.complete_ok(generation) {
+                    return;
+                }
+                // `complete_ok` already flipped `loading=false`.
+                self.global_search.replace_progress = None;
+                match result {
+                    Ok(summary) => {
+                        let mut text = format!(
+                            "{} {} / {}",
+                            crate::i18n::t(crate::i18n::Msg::ReplaceSummaryToast),
+                            summary.lines_replaced,
+                            summary.files_changed,
+                        );
+                        if summary.skipped_stale > 0 {
+                            text.push_str(&format!(
+                                " · {} {}",
+                                summary.skipped_stale,
+                                crate::i18n::t(crate::i18n::Msg::ReplaceSkippedStaleSuffix),
+                            ));
+                        }
+                        if summary.skipped_too_large > 0 {
+                            text.push_str(&format!(
+                                " · {} {}",
+                                summary.skipped_too_large,
+                                crate::i18n::t(crate::i18n::Msg::ReplaceTooLargeSuffix),
+                            ));
+                        }
+                        if !summary.errors.is_empty() {
+                            text.push_str(&format!(" · {} error(s)", summary.errors.len()));
+                        }
+                        self.toasts.push(Toast::info(text));
+                        // Drop stale exclusions and rerun the search;
+                        // the file content changed under our feet, so
+                        // the on-screen results are about to be wrong.
+                        self.global_search.excluded.clear();
+                        crate::global_search::reload(self);
+                        // Git decorations on the file tree need a
+                        // refresh — replaced files now show as
+                        // modified in the status sidebar.
+                        self.refresh_status();
+                    }
+                    Err(e) => {
+                        self.toasts
+                            .push(Toast::error(format!("replace failed: {e}")));
+                    }
+                }
+            }
         }
+    }
+
+    /// Open Settings. No-op when already open so a stray re-entry
+    /// can't silently discard an in-progress inline text edit. The
+    /// pref-cache refresh keeps the page reading from memory rather
+    /// than disk on every render.
+    pub fn open_settings(&mut self) {
+        if self.view_mode == ViewMode::Settings {
+            return;
+        }
+        self.view_mode = ViewMode::Settings;
+        self.settings.editor_edit = None;
+        crate::settings::refresh_pref_cache(&mut self.settings);
+    }
+
+    /// Esc semantics — uncommitted buffer discarded, Enter is the
+    /// explicit commit.
+    pub fn close_settings(&mut self) {
+        self.view_mode = ViewMode::Main;
+        self.settings.editor_edit = None;
     }
 
     pub fn set_active_tab(&mut self, tab: Tab) {
@@ -4247,7 +4485,7 @@ impl App {
             }
             ClickAction::GlobalSearchFocusInput => {
                 if self.active_tab == Tab::Search {
-                    self.global_search.tab_input_focused = true;
+                    self.global_search.focus = crate::global_search::SearchPanelFocus::FindInput;
                 }
             }
             ClickAction::PlaceModeFolder(index) => {
@@ -4342,6 +4580,36 @@ impl App {
             }
             ClickAction::DbGotoPage(page) => {
                 self.db_navigate_to_page(page);
+            }
+            ClickAction::SearchToggleReplace => {
+                if self.active_tab == Tab::Search {
+                    self.global_search.replace_open = !self.global_search.replace_open;
+                    if !self.global_search.replace_open
+                        && matches!(
+                            self.global_search.focus,
+                            crate::global_search::SearchPanelFocus::ReplaceInput
+                        )
+                    {
+                        self.global_search.focus =
+                            crate::global_search::SearchPanelFocus::FindInput;
+                    }
+                }
+            }
+            ClickAction::GlobalSearchFocusReplaceInput => {
+                if self.active_tab == Tab::Search && self.global_search.replace_open {
+                    self.global_search.focus = crate::global_search::SearchPanelFocus::ReplaceInput;
+                }
+            }
+            ClickAction::SearchToggleMatch(idx) => {
+                self.global_search.toggle_match_excluded(idx);
+            }
+            ClickAction::SearchApplyReplace => {
+                self.commit_replace_in_files();
+            }
+            ClickAction::SettingsRow(idx) => {
+                if self.view_mode == ViewMode::Settings {
+                    self.settings.select(idx);
+                }
             }
         }
     }
@@ -4704,32 +4972,20 @@ fn folder_contains(folder_path: &str, file_path: &str) -> bool {
 /// unprefixed `layout=` / `mode=` entries have been renamed by the time
 /// we get here.
 fn load_prefs() -> (DiffLayout, DiffMode) {
-    let layout = match crate::prefs::get("diff.layout").as_deref() {
-        Some("side_by_side") => DiffLayout::SideBySide,
-        _ => DiffLayout::Unified,
-    };
-    let mode = match crate::prefs::get("diff.mode").as_deref() {
-        Some("full_file") => DiffMode::FullFile,
-        _ => DiffMode::Compact,
-    };
+    let layout = crate::prefs::get("diff.layout")
+        .as_deref()
+        .map(DiffLayout::from_pref_str)
+        .unwrap_or(DiffLayout::Unified);
+    let mode = crate::prefs::get("diff.mode")
+        .as_deref()
+        .map(DiffMode::from_pref_str)
+        .unwrap_or(DiffMode::Compact);
     (layout, mode)
 }
 
 fn save_prefs(layout: DiffLayout, mode: DiffMode) {
-    crate::prefs::set(
-        "diff.layout",
-        match layout {
-            DiffLayout::Unified => "unified",
-            DiffLayout::SideBySide => "side_by_side",
-        },
-    );
-    crate::prefs::set(
-        "diff.mode",
-        match mode {
-            DiffMode::Compact => "compact",
-            DiffMode::FullFile => "full_file",
-        },
-    );
+    crate::prefs::set("diff.layout", layout.pref_str());
+    crate::prefs::set("diff.mode", mode.pref_str());
 }
 
 #[cfg(test)]

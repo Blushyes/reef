@@ -36,10 +36,25 @@ pub enum ClickAction {
     /// `input::handle_mouse` while the picker owns mouse input.
     HostsPickerSelect(usize),
     /// Click on the input row of the Search tab's left panel while in
-    /// list mode. Flips `tab_input_focused` so the user can mouse-drive
+    /// list mode. Sets `focus = FindInput` so the user can mouse-drive
     /// the mode switch instead of hunting for `/` or `i`. Only registered
     /// when the input isn't already focused (overlay always is).
     GlobalSearchFocusInput,
+    /// Click on the chevron toggle (▶/▼) at the left edge of the Search
+    /// tab's input row. Toggles `replace_open`. Same effect as the bare
+    /// `r` shortcut and the Space+H leader chord.
+    SearchToggleReplace,
+    /// Click on the replace input row in the Search tab — focus jumps
+    /// to the replace text field. Mirrors `GlobalSearchFocusInput` but
+    /// for the second input row.
+    GlobalSearchFocusReplaceInput,
+    /// Click on a result row's checkbox in replace mode. The `usize`
+    /// indexes into `GlobalSearchState.results`. Toggles whether that
+    /// hit is included in the next Apply.
+    SearchToggleMatch(usize),
+    /// Click on the `[Apply]` button in the Search tab footer when
+    /// replace mode is open. Commits the replace batch.
+    SearchApplyReplace,
     /// Invoke an inline Git panel command (`git.stage`, `git.selectCommit`, …).
     /// `dbl_command`/`dbl_args`, if present, are fired on double-click instead.
     GitCommand {
@@ -79,6 +94,12 @@ pub enum ClickAction {
     /// Jump directly to a 1-based page index. Clicking the `[5]` chip
     /// dispatches `DbGotoPage(5)`.
     DbGotoPage(u64),
+    /// Click on a row in the Settings page. The `usize` indexes into
+    /// `crate::settings::SettingItem::ALL`. Clicking just moves the
+    /// selection cursor — activation (toggle / open inline editor) is
+    /// keyboard-only, mirroring the file tree where double-click /
+    /// Enter is the deliberate-action gate.
+    SettingsRow(usize),
 }
 
 #[derive(Debug, Clone)]

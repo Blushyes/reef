@@ -578,3 +578,102 @@ fn snapshot_binary_info_pdf() {
     let output = render_app(&mut app, 80, 20);
     with_filters(&[], || insta::assert_snapshot!("binary_info_pdf", output));
 }
+
+#[test]
+fn snapshot_search_tab_replace_open_with_excluded_row() {
+    // Lock in the VSCode-style Find & Replace layout in Tab::Search:
+    // chevron toggle in the find input row, second `↪ ` prompt for the
+    // replace text, per-result `[✓] / [ ] ` checkbox column, and the
+    // footer `· N to replace · [Apply]` summary. Regressing any of
+    // these visuals would break the muscle-memory the user built up
+    // around VSCode's panel.
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "alpha.txt", "needle in alpha\nuntouched\n", "init");
+    write_file(&raw, "beta.txt", "another needle here\n");
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    wait_for_file_tree(&mut app);
+    app.set_active_tab(reef::app::Tab::Search);
+    app.global_search.query = "needle".to_string();
+    app.global_search.cursor = "needle".len();
+    app.global_search.replace_text = "thread".to_string();
+    app.global_search.replace_cursor = "thread".len();
+    app.global_search.replace_open = true;
+    app.global_search.focus = reef::global_search::SearchPanelFocus::List;
+    // Seed two synthetic hits — going through the actual ripgrep
+    // worker would couple the snapshot to walker timing on CI.
+    app.global_search.results = vec![
+        reef::global_search::MatchHit {
+            path: std::path::PathBuf::from("alpha.txt"),
+            display: "alpha.txt".to_string(),
+            line: 0,
+            line_text: "needle in alpha".to_string(),
+            byte_range: 0..6,
+        },
+        reef::global_search::MatchHit {
+            path: std::path::PathBuf::from("beta.txt"),
+            display: "beta.txt".to_string(),
+            line: 0,
+            line_text: "another needle here".to_string(),
+            byte_range: 8..14,
+        },
+    ];
+    // Exclude the second row — strikethrough + dim styling should show.
+    app.global_search.toggle_match_excluded(1);
+
+    let output = render_app(&mut app, 100, 16);
+    with_filters(&[], || {
+        insta::assert_snapshot!("search_tab_replace_open_with_excluded_row", output)
+    });
+}
+
+#[test]
+fn snapshot_settings_page_default() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
+    let (tmp, _raw) = tempdir_repo();
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    wait_for_file_tree(&mut app);
+    app.open_settings();
+    let output = render_app(&mut app, 80, 24);
+    with_filters(&[], || {
+        insta::assert_snapshot!("settings_page_default", output)
+    });
+}
+
+#[test]
+fn snapshot_settings_page_editing_editor_command() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
+    let (tmp, _raw) = tempdir_repo();
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    wait_for_file_tree(&mut app);
+    app.open_settings();
+    let editor_idx = reef::settings::SettingItem::ALL
+        .iter()
+        .position(|i| matches!(i, reef::settings::SettingItem::EditorCommand))
+        .unwrap();
+    app.settings.select(editor_idx);
+    reef::settings::begin_edit_editor_command(&mut app.settings);
+    if let Some(edit) = app.settings.editor_edit.as_mut() {
+        edit.buffer = "nvim --clean".to_string();
+        edit.cursor = edit.buffer.len();
+    }
+    let output = render_app(&mut app, 80, 24);
+    with_filters(&[], || {
+        insta::assert_snapshot!("settings_page_editing_editor_command", output)
+    });
+}

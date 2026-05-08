@@ -408,44 +408,15 @@ fn split_sbs_ranges(
 pub fn handle_key(app: &mut App, key: &str) -> bool {
     match key {
         "m" => {
-            app.commit_detail.diff_layout = match app.commit_detail.diff_layout {
-                DiffLayout::Unified => DiffLayout::SideBySide,
-                DiffLayout::SideBySide => DiffLayout::Unified,
-            };
-            crate::prefs::set(
-                "commit.diff_layout",
-                match app.commit_detail.diff_layout {
-                    DiffLayout::Unified => "unified",
-                    DiffLayout::SideBySide => "side_by_side",
-                },
-            );
+            app.toggle_commit_diff_layout();
             true
         }
         "f" => {
-            app.commit_detail.diff_mode = match app.commit_detail.diff_mode {
-                DiffMode::Compact => DiffMode::FullFile,
-                DiffMode::FullFile => DiffMode::Compact,
-            };
-            crate::prefs::set(
-                "commit.diff_mode",
-                match app.commit_detail.diff_mode {
-                    DiffMode::Compact => "compact",
-                    DiffMode::FullFile => "full_file",
-                },
-            );
-            app.reload_commit_file_diff();
+            app.toggle_commit_diff_mode();
             true
         }
         "t" => {
-            app.commit_detail.files_tree_mode = !app.commit_detail.files_tree_mode;
-            crate::prefs::set(
-                "commit.files_tree_mode",
-                if app.commit_detail.files_tree_mode {
-                    "true"
-                } else {
-                    "false"
-                },
-            );
+            app.toggle_commit_files_tree_mode();
             true
         }
         _ => false,

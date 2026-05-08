@@ -1,0 +1,18 @@
+[package]
+name = "reef-sqlite-preview"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# `bundled` compiles SQLite C source in-tree — no system libsqlite linkage,
+# matches the project's avoid-system-C-libs stance (see top-level Cargo.toml
+# notes on sixel/chafa). `default-features = false` drops `modern_sqlite`
+# auto-feature-detect probes we don't need for read-only previews.
+rusqlite = { version = "0.32", default-features = false, features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"

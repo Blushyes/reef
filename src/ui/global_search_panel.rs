@@ -15,9 +15,20 @@ use ratatui::widgets::{Block, Borders, Clear, Padding};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::App;
-use crate::global_search::{MAX_RESULTS, MatchHit};
+use crate::global_search::{MAX_RESULTS, MatchHit, SearchPanelFocus};
 use crate::ui::mouse::ClickAction;
 use crate::ui::theme::Theme;
+
+/// Width (in display cols) of the per-row checkbox column when
+/// `replace_open` is true: `"[✓] "` / `"[ ] "` are 4 cells. Zero when
+/// closed so the layout is byte-identical to today's search-only render.
+const CHECKBOX_COL_W: u16 = 4;
+/// Width of the find-input prompt (`"> "` / `"▾ "`). The prompt's
+/// leading 2 cells double as the replace-toggle hit target on
+/// Tab::Search — clicking the arrow expands/collapses the replace row,
+/// matching VSCode's chevron-in-input affordance without burning extra
+/// columns on a separate icon.
+const PROMPT_COL_W: u16 = 2;
 
 /// Overlay entry point — centred popup with border, calling `render_body`
 /// on the inner rect. The popup itself stashes its bounds so the mouse
@@ -67,7 +78,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
 /// `input_focused` controls the visible cues (cursor, prompt colour,
 /// empty-state hint) without changing which keys are handled — that's the
 /// caller's job in `input::handle_key_search`. Overlay passes true; the
-/// tab passes `app.global_search.tab_input_focused`.
+/// tab passes `app.global_search.input_focused()`.
 ///
 /// Writes `app.global_search.last_view_h` so PageUp/PageDown (overlay and
 /// tab both bind them) get a correct step size, and registers one
@@ -78,58 +89,134 @@ pub fn render_body(f: &mut Frame, app: &mut App, inner: Rect, input_focused: boo
         return;
     }
 
-    let input_y = inner.y;
-    let sep_y = inner.y + 1;
-    let list_y = inner.y + 2;
-    let has_footer = inner.height >= 5;
+    // Layout budgets shift by ±1 row when the user toggles the Replace
+    // input on. `toggle_in_use` gates whether the prompt arrow doubles
+    // as a replace-toggle button — overlay is single-input + transient,
+    // so its prompt is just a prompt; Tab::Search makes the prompt
+    // clickable.
+    let replace_open = app.global_search.replace_open;
+    let toggle_in_use = !app.global_search.active; // overlay sets `active=true`
+    let header_rows: u16 = if replace_open { 2 } else { 1 };
+
+    let find_y = inner.y;
+    let replace_y = inner.y + 1;
+    let sep_y = inner.y + header_rows;
+    let list_y = inner.y + header_rows + 1;
+    let has_footer = inner.height >= header_rows + 4;
     let list_h = if has_footer {
-        inner.height.saturating_sub(3)
+        inner.height.saturating_sub(header_rows + 2)
     } else {
-        inner.height.saturating_sub(2)
+        inner.height.saturating_sub(header_rows + 1)
     };
     let footer_y = inner.y + inner.height.saturating_sub(1);
 
     app.global_search.last_view_h = list_h;
 
-    // ── Input row ──────────────────────────────────────────────────────
-    // Prompt glyph signals focus: accent+bold when input is active, dim
-    // when in list mode. Same signal the cursor gives, but visible even on
-    // terminals that hide the caret.
-    let prompt_style = if input_focused {
+    // ── Find input row ────────────────────────────────────────────────
+    // Overlay has only one input row, so any input-focus there is by
+    // definition Find. Tab::Search uses the focus enum to disambiguate.
+    let find_focused = input_focused
+        && (!toggle_in_use || matches!(app.global_search.focus, SearchPanelFocus::FindInput));
+    // Prompt arrow doubles as the replace-toggle on Tab::Search:
+    // `> ` when collapsed, `▾ ` (U+25BE BLACK DOWN-POINTING SMALL
+    // TRIANGLE) when the replace row is showing. Picked from a few
+    // candidates:
+    //   - `v` (letter) looks like a typo
+    //   - `▼` (U+25BC) is too visually heavy next to ASCII `>`
+    //   - `⌄` (U+2304) renders as 0-width or a missing-glyph box on
+    //     several common terminal fonts (Apple Terminal, older tmux
+    //     setups). `▾` is in Geometric Shapes (U+25xx), broadly
+    //     supported across monospace fonts.
+    // The overlay always shows `> ` because it has no replace mode.
+    let prompt_glyph = if toggle_in_use && replace_open {
+        "▾ "
+    } else {
+        "> "
+    };
+    let prompt_style = if find_focused {
         Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(th.fg_secondary)
     };
-    let query_style = if input_focused {
+    let query_style = if find_focused {
         Style::default().fg(th.fg_primary)
     } else {
         Style::default().fg(th.fg_secondary)
     };
-    let prompt_spans = vec![
-        Span::styled("> ", prompt_style),
-        Span::styled(app.global_search.query.clone(), query_style),
-    ];
     f.render_widget(
-        Line::from(prompt_spans),
-        Rect::new(inner.x, input_y, inner.width, 1),
+        Line::from(vec![
+            Span::styled(prompt_glyph.to_string(), prompt_style),
+            Span::styled(app.global_search.query.clone(), query_style),
+        ]),
+        Rect::new(inner.x, find_y, inner.width, 1),
     );
-    // Blinking cursor only when the input is focused — hiding it in list
-    // mode makes the mode legible even without looking at colours.
-    if input_focused {
+    if find_focused {
         let cursor_w =
             UnicodeWidthStr::width(&app.global_search.query[..app.global_search.cursor]) as u16;
-        let cursor_x = inner.x + 2 + cursor_w.min(inner.width.saturating_sub(3));
-        f.set_cursor_position((cursor_x, input_y));
-    } else {
-        // Clicking the prompt row while in list mode should focus the
-        // input — avoid making users hunt for `/` or `i`. Overlay is
-        // always input-focused, so this only registers in the tab case.
+        let cursor_x = inner.x + PROMPT_COL_W + cursor_w.min(inner.width.saturating_sub(3));
+        f.set_cursor_position((cursor_x, find_y));
+    }
+    // Hit-test order matters: register the narrower toggle target FIRST
+    // so its 2-cell zone wins over the row-wide focus zone.
+    if toggle_in_use {
         app.hit_registry.register_row(
             inner.x,
-            input_y,
-            inner.width,
-            ClickAction::GlobalSearchFocusInput,
+            find_y,
+            PROMPT_COL_W,
+            ClickAction::SearchToggleReplace,
         );
+    }
+    if !find_focused && toggle_in_use {
+        // Click anywhere on the find row past the prompt arrow → focus
+        // the find input. Avoids making users hunt for `/` or `i`.
+        let body_x = inner.x + PROMPT_COL_W;
+        let body_w = inner.width.saturating_sub(PROMPT_COL_W);
+        app.hit_registry
+            .register_row(body_x, find_y, body_w, ClickAction::GlobalSearchFocusInput);
+    }
+
+    // ── Replace input row ─────────────────────────────────────────────
+    if replace_open {
+        let replace_focused = matches!(app.global_search.focus, SearchPanelFocus::ReplaceInput);
+        let r_prompt_style = if replace_focused {
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.fg_secondary)
+        };
+        let r_query_style = if replace_focused {
+            Style::default().fg(th.fg_primary)
+        } else {
+            Style::default().fg(th.fg_secondary)
+        };
+        let placeholder = crate::i18n::t(crate::i18n::Msg::ReplaceWithPlaceholder);
+        let body: Span<'static> = if app.global_search.replace_text.is_empty() && !replace_focused {
+            Span::styled(
+                placeholder.to_string(),
+                Style::default()
+                    .fg(th.fg_secondary)
+                    .add_modifier(Modifier::ITALIC),
+            )
+        } else {
+            Span::styled(app.global_search.replace_text.clone(), r_query_style)
+        };
+        f.render_widget(
+            Line::from(vec![Span::styled("↪ ", r_prompt_style), body]),
+            Rect::new(inner.x, replace_y, inner.width, 1),
+        );
+        if replace_focused {
+            let cursor_w = UnicodeWidthStr::width(
+                &app.global_search.replace_text[..app.global_search.replace_cursor],
+            ) as u16;
+            let cursor_x = inner.x + PROMPT_COL_W + cursor_w.min(inner.width.saturating_sub(3));
+            f.set_cursor_position((cursor_x, replace_y));
+        } else {
+            app.hit_registry.register_row(
+                inner.x,
+                replace_y,
+                inner.width,
+                ClickAction::GlobalSearchFocusReplaceInput,
+            );
+        }
     }
 
     // ── Separator row ──────────────────────────────────────────────────
@@ -187,15 +274,44 @@ pub fn render_body(f: &mut Frame, app: &mut App, inner: Rect, input_focused: boo
                 break;
             };
             let is_sel = hit_idx == sel;
+            let included = app.global_search.is_match_included(hit_idx);
             let y = list_y + row as u16;
             let row_area = Rect::new(inner.x, y, inner.width, 1);
             let hover = crate::ui::hover::is_hover(app, row_area, y);
-            let line = build_row_line(hit, is_sel, hover, inner.width, h_scroll, &th);
-            f.render_widget(line, row_area);
+
+            // Checkbox column (only in replace mode). Sits at the left
+            // edge of the row, before the leading-pad space the natural
+            // row layout already includes. Click toggles the per-match
+            // exclusion; the rest of the row keeps its existing
+            // "select hit" hit-test.
+            let checkbox_w = if replace_open { CHECKBOX_COL_W } else { 0 };
+            if replace_open {
+                let glyph = if included { "[✓] " } else { "[ ] " };
+                let style = if included {
+                    Style::default().fg(th.accent)
+                } else {
+                    Style::default().fg(th.fg_secondary)
+                };
+                f.render_widget(
+                    Line::from(Span::styled(glyph.to_string(), style)),
+                    Rect::new(inner.x, y, checkbox_w, 1),
+                );
+                app.hit_registry.register_row(
+                    inner.x,
+                    y,
+                    checkbox_w,
+                    ClickAction::SearchToggleMatch(hit_idx),
+                );
+            }
+
+            let body_x = inner.x + checkbox_w;
+            let body_w = inner.width.saturating_sub(checkbox_w);
+            let line = build_row_line(hit, is_sel, hover, body_w, h_scroll, included, &th);
+            f.render_widget(line, Rect::new(body_x, y, body_w, 1));
             app.hit_registry.register_row(
-                inner.x,
+                body_x,
                 y,
-                inner.width,
+                body_w,
                 ClickAction::GlobalSearchSelect(hit_idx),
             );
         }
@@ -203,13 +319,70 @@ pub fn render_body(f: &mut Frame, app: &mut App, inner: Rect, input_focused: boo
 
     // ── Footer ─────────────────────────────────────────────────────────
     if has_footer {
-        let text = render_footer_text(&app.global_search, loading);
-        let w = UnicodeWidthStr::width(text.as_str()) as u16;
-        let fx = inner.x + inner.width.saturating_sub(w);
-        f.render_widget(
-            Line::from(Span::styled(text, Style::default().fg(th.fg_secondary))),
-            Rect::new(fx, footer_y, w, 1),
-        );
+        let base_text = render_footer_text(&app.global_search, loading);
+
+        if replace_open {
+            // Replace footer adds a count + clickable Apply button. Lay
+            // it out as: `<base>  ·  N <suffix>  ·  [Apply]`. The Apply
+            // span gets its own hit-test so the rest of the footer is
+            // inert.
+            let included_count = app.global_search.included_count();
+            let suffix = crate::i18n::t(crate::i18n::Msg::ReplaceCountSuffix);
+            let count_text = format!(" · {included_count} {suffix} · ");
+            let in_flight = app.replace_load.loading;
+            let apply_label = if in_flight {
+                let hint = crate::i18n::t(crate::i18n::Msg::ReplacingHint);
+                match app.global_search.replace_progress {
+                    Some((done, total)) if total > 0 => format!(" {hint} {done}/{total} "),
+                    _ => format!(" {hint} "),
+                }
+            } else {
+                format!(" {} ", crate::i18n::t(crate::i18n::Msg::ApplyReplace))
+            };
+            let count_w = UnicodeWidthStr::width(count_text.as_str()) as u16;
+            let apply_w = UnicodeWidthStr::width(apply_label.as_str()) as u16;
+            let base_w = UnicodeWidthStr::width(base_text.as_str()) as u16;
+            let total_w = base_w + count_w + apply_w;
+            let fx = inner.x + inner.width.saturating_sub(total_w);
+
+            let base_span = Span::styled(base_text, Style::default().fg(th.fg_secondary));
+            let count_span = Span::styled(count_text, Style::default().fg(th.fg_secondary));
+            let apply_can_fire = !in_flight && included_count > 0;
+            let apply_style = if apply_can_fire {
+                Style::default()
+                    .fg(th.chrome_active_fg)
+                    .bg(th.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(th.fg_secondary)
+                    .add_modifier(Modifier::DIM)
+            };
+            let apply_span = Span::styled(apply_label, apply_style);
+
+            f.render_widget(
+                Line::from(vec![base_span, count_span, apply_span]),
+                Rect::new(fx, footer_y, total_w, 1),
+            );
+            if apply_can_fire {
+                app.hit_registry.register_row(
+                    fx + base_w + count_w,
+                    footer_y,
+                    apply_w,
+                    ClickAction::SearchApplyReplace,
+                );
+            }
+        } else {
+            let w = UnicodeWidthStr::width(base_text.as_str()) as u16;
+            let fx = inner.x + inner.width.saturating_sub(w);
+            f.render_widget(
+                Line::from(Span::styled(
+                    base_text,
+                    Style::default().fg(th.fg_secondary),
+                )),
+                Rect::new(fx, footer_y, w, 1),
+            );
+        }
     }
 }
 
@@ -266,6 +439,7 @@ fn build_row_line(
     hover: bool,
     viewport_w: u16,
     h_scroll: usize,
+    included: bool,
     th: &Theme,
 ) -> Line<'static> {
     let row_bg: Option<Color> = if is_sel {
@@ -282,19 +456,31 @@ fn build_row_line(
         }
     };
 
-    let path_base = with_row_bg(Style::default().fg(th.fg_secondary));
-    let text_base = with_row_bg(Style::default().fg(th.fg_primary));
-    let sep_style = with_row_bg(Style::default().fg(th.border));
+    let dim = !included;
+    let mut path_base = with_row_bg(Style::default().fg(th.fg_secondary));
+    let mut text_base = with_row_bg(Style::default().fg(th.fg_primary));
+    let mut sep_style = with_row_bg(Style::default().fg(th.border));
     let pad_style = with_row_bg(Style::default());
     let hl_bg = if is_sel {
         th.search_current
     } else {
         th.search_match
     };
-    let hl = Style::default()
+    let mut hl = Style::default()
         .fg(th.fg_primary)
         .bg(hl_bg)
         .add_modifier(Modifier::BOLD);
+    if dim {
+        // Visually mark excluded rows: strikethrough + dim foreground so
+        // the user can scan a result list and immediately see which
+        // matches Apply will skip. The match-highlight bg stays so the
+        // pattern is still readable.
+        let strike = Modifier::CROSSED_OUT;
+        path_base = path_base.add_modifier(strike).fg(th.fg_secondary);
+        text_base = text_base.add_modifier(strike).fg(th.fg_secondary);
+        sep_style = sep_style.add_modifier(strike);
+        hl = hl.add_modifier(strike);
+    }
 
     // Build the full natural row as a Span stream. No clipping here.
     let mut full: Vec<Span<'static>> = Vec::new();

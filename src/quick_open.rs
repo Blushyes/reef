@@ -302,12 +302,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
 /// Called from `input::handle_paste` after the drop-path parser has already
 /// ruled out the payload as a file drop.
 pub fn handle_paste(s: &str, app: &mut App) {
-    for c in s.chars() {
-        if c == '\n' || c == '\r' {
-            continue;
-        }
-        input_edit::insert_char(&mut app.quick_open.query, &mut app.quick_open.cursor, c);
-    }
+    input_edit::paste_single_line(s, &mut app.quick_open.query, &mut app.quick_open.cursor);
     filter(&mut app.quick_open);
 }
 

@@ -253,3 +253,110 @@ fn superseded_generation_is_dropped() {
     assert!(g10_hits.iter().any(|h| h.line_text.contains("alpha")));
     assert!(g11_hits.iter().any(|h| h.line_text.contains("bravo")));
 }
+
+/// Drain a `ReplaceInFiles` batch into the final `ReplaceSummary`.
+/// Mirrors `collect` but for the replace-progress / replace-done frame
+/// pair. Late results from other workers are ignored.
+fn collect_replace(
+    coord: &TaskCoordinator,
+    generation: u64,
+    deadline: Duration,
+) -> reef::tasks::ReplaceSummary {
+    let start = Instant::now();
+    while start.elapsed() < deadline {
+        match coord.try_recv() {
+            Ok(WorkerResult::ReplaceDone {
+                generation: g,
+                result,
+            }) if g == generation => {
+                return result.expect("replace failed");
+            }
+            Ok(_) => {}
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => break,
+        }
+    }
+    panic!("ReplaceDone never arrived");
+}
+
+#[test]
+fn end_to_end_search_then_replace_with_per_match_exclusion() {
+    // Plant three files, search for `foo`, run replace with one
+    // result line excluded, verify on-disk content + idempotence
+    // (a second apply changes nothing).
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(root, "a.txt", "foo on a\n");
+    write(root, "b.txt", "foo on b\nuntouched\n");
+    write(root, "c.txt", "foo on c\n");
+
+    let coord = TaskCoordinator::new();
+    let c = Arc::new(AtomicBool::new(false));
+    coord.search_all(1, c, local_backend(root), "foo".into());
+    let (hits, _) = collect(&coord, 1, Duration::from_secs(5));
+    assert!(hits.len() >= 3, "expected hits in all three files");
+
+    // Build replace items skipping the hit in `b.txt` (simulates the
+    // user unchecking that row in the UI).
+    use std::collections::BTreeMap;
+    let mut buckets: BTreeMap<std::path::PathBuf, Vec<reef::tasks::ReplaceLine>> = BTreeMap::new();
+    let excluded_path = std::path::PathBuf::from("b.txt");
+    for hit in &hits {
+        if hit.path == excluded_path {
+            continue;
+        }
+        buckets
+            .entry(hit.path.clone())
+            .or_default()
+            .push(reef::tasks::ReplaceLine {
+                line_no: hit.line,
+                expected_text: hit.line_text.clone(),
+            });
+    }
+    let items: Vec<reef::tasks::ReplaceItem> = buckets
+        .into_iter()
+        .map(|(path, lines)| reef::tasks::ReplaceItem { path, lines })
+        .collect();
+
+    coord.replace_in_files(
+        2,
+        local_backend(root),
+        "foo".into(),
+        "BAR".into(),
+        items.clone(),
+    );
+    let summary = collect_replace(&coord, 2, Duration::from_secs(5));
+    assert_eq!(summary.lines_replaced, 2, "two files should change");
+    assert_eq!(summary.files_changed, 2);
+
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "BAR on a\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("b.txt")).unwrap(),
+        "foo on b\nuntouched\n",
+        "excluded file must remain pristine",
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("c.txt")).unwrap(),
+        "BAR on c\n"
+    );
+
+    // Idempotence: a second apply on the same items finds no matches
+    // (the lines no longer say "foo") so nothing changes on disk.
+    coord.replace_in_files(3, local_backend(root), "foo".into(), "BAR".into(), items);
+    let summary2 = collect_replace(&coord, 3, Duration::from_secs(5));
+    assert_eq!(summary2.lines_replaced, 0, "second apply must be a no-op");
+    assert_eq!(summary2.skipped_stale, 2, "now-stale lines must be counted");
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "BAR on a\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("c.txt")).unwrap(),
+        "BAR on c\n"
+    );
+}

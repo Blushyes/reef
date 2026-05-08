@@ -1,4 +1,6 @@
-use crate::backend::{Backend, LocalBackend};
+use crate::backend::{
+    Backend, LocalBackend, RepoDiscoverOpts, WorkspaceRepoMeta, normalize_repo_root_rel,
+};
 use crate::file_tree::{FileTree, PreviewBody, PreviewContent};
 use crate::git::graph::GraphRow;
 use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, GitRepo, RefLabel};
@@ -27,6 +29,7 @@ pub struct BuiltProtocol {
 /// perceive delay but well above the keystroke rate of arrow-repeat,
 /// so rapid scrubbing coalesces into a single load.
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(80);
+const SELECTED_GIT_REPO_PREF: &str = "status.selected_repo";
 
 /// Pagination + table-selection state for the SQLite preview card.
 /// Lives `Some` for as long as the current `preview_content` is a
@@ -268,6 +271,67 @@ pub struct GitGraphState {
     pub last_rendered_selected: Option<usize>,
 }
 
+#[derive(Debug)]
+pub struct RepoCatalogState {
+    pub repos: Vec<WorkspaceRepoMeta>,
+    pub selected_git_repo: Option<PathBuf>,
+    pub discover_load: AsyncState,
+    pub max_depth: usize,
+    pub include_nested: bool,
+    pub max_repos: Option<usize>,
+    pub truncated: bool,
+}
+
+impl Default for RepoCatalogState {
+    fn default() -> Self {
+        let opts = RepoDiscoverOpts::default();
+        Self {
+            repos: Vec::new(),
+            selected_git_repo: None,
+            discover_load: AsyncState::default(),
+            max_depth: opts.max_depth,
+            include_nested: opts.include_nested,
+            max_repos: opts.max_repos,
+            truncated: false,
+        }
+    }
+}
+
+impl RepoCatalogState {
+    fn from_prefs() -> Self {
+        let mut state = Self::default();
+        if let Some(raw) = crate::prefs::get(SELECTED_GIT_REPO_PREF)
+            && let Ok(repo_root_rel) = normalize_repo_root_rel(Path::new(&raw))
+        {
+            state.selected_git_repo = Some(repo_root_rel);
+        }
+        state
+    }
+
+    pub fn discover_opts(&self) -> RepoDiscoverOpts {
+        RepoDiscoverOpts {
+            max_depth: self.max_depth,
+            include_nested: self.include_nested,
+            max_repos: self.max_repos,
+        }
+    }
+
+    fn reconcile_selected_repo(&mut self) {
+        if let Some(selected) = self.selected_git_repo.as_ref()
+            && self
+                .repos
+                .iter()
+                .any(|repo| &repo.repo_root_rel == selected)
+        {
+            return;
+        }
+        self.selected_git_repo = match self.repos.as_slice() {
+            [only] => Some(only.repo_root_rel.clone()),
+            _ => None,
+        };
+    }
+}
+
 impl GitGraphState {
     /// Inclusive `(lo, hi)` bounds of the current selection. Returns
     /// `(selected_idx, selected_idx)` when there's no anchor or the anchor
@@ -428,6 +492,7 @@ pub struct App {
     pub repo: Option<GitRepo>,
     pub workdir_name: String,
     pub branch_name: String,
+    pub repo_catalog: RepoCatalogState,
 
     // Tab
     pub active_tab: Tab,
@@ -919,6 +984,7 @@ impl App {
             repo,
             workdir_name,
             branch_name,
+            repo_catalog: RepoCatalogState::from_prefs(),
             active_tab: Tab::Files,
             active_panel: Panel::Files,
             staged_files: Vec::new(),
@@ -1036,6 +1102,7 @@ impl App {
             next_graph_revalidate_at: now + Duration::from_millis(1200),
         };
         app.refresh_status();
+        app.refresh_repo_catalog();
         app.refresh_file_tree();
         app
     }
@@ -1164,12 +1231,51 @@ impl App {
     }
 
     pub fn refresh_status(&mut self) {
-        if !self.backend.has_repo() {
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
             return;
         };
         let generation = self.git_status_load.begin();
         self.tasks
-            .refresh_status(generation, Arc::clone(&self.backend));
+            .refresh_status(generation, Arc::clone(&self.backend), repo_root_rel);
+    }
+
+    fn status_repo_root_rel(&self) -> Option<PathBuf> {
+        if let Some(repo_root_rel) = self.repo_catalog.selected_git_repo.as_ref() {
+            return Some(repo_root_rel.clone());
+        }
+        if self.backend.has_repo() {
+            return Some(PathBuf::from("."));
+        }
+        None
+    }
+
+    fn clear_git_status_snapshot(&mut self) {
+        self.staged_files.clear();
+        self.unstaged_files.clear();
+        self.selected_file = None;
+        self.diff_content = None;
+        self.git_status.ahead_behind = None;
+        self.branch_name.clear();
+        self.file_tree.refresh_git_statuses(&[], &[]);
+    }
+
+    fn clear_graph_snapshot(&mut self) {
+        self.git_graph.rows.clear();
+        self.git_graph.ref_map.clear();
+        self.git_graph.cache_key = None;
+        self.git_graph.selected_idx = 0;
+        self.git_graph.selected_commit = None;
+        self.git_graph.selection_anchor = None;
+        self.commit_detail.detail = None;
+        self.commit_detail.range_detail = None;
+        self.commit_detail.file_diff = None;
+    }
+
+    pub fn refresh_repo_catalog(&mut self) {
+        let generation = self.repo_catalog.discover_load.begin();
+        let opts = self.repo_catalog.discover_opts();
+        self.tasks
+            .discover_repos(generation, Arc::clone(&self.backend), opts);
     }
 
     /// Enter the drag-and-drop destination picker. Switches to the Files
@@ -2633,10 +2739,10 @@ impl App {
             self.diff_content = None;
             return;
         };
-        if !self.backend.has_repo() {
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
             self.diff_content = None;
             return;
-        }
+        };
         let context = match self.diff_mode {
             DiffMode::FullFile => 9999,
             DiffMode::Compact => 3,
@@ -2645,6 +2751,7 @@ impl App {
         self.tasks.load_diff(
             generation,
             Arc::clone(&self.backend),
+            repo_root_rel,
             sel.path,
             sel.is_staged,
             context,
@@ -2682,7 +2789,10 @@ impl App {
     }
 
     pub fn stage_file(&mut self, path: &str) {
-        let ok = self.backend.stage(path).is_ok();
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
+            return;
+        };
+        let ok = self.backend.stage_for(&repo_root_rel, path).is_ok();
         if ok {
             // If we were viewing this file, update selection
             if let Some(ref mut sel) = self.selected_file {
@@ -2696,7 +2806,10 @@ impl App {
     }
 
     pub fn unstage_file(&mut self, path: &str) {
-        let ok = self.backend.unstage(path).is_ok();
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
+            return;
+        };
+        let ok = self.backend.unstage_for(&repo_root_rel, path).is_ok();
         if ok {
             if let Some(ref mut sel) = self.selected_file {
                 if sel.path == path && sel.is_staged {
@@ -2709,9 +2822,12 @@ impl App {
     }
 
     pub fn stage_all(&mut self) {
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
+            return;
+        };
         let paths: Vec<String> = self.unstaged_files.iter().map(|f| f.path.clone()).collect();
         for p in &paths {
-            let _ = self.backend.stage(p);
+            let _ = self.backend.stage_for(&repo_root_rel, p);
         }
         if let Some(ref mut sel) = self.selected_file {
             if paths.iter().any(|p| p == &sel.path) {
@@ -2723,9 +2839,12 @@ impl App {
     }
 
     pub fn unstage_all(&mut self) {
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
+            return;
+        };
         let paths: Vec<String> = self.staged_files.iter().map(|f| f.path.clone()).collect();
         for p in &paths {
-            let _ = self.backend.unstage(p);
+            let _ = self.backend.unstage_for(&repo_root_rel, p);
         }
         if let Some(ref mut sel) = self.selected_file {
             if paths.iter().any(|p| p == &sel.path) {
@@ -2737,6 +2856,9 @@ impl App {
     }
 
     pub fn stage_folder(&mut self, folder_path: &str) {
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
+            return;
+        };
         let paths: Vec<String> = self
             .unstaged_files
             .iter()
@@ -2744,9 +2866,7 @@ impl App {
             .map(|f| f.path.clone())
             .collect();
         for p in &paths {
-            if let Some(ref repo) = self.repo {
-                let _ = repo.stage_file(p);
-            }
+            let _ = self.backend.stage_for(&repo_root_rel, p);
         }
         if let Some(ref mut sel) = self.selected_file {
             if paths.iter().any(|p| p == &sel.path) {
@@ -2758,6 +2878,9 @@ impl App {
     }
 
     pub fn unstage_folder(&mut self, folder_path: &str) {
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
+            return;
+        };
         let paths: Vec<String> = self
             .staged_files
             .iter()
@@ -2765,9 +2888,7 @@ impl App {
             .map(|f| f.path.clone())
             .collect();
         for p in &paths {
-            if let Some(ref repo) = self.repo {
-                let _ = repo.unstage_file(p);
-            }
+            let _ = self.backend.unstage_for(&repo_root_rel, p);
         }
         if let Some(ref mut sel) = self.selected_file {
             if paths.iter().any(|p| p == &sel.path) {
@@ -2807,15 +2928,20 @@ impl App {
 
     fn apply_discard_target(&mut self, target: &DiscardTarget) -> HashSet<String> {
         let mut touched: HashSet<String> = HashSet::new();
-        // Post-M4: discard goes through `backend.revert_path` so
-        // RemoteBackend gets the same folder/section semantics as local.
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
+            return touched;
+        };
+        // Discard still uses the original Git semantics; the only multi-repo
+        // addition is selecting which repository root those operations run in.
         // We ignore errors (matches the pre-M4 `let _ = repo.…` pattern):
         // the refresh_status + load_diff that follow will reflect whatever
         // actually landed on disk, and a partial failure on one path in a
         // folder discard shouldn't block the rest.
         match target {
             DiscardTarget::File(path) => {
-                let _ = self.backend.revert_path(path, /*is_staged=*/ false);
+                let _ =
+                    self.backend
+                        .revert_path_for(&repo_root_rel, path, /*is_staged=*/ false);
                 touched.insert(path.clone());
             }
             DiscardTarget::Folder { is_staged, path } => {
@@ -2826,7 +2952,7 @@ impl App {
                 };
                 for p in source {
                     if folder_contains(path, &p) {
-                        let _ = self.backend.revert_path(&p, *is_staged);
+                        let _ = self.backend.revert_path_for(&repo_root_rel, &p, *is_staged);
                         touched.insert(p);
                     }
                 }
@@ -2838,7 +2964,7 @@ impl App {
                     self.unstaged_files.iter().map(|f| f.path.clone()).collect()
                 };
                 for p in source {
-                    let _ = self.backend.revert_path(&p, *is_staged);
+                    let _ = self.backend.revert_path_for(&repo_root_rel, &p, *is_staged);
                     touched.insert(p);
                 }
             }
@@ -2850,15 +2976,19 @@ impl App {
     /// Working-tree fs events do NOT invalidate the cache — see plan pitfall #2.
     pub fn refresh_graph(&mut self) {
         const GRAPH_COMMIT_LIMIT: usize = 500;
-        if !self.backend.has_repo() {
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
             self.git_graph.rows.clear();
             self.git_graph.ref_map.clear();
             self.git_graph.cache_key = None;
             return;
         };
         let generation = self.graph_load.begin();
-        self.tasks
-            .refresh_graph(generation, Arc::clone(&self.backend), GRAPH_COMMIT_LIMIT);
+        self.tasks.refresh_graph(
+            generation,
+            Arc::clone(&self.backend),
+            repo_root_rel,
+            GRAPH_COMMIT_LIMIT,
+        );
     }
 
     /// (Re)load commit detail for the currently-selected commit. Clears detail
@@ -2875,13 +3005,13 @@ impl App {
             self.commit_detail.detail = None;
             return;
         };
-        if !self.backend.has_repo() {
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
             self.commit_detail.detail = None;
             return;
-        }
+        };
         let generation = self.commit_detail_load.begin();
         self.tasks
-            .load_commit_detail(generation, Arc::clone(&self.backend), oid);
+            .load_commit_detail(generation, Arc::clone(&self.backend), repo_root_rel, oid);
     }
 
     /// (Re)load the range-mode payload for the current Shift-extended
@@ -2926,13 +3056,14 @@ impl App {
             commits,
             files: Vec::new(),
         });
-        if !self.backend.has_repo() {
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
             return;
-        }
+        };
         let generation = self.commit_detail_load.begin();
         self.tasks.load_commit_range_detail(
             generation,
             Arc::clone(&self.backend),
+            repo_root_rel,
             oldest_oid,
             newest_oid,
         );
@@ -2972,10 +3103,10 @@ impl App {
             DiffMode::Compact => 3,
             DiffMode::FullFile => 9999,
         };
-        if !self.backend.has_repo() {
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
             self.commit_detail.file_diff = None;
             return;
-        }
+        };
         // Different file → reset h_scrolls so the new diff starts at the
         // left edge. Same-path reload (e.g. after toggling diff_mode) keeps
         // scroll state so the user doesn't lose their place.
@@ -3005,6 +3136,7 @@ impl App {
             self.tasks.load_range_file_diff(
                 generation,
                 Arc::clone(&self.backend),
+                repo_root_rel,
                 oldest,
                 newest,
                 path.to_string(),
@@ -3021,6 +3153,7 @@ impl App {
         self.tasks.load_commit_file_diff(
             generation,
             Arc::clone(&self.backend),
+            repo_root_rel,
             oid,
             path.to_string(),
             context,
@@ -3119,9 +3252,9 @@ impl App {
         if self.commit_in_flight {
             return;
         }
-        if !self.backend.has_repo() {
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
             return;
-        }
+        };
         let message = self.git_status.commit_message.trim().to_string();
         if message.is_empty() {
             return;
@@ -3141,7 +3274,9 @@ impl App {
         self.commit_rx = Some(rx);
         self.commit_in_flight = true;
         std::thread::spawn(move || {
-            let result = backend.commit(&message).map_err(|e| e.to_string());
+            let result = backend
+                .commit_for(&repo_root_rel, &message)
+                .map_err(|e| e.to_string());
             let _ = tx.send(result);
         });
     }
@@ -3210,15 +3345,17 @@ impl App {
         if self.push_in_flight {
             return;
         }
-        if !self.backend.has_repo() {
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
             return;
-        }
+        };
         let backend = Arc::clone(&self.backend);
         let (tx, rx) = mpsc::channel();
         self.push_rx = Some(rx);
         self.push_in_flight = true;
         std::thread::spawn(move || {
-            let result = backend.push(force).map_err(|e| e.to_string());
+            let result = backend
+                .push_for(&repo_root_rel, force)
+                .map_err(|e| e.to_string());
             // Recv side may have been dropped by the time we finish (e.g.
             // user quit mid-push); ignore the send error.
             let _ = tx.send((force, result));
@@ -3290,6 +3427,31 @@ impl App {
 
     fn apply_worker_result(&mut self, result: WorkerResult) {
         match result {
+            WorkerResult::RepoCatalog { generation, result } => match result {
+                Ok(resp) => {
+                    if self.repo_catalog.discover_load.complete_ok(generation) {
+                        let selected_before = self.repo_catalog.selected_git_repo.clone();
+                        self.repo_catalog.repos = resp.repos;
+                        self.repo_catalog.truncated = resp.truncated;
+                        self.repo_catalog.reconcile_selected_repo();
+                        if self.repo_catalog.selected_git_repo != selected_before {
+                            let selected_root = self.repo_catalog.selected_git_repo.as_deref()
+                                == Some(Path::new("."));
+                            if !selected_root || !self.backend.has_repo() {
+                                self.clear_git_status_snapshot();
+                            }
+                            self.clear_graph_snapshot();
+                            self.refresh_status();
+                            self.graph_load.invalidate_stale();
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.repo_catalog
+                        .discover_load
+                        .complete_err(generation, error);
+                }
+            },
             WorkerResult::FileTree { generation, result } => match result {
                 Ok(payload) => {
                     if self.file_tree_load.complete_ok(generation) {
@@ -4164,6 +4326,7 @@ impl App {
             self.preview_load.mark_stale();
             self.diff_load.mark_stale();
             self.git_status_load.mark_stale();
+            self.repo_catalog.discover_load.mark_stale();
             // Mark the quick-open index stale so the next palette open picks up
             // the new/deleted files. Rebuilding immediately on every fs
             // event would be wasteful for a palette the user may not open.
@@ -4333,6 +4496,10 @@ impl App {
             self.refresh_file_tree();
         }
 
+        if self.repo_catalog.discover_load.should_request() {
+            self.refresh_repo_catalog();
+        }
+
         match self.active_tab {
             Tab::Files => {
                 if self.preview_load.should_request() {
@@ -4353,7 +4520,7 @@ impl App {
                 }
             }
             Tab::Graph => {
-                let has_repo = self.backend.has_repo();
+                let has_repo = self.status_repo_root_rel().is_some();
                 let should_poll_graph = has_repo && now >= self.next_graph_revalidate_at;
                 if self.graph_load.should_request()
                     || (has_repo && self.git_graph.rows.is_empty() && !self.graph_load.loading)

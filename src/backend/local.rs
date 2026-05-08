@@ -14,7 +14,8 @@ use std::sync::{Mutex, OnceLock, mpsc};
 
 use super::{
     Backend, BackendError, ContentMatchHit, ContentSearchCompleted, ContentSearchRequest,
-    EditorLaunchSpec, SearchChunkSink, StatusSnapshot, TrashOutcome, WalkOpts, WalkResponse,
+    EditorLaunchSpec, RepoDiscoverOpts, RepoDiscoverResponse, SearchChunkSink, StatusSnapshot,
+    TrashOutcome, WalkOpts, WalkResponse, WorkspaceRepoMeta, normalize_repo_root_rel,
 };
 use crate::file_tree::{self, PreviewContent, TreeEntry};
 use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, GitRepo, RefLabel};
@@ -113,7 +114,21 @@ impl LocalBackend {
     }
 
     fn repo(&self) -> Result<GitRepo, BackendError> {
-        GitRepo::open_at(&self.workdir).map_err(|e| BackendError::Git(e.message().to_string()))
+        self.repo_at(Path::new("."))
+    }
+
+    fn repo_at(&self, repo_root_rel: &Path) -> Result<GitRepo, BackendError> {
+        let abs = self.workdir_at(repo_root_rel)?;
+        GitRepo::open_at(&abs).map_err(|e| BackendError::Git(e.message().to_string()))
+    }
+
+    fn workdir_at(&self, repo_root_rel: &Path) -> Result<PathBuf, BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            Ok(self.workdir.clone())
+        } else {
+            self.resolve_rel(&repo_root_rel)
+        }
     }
 
     /// Join a workdir-relative path to the backend's workdir root, rejecting
@@ -198,6 +213,93 @@ pub fn canonical_child_within(canon_root: &Path, rel: &Path) -> Result<PathBuf, 
     Ok(canon_target)
 }
 
+pub(crate) fn discover_repos_local(root: &Path, opts: &RepoDiscoverOpts) -> RepoDiscoverResponse {
+    let cap = opts.max_repos.unwrap_or(usize::MAX);
+    let mut repos = Vec::new();
+    let mut truncated = false;
+    let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
+    queue.push_back((PathBuf::from("."), 0));
+
+    while let Some((rel, depth)) = queue.pop_front() {
+        let abs = if rel == Path::new(".") {
+            root.to_path_buf()
+        } else {
+            root.join(&rel)
+        };
+
+        let is_repo = has_git_marker(&abs);
+        if is_repo {
+            if repos.len() >= cap {
+                truncated = true;
+                break;
+            }
+            let repo_root_rel = normalize_repo_root_rel(&rel)
+                .expect("discovery only generates normalized relative paths");
+            repos.push(WorkspaceRepoMeta {
+                display_name: repo_display_name(root, &repo_root_rel),
+                repo_root_rel,
+            });
+            if !opts.include_nested {
+                continue;
+            }
+        }
+
+        if depth >= opts.max_depth {
+            continue;
+        }
+
+        let Ok(entries) = std::fs::read_dir(&abs) else {
+            continue;
+        };
+        let mut children = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name == ".git" {
+                continue;
+            }
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if !ft.is_dir() || ft.is_symlink() {
+                continue;
+            }
+            let child_rel = if rel == Path::new(".") {
+                PathBuf::from(name)
+            } else {
+                rel.join(name)
+            };
+            children.push(child_rel);
+        }
+        children.sort();
+        for child_rel in children {
+            queue.push_back((child_rel, depth + 1));
+        }
+    }
+
+    repos.sort_by(|a, b| a.repo_root_rel.cmp(&b.repo_root_rel));
+    RepoDiscoverResponse { repos, truncated }
+}
+
+fn has_git_marker(dir: &Path) -> bool {
+    let marker = dir.join(".git");
+    match std::fs::symlink_metadata(marker) {
+        Ok(meta) => meta.is_dir() || meta.is_file(),
+        Err(_) => false,
+    }
+}
+
+fn repo_display_name(root: &Path, repo_root_rel: &Path) -> String {
+    let path = if repo_root_rel == Path::new(".") {
+        root
+    } else {
+        repo_root_rel
+    };
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(String::from)
+        .unwrap_or_else(|| "repo".to_string())
+}
+
 impl Backend for LocalBackend {
     fn workdir_path(&self) -> PathBuf {
         self.workdir.clone()
@@ -225,6 +327,13 @@ impl Backend for LocalBackend {
 
     fn has_repo(&self) -> bool {
         self.repo().is_ok()
+    }
+
+    fn discover_repos(
+        &self,
+        opts: &RepoDiscoverOpts,
+    ) -> Result<RepoDiscoverResponse, BackendError> {
+        Ok(discover_repos_local(&self.workdir, opts))
     }
 
     fn build_file_tree(
@@ -326,7 +435,11 @@ impl Backend for LocalBackend {
     }
 
     fn git_status(&self) -> Result<StatusSnapshot, BackendError> {
-        let repo = self.repo()?;
+        self.git_status_for(Path::new("."))
+    }
+
+    fn git_status_for(&self, repo_root_rel: &Path) -> Result<StatusSnapshot, BackendError> {
+        let repo = self.repo_at(repo_root_rel)?;
         let (staged, unstaged) = repo.get_status();
         Ok(StatusSnapshot {
             staged,
@@ -341,7 +454,18 @@ impl Backend for LocalBackend {
         path: &str,
         context_lines: u32,
     ) -> Result<Option<DiffContent>, BackendError> {
-        Ok(self.repo()?.get_diff(path, true, context_lines))
+        self.staged_diff_for(Path::new("."), path, context_lines)
+    }
+
+    fn staged_diff_for(
+        &self,
+        repo_root_rel: &Path,
+        path: &str,
+        context_lines: u32,
+    ) -> Result<Option<DiffContent>, BackendError> {
+        Ok(self
+            .repo_at(repo_root_rel)?
+            .get_diff(path, true, context_lines))
     }
 
     fn unstaged_diff(
@@ -349,24 +473,51 @@ impl Backend for LocalBackend {
         path: &str,
         context_lines: u32,
     ) -> Result<Option<DiffContent>, BackendError> {
-        Ok(self.repo()?.get_diff(path, false, context_lines))
+        self.unstaged_diff_for(Path::new("."), path, context_lines)
+    }
+
+    fn unstaged_diff_for(
+        &self,
+        repo_root_rel: &Path,
+        path: &str,
+        context_lines: u32,
+    ) -> Result<Option<DiffContent>, BackendError> {
+        Ok(self
+            .repo_at(repo_root_rel)?
+            .get_diff(path, false, context_lines))
     }
 
     fn untracked_diff(&self, path: &str) -> Result<Option<DiffContent>, BackendError> {
+        self.untracked_diff_for(Path::new("."), path)
+    }
+
+    fn untracked_diff_for(
+        &self,
+        repo_root_rel: &Path,
+        path: &str,
+    ) -> Result<Option<DiffContent>, BackendError> {
         // `get_diff(staged=false)` already dispatches to untracked-diff when
         // the path is new — so we route through the same entry point and
         // keep the UNtracked-only API available for explicit use.
-        Ok(self.repo()?.get_diff(path, false, 3))
+        Ok(self.repo_at(repo_root_rel)?.get_diff(path, false, 3))
     }
 
     fn stage(&self, path: &str) -> Result<(), BackendError> {
-        self.repo()?
+        self.stage_for(Path::new("."), path)
+    }
+
+    fn stage_for(&self, repo_root_rel: &Path, path: &str) -> Result<(), BackendError> {
+        self.repo_at(repo_root_rel)?
             .stage_file(path)
             .map_err(|e| BackendError::Git(e.message().to_string()))
     }
 
     fn unstage(&self, path: &str) -> Result<(), BackendError> {
-        self.repo()?
+        self.unstage_for(Path::new("."), path)
+    }
+
+    fn unstage_for(&self, repo_root_rel: &Path, path: &str) -> Result<(), BackendError> {
+        self.repo_at(repo_root_rel)?
             .unstage_file(path)
             .map_err(|e| BackendError::Git(e.message().to_string()))
     }
@@ -378,13 +529,22 @@ impl Backend for LocalBackend {
     }
 
     fn revert_path(&self, path: &str, is_staged: bool) -> Result<(), BackendError> {
+        self.revert_path_for(Path::new("."), path, is_staged)
+    }
+
+    fn revert_path_for(
+        &self,
+        repo_root_rel: &Path,
+        path: &str,
+        is_staged: bool,
+    ) -> Result<(), BackendError> {
         // Staged-path revert = unstage → restore-workdir. Unstaged-path
         // revert = just restore-workdir. Mirrors the free `revert_path`
         // helper in `app.rs` (removed in M4 Track A-0.1) — errors on
         // either side are swallowed the same way the UI did before,
         // except we surface the *last* error so the backend contract
         // stays `Result<(), _>`.
-        let repo = self.repo()?;
+        let repo = self.repo_at(repo_root_rel)?;
         if is_staged {
             let _ = repo.unstage_file(path);
         }
@@ -393,30 +553,65 @@ impl Backend for LocalBackend {
     }
 
     fn push(&self, force: bool) -> Result<(), BackendError> {
+        self.push_for(Path::new("."), force)
+    }
+
+    fn push_for(&self, repo_root_rel: &Path, force: bool) -> Result<(), BackendError> {
         // Reuse the free function so we don't need a GitRepo handle — it
         // shells out to `git push` and is the same thing the foreground
         // App::run_push() uses on its worker thread.
-        crate::git::push_at(&self.workdir, force).map_err(BackendError::Git)
+        crate::git::push_at(&self.workdir_at(repo_root_rel)?, force).map_err(BackendError::Git)
     }
 
     fn commit(&self, message: &str) -> Result<(), BackendError> {
-        crate::git::commit_at(&self.workdir, message).map_err(BackendError::Git)
+        self.commit_for(Path::new("."), message)
+    }
+
+    fn commit_for(&self, repo_root_rel: &Path, message: &str) -> Result<(), BackendError> {
+        crate::git::commit_at(&self.workdir_at(repo_root_rel)?, message).map_err(BackendError::Git)
     }
 
     fn list_commits(&self, limit: usize) -> Result<Vec<CommitInfo>, BackendError> {
-        Ok(self.repo()?.list_commits(limit))
+        self.list_commits_for(Path::new("."), limit)
+    }
+
+    fn list_commits_for(
+        &self,
+        repo_root_rel: &Path,
+        limit: usize,
+    ) -> Result<Vec<CommitInfo>, BackendError> {
+        Ok(self.repo_at(repo_root_rel)?.list_commits(limit))
     }
 
     fn list_refs(&self) -> Result<HashMap<String, Vec<RefLabel>>, BackendError> {
-        Ok(self.repo()?.list_refs())
+        self.list_refs_for(Path::new("."))
+    }
+
+    fn list_refs_for(
+        &self,
+        repo_root_rel: &Path,
+    ) -> Result<HashMap<String, Vec<RefLabel>>, BackendError> {
+        Ok(self.repo_at(repo_root_rel)?.list_refs())
     }
 
     fn head_oid(&self) -> Result<Option<String>, BackendError> {
-        Ok(self.repo()?.head_oid())
+        self.head_oid_for(Path::new("."))
+    }
+
+    fn head_oid_for(&self, repo_root_rel: &Path) -> Result<Option<String>, BackendError> {
+        Ok(self.repo_at(repo_root_rel)?.head_oid())
     }
 
     fn commit_detail(&self, oid: &str) -> Result<Option<CommitDetail>, BackendError> {
-        Ok(self.repo()?.get_commit(oid))
+        self.commit_detail_for(Path::new("."), oid)
+    }
+
+    fn commit_detail_for(
+        &self,
+        repo_root_rel: &Path,
+        oid: &str,
+    ) -> Result<Option<CommitDetail>, BackendError> {
+        Ok(self.repo_at(repo_root_rel)?.get_commit(oid))
     }
 
     fn commit_file_diff(
@@ -425,7 +620,19 @@ impl Backend for LocalBackend {
         path: &str,
         context_lines: u32,
     ) -> Result<Option<DiffContent>, BackendError> {
-        Ok(self.repo()?.get_commit_file_diff(oid, path, context_lines))
+        self.commit_file_diff_for(Path::new("."), oid, path, context_lines)
+    }
+
+    fn commit_file_diff_for(
+        &self,
+        repo_root_rel: &Path,
+        oid: &str,
+        path: &str,
+        context_lines: u32,
+    ) -> Result<Option<DiffContent>, BackendError> {
+        Ok(self
+            .repo_at(repo_root_rel)?
+            .get_commit_file_diff(oid, path, context_lines))
     }
 
     fn range_files(
@@ -433,7 +640,18 @@ impl Backend for LocalBackend {
         oldest_oid: &str,
         newest_oid: &str,
     ) -> Result<Vec<FileEntry>, BackendError> {
-        Ok(self.repo()?.get_range_files(oldest_oid, newest_oid))
+        self.range_files_for(Path::new("."), oldest_oid, newest_oid)
+    }
+
+    fn range_files_for(
+        &self,
+        repo_root_rel: &Path,
+        oldest_oid: &str,
+        newest_oid: &str,
+    ) -> Result<Vec<FileEntry>, BackendError> {
+        Ok(self
+            .repo_at(repo_root_rel)?
+            .get_range_files(oldest_oid, newest_oid))
     }
 
     fn range_file_diff(
@@ -443,9 +661,23 @@ impl Backend for LocalBackend {
         path: &str,
         context_lines: u32,
     ) -> Result<Option<DiffContent>, BackendError> {
-        Ok(self
-            .repo()?
-            .get_range_file_diff(oldest_oid, newest_oid, path, context_lines))
+        self.range_file_diff_for(Path::new("."), oldest_oid, newest_oid, path, context_lines)
+    }
+
+    fn range_file_diff_for(
+        &self,
+        repo_root_rel: &Path,
+        oldest_oid: &str,
+        newest_oid: &str,
+        path: &str,
+        context_lines: u32,
+    ) -> Result<Option<DiffContent>, BackendError> {
+        Ok(self.repo_at(repo_root_rel)?.get_range_file_diff(
+            oldest_oid,
+            newest_oid,
+            path,
+            context_lines,
+        ))
     }
 
     fn subscribe_fs_events(&self) -> mpsc::Receiver<()> {

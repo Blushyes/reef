@@ -8,6 +8,8 @@
 //!   - `diff.layout` / `diff.mode`             — Git tab right-side diff
 //!   - `commit.diff_layout` / `commit.diff_mode` — Graph tab commit-file diff
 //!   - `status.tree_mode`                       — Git tab left-side list/tree
+//!   - `status.selected_repo`                   — Git tab selected repository
+//!                                                root, workdir-relative (`.` for root).
 //!   - `commit.files_tree_mode`                 — Graph tab commit files list/tree
 //!   - `ui.theme`                               — `dark` | `light` | `auto` (default `auto`).
 //!                                                Read once in `main.rs` before raw-mode

@@ -5,19 +5,19 @@ expression: output
 ---
  reef  [TMPDIR]  ⎇ master
  📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph        ⊟  1:Files 2:Search 3:Git 4:Graph
+ Repository            │
+ * .                   │
+                       │
   ┌ Message (commit sta│
   │                    │
   └                    │
     ✓ Commit   (Ctrl+En│
                        │
- View: list            │
+ View: list            │                 Select a file to view diff
                        │
  ⌄ Changes  2 Stage all│
-   new.txt +1 U ↗ + ↺  │                 Select a file to view diff
+   new.txt +1 U ↗ + ↺  │
    ...t +1 -1 M ↗ + ↺  │
-                       │
-                       │
-                       │
                        │
                        │
                        │

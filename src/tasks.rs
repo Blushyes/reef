@@ -5,7 +5,7 @@
 //! these workers and merged back into `App` from `tick()`.
 
 use crate::app::{CommitFileDiff, DiffHighlighted, HighlightedDiff};
-use crate::backend::Backend;
+use crate::backend::{Backend, RepoDiscoverOpts, RepoDiscoverResponse};
 use crate::file_tree::{PreviewContent, TreeEntry};
 use crate::git::graph::GraphRow;
 use crate::git::{CommitDetail, DiffContent, FileEntry, RefLabel};
@@ -30,6 +30,12 @@ pub struct AsyncState {
 
 impl AsyncState {
     pub fn mark_stale(&mut self) {
+        self.stale = true;
+    }
+
+    pub fn invalidate_stale(&mut self) {
+        self.generation = self.generation.wrapping_add(1).max(1);
+        self.loading = false;
         self.stale = true;
     }
 
@@ -89,6 +95,10 @@ pub struct GraphPayload {
 
 #[derive(Debug)]
 pub enum WorkerResult {
+    RepoCatalog {
+        generation: u64,
+        result: Result<RepoDiscoverResponse, String>,
+    },
     FileTree {
         generation: u64,
         result: Result<FileTreePayload, String>,
@@ -326,13 +336,20 @@ pub struct PasteItem {
 }
 
 enum GitTask {
+    DiscoverRepos {
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        opts: RepoDiscoverOpts,
+    },
     RefreshStatus {
         generation: u64,
         backend: Arc<dyn Backend>,
+        repo_root_rel: PathBuf,
     },
     LoadDiff {
         generation: u64,
         backend: Arc<dyn Backend>,
+        repo_root_rel: PathBuf,
         path: String,
         staged: bool,
         context_lines: u32,
@@ -355,16 +372,19 @@ enum GraphTask {
     RefreshGraph {
         generation: u64,
         backend: Arc<dyn Backend>,
+        repo_root_rel: PathBuf,
         limit: usize,
     },
     LoadCommitDetail {
         generation: u64,
         backend: Arc<dyn Backend>,
+        repo_root_rel: PathBuf,
         oid: String,
     },
     LoadCommitFileDiff {
         generation: u64,
         backend: Arc<dyn Backend>,
+        repo_root_rel: PathBuf,
         oid: String,
         path: String,
         context_lines: u32,
@@ -375,12 +395,14 @@ enum GraphTask {
     LoadCommitRangeDetail {
         generation: u64,
         backend: Arc<dyn Backend>,
+        repo_root_rel: PathBuf,
         oldest_oid: String,
         newest_oid: String,
     },
     LoadRangeFileDiff {
         generation: u64,
         backend: Arc<dyn Backend>,
+        repo_root_rel: PathBuf,
         oldest_oid: String,
         newest_oid: String,
         path: String,
@@ -601,10 +623,29 @@ impl TaskCoordinator {
         });
     }
 
-    pub fn refresh_status(&self, generation: u64, backend: Arc<dyn Backend>) {
+    pub fn refresh_status(
+        &self,
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        repo_root_rel: PathBuf,
+    ) {
         let _ = self.git_tx.send(GitTask::RefreshStatus {
             generation,
             backend,
+            repo_root_rel,
+        });
+    }
+
+    pub fn discover_repos(
+        &self,
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        opts: RepoDiscoverOpts,
+    ) {
+        let _ = self.git_tx.send(GitTask::DiscoverRepos {
+            generation,
+            backend,
+            opts,
         });
     }
 
@@ -612,6 +653,7 @@ impl TaskCoordinator {
         &self,
         generation: u64,
         backend: Arc<dyn Backend>,
+        repo_root_rel: PathBuf,
         path: String,
         staged: bool,
         context_lines: u32,
@@ -620,6 +662,7 @@ impl TaskCoordinator {
         let _ = self.git_tx.send(GitTask::LoadDiff {
             generation,
             backend,
+            repo_root_rel,
             path,
             staged,
             context_lines,
@@ -627,18 +670,32 @@ impl TaskCoordinator {
         });
     }
 
-    pub fn refresh_graph(&self, generation: u64, backend: Arc<dyn Backend>, limit: usize) {
+    pub fn refresh_graph(
+        &self,
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        repo_root_rel: PathBuf,
+        limit: usize,
+    ) {
         let _ = self.graph_tx.send(GraphTask::RefreshGraph {
             generation,
             backend,
+            repo_root_rel,
             limit,
         });
     }
 
-    pub fn load_commit_detail(&self, generation: u64, backend: Arc<dyn Backend>, oid: String) {
+    pub fn load_commit_detail(
+        &self,
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        repo_root_rel: PathBuf,
+        oid: String,
+    ) {
         let _ = self.graph_tx.send(GraphTask::LoadCommitDetail {
             generation,
             backend,
+            repo_root_rel,
             oid,
         });
     }
@@ -647,6 +704,7 @@ impl TaskCoordinator {
         &self,
         generation: u64,
         backend: Arc<dyn Backend>,
+        repo_root_rel: PathBuf,
         oid: String,
         path: String,
         context_lines: u32,
@@ -655,6 +713,7 @@ impl TaskCoordinator {
         let _ = self.graph_tx.send(GraphTask::LoadCommitFileDiff {
             generation,
             backend,
+            repo_root_rel,
             oid,
             path,
             context_lines,
@@ -666,12 +725,14 @@ impl TaskCoordinator {
         &self,
         generation: u64,
         backend: Arc<dyn Backend>,
+        repo_root_rel: PathBuf,
         oldest_oid: String,
         newest_oid: String,
     ) {
         let _ = self.graph_tx.send(GraphTask::LoadCommitRangeDetail {
             generation,
             backend,
+            repo_root_rel,
             oldest_oid,
             newest_oid,
         });
@@ -682,6 +743,7 @@ impl TaskCoordinator {
         &self,
         generation: u64,
         backend: Arc<dyn Backend>,
+        repo_root_rel: PathBuf,
         oldest_oid: String,
         newest_oid: String,
         path: String,
@@ -691,6 +753,7 @@ impl TaskCoordinator {
         let _ = self.graph_tx.send(GraphTask::LoadRangeFileDiff {
             generation,
             backend,
+            repo_root_rel,
             oldest_oid,
             newest_oid,
             path,
@@ -1347,12 +1410,21 @@ fn spawn_git_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<GitTa
         .spawn(move || {
             while let Ok(task) = rx.recv() {
                 match task {
+                    GitTask::DiscoverRepos {
+                        generation,
+                        backend,
+                        opts,
+                    } => {
+                        let result = backend.discover_repos(&opts).map_err(|e| e.to_string());
+                        let _ = result_tx.send(WorkerResult::RepoCatalog { generation, result });
+                    }
                     GitTask::RefreshStatus {
                         generation,
                         backend,
+                        repo_root_rel,
                     } => {
                         let result = backend
-                            .git_status()
+                            .git_status_for(&repo_root_rel)
                             .map(|snap| GitStatusPayload {
                                 staged: snap.staged,
                                 unstaged: snap.unstaged,
@@ -1365,6 +1437,7 @@ fn spawn_git_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<GitTa
                     GitTask::LoadDiff {
                         generation,
                         backend,
+                        repo_root_rel,
                         path,
                         staged,
                         context_lines,
@@ -1374,9 +1447,9 @@ fn spawn_git_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<GitTa
                         // then apply v0.14.0's syntect highlighting on
                         // the client side.
                         let result = if staged {
-                            backend.staged_diff(&path, context_lines)
+                            backend.staged_diff_for(&repo_root_rel, &path, context_lines)
                         } else {
-                            backend.unstaged_diff(&path, context_lines)
+                            backend.unstaged_diff_for(&repo_root_rel, &path, context_lines)
                         }
                         .map_err(|e| e.to_string())
                         .map(|opt| opt.map(|diff| build_highlighted_diff(&path, diff, dark)));
@@ -1398,16 +1471,21 @@ fn spawn_graph_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Gra
                     GraphTask::RefreshGraph {
                         generation,
                         backend,
+                        repo_root_rel,
                         limit,
                     } => {
                         let result = (|| -> Result<GraphPayload, String> {
                             let head = backend
-                                .head_oid()
+                                .head_oid_for(&repo_root_rel)
                                 .map_err(|e| e.to_string())?
                                 .unwrap_or_default();
-                            let ref_map = backend.list_refs().map_err(|e| e.to_string())?;
+                            let ref_map = backend
+                                .list_refs_for(&repo_root_rel)
+                                .map_err(|e| e.to_string())?;
                             let refs_hash = hash_ref_map(&ref_map);
-                            let commits = backend.list_commits(limit).map_err(|e| e.to_string())?;
+                            let commits = backend
+                                .list_commits_for(&repo_root_rel, limit)
+                                .map_err(|e| e.to_string())?;
                             let rows = crate::git::graph::build_graph(&commits);
                             Ok(GraphPayload {
                                 rows,
@@ -1420,21 +1498,25 @@ fn spawn_graph_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Gra
                     GraphTask::LoadCommitDetail {
                         generation,
                         backend,
+                        repo_root_rel,
                         oid,
                     } => {
-                        let result = backend.commit_detail(&oid).map_err(|e| e.to_string());
+                        let result = backend
+                            .commit_detail_for(&repo_root_rel, &oid)
+                            .map_err(|e| e.to_string());
                         let _ = result_tx.send(WorkerResult::CommitDetail { generation, result });
                     }
                     GraphTask::LoadCommitFileDiff {
                         generation,
                         backend,
+                        repo_root_rel,
                         oid,
                         path,
                         context_lines,
                         dark,
                     } => {
                         let result = backend
-                            .commit_file_diff(&oid, &path, context_lines)
+                            .commit_file_diff_for(&repo_root_rel, &oid, &path, context_lines)
                             .map_err(|e| e.to_string())
                             .map(|opt| opt.map(|diff| build_commit_file_diff(path, diff, dark)));
                         let _ = result_tx.send(WorkerResult::CommitFileDiff { generation, result });
@@ -1442,17 +1524,19 @@ fn spawn_graph_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Gra
                     GraphTask::LoadCommitRangeDetail {
                         generation,
                         backend,
+                        repo_root_rel,
                         oldest_oid,
                         newest_oid,
                     } => {
                         let result = backend
-                            .range_files(&oldest_oid, &newest_oid)
+                            .range_files_for(&repo_root_rel, &oldest_oid, &newest_oid)
                             .map_err(|e| e.to_string());
                         let _ = result_tx.send(WorkerResult::RangeDetail { generation, result });
                     }
                     GraphTask::LoadRangeFileDiff {
                         generation,
                         backend,
+                        repo_root_rel,
                         oldest_oid,
                         newest_oid,
                         path,
@@ -1460,7 +1544,13 @@ fn spawn_graph_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Gra
                         dark,
                     } => {
                         let result = backend
-                            .range_file_diff(&oldest_oid, &newest_oid, &path, context_lines)
+                            .range_file_diff_for(
+                                &repo_root_rel,
+                                &oldest_oid,
+                                &newest_oid,
+                                &path,
+                                context_lines,
+                            )
                             .map_err(|e| e.to_string())
                             .map(|opt| opt.map(|diff| build_commit_file_diff(path, diff, dark)));
                         let _ = result_tx.send(WorkerResult::RangeFileDiff { generation, result });

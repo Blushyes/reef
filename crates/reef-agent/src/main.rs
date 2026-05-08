@@ -24,8 +24,8 @@ use reef_proto::{
     CommitDetailDto, CommitInfoDto, ContentSearchCompletedDto, DiffContentDto, DiffHunkDto,
     DiffLineDto, DirEntryDto, Envelope, ErrorCode, FileEntryDto, FileStatusDto, Frame,
     HandshakeResponse, LineTagDto, MatchHitDto, Notification, PROTOCOL_VERSION, ReadFileResponse,
-    RefLabelDto, Request, Response, StatusSnapshotDto, TrashResponseDto, WalkResponseDto,
-    encode_frame, read_envelope,
+    RefLabelDto, RepoDiscoverResponseDto, Request, Response, StatusSnapshotDto, TrashResponseDto,
+    WalkResponseDto, WorkspaceRepoMetaDto, encode_frame, read_envelope,
 };
 
 struct Args {
@@ -232,6 +232,29 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
 
         Request::ReadFile { path, max_bytes } => read_file_response(workdir, &path, max_bytes),
 
+        Request::DiscoverRepos { opts } => {
+            let domain = reef::backend::RepoDiscoverOpts {
+                max_depth: opts.max_depth as usize,
+                include_nested: opts.include_nested,
+                max_repos: opts.max_repos.map(|n| n as usize),
+            };
+            match backend.discover_repos(&domain) {
+                Ok(resp) => serde_json::to_value(RepoDiscoverResponseDto {
+                    repos: resp
+                        .repos
+                        .into_iter()
+                        .map(|r| WorkspaceRepoMetaDto {
+                            repo_root_rel: reef::backend::repo_key(&r.repo_root_rel),
+                            display_name: r.display_name,
+                        })
+                        .collect(),
+                    truncated: resp.truncated,
+                })
+                .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
+                Err(e) => Err(backend_err(e)),
+            }
+        }
+
         Request::GitStatus => match backend.git_status() {
             Ok(snap) => serde_json::to_value(StatusSnapshotDto {
                 staged: snap.staged.into_iter().map(file_entry_to_dto).collect(),
@@ -243,10 +266,33 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
             Err(e) => Err(backend_err(e)),
         },
 
+        Request::GitStatusFor { repo_root_rel } => {
+            let repo_root_rel = PathBuf::from(repo_root_rel);
+            match backend.git_status_for(&repo_root_rel) {
+                Ok(snap) => serde_json::to_value(StatusSnapshotDto {
+                    staged: snap.staged.into_iter().map(file_entry_to_dto).collect(),
+                    unstaged: snap.unstaged.into_iter().map(file_entry_to_dto).collect(),
+                    branch_name: snap.branch_name,
+                    ahead_behind: snap.ahead_behind,
+                })
+                .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
+                Err(e) => Err(backend_err(e)),
+            }
+        }
+
         Request::StagedDiff {
             path,
             context_lines,
         } => match backend.staged_diff(&path, context_lines) {
+            Ok(diff) => serde_json::to_value(diff.map(diff_to_dto))
+                .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::StagedDiffFor {
+            repo_root_rel,
+            path,
+            context_lines,
+        } => match backend.staged_diff_for(&PathBuf::from(repo_root_rel), &path, context_lines) {
             Ok(diff) => serde_json::to_value(diff.map(diff_to_dto))
                 .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
             Err(e) => Err(backend_err(e)),
@@ -259,7 +305,24 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
                 .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
             Err(e) => Err(backend_err(e)),
         },
+        Request::UnstagedDiffFor {
+            repo_root_rel,
+            path,
+            context_lines,
+        } => match backend.unstaged_diff_for(&PathBuf::from(repo_root_rel), &path, context_lines) {
+            Ok(diff) => serde_json::to_value(diff.map(diff_to_dto))
+                .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
+            Err(e) => Err(backend_err(e)),
+        },
         Request::UntrackedDiff { path } => match backend.untracked_diff(&path) {
+            Ok(diff) => serde_json::to_value(diff.map(diff_to_dto))
+                .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::UntrackedDiffFor {
+            repo_root_rel,
+            path,
+        } => match backend.untracked_diff_for(&PathBuf::from(repo_root_rel), &path) {
             Ok(diff) => serde_json::to_value(diff.map(diff_to_dto))
                 .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
             Err(e) => Err(backend_err(e)),
@@ -269,7 +332,21 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
             Ok(()) => Ok(serde_json::json!({"ok": true})),
             Err(e) => Err(backend_err(e)),
         },
+        Request::StageFor {
+            repo_root_rel,
+            path,
+        } => match backend.stage_for(&PathBuf::from(repo_root_rel), &path) {
+            Ok(()) => Ok(serde_json::json!({"ok": true})),
+            Err(e) => Err(backend_err(e)),
+        },
         Request::Unstage { path } => match backend.unstage(&path) {
+            Ok(()) => Ok(serde_json::json!({"ok": true})),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::UnstageFor {
+            repo_root_rel,
+            path,
+        } => match backend.unstage_for(&PathBuf::from(repo_root_rel), &path) {
             Ok(()) => Ok(serde_json::json!({"ok": true})),
             Err(e) => Err(backend_err(e)),
         },
@@ -281,7 +358,22 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
             Ok(()) => Ok(serde_json::json!({"ok": true})),
             Err(e) => Err(backend_err(e)),
         },
+        Request::RevertPathFor {
+            repo_root_rel,
+            path,
+            is_staged,
+        } => match backend.revert_path_for(&PathBuf::from(repo_root_rel), &path, is_staged) {
+            Ok(()) => Ok(serde_json::json!({"ok": true})),
+            Err(e) => Err(backend_err(e)),
+        },
         Request::Push { force } => match backend.push(force) {
+            Ok(()) => Ok(serde_json::json!({"ok": true})),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::PushFor {
+            repo_root_rel,
+            force,
+        } => match backend.push_for(&PathBuf::from(repo_root_rel), force) {
             Ok(()) => Ok(serde_json::json!({"ok": true})),
             Err(e) => Err(backend_err(e)),
         },
@@ -289,8 +381,26 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
             Ok(()) => Ok(serde_json::json!({"ok": true})),
             Err(e) => Err(backend_err(e)),
         },
+        Request::CommitFor {
+            repo_root_rel,
+            message,
+        } => match backend.commit_for(&PathBuf::from(repo_root_rel), &message) {
+            Ok(()) => Ok(serde_json::json!({"ok": true})),
+            Err(e) => Err(backend_err(e)),
+        },
 
         Request::ListCommits { limit } => match backend.list_commits(limit as usize) {
+            Ok(list) => {
+                let dtos: Vec<CommitInfoDto> = list.into_iter().map(commit_info_to_dto).collect();
+                serde_json::to_value(dtos)
+                    .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}")))
+            }
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::ListCommitsFor {
+            repo_root_rel,
+            limit,
+        } => match backend.list_commits_for(&PathBuf::from(repo_root_rel), limit as usize) {
             Ok(list) => {
                 let dtos: Vec<CommitInfoDto> = list.into_iter().map(commit_info_to_dto).collect();
                 serde_json::to_value(dtos)
@@ -309,6 +419,19 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
             }
             Err(e) => Err(backend_err(e)),
         },
+        Request::ListRefsFor { repo_root_rel } => {
+            match backend.list_refs_for(&PathBuf::from(repo_root_rel)) {
+                Ok(map) => {
+                    let mut out = std::collections::HashMap::new();
+                    for (k, v) in map.into_iter() {
+                        out.insert(k, v.into_iter().map(ref_label_to_dto).collect::<Vec<_>>());
+                    }
+                    serde_json::to_value(out)
+                        .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}")))
+                }
+                Err(e) => Err(backend_err(e)),
+            }
+        }
 
         Request::HeadOid => match backend.head_oid() {
             Ok(opt) => {
@@ -316,18 +439,47 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
             }
             Err(e) => Err(backend_err(e)),
         },
+        Request::HeadOidFor { repo_root_rel } => {
+            match backend.head_oid_for(&PathBuf::from(repo_root_rel)) {
+                Ok(opt) => serde_json::to_value(opt)
+                    .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
+                Err(e) => Err(backend_err(e)),
+            }
+        }
 
         Request::CommitDetail { oid } => match backend.commit_detail(&oid) {
             Ok(opt) => serde_json::to_value(opt.map(commit_detail_to_dto))
                 .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
             Err(e) => Err(backend_err(e)),
         },
+        Request::CommitDetailFor { repo_root_rel, oid } => {
+            match backend.commit_detail_for(&PathBuf::from(repo_root_rel), &oid) {
+                Ok(opt) => serde_json::to_value(opt.map(commit_detail_to_dto))
+                    .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
+                Err(e) => Err(backend_err(e)),
+            }
+        }
 
         Request::CommitFileDiff {
             oid,
             path,
             context_lines,
         } => match backend.commit_file_diff(&oid, &path, context_lines) {
+            Ok(opt) => serde_json::to_value(opt.map(diff_to_dto))
+                .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::CommitFileDiffFor {
+            repo_root_rel,
+            oid,
+            path,
+            context_lines,
+        } => match backend.commit_file_diff_for(
+            &PathBuf::from(repo_root_rel),
+            &oid,
+            &path,
+            context_lines,
+        ) {
             Ok(opt) => serde_json::to_value(opt.map(diff_to_dto))
                 .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
             Err(e) => Err(backend_err(e)),
@@ -344,12 +496,42 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
             }
             Err(e) => Err(backend_err(e)),
         },
+        Request::RangeFilesFor {
+            repo_root_rel,
+            oldest_oid,
+            newest_oid,
+        } => match backend.range_files_for(&PathBuf::from(repo_root_rel), &oldest_oid, &newest_oid)
+        {
+            Ok(files) => {
+                let dtos: Vec<FileEntryDto> = files.into_iter().map(file_entry_to_dto).collect();
+                serde_json::to_value(dtos)
+                    .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}")))
+            }
+            Err(e) => Err(backend_err(e)),
+        },
         Request::RangeFileDiff {
             oldest_oid,
             newest_oid,
             path,
             context_lines,
         } => match backend.range_file_diff(&oldest_oid, &newest_oid, &path, context_lines) {
+            Ok(opt) => serde_json::to_value(opt.map(diff_to_dto))
+                .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::RangeFileDiffFor {
+            repo_root_rel,
+            oldest_oid,
+            newest_oid,
+            path,
+            context_lines,
+        } => match backend.range_file_diff_for(
+            &PathBuf::from(repo_root_rel),
+            &oldest_oid,
+            &newest_oid,
+            &path,
+            context_lines,
+        ) {
             Ok(opt) => serde_json::to_value(opt.map(diff_to_dto))
                 .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
             Err(e) => Err(backend_err(e)),

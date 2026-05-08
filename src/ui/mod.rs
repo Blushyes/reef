@@ -143,7 +143,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     match app.active_tab {
         Tab::Git => {
-            if !app.backend.has_repo() {
+            let no_known_repo = !app.backend.has_repo()
+                && !app.repo_catalog.discover_load.loading
+                && app.repo_catalog.repos.is_empty();
+            if no_known_repo {
                 render_no_repo(f, app, body_layout[0]);
             } else {
                 if has_sidebar {

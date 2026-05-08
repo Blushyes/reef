@@ -708,8 +708,10 @@ pub fn push_button(ahead: usize) -> String {
 
 pub fn pull_button(behind: usize) -> String {
     match lang() {
-        Lang::Zh => format!(" ↓ 拉取 ({behind}) "),
-        Lang::En => format!(" ↓ Pull ({behind}) "),
+        Lang::Zh if behind > 0 => format!(" ↓ 拉取 ({behind}) "),
+        Lang::En if behind > 0 => format!(" ↓ Pull ({behind}) "),
+        Lang::Zh => " ↓ 拉取 ".to_string(),
+        Lang::En => " ↓ Pull ".to_string(),
     }
 }
 

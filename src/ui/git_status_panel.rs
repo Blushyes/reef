@@ -196,6 +196,9 @@ pub fn handle_key(app: &mut App, key: &str) -> bool {
             } else if app.git_status.push_error.is_some() {
                 app.git_status.push_error = None;
                 true
+            } else if app.git_status.branch_dropdown_open {
+                app.git_status.branch_dropdown_open = false;
+                true
             } else {
                 false
             }
@@ -253,6 +256,7 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
                 app.diff_scroll = 0;
                 app.diff_h_scroll = 0;
                 app.git_status.confirm_discard = None;
+                app.git_status.branch_dropdown_open = false;
                 app.staged_files.clear();
                 app.unstaged_files.clear();
                 app.git_status.ahead_behind = None;
@@ -276,8 +280,13 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             }
             let branch = args.get("branch").and_then(|v| v.as_str()).unwrap_or("");
             if !branch.is_empty() {
+                app.git_status.branch_dropdown_open = false;
                 app.checkout_branch(branch);
             }
+            true
+        }
+        "git.toggleBranchDropdown" => {
+            app.git_status.branch_dropdown_open = !app.git_status.branch_dropdown_open;
             true
         }
         "git.toggleStaged" => {
@@ -774,11 +783,9 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
         rows.push(Row::blank());
     }
 
-    // Push indicator (only when tree is clean, no confirmation banner is
-    // already shown, and no push is currently in flight).
+    // Push indicator. Pull lives on the commit action row so the two primary
+    // Git actions share one horizontal control strip.
     if allow_git_writes
-        && app.staged_files.is_empty()
-        && app.unstaged_files.is_empty()
         && !status.confirm_push
         && !status.confirm_force_push
         && !app.push_in_flight
@@ -1050,9 +1057,25 @@ fn push_branch_selector(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: 
         return;
     }
 
-    let spans = vec![
+    let branches: Vec<String> = app
+        .git_status
+        .branches
+        .iter()
+        .filter(|branch| branch.as_str() != app.branch_name)
+        .take(6)
+        .cloned()
+        .collect();
+    let has_choices = !branches.is_empty();
+    let arrow = if app.git_status.branch_dropdown_open {
+        " ▴"
+    } else {
+        " ▾"
+    };
+    let branch_prefix = format!("{}: ", t(Msg::Branch));
+    let branch_prefix_width = branch_prefix.width();
+    let mut spans = vec![
         RowSpan::styled(
-            format!("{}: ", t(Msg::Branch)),
+            branch_prefix,
             Style::default()
                 .fg(theme.fg_primary)
                 .add_modifier(Modifier::BOLD),
@@ -1064,38 +1087,42 @@ fn push_branch_selector(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: 
                 .add_modifier(Modifier::BOLD),
         ),
     ];
-    rows.push(Row::new(spans));
-
-    let branches: Vec<String> = app
-        .git_status
-        .branches
-        .iter()
-        .filter(|branch| branch.as_str() != app.branch_name)
-        .take(6)
-        .cloned()
-        .collect();
-    if !branches.is_empty() {
-        let mut line = Vec::new();
-        line.push(RowSpan::styled(
-            "  ",
-            Style::default().fg(theme.fg_secondary),
+    if has_choices {
+        spans.push(RowSpan::styled(
+            arrow,
+            Style::default()
+                .fg(theme.fg_secondary)
+                .add_modifier(Modifier::BOLD),
         ));
+    }
+    let row = Row::new(spans);
+    rows.push(if has_choices {
+        row.on_click("git.toggleBranchDropdown", Value::Null)
+    } else {
+        row
+    });
+
+    if app.git_status.branch_dropdown_open && !branches.is_empty() {
         for branch in branches {
             let mut label = branch.clone();
-            truncate_in_place(&mut label, max_path.saturating_sub(4));
-            line.push(
-                RowSpan::styled(
-                    format!(" {} ", label),
-                    Style::default().fg(Color::Black).bg(theme.accent),
-                )
+            truncate_in_place(&mut label, max_path.saturating_sub(2).max(1));
+            rows.push(
+                Row::new(vec![
+                    RowSpan::plain(" ".repeat(branch_prefix_width)),
+                    RowSpan::styled("› ", Style::default().fg(theme.fg_secondary)),
+                    RowSpan::styled(
+                        label,
+                        Style::default()
+                            .fg(theme.fg_primary)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ])
                 .on_click(
                     "git.checkoutBranch",
                     serde_json::json!({ "branch": branch }),
                 ),
             );
-            line.push(RowSpan::plain(" "));
         }
-        rows.push(Row::new(line));
     }
     rows.push(Row::blank());
 }
@@ -1692,26 +1719,42 @@ fn push_commit_box(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Them
     } else {
         (theme.chrome_fg, theme.chrome_muted_fg)
     };
-    rows.push(
-        Row::new(vec![
-            RowSpan::plain("  "),
-            RowSpan {
-                text: t(Msg::CommitButton).to_string(),
-                style: Style::default()
-                    .fg(btn_fg)
-                    .bg(btn_bg)
-                    .add_modifier(Modifier::BOLD),
-                click: Some(("git.commitSubmit".into(), Value::Null)),
-                dbl: None,
-            },
-            RowSpan::plain("  "),
+    let mut action_spans = vec![
+        RowSpan::plain("  "),
+        RowSpan {
+            text: t(Msg::CommitButton).to_string(),
+            style: Style::default()
+                .fg(btn_fg)
+                .bg(btn_bg)
+                .add_modifier(Modifier::BOLD),
+            click: Some(("git.commitSubmit".into(), Value::Null)),
+            dbl: None,
+        },
+    ];
+
+    if !app.pull_in_flight
+        && let Some((_, behind)) = app.git_status.ahead_behind
+    {
+        action_spans.push(RowSpan::plain("  "));
+        action_spans.push(
             RowSpan::styled(
-                t(Msg::CommitHint).to_string(),
-                Style::default().fg(theme.fg_secondary),
-            ),
-        ])
-        .on_click("git.commitSubmit", Value::Null),
-    );
+                crate::i18n::pull_button(behind),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .on_click("git.pull", Value::Null),
+        );
+    }
+
+    action_spans.push(RowSpan::plain("  "));
+    action_spans.push(RowSpan::styled(
+        t(Msg::CommitHint).to_string(),
+        Style::default().fg(theme.fg_secondary),
+    ));
+
+    rows.push(Row::new(action_spans).on_click("git.commitSubmit", Value::Null));
 }
 
 /// Split `s` into `(first n chars, rest)` in char units so truncation
@@ -1768,16 +1811,7 @@ fn push_indicator_row(ahead: usize, behind: usize) -> Option<Row> {
                 dbl: None,
             },
         ])),
-        (0, b) => Some(Row::new(vec![
-            RowSpan::styled(
-                crate::i18n::pull_button(b),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .on_click("git.pull", Value::Null),
-        ])),
+        (0, _) => None,
         (a, b) => Some(Row::new(vec![
             RowSpan::plain("  "),
             RowSpan {

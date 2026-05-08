@@ -128,6 +128,71 @@ fn snapshot_with_staged_and_unstaged() {
 }
 
 #[test]
+fn pull_button_stays_visible_when_dirty_or_synced() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "tracked.txt", "v1\n", "init");
+    write_file(&raw, "tracked.txt", "v2\n");
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    app.set_active_tab(reef::app::Tab::Git);
+    app.refresh_status();
+    wait_for_git_status(&mut app);
+
+    app.git_status.ahead_behind = Some((0, 0));
+    let synced_output = render_app(&mut app, 80, 20);
+    assert!(
+        synced_output
+            .lines()
+            .any(|line| line.contains("Commit") && line.contains("↓ Pull")),
+        "pull button should share the commit action row even before a fetch discovers remote commits"
+    );
+
+    app.git_status.ahead_behind = Some((0, 1));
+    let dirty_behind_output = render_app(&mut app, 80, 20);
+    assert!(
+        dirty_behind_output
+            .lines()
+            .any(|line| line.contains("Commit") && line.contains("↓ Pull")),
+        "pull button should not disappear from the commit action row just because the worktree is dirty"
+    );
+}
+
+#[test]
+fn branch_selector_renders_as_dropdown() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "tracked.txt", "v1\n", "init");
+    let head = raw.head().unwrap().peel_to_commit().unwrap();
+    raw.branch("feature", &head, false).unwrap();
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    app.set_active_tab(reef::app::Tab::Git);
+    app.refresh_status();
+    wait_for_git_status(&mut app);
+
+    let closed = render_app(&mut app, 80, 20);
+    assert!(closed.contains("Branch: master ▾"));
+    assert!(!closed.lines().any(|line| line.contains("› feature")));
+
+    app.git_status.branch_dropdown_open = true;
+    let open = render_app(&mut app, 80, 20);
+    assert!(open.contains("Branch: master ▴"));
+    assert!(
+        open.lines()
+            .any(|line| line.contains("› ") && line.contains("feature"))
+    );
+}
+
+#[test]
 fn snapshot_place_mode_renders_banner_and_border() {
     // Lock in the VSCode-style drag-and-drop picker visuals: double-line
     // accent border + top banner + dimmed file rows vs. accent folder rows.

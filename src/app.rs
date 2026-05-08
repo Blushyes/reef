@@ -272,6 +272,7 @@ pub struct GitStatusState {
     pub scroll: usize,
     pub ahead_behind: Option<(usize, usize)>,
     pub branches: Vec<String>,
+    pub branch_dropdown_open: bool,
 
     // ─── Commit input (VSCode-style "Source Control" message box) ───
     /// Draft commit message buffer. Freeform UTF-8 — newlines are

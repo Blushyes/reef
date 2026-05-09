@@ -7,7 +7,7 @@
 //! …) which keeps host side state coherent.
 
 use crate::app::{App, DiscardTarget, GitKeyboardFocus, Panel, PushOperation, SelectedFile, Tab};
-use crate::backend::{normalize_repo_root_rel, repo_key};
+use crate::backend::{WorkspaceRepoMeta, normalize_repo_root_rel, repo_key};
 use crate::git::tree::{self as gtree, Node};
 use crate::git::{FileEntry, FileStatus};
 use crate::i18n::{Msg, t};
@@ -1357,15 +1357,23 @@ fn push_repo_selector(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &T
         .git_status
         .repo_selector_idx
         .min(app.repo_catalog.repos.len().saturating_sub(1));
-    let selected_label = app
+    let mut selected_label = app
         .repo_catalog
         .selected_git_repo
         .as_ref()
-        .map(|repo| repo_key(repo))
+        .map(|selected| {
+            app.repo_catalog
+                .repos
+                .iter()
+                .find(|repo| repo.repo_root_rel == *selected)
+                .map(repo_display_label)
+                .unwrap_or_else(|| repo_key(selected))
+        })
         .unwrap_or_else(|| t(Msg::RepoSelectPrompt).to_string());
     let repo_open =
         app.git_status.repo_selector_open || app.repo_catalog.selected_git_repo.is_none();
     let arrow = if repo_open { " ▴" } else { " ▾" };
+    truncate_in_place(&mut selected_label, max_path.saturating_sub(arrow.width()));
     let repo_prefix = format!("{}: ", t(Msg::Repository));
     let repo_prefix_width = repo_prefix.width();
     rows.push(
@@ -1417,7 +1425,7 @@ fn push_repo_selector(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &T
         let keyboard_selected = repo_focused && idx == keyboard_idx;
         let bg = keyboard_selected.then_some(theme.selection_bg);
         let marker = if selected { "* " } else { "  " };
-        let mut label = key.clone();
+        let mut label = repo_display_label(repo);
         truncate_in_place(&mut label, max_path.saturating_sub(2));
         let color = if selected {
             theme.fg_primary
@@ -1445,6 +1453,14 @@ fn push_repo_selector(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &T
     }
 
     rows.push(Row::blank());
+}
+
+fn repo_display_label(repo: &WorkspaceRepoMeta) -> String {
+    if repo.repo_root_rel == Path::new(".") {
+        "Workspace".to_string()
+    } else {
+        repo_key(&repo.repo_root_rel)
+    }
 }
 
 fn push_branch_selector(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Theme) {

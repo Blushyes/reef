@@ -534,6 +534,9 @@ pub struct TaskCoordinator {
     /// clicked. Both threads can hit the `LocalBackend` preview cache
     /// safely via the internal `Mutex`.
     preview_tx: mpsc::Sender<FilesTask>,
+    /// Separate fire-and-forget prefetch lane. A neighbor prefetch can be
+    /// slow, but it must never sit in front of the user's real preview load.
+    prefetch_tx: mpsc::Sender<FilesTask>,
     git_tx: mpsc::Sender<GitTask>,
     graph_tx: mpsc::Sender<GraphTask>,
     global_search_tx: mpsc::Sender<GlobalSearchTask>,
@@ -546,6 +549,7 @@ impl TaskCoordinator {
         Self {
             files_tx: spawn_files_worker(result_tx.clone()),
             preview_tx: spawn_preview_worker(result_tx.clone()),
+            prefetch_tx: spawn_preview_prefetch_worker(),
             git_tx: spawn_git_worker(result_tx.clone()),
             graph_tx: spawn_graph_worker(result_tx.clone()),
             global_search_tx: spawn_global_search_worker(result_tx),
@@ -606,7 +610,7 @@ impl TaskCoordinator {
         dark: bool,
         wants_decoded_image: bool,
     ) {
-        let _ = self.preview_tx.send(FilesTask::PrefetchPreview {
+        let _ = self.prefetch_tx.send(FilesTask::PrefetchPreview {
             backend,
             rel_path,
             dark,
@@ -1592,6 +1596,28 @@ fn spawn_preview_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<F
                         });
                     }
                     _ => {}
+                }
+            }
+        });
+    tx
+}
+
+fn spawn_preview_prefetch_worker() -> mpsc::Sender<FilesTask> {
+    let (tx, rx) = mpsc::channel();
+    let _ = thread::Builder::new()
+        .name("reef-preview-prefetch-worker".into())
+        .spawn(move || {
+            while let Ok(task) = rx.recv() {
+                if let FilesTask::PrefetchPreview {
+                    backend,
+                    rel_path,
+                    dark,
+                    wants_decoded_image,
+                } = task
+                {
+                    let _ = run_preview_with_panic_guard(&rel_path, || {
+                        backend.load_preview(&rel_path, dark, wants_decoded_image)
+                    });
                 }
             }
         });
@@ -3082,5 +3108,566 @@ mod preview_panic_guard_tests {
         let result = run_preview_with_panic_guard(Path::new("x.txt"), move || Some(preview));
         let got = result.expect("Ok").expect("Some");
         assert_eq!(got.file_path, "x.txt");
+    }
+}
+
+#[cfg(test)]
+mod preview_priority_tests {
+    use super::*;
+    use crate::backend::{
+        Backend, BackendError, ContentSearchCompleted, ContentSearchRequest, EditorLaunchSpec,
+        RepoDiscoverOpts, RepoDiscoverResponse, SearchChunkSink, StatusSnapshot, TrashOutcome,
+        WalkOpts, WalkResponse,
+    };
+    use crate::git::{
+        CommitDetail, CommitInfo, DiffContent, FileEntry, RefLabel, StashDetail, StashEntry,
+        StashPushOptions,
+    };
+    use std::collections::{HashMap, HashSet};
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, mpsc};
+    use std::time::{Duration, Instant};
+
+    struct BlockingPreviewBackend {
+        prefetch_started_tx: Mutex<Option<mpsc::Sender<()>>>,
+        prefetch_release_rx: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl BlockingPreviewBackend {
+        fn new(started_tx: mpsc::Sender<()>, release_rx: mpsc::Receiver<()>) -> Self {
+            Self {
+                prefetch_started_tx: Mutex::new(Some(started_tx)),
+                prefetch_release_rx: Mutex::new(release_rx),
+            }
+        }
+    }
+
+    fn text_preview(path: &Path) -> PreviewContent {
+        PreviewContent {
+            file_path: path.to_string_lossy().to_string(),
+            body: crate::file_tree::PreviewBody::Text {
+                lines: vec!["ok".into()],
+                highlighted: None,
+            },
+        }
+    }
+
+    macro_rules! unused_backend_method {
+        ($name:literal) => {
+            panic!("unused backend method in preview priority test: {}", $name)
+        };
+    }
+
+    impl Backend for BlockingPreviewBackend {
+        fn workdir_path(&self) -> PathBuf {
+            PathBuf::new()
+        }
+
+        fn workdir_name(&self) -> String {
+            "test".into()
+        }
+
+        fn branch_name(&self) -> String {
+            "main".into()
+        }
+
+        fn has_repo(&self) -> bool {
+            false
+        }
+
+        fn discover_repos(
+            &self,
+            _opts: &RepoDiscoverOpts,
+        ) -> Result<RepoDiscoverResponse, BackendError> {
+            unused_backend_method!("discover_repos")
+        }
+
+        fn build_file_tree(
+            &self,
+            _expanded: &HashSet<PathBuf>,
+            _git_statuses: &HashMap<String, char>,
+        ) -> Result<Vec<crate::file_tree::TreeEntry>, String> {
+            unused_backend_method!("build_file_tree")
+        }
+
+        fn load_preview(
+            &self,
+            rel_path: &Path,
+            _dark: bool,
+            _wants_decoded_image: bool,
+        ) -> Option<PreviewContent> {
+            if rel_path == Path::new("slow.prefetch") {
+                if let Some(tx) = self.prefetch_started_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                let _ = self.prefetch_release_rx.lock().unwrap().recv();
+            }
+            Some(text_preview(rel_path))
+        }
+
+        fn read_file(&self, _rel_path: &Path, _max_bytes: u64) -> Result<Vec<u8>, BackendError> {
+            unused_backend_method!("read_file")
+        }
+
+        fn file_size(&self, _rel_path: &Path) -> Result<u64, BackendError> {
+            unused_backend_method!("file_size")
+        }
+
+        fn db_load_page(
+            &self,
+            _rel_path: &Path,
+            _table: &str,
+            _offset: u64,
+            _limit: u32,
+        ) -> Result<reef_sqlite_preview::DbPage, BackendError> {
+            unused_backend_method!("db_load_page")
+        }
+
+        fn git_status(&self) -> Result<StatusSnapshot, BackendError> {
+            unused_backend_method!("git_status")
+        }
+
+        fn git_status_for(&self, _repo_root_rel: &Path) -> Result<StatusSnapshot, BackendError> {
+            unused_backend_method!("git_status_for")
+        }
+
+        fn staged_diff(
+            &self,
+            _path: &str,
+            _context_lines: u32,
+        ) -> Result<Option<DiffContent>, BackendError> {
+            unused_backend_method!("staged_diff")
+        }
+
+        fn staged_diff_for(
+            &self,
+            _repo_root_rel: &Path,
+            _path: &str,
+            _context_lines: u32,
+        ) -> Result<Option<DiffContent>, BackendError> {
+            unused_backend_method!("staged_diff_for")
+        }
+
+        fn unstaged_diff(
+            &self,
+            _path: &str,
+            _context_lines: u32,
+        ) -> Result<Option<DiffContent>, BackendError> {
+            unused_backend_method!("unstaged_diff")
+        }
+
+        fn unstaged_diff_for(
+            &self,
+            _repo_root_rel: &Path,
+            _path: &str,
+            _context_lines: u32,
+        ) -> Result<Option<DiffContent>, BackendError> {
+            unused_backend_method!("unstaged_diff_for")
+        }
+
+        fn untracked_diff(&self, _path: &str) -> Result<Option<DiffContent>, BackendError> {
+            unused_backend_method!("untracked_diff")
+        }
+
+        fn untracked_diff_for(
+            &self,
+            _repo_root_rel: &Path,
+            _path: &str,
+        ) -> Result<Option<DiffContent>, BackendError> {
+            unused_backend_method!("untracked_diff_for")
+        }
+
+        fn stage(&self, _path: &str) -> Result<(), BackendError> {
+            unused_backend_method!("stage")
+        }
+
+        fn stage_for(&self, _repo_root_rel: &Path, _path: &str) -> Result<(), BackendError> {
+            unused_backend_method!("stage_for")
+        }
+
+        fn unstage(&self, _path: &str) -> Result<(), BackendError> {
+            unused_backend_method!("unstage")
+        }
+
+        fn unstage_for(&self, _repo_root_rel: &Path, _path: &str) -> Result<(), BackendError> {
+            unused_backend_method!("unstage_for")
+        }
+
+        fn restore(&self, _path: &str) -> Result<(), BackendError> {
+            unused_backend_method!("restore")
+        }
+
+        fn revert_path(&self, _path: &str, _is_staged: bool) -> Result<(), BackendError> {
+            unused_backend_method!("revert_path")
+        }
+
+        fn revert_path_for(
+            &self,
+            _repo_root_rel: &Path,
+            _path: &str,
+            _is_staged: bool,
+        ) -> Result<(), BackendError> {
+            unused_backend_method!("revert_path_for")
+        }
+
+        fn push(&self, _force: bool) -> Result<(), BackendError> {
+            unused_backend_method!("push")
+        }
+
+        fn push_for(&self, _repo_root_rel: &Path, _force: bool) -> Result<(), BackendError> {
+            unused_backend_method!("push_for")
+        }
+
+        fn publish_branch(&self) -> Result<(), BackendError> {
+            unused_backend_method!("publish_branch")
+        }
+
+        fn publish_branch_for(&self, _repo_root_rel: &Path) -> Result<(), BackendError> {
+            unused_backend_method!("publish_branch_for")
+        }
+
+        fn pull(&self) -> Result<(), BackendError> {
+            unused_backend_method!("pull")
+        }
+
+        fn pull_for(&self, _repo_root_rel: &Path) -> Result<(), BackendError> {
+            unused_backend_method!("pull_for")
+        }
+
+        fn checkout_branch(&self, _branch: &str) -> Result<(), BackendError> {
+            unused_backend_method!("checkout_branch")
+        }
+
+        fn checkout_branch_for(
+            &self,
+            _repo_root_rel: &Path,
+            _branch: &str,
+        ) -> Result<(), BackendError> {
+            unused_backend_method!("checkout_branch_for")
+        }
+
+        fn create_branch(&self, _branch: &str, _base: Option<&str>) -> Result<(), BackendError> {
+            unused_backend_method!("create_branch")
+        }
+
+        fn create_branch_for(
+            &self,
+            _repo_root_rel: &Path,
+            _branch: &str,
+            _base: Option<&str>,
+        ) -> Result<(), BackendError> {
+            unused_backend_method!("create_branch_for")
+        }
+
+        fn list_stashes(&self) -> Result<Vec<StashEntry>, BackendError> {
+            unused_backend_method!("list_stashes")
+        }
+
+        fn list_stashes_for(&self, _repo_root_rel: &Path) -> Result<Vec<StashEntry>, BackendError> {
+            unused_backend_method!("list_stashes_for")
+        }
+
+        fn stash_detail(&self, _stash_ref: &str) -> Result<StashDetail, BackendError> {
+            unused_backend_method!("stash_detail")
+        }
+
+        fn stash_detail_for(
+            &self,
+            _repo_root_rel: &Path,
+            _stash_ref: &str,
+        ) -> Result<StashDetail, BackendError> {
+            unused_backend_method!("stash_detail_for")
+        }
+
+        fn stash_push(&self, _options: &StashPushOptions) -> Result<(), BackendError> {
+            unused_backend_method!("stash_push")
+        }
+
+        fn stash_push_for(
+            &self,
+            _repo_root_rel: &Path,
+            _options: &StashPushOptions,
+        ) -> Result<(), BackendError> {
+            unused_backend_method!("stash_push_for")
+        }
+
+        fn stash_apply(
+            &self,
+            _stash_ref: &str,
+            _reinstate_index: bool,
+        ) -> Result<(), BackendError> {
+            unused_backend_method!("stash_apply")
+        }
+
+        fn stash_apply_for(
+            &self,
+            _repo_root_rel: &Path,
+            _stash_ref: &str,
+            _reinstate_index: bool,
+        ) -> Result<(), BackendError> {
+            unused_backend_method!("stash_apply_for")
+        }
+
+        fn stash_pop(&self, _stash_ref: &str, _reinstate_index: bool) -> Result<(), BackendError> {
+            unused_backend_method!("stash_pop")
+        }
+
+        fn stash_pop_for(
+            &self,
+            _repo_root_rel: &Path,
+            _stash_ref: &str,
+            _reinstate_index: bool,
+        ) -> Result<(), BackendError> {
+            unused_backend_method!("stash_pop_for")
+        }
+
+        fn stash_drop(&self, _stash_ref: &str) -> Result<(), BackendError> {
+            unused_backend_method!("stash_drop")
+        }
+
+        fn stash_drop_for(
+            &self,
+            _repo_root_rel: &Path,
+            _stash_ref: &str,
+        ) -> Result<(), BackendError> {
+            unused_backend_method!("stash_drop_for")
+        }
+
+        fn stash_branch(&self, _stash_ref: &str, _branch: &str) -> Result<(), BackendError> {
+            unused_backend_method!("stash_branch")
+        }
+
+        fn stash_branch_for(
+            &self,
+            _repo_root_rel: &Path,
+            _stash_ref: &str,
+            _branch: &str,
+        ) -> Result<(), BackendError> {
+            unused_backend_method!("stash_branch_for")
+        }
+
+        fn commit(&self, _message: &str) -> Result<(), BackendError> {
+            unused_backend_method!("commit")
+        }
+
+        fn commit_for(&self, _repo_root_rel: &Path, _message: &str) -> Result<(), BackendError> {
+            unused_backend_method!("commit_for")
+        }
+
+        fn list_commits(&self, _limit: usize) -> Result<Vec<CommitInfo>, BackendError> {
+            unused_backend_method!("list_commits")
+        }
+
+        fn list_commits_for(
+            &self,
+            _repo_root_rel: &Path,
+            _limit: usize,
+        ) -> Result<Vec<CommitInfo>, BackendError> {
+            unused_backend_method!("list_commits_for")
+        }
+
+        fn list_refs(&self) -> Result<HashMap<String, Vec<RefLabel>>, BackendError> {
+            unused_backend_method!("list_refs")
+        }
+
+        fn list_refs_for(
+            &self,
+            _repo_root_rel: &Path,
+        ) -> Result<HashMap<String, Vec<RefLabel>>, BackendError> {
+            unused_backend_method!("list_refs_for")
+        }
+
+        fn head_oid(&self) -> Result<Option<String>, BackendError> {
+            unused_backend_method!("head_oid")
+        }
+
+        fn head_oid_for(&self, _repo_root_rel: &Path) -> Result<Option<String>, BackendError> {
+            unused_backend_method!("head_oid_for")
+        }
+
+        fn commit_detail(&self, _oid: &str) -> Result<Option<CommitDetail>, BackendError> {
+            unused_backend_method!("commit_detail")
+        }
+
+        fn commit_detail_for(
+            &self,
+            _repo_root_rel: &Path,
+            _oid: &str,
+        ) -> Result<Option<CommitDetail>, BackendError> {
+            unused_backend_method!("commit_detail_for")
+        }
+
+        fn commit_file_diff(
+            &self,
+            _oid: &str,
+            _path: &str,
+            _context_lines: u32,
+        ) -> Result<Option<DiffContent>, BackendError> {
+            unused_backend_method!("commit_file_diff")
+        }
+
+        fn commit_file_diff_for(
+            &self,
+            _repo_root_rel: &Path,
+            _oid: &str,
+            _path: &str,
+            _context_lines: u32,
+        ) -> Result<Option<DiffContent>, BackendError> {
+            unused_backend_method!("commit_file_diff_for")
+        }
+
+        fn range_files(
+            &self,
+            _oldest_oid: &str,
+            _newest_oid: &str,
+        ) -> Result<Vec<FileEntry>, BackendError> {
+            unused_backend_method!("range_files")
+        }
+
+        fn range_files_for(
+            &self,
+            _repo_root_rel: &Path,
+            _oldest_oid: &str,
+            _newest_oid: &str,
+        ) -> Result<Vec<FileEntry>, BackendError> {
+            unused_backend_method!("range_files_for")
+        }
+
+        fn range_file_diff(
+            &self,
+            _oldest_oid: &str,
+            _newest_oid: &str,
+            _path: &str,
+            _context_lines: u32,
+        ) -> Result<Option<DiffContent>, BackendError> {
+            unused_backend_method!("range_file_diff")
+        }
+
+        fn range_file_diff_for(
+            &self,
+            _repo_root_rel: &Path,
+            _oldest_oid: &str,
+            _newest_oid: &str,
+            _path: &str,
+            _context_lines: u32,
+        ) -> Result<Option<DiffContent>, BackendError> {
+            unused_backend_method!("range_file_diff_for")
+        }
+
+        fn subscribe_fs_events(&self) -> mpsc::Receiver<()> {
+            unused_backend_method!("subscribe_fs_events")
+        }
+
+        fn launch_editor(&self, _rel_path: &Path) -> Result<(), BackendError> {
+            unused_backend_method!("launch_editor")
+        }
+
+        fn editor_launch_spec(&self, _rel_path: &Path) -> Result<EditorLaunchSpec, BackendError> {
+            Ok(EditorLaunchSpec {
+                program: OsString::new(),
+                args: Vec::new(),
+                inherit_tty: false,
+            })
+        }
+
+        fn create_file(&self, _rel_path: &Path) -> Result<(), BackendError> {
+            unused_backend_method!("create_file")
+        }
+
+        fn create_dir_all(&self, _rel_path: &Path) -> Result<(), BackendError> {
+            unused_backend_method!("create_dir_all")
+        }
+
+        fn rename(&self, _from_rel: &Path, _to_rel: &Path) -> Result<(), BackendError> {
+            unused_backend_method!("rename")
+        }
+
+        fn copy_file(&self, _from_rel: &Path, _to_rel: &Path) -> Result<(), BackendError> {
+            unused_backend_method!("copy_file")
+        }
+
+        fn copy_dir_recursive(&self, _from_rel: &Path, _to_rel: &Path) -> Result<(), BackendError> {
+            unused_backend_method!("copy_dir_recursive")
+        }
+
+        fn upload_from_local(
+            &self,
+            _local_src: &Path,
+            _remote_dst_rel: &Path,
+        ) -> Result<(), BackendError> {
+            unused_backend_method!("upload_from_local")
+        }
+
+        fn remove_file(&self, _rel_path: &Path) -> Result<(), BackendError> {
+            unused_backend_method!("remove_file")
+        }
+
+        fn remove_dir_all(&self, _rel_path: &Path) -> Result<(), BackendError> {
+            unused_backend_method!("remove_dir_all")
+        }
+
+        fn write_file(&self, _rel_path: &Path, _content: &[u8]) -> Result<(), BackendError> {
+            unused_backend_method!("write_file")
+        }
+
+        fn trash(&self, _rel_paths: &[PathBuf]) -> Result<TrashOutcome, BackendError> {
+            unused_backend_method!("trash")
+        }
+
+        fn hard_delete(&self, _rel_paths: &[PathBuf]) -> Result<(), BackendError> {
+            unused_backend_method!("hard_delete")
+        }
+
+        fn walk_repo_paths(&self, _opts: &WalkOpts) -> Result<WalkResponse, BackendError> {
+            unused_backend_method!("walk_repo_paths")
+        }
+
+        fn search_content(
+            &self,
+            _request: &ContentSearchRequest,
+            _on_chunk: &mut SearchChunkSink<'_>,
+        ) -> Result<ContentSearchCompleted, BackendError> {
+            Ok(ContentSearchCompleted { truncated: false })
+        }
+    }
+
+    #[test]
+    fn load_preview_is_not_blocked_by_in_flight_prefetch() {
+        let tasks = TaskCoordinator::new();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let backend = Arc::new(BlockingPreviewBackend::new(started_tx, release_rx));
+
+        tasks.prefetch_preview(
+            backend.clone(),
+            PathBuf::from("slow.prefetch"),
+            false,
+            false,
+        );
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("prefetch should start before the real preview is queued");
+
+        tasks.load_preview(42, backend, PathBuf::from("fast.txt"), false, false);
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let mut got_preview = false;
+        while Instant::now() < deadline {
+            if let Ok(WorkerResult::Preview { generation, result }) = tasks.try_recv() {
+                assert_eq!(generation, 42);
+                let content = result.expect("panic guard ok").expect("preview content");
+                assert_eq!(content.file_path, "fast.txt");
+                got_preview = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let _ = release_tx.send(());
+        assert!(
+            got_preview,
+            "real LoadPreview should not wait for an already-running prefetch"
+        );
     }
 }

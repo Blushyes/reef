@@ -783,6 +783,9 @@ fn git_keyboard_focus_reaches_branch_and_commit_actions() {
     });
 
     input::handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &mut app);
+    assert_eq!(app.git_status.keyboard_focus, GitKeyboardFocus::StashHeader);
+
+    input::handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &mut app);
     assert_eq!(app.git_status.keyboard_focus, GitKeyboardFocus::StashButton);
 
     input::handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &mut app);
@@ -848,6 +851,19 @@ fn app_stashes_and_applies_selected_repo_changes() {
     );
     wait_for_git_status(&mut app);
 
+    assert!(app.git_status.pending_stash_action.is_some());
+    assert_eq!(app.git_status.stashes.len(), 0);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("only/a.txt")).unwrap(),
+        "changed\n"
+    );
+
+    input::handle_key(
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        &mut app,
+    );
+    wait_for_git_status(&mut app);
+
     assert_eq!(app.git_status.stashes.len(), 1);
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("only/a.txt")).unwrap(),
@@ -856,6 +872,15 @@ fn app_stashes_and_applies_selected_repo_changes() {
 
     app.git_status.keyboard_focus = GitKeyboardFocus::Files;
     input::handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &mut app);
+    assert_eq!(app.git_status.keyboard_focus, GitKeyboardFocus::StashHeader);
+    input::handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+    assert!(app.git_status.stash_section_open);
+    input::handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app);
+    assert_eq!(
+        app.git_status.keyboard_focus,
+        GitKeyboardFocus::StashAllButton
+    );
+    input::handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app);
     assert_eq!(app.git_status.keyboard_focus, GitKeyboardFocus::Stashes);
     input::handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
     wait_for_git_status(&mut app);
@@ -863,5 +888,81 @@ fn app_stashes_and_applies_selected_repo_changes() {
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("only/a.txt")).unwrap(),
         "changed\n"
+    );
+}
+
+#[test]
+fn git_keyboard_selects_stash_modes() {
+    let _lock = APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let _home = HomeGuard::enter(tmp.path());
+    init_repo(&tmp.path().join("only"));
+    configure_identity(&tmp.path().join("only"));
+    write_file(&tmp.path().join("only/a.txt"), "a base\n");
+    write_file(&tmp.path().join("only/b.txt"), "b base\n");
+    commit_all(&tmp.path().join("only"), "base commit");
+    write_file(&tmp.path().join("only/a.txt"), "a changed\n");
+    write_file(&tmp.path().join("only/b.txt"), "b changed\n");
+
+    let mut app = app_for(tmp.path());
+    app.set_active_tab(Tab::Git);
+    wait_for_repo_catalog(&mut app);
+    wait_for_git_status(&mut app);
+    app.selected_file = Some(SelectedFile {
+        path: "a.txt".to_string(),
+        is_staged: false,
+    });
+    app.git_status.keyboard_focus = GitKeyboardFocus::Files;
+
+    input::handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &mut app);
+    assert_eq!(app.git_status.keyboard_focus, GitKeyboardFocus::StashHeader);
+    input::handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+    assert!(app.git_status.stash_section_open);
+    input::handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app);
+    assert_eq!(
+        app.git_status.keyboard_focus,
+        GitKeyboardFocus::StashAllButton
+    );
+    for _ in 0..4 {
+        input::handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &mut app);
+    }
+    assert_eq!(
+        app.git_status.keyboard_focus,
+        GitKeyboardFocus::StashSelectedButton
+    );
+    input::handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &mut app);
+    assert_eq!(
+        app.git_status.keyboard_focus,
+        GitKeyboardFocus::StashStagedButton
+    );
+    input::handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &mut app);
+    assert_eq!(
+        app.git_status.keyboard_focus,
+        GitKeyboardFocus::StashSelectedButton
+    );
+    input::handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+    wait_for_git_status(&mut app);
+
+    assert!(app.git_status.pending_stash_action.is_some());
+    assert_eq!(app.git_status.stashes.len(), 0);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("only/a.txt")).unwrap(),
+        "a changed\n"
+    );
+
+    input::handle_key(
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        &mut app,
+    );
+    wait_for_git_status(&mut app);
+
+    assert_eq!(app.git_status.stashes.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("only/a.txt")).unwrap(),
+        "a base\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("only/b.txt")).unwrap(),
+        "b changed\n"
     );
 }

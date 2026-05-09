@@ -269,6 +269,7 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
                     app.git_status.repo_selector_idx = idx;
                 }
                 app.repo_catalog.selected_git_repo = Some(repo_root_rel.clone());
+                app.git_status.repo_selector_open = false;
                 crate::prefs::set("status.selected_repo", &repo_key(&repo_root_rel));
                 app.selected_file = None;
                 app.diff_content = None;
@@ -290,6 +291,14 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
                 app.commit_detail.file_diff = None;
                 app.refresh_status();
                 app.graph_load.invalidate_stale();
+            }
+            true
+        }
+        "git.toggleRepoSelector" => {
+            app.git_status.keyboard_focus = GitKeyboardFocus::Repository;
+            app.git_status.repo_selector_open = !app.git_status.repo_selector_open;
+            if let Some(idx) = app.selected_repo_idx() {
+                app.git_status.repo_selector_idx = idx;
             }
             true
         }
@@ -572,75 +581,116 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             app.git_status.stash_error = None;
             true
         }
+        "git.toggleStashes" => {
+            app.git_status.keyboard_focus = GitKeyboardFocus::StashHeader;
+            app.git_status.stash_section_open = !app.git_status.stash_section_open;
+            true
+        }
         "git.stashPush" => {
             if !can_perform_git_writes(app) {
                 return true;
             }
             app.git_status.keyboard_focus = GitKeyboardFocus::StashButton;
-            app.stash_current_changes(crate::git::StashPushOptions {
-                message: app.default_stash_message(),
-                include_untracked: true,
-                keep_index: false,
-                staged_only: false,
-                paths: Vec::new(),
-            });
+            app.prepare_stash_push(
+                crate::git::StashPushOptions {
+                    message: app.default_stash_message(),
+                    include_untracked: true,
+                    keep_index: false,
+                    staged_only: false,
+                    paths: Vec::new(),
+                },
+                "all",
+            );
+            true
+        }
+        "git.stashPushAll" => {
+            if !can_perform_git_writes(app) {
+                return true;
+            }
+            app.git_status.keyboard_focus = GitKeyboardFocus::StashAllButton;
+            app.prepare_stash_push(
+                crate::git::StashPushOptions {
+                    message: app.default_stash_message(),
+                    include_untracked: true,
+                    keep_index: false,
+                    staged_only: false,
+                    paths: Vec::new(),
+                },
+                "all",
+            );
             true
         }
         "git.stashPushTracked" => {
             if !can_perform_git_writes(app) {
                 return true;
             }
-            app.stash_current_changes(crate::git::StashPushOptions {
-                message: app.default_stash_message(),
-                include_untracked: false,
-                keep_index: false,
-                staged_only: false,
-                paths: Vec::new(),
-            });
+            app.git_status.keyboard_focus = GitKeyboardFocus::StashTrackedButton;
+            app.prepare_stash_push(
+                crate::git::StashPushOptions {
+                    message: app.default_stash_message(),
+                    include_untracked: false,
+                    keep_index: false,
+                    staged_only: false,
+                    paths: Vec::new(),
+                },
+                "tracked",
+            );
             true
         }
         "git.stashPushKeepIndex" => {
             if !can_perform_git_writes(app) {
                 return true;
             }
-            app.stash_current_changes(crate::git::StashPushOptions {
-                message: app.default_stash_message(),
-                include_untracked: true,
-                keep_index: true,
-                staged_only: false,
-                paths: Vec::new(),
-            });
+            app.git_status.keyboard_focus = GitKeyboardFocus::StashKeepIndexButton;
+            app.prepare_stash_push(
+                crate::git::StashPushOptions {
+                    message: app.default_stash_message(),
+                    include_untracked: true,
+                    keep_index: true,
+                    staged_only: false,
+                    paths: Vec::new(),
+                },
+                "keep-index",
+            );
             true
         }
         "git.stashPushStaged" => {
             if !can_perform_git_writes(app) {
                 return true;
             }
-            app.stash_current_changes(crate::git::StashPushOptions {
-                message: app.default_stash_message(),
-                include_untracked: false,
-                keep_index: false,
-                staged_only: true,
-                paths: Vec::new(),
-            });
+            app.git_status.keyboard_focus = GitKeyboardFocus::StashStagedButton;
+            app.prepare_stash_push(
+                crate::git::StashPushOptions {
+                    message: app.default_stash_message(),
+                    include_untracked: false,
+                    keep_index: false,
+                    staged_only: true,
+                    paths: Vec::new(),
+                },
+                "staged",
+            );
             true
         }
         "git.stashPushSelected" => {
             if !can_perform_git_writes(app) {
                 return true;
             }
+            app.git_status.keyboard_focus = GitKeyboardFocus::StashSelectedButton;
             let paths = app
                 .selected_file
                 .as_ref()
                 .map(|sel| vec![sel.path.clone()])
                 .unwrap_or_default();
-            app.stash_current_changes(crate::git::StashPushOptions {
-                message: app.default_stash_message(),
-                include_untracked: true,
-                keep_index: false,
-                staged_only: false,
-                paths,
-            });
+            app.prepare_stash_push(
+                crate::git::StashPushOptions {
+                    message: app.default_stash_message(),
+                    include_untracked: true,
+                    keep_index: false,
+                    staged_only: false,
+                    paths,
+                },
+                "selected",
+            );
             true
         }
         "git.selectStash" => {
@@ -951,6 +1001,14 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
 
     if allow_git_writes && let Some(action) = status.pending_stash_action.as_ref() {
         let msg = match action {
+            crate::app::PendingStashAction::Push { label, options } => {
+                let scope = if options.paths.is_empty() {
+                    label.clone()
+                } else {
+                    format!("{} ({})", label, options.paths.join(", "))
+                };
+                format!("  Stash {scope} changes?")
+            }
             crate::app::PendingStashAction::Apply { stash_ref, .. } => {
                 format!("  Apply {stash_ref} over current changes?")
             }
@@ -1258,44 +1316,100 @@ fn can_perform_git_writes(app: &App) -> bool {
 }
 
 fn push_repo_selector(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Theme) {
-    rows.push(Row::new(vec![RowSpan::styled(
-        t(Msg::Repository),
-        Style::default()
-            .fg(theme.fg_primary)
-            .add_modifier(Modifier::BOLD),
-    )]));
-
     if app.repo_catalog.discover_load.loading {
-        rows.push(Row::new(vec![RowSpan::styled(
-            t(Msg::RepoScanning),
-            Style::default().fg(theme.fg_secondary),
-        )]));
+        rows.push(Row::new(vec![
+            RowSpan::styled(
+                format!("{}: ", t(Msg::Repository)),
+                Style::default()
+                    .fg(theme.fg_primary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            RowSpan::styled(
+                t(Msg::RepoScanning),
+                Style::default().fg(theme.fg_secondary),
+            ),
+        ]));
         rows.push(Row::blank());
         return;
     }
 
     if app.repo_catalog.repos.is_empty() {
-        rows.push(Row::new(vec![RowSpan::styled(
-            t(Msg::NoReposFound),
-            Style::default().fg(theme.fg_secondary),
-        )]));
+        rows.push(Row::new(vec![
+            RowSpan::styled(
+                format!("{}: ", t(Msg::Repository)),
+                Style::default()
+                    .fg(theme.fg_primary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            RowSpan::styled(
+                t(Msg::NoReposFound),
+                Style::default().fg(theme.fg_secondary),
+            ),
+        ]));
         rows.push(Row::blank());
         return;
     }
 
-    if app.repo_catalog.selected_git_repo.is_none() {
-        rows.push(Row::new(vec![RowSpan::styled(
-            t(Msg::RepoSelectPrompt),
-            Style::default().fg(Color::Yellow),
-        )]));
-    }
-
     let repo_focused = app.git_status.keyboard_focus == GitKeyboardFocus::Repository
         || app.repo_catalog.selected_git_repo.is_none();
+    let focus_bg = repo_focused.then_some(theme.selection_bg);
     let keyboard_idx = app
         .git_status
         .repo_selector_idx
         .min(app.repo_catalog.repos.len().saturating_sub(1));
+    let selected_label = app
+        .repo_catalog
+        .selected_git_repo
+        .as_ref()
+        .map(|repo| repo_key(repo))
+        .unwrap_or_else(|| t(Msg::RepoSelectPrompt).to_string());
+    let repo_open =
+        app.git_status.repo_selector_open || app.repo_catalog.selected_git_repo.is_none();
+    let arrow = if repo_open { " ▴" } else { " ▾" };
+    let repo_prefix = format!("{}: ", t(Msg::Repository));
+    let repo_prefix_width = repo_prefix.width();
+    rows.push(
+        Row::new(vec![
+            RowSpan::styled(
+                repo_prefix.clone(),
+                apply_bg(
+                    Style::default()
+                        .fg(theme.fg_primary)
+                        .add_modifier(Modifier::BOLD),
+                    focus_bg,
+                ),
+            ),
+            RowSpan::styled(
+                selected_label,
+                apply_bg(
+                    Style::default()
+                        .fg(if app.repo_catalog.selected_git_repo.is_some() {
+                            theme.accent
+                        } else {
+                            Color::Yellow
+                        })
+                        .add_modifier(Modifier::BOLD),
+                    focus_bg,
+                ),
+            ),
+            RowSpan::styled(
+                arrow,
+                apply_bg(
+                    Style::default()
+                        .fg(theme.fg_secondary)
+                        .add_modifier(Modifier::BOLD),
+                    focus_bg,
+                ),
+            ),
+        ])
+        .on_click("git.toggleRepoSelector", Value::Null),
+    );
+
+    if !repo_open {
+        rows.push(Row::blank());
+        return;
+    }
+
     for (idx, repo) in app.repo_catalog.repos.iter().enumerate() {
         let key = repo_key(&repo.repo_root_rel);
         let selected =
@@ -1312,6 +1426,10 @@ fn push_repo_selector(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &T
         };
         rows.push(
             Row::new(vec![
+                RowSpan::styled(
+                    " ".repeat(repo_prefix_width),
+                    apply_bg(Style::default(), bg),
+                ),
                 RowSpan::styled(marker, apply_bg(Style::default().fg(Color::Green), bg)),
                 RowSpan::styled(label, apply_bg(Style::default().fg(color), bg)),
             ])
@@ -1866,23 +1984,28 @@ fn section_header(
     width: u16,
     theme: &Theme,
 ) -> Row {
-    let arrow = if collapsed { "›" } else { "⌄" };
-    let prefix = format!("{} ", arrow);
-    let count_str = format!("  {}", count);
+    let arrow = if collapsed { " ▾" } else { " ▴" };
+    let prefix = format!("{}: ", label);
+    let count_str = format!("{}", count);
     let button_texts: Vec<String> = actions.iter().map(|a| format!(" {} ", a.label)).collect();
     let buttons_w: usize = button_texts.iter().map(|s| s.width()).sum();
-    let used = prefix.width() + label.width() + count_str.width() + buttons_w;
+    let used = prefix.width() + count_str.width() + arrow.width() + buttons_w;
     let padding = (width as usize).saturating_sub(used);
 
     let mut spans = vec![
-        RowSpan::styled(prefix, Style::default().fg(theme.fg_primary)),
         RowSpan::styled(
-            label.to_string(),
+            prefix,
             Style::default()
                 .fg(theme.fg_primary)
                 .add_modifier(Modifier::BOLD),
         ),
         RowSpan::styled(count_str, Style::default().fg(count_color)),
+        RowSpan::styled(
+            arrow,
+            Style::default()
+                .fg(theme.fg_secondary)
+                .add_modifier(Modifier::BOLD),
+        ),
     ];
     if padding > 0 {
         spans.push(RowSpan::plain(" ".repeat(padding)));
@@ -1902,29 +2025,92 @@ fn section_header(
 }
 
 fn push_stash_section(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Theme) {
+    let header_focused = app.git_status.keyboard_focus == GitKeyboardFocus::StashHeader;
+    let header_bg = header_focused.then_some(theme.selection_bg);
+    let arrow = if app.git_status.stash_section_open {
+        " ▴"
+    } else {
+        " ▾"
+    };
+    rows.push(
+        Row::new(vec![
+            RowSpan::styled(
+                "Stashes: ".to_string(),
+                apply_bg(
+                    Style::default()
+                        .fg(theme.fg_primary)
+                        .add_modifier(Modifier::BOLD),
+                    header_bg,
+                ),
+            ),
+            RowSpan::styled(
+                app.git_status.stashes.len().to_string(),
+                apply_bg(Style::default().fg(theme.fg_secondary), header_bg),
+            ),
+            RowSpan::styled(
+                arrow.to_string(),
+                apply_bg(
+                    Style::default()
+                        .fg(theme.fg_secondary)
+                        .add_modifier(Modifier::BOLD),
+                    header_bg,
+                ),
+            ),
+        ])
+        .on_click("git.toggleStashes", Value::Null),
+    );
+
+    if !app.git_status.stash_section_open {
+        rows.push(Row::blank());
+        return;
+    }
+
+    let stash_option =
+        |focus: GitKeyboardFocus, text: &str, fg: Color, bold: bool, command: &str| -> RowSpan {
+            let bg = (app.git_status.keyboard_focus == focus).then_some(theme.selection_bg);
+            let mut style = apply_bg(Style::default().fg(fg), bg);
+            if bold {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            RowSpan::styled(text.to_string(), style).on_click(command, Value::Null)
+        };
     rows.push(Row::new(vec![
-        RowSpan::styled(
-            "Stashes".to_string(),
-            Style::default()
-                .fg(theme.fg_primary)
-                .add_modifier(Modifier::BOLD),
-        ),
         RowSpan::plain("  "),
-        RowSpan::styled(
+        stash_option(
+            GitKeyboardFocus::StashAllButton,
             " all ",
-            Style::default()
-                .fg(Color::Blue)
-                .add_modifier(Modifier::BOLD),
-        )
-        .on_click("git.stashPush", Value::Null),
-        RowSpan::styled(" tracked ", Style::default().fg(theme.fg_secondary))
-            .on_click("git.stashPushTracked", Value::Null),
-        RowSpan::styled(" keep-index ", Style::default().fg(theme.fg_secondary))
-            .on_click("git.stashPushKeepIndex", Value::Null),
-        RowSpan::styled(" staged ", Style::default().fg(theme.fg_secondary))
-            .on_click("git.stashPushStaged", Value::Null),
-        RowSpan::styled(" selected ", Style::default().fg(theme.fg_secondary))
-            .on_click("git.stashPushSelected", Value::Null),
+            Color::Blue,
+            true,
+            "git.stashPushAll",
+        ),
+        stash_option(
+            GitKeyboardFocus::StashTrackedButton,
+            " tracked ",
+            theme.fg_secondary,
+            false,
+            "git.stashPushTracked",
+        ),
+        stash_option(
+            GitKeyboardFocus::StashKeepIndexButton,
+            " keep-index ",
+            theme.fg_secondary,
+            false,
+            "git.stashPushKeepIndex",
+        ),
+        stash_option(
+            GitKeyboardFocus::StashStagedButton,
+            " staged ",
+            theme.fg_secondary,
+            false,
+            "git.stashPushStaged",
+        ),
+        stash_option(
+            GitKeyboardFocus::StashSelectedButton,
+            " selected ",
+            theme.fg_secondary,
+            false,
+            "git.stashPushSelected",
+        ),
     ]));
 
     if app.git_status.stashes.is_empty() {

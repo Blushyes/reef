@@ -5,7 +5,7 @@ use git2::{DiffOptions, Repository, Sort, StatusOptions};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StashPushOptions {
     pub message: String,
     pub include_untracked: bool,

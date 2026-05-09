@@ -56,12 +56,22 @@ pub enum GitKeyboardFocus {
     PushButton,
     PublishBranchButton,
     PullButton,
+    StashHeader,
+    StashAllButton,
+    StashTrackedButton,
+    StashKeepIndexButton,
+    StashStagedButton,
+    StashSelectedButton,
     Stashes,
     Files,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingStashAction {
+    Push {
+        options: StashPushOptions,
+        label: String,
+    },
     Apply {
         stash_ref: String,
         reinstate_index: bool,
@@ -352,10 +362,12 @@ pub struct GitStatusState {
     pub ahead_behind: Option<(usize, usize)>,
     pub branches: Vec<String>,
     pub branch_dropdown_open: bool,
+    pub repo_selector_open: bool,
     pub branch_dropdown_idx: usize,
     pub repo_selector_idx: usize,
     pub keyboard_focus: GitKeyboardFocus,
     pub stashes: Vec<StashEntry>,
+    pub stash_section_open: bool,
     pub selected_stash_idx: usize,
     pub stash_detail: Option<StashDetail>,
     pub stash_error: Option<String>,
@@ -3673,8 +3685,16 @@ impl App {
             }
         }
         order.push(GitKeyboardFocus::StashButton);
-        if !self.git_status.stashes.is_empty() {
-            order.push(GitKeyboardFocus::Stashes);
+        order.push(GitKeyboardFocus::StashHeader);
+        if self.git_status.stash_section_open {
+            order.push(GitKeyboardFocus::StashAllButton);
+            order.push(GitKeyboardFocus::StashTrackedButton);
+            order.push(GitKeyboardFocus::StashKeepIndexButton);
+            order.push(GitKeyboardFocus::StashStagedButton);
+            order.push(GitKeyboardFocus::StashSelectedButton);
+            if !self.git_status.stashes.is_empty() {
+                order.push(GitKeyboardFocus::Stashes);
+            }
         }
         order.push(GitKeyboardFocus::Files);
         order
@@ -3726,6 +3746,7 @@ impl App {
         self.diff_h_scroll = 0;
         self.git_status.confirm_discard = None;
         self.git_status.branch_dropdown_open = false;
+        self.git_status.repo_selector_open = false;
         self.staged_files.clear();
         self.unstaged_files.clear();
         self.git_status.ahead_behind = None;
@@ -3740,6 +3761,10 @@ impl App {
         self.commit_detail.file_diff = None;
         self.refresh_status();
         self.graph_load.invalidate_stale();
+    }
+
+    fn repo_selector_effectively_open(&self) -> bool {
+        self.git_status.repo_selector_open || self.repo_catalog.selected_git_repo.is_none()
     }
 
     fn git_selected_file_idx(&self) -> Option<usize> {
@@ -3782,7 +3807,7 @@ impl App {
         self.normalize_git_keyboard_focus();
         if self.git_status.keyboard_focus == GitKeyboardFocus::Repository {
             let repo_count = self.repo_catalog.repos.len();
-            if repo_count > 0 {
+            if repo_count > 0 && self.repo_selector_effectively_open() {
                 let idx = self.git_status.repo_selector_idx.min(repo_count - 1);
                 self.git_status.repo_selector_idx = idx;
                 if delta < 0 && idx > 0 {
@@ -3828,6 +3853,24 @@ impl App {
             }
         }
 
+        if matches!(
+            self.git_status.keyboard_focus,
+            GitKeyboardFocus::StashAllButton
+                | GitKeyboardFocus::StashTrackedButton
+                | GitKeyboardFocus::StashKeepIndexButton
+                | GitKeyboardFocus::StashStagedButton
+                | GitKeyboardFocus::StashSelectedButton
+        ) {
+            self.git_status.keyboard_focus = if delta < 0 {
+                GitKeyboardFocus::StashHeader
+            } else if self.git_status.stashes.is_empty() {
+                GitKeyboardFocus::Files
+            } else {
+                GitKeyboardFocus::Stashes
+            };
+            return;
+        }
+
         let order = self.git_keyboard_focus_order();
         let current = order
             .iter()
@@ -3866,7 +3909,27 @@ impl App {
                 _ => None,
             })
             .collect();
-        let Some(current_action_pos) = action_indices
+        let stash_option_indices: Vec<usize> = order
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, focus)| match focus {
+                GitKeyboardFocus::StashAllButton
+                | GitKeyboardFocus::StashTrackedButton
+                | GitKeyboardFocus::StashKeepIndexButton
+                | GitKeyboardFocus::StashStagedButton
+                | GitKeyboardFocus::StashSelectedButton => Some(idx),
+                _ => None,
+            })
+            .collect();
+        let indices = if stash_option_indices
+            .iter()
+            .any(|idx| order[*idx] == self.git_status.keyboard_focus)
+        {
+            stash_option_indices
+        } else {
+            action_indices
+        };
+        let Some(current_action_pos) = indices
             .iter()
             .position(|idx| order[*idx] == self.git_status.keyboard_focus)
         else {
@@ -3875,11 +3938,11 @@ impl App {
         let next_action_pos = if delta < 0 {
             current_action_pos.saturating_sub(1)
         } else if delta > 0 {
-            (current_action_pos + 1).min(action_indices.len().saturating_sub(1))
+            (current_action_pos + 1).min(indices.len().saturating_sub(1))
         } else {
             current_action_pos
         };
-        if let Some(idx) = action_indices.get(next_action_pos) {
+        if let Some(idx) = indices.get(next_action_pos) {
             self.git_status.keyboard_focus = order[*idx];
         }
     }
@@ -3889,7 +3952,13 @@ impl App {
         self.active_panel = Panel::Files;
         match self.git_status.keyboard_focus {
             GitKeyboardFocus::Repository => {
-                self.select_git_repo_at_idx(self.git_status.repo_selector_idx);
+                if self.repo_selector_effectively_open() {
+                    self.select_git_repo_at_idx(self.git_status.repo_selector_idx);
+                    self.git_status.repo_selector_open = false;
+                } else {
+                    self.git_status.repo_selector_open = true;
+                    self.git_status.repo_selector_idx = self.selected_repo_idx().unwrap_or(0);
+                }
             }
             GitKeyboardFocus::Branch => {
                 if self.git_status.branch_dropdown_open {
@@ -3911,13 +3980,76 @@ impl App {
                 self.git_status.commit_editing = true;
             }
             GitKeyboardFocus::CommitButton => self.run_commit(),
-            GitKeyboardFocus::StashButton => self.stash_current_changes(StashPushOptions {
-                message: self.default_stash_message(),
-                include_untracked: true,
-                keep_index: false,
-                staged_only: false,
-                paths: Vec::new(),
-            }),
+            GitKeyboardFocus::StashHeader => {
+                self.git_status.stash_section_open = !self.git_status.stash_section_open;
+            }
+            GitKeyboardFocus::StashButton => self.prepare_stash_push(
+                StashPushOptions {
+                    message: self.default_stash_message(),
+                    include_untracked: true,
+                    keep_index: false,
+                    staged_only: false,
+                    paths: Vec::new(),
+                },
+                "all",
+            ),
+            GitKeyboardFocus::StashAllButton => self.prepare_stash_push(
+                StashPushOptions {
+                    message: self.default_stash_message(),
+                    include_untracked: true,
+                    keep_index: false,
+                    staged_only: false,
+                    paths: Vec::new(),
+                },
+                "all",
+            ),
+            GitKeyboardFocus::StashTrackedButton => self.prepare_stash_push(
+                StashPushOptions {
+                    message: self.default_stash_message(),
+                    include_untracked: false,
+                    keep_index: false,
+                    staged_only: false,
+                    paths: Vec::new(),
+                },
+                "tracked",
+            ),
+            GitKeyboardFocus::StashKeepIndexButton => self.prepare_stash_push(
+                StashPushOptions {
+                    message: self.default_stash_message(),
+                    include_untracked: true,
+                    keep_index: true,
+                    staged_only: false,
+                    paths: Vec::new(),
+                },
+                "keep-index",
+            ),
+            GitKeyboardFocus::StashStagedButton => self.prepare_stash_push(
+                StashPushOptions {
+                    message: self.default_stash_message(),
+                    include_untracked: false,
+                    keep_index: false,
+                    staged_only: true,
+                    paths: Vec::new(),
+                },
+                "staged",
+            ),
+            GitKeyboardFocus::StashSelectedButton => {
+                let paths = self
+                    .selected_file
+                    .as_ref()
+                    .map(|sel| vec![sel.path.clone()])
+                    .unwrap_or_default();
+                self.prepare_stash_push(
+                    StashPushOptions {
+                        message: self.default_stash_message(),
+                        include_untracked: true,
+                        keep_index: false,
+                        staged_only: false,
+                        paths,
+                    },
+                    "selected",
+                )
+            }
             GitKeyboardFocus::PushButton => {
                 self.git_status.confirm_push = true;
                 self.git_status.confirm_force_push = false;
@@ -4006,6 +4138,14 @@ impl App {
         }
     }
 
+    pub fn prepare_stash_push(&mut self, options: StashPushOptions, label: &str) {
+        self.git_status.pending_stash_action = Some(PendingStashAction::Push {
+            options,
+            label: label.to_string(),
+        });
+        self.git_status.stash_error = None;
+    }
+
     pub fn prepare_stash_apply(&mut self, stash_ref: String, pop: bool, reinstate_index: bool) {
         let action = if pop {
             PendingStashAction::Pop {
@@ -4044,6 +4184,9 @@ impl App {
             return;
         };
         let result = match &action {
+            PendingStashAction::Push { options, .. } => {
+                self.backend.stash_push_for(&repo_root_rel, options)
+            }
             PendingStashAction::Apply {
                 stash_ref,
                 reinstate_index,
@@ -4064,6 +4207,7 @@ impl App {
             Ok(()) => {
                 self.git_status.stash_error = None;
                 let label = match action {
+                    PendingStashAction::Push { .. } => "Stashed changes",
                     PendingStashAction::Apply { .. } => "Applied stash",
                     PendingStashAction::Pop { .. } => "Popped stash",
                     PendingStashAction::Drop { .. } => "Dropped stash",

@@ -5,21 +5,21 @@ expression: output
 ---
  reef  [TMPDIR]  ⎇ master
  📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph        ⊟  1:Files 2:Search 3:Git 4:Graph
- Repository            │
- * .                   │
+ Repository: . ▾       │
                        │
  Branch: master ▾      │
                        │
   ┌ Message (commit sta│
   │                    │
   └                    │
-    ✓ Commit    ↑ Publi│                 Select a file to view diff
-                       │
- Stashes   all  tracked│
-   No stashes          │
+    ✓ Commit    ↑ Publi│
+                       │                 Select a file to view diff
+ Stashes: 0 ▾          │
                        │
  View: list            │
                        │
- ⌄ Changes  2 Stage all│
+ Changes: 2 ▴ Stage all│
    new.txt +1 U ↗ + ↺  │
+   ...t +1 -1 M ↗ + ↺  │
+                       │
                   q:quit Tab:switch s:stage u:unstage r:refresh h:help  [Files]

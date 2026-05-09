@@ -1,6 +1,6 @@
 ---
 source: tests/ui_snapshots.rs
-assertion_line: 444
+assertion_line: 576
 expression: output
 ---
  reef  [TMPDIR]  ⎇ master
@@ -15,11 +15,11 @@ expression: output
   └                    │
     ✓ Commit    ↑ Publi│                 Select a file to view diff
                        │
+ Stashes   all  tracked│
+   No stashes          │
+                       │
  View: list            │
                        │
  ⌄ Changes  2 Stage all│
    new.txt +1 U ↗ + ↺  │
-   ...t +1 -1 M ↗ + ↺  │
-                       │
-                       │
                   q:quit Tab:switch s:stage u:unstage r:refresh h:help  [Files]

@@ -81,7 +81,8 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 /// - v17: adds repo-scoped pull.
 /// - v18: adds repo-scoped branch creation.
 /// - v19: adds repo-scoped branch publishing.
-pub const PROTOCOL_VERSION: u32 = 19;
+/// - v20: adds repo-scoped stash operations.
+pub const PROTOCOL_VERSION: u32 = 20;
 
 /// Encode a single envelope-level value to `writer` using the
 /// length-prefixed framing. The caller is expected to flush.
@@ -278,6 +279,59 @@ pub enum Request {
         repo_root_rel: String,
         branch: String,
         base: Option<String>,
+    },
+
+    ListStashes,
+    ListStashesFor {
+        repo_root_rel: String,
+    },
+    StashDetail {
+        stash_ref: String,
+    },
+    StashDetailFor {
+        repo_root_rel: String,
+        stash_ref: String,
+    },
+    StashPush {
+        options: StashPushOptionsDto,
+    },
+    StashPushFor {
+        repo_root_rel: String,
+        options: StashPushOptionsDto,
+    },
+    StashApply {
+        stash_ref: String,
+        reinstate_index: bool,
+    },
+    StashApplyFor {
+        repo_root_rel: String,
+        stash_ref: String,
+        reinstate_index: bool,
+    },
+    StashPop {
+        stash_ref: String,
+        reinstate_index: bool,
+    },
+    StashPopFor {
+        repo_root_rel: String,
+        stash_ref: String,
+        reinstate_index: bool,
+    },
+    StashDrop {
+        stash_ref: String,
+    },
+    StashDropFor {
+        repo_root_rel: String,
+        stash_ref: String,
+    },
+    StashBranch {
+        stash_ref: String,
+        branch: String,
+    },
+    StashBranchFor {
+        repo_root_rel: String,
+        stash_ref: String,
+        branch: String,
     },
 
     /// Create a commit from the staged index with `message`. Agent-side
@@ -687,6 +741,35 @@ pub struct FileEntryDto {
     pub additions: u32,
     #[serde(default)]
     pub deletions: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StashPushOptionsDto {
+    pub message: String,
+    pub include_untracked: bool,
+    pub keep_index: bool,
+    pub staged_only: bool,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StashEntryDto {
+    pub index: usize,
+    pub stash_ref: String,
+    pub message: String,
+    pub created: String,
+    pub branch: String,
+    pub files_changed: usize,
+    pub insertions: u32,
+    pub deletions: u32,
+    pub includes_untracked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StashDetailDto {
+    pub entry: StashEntryDto,
+    pub files: Vec<FileEntryDto>,
+    pub patch: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

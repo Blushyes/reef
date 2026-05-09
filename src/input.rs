@@ -8,7 +8,7 @@
 //! capture mode, and both are simple enough that splitting them out would
 //! just add indirection.
 
-use crate::app::{App, BranchCreateStep, DbNav, Panel, Tab, ViewMode};
+use crate::app::{App, BranchCreateStep, DbNav, GitKeyboardFocus, Panel, Tab, ViewMode};
 use crate::clipboard;
 use crate::global_search;
 use crate::i18n::{Msg, t};
@@ -1386,7 +1386,7 @@ fn handle_key_git(key: KeyEvent, app: &mut App) {
     }
     match key.code {
         KeyCode::Up | KeyCode::Char('k') if !ctrl => match app.active_panel {
-            Panel::Files => app.navigate_files(-1),
+            Panel::Files => app.move_git_keyboard_focus_vertical(-1),
             // Git tab has no middle column — Panel::Commit should never
             // be set here, but if it slips through treat it as Diff.
             Panel::Diff | Panel::Commit => {
@@ -1394,7 +1394,7 @@ fn handle_key_git(key: KeyEvent, app: &mut App) {
             }
         },
         KeyCode::Down | KeyCode::Char('j') if !ctrl => match app.active_panel {
-            Panel::Files => app.navigate_files(1),
+            Panel::Files => app.move_git_keyboard_focus_vertical(1),
             Panel::Diff | Panel::Commit => {
                 app.diff_scroll += 1;
             }
@@ -1406,13 +1406,13 @@ fn handle_key_git(key: KeyEvent, app: &mut App) {
         // own arms because they check `!ctrl` implicitly via being
         // matched only if the Ctrl arm above didn't fire.
         KeyCode::Char('p' | 'k') if ctrl => match app.active_panel {
-            Panel::Files => app.navigate_files(-1),
+            Panel::Files => app.move_git_keyboard_focus_vertical(-1),
             Panel::Diff | Panel::Commit => {
                 app.diff_scroll = app.diff_scroll.saturating_sub(1);
             }
         },
         KeyCode::Char('n' | 'j') if ctrl => match app.active_panel {
-            Panel::Files => app.navigate_files(1),
+            Panel::Files => app.move_git_keyboard_focus_vertical(1),
             Panel::Diff | Panel::Commit => {
                 app.diff_scroll += 1;
             }
@@ -1429,6 +1429,12 @@ fn handle_key_git(key: KeyEvent, app: &mut App) {
                 app.diff_scroll += 20;
             }
         },
+        KeyCode::Left if app.active_panel == Panel::Files => {
+            app.move_git_keyboard_focus_horizontal(-1);
+        }
+        KeyCode::Right if app.active_panel == Panel::Files => {
+            app.move_git_keyboard_focus_horizontal(1);
+        }
         KeyCode::Left if app.active_panel == Panel::Diff => {
             let step = if key.modifiers.contains(KeyModifiers::SHIFT) {
                 10
@@ -1463,6 +1469,44 @@ fn handle_key_git(key: KeyEvent, app: &mut App) {
             app.sbs_left_h_scroll = usize::MAX;
             app.sbs_right_h_scroll = usize::MAX;
         }
+        KeyCode::Char('m') if ctrl && alt => {
+            app.active_panel = Panel::Files;
+            app.git_status.keyboard_focus = GitKeyboardFocus::CommitMessage;
+            app.git_status.commit_editing = true;
+        }
+        KeyCode::Char('b') if ctrl && alt => {
+            if app.git_branch_selector_visible() {
+                app.active_panel = Panel::Files;
+                app.git_status.keyboard_focus = GitKeyboardFocus::Branch;
+                app.activate_git_keyboard_focus();
+            }
+        }
+        KeyCode::Char('s') if ctrl && alt => {
+            ui::git_status_panel::handle_command(app, "git.stashPush", &serde_json::json!({}));
+        }
+        KeyCode::Char('a') if ctrl && alt => {
+            ui::git_status_panel::handle_command(app, "git.stashApply", &serde_json::json!({}));
+        }
+        KeyCode::Char('p') if ctrl && alt => {
+            ui::git_status_panel::handle_command(app, "git.stashPop", &serde_json::json!({}));
+        }
+        KeyCode::Char('d') if ctrl && alt => {
+            ui::git_status_panel::handle_command(
+                app,
+                "git.stashDropPrompt",
+                &serde_json::json!({}),
+            );
+        }
+        KeyCode::Char('k') if ctrl && alt => {
+            ui::git_status_panel::handle_command(
+                app,
+                "git.stashApplyIndex",
+                &serde_json::json!({}),
+            );
+        }
+        KeyCode::Char('n') if ctrl && alt => {
+            ui::git_status_panel::handle_command(app, "git.stashBranch", &serde_json::json!({}));
+        }
         KeyCode::Char('s') => {
             ui::git_status_panel::handle_key(app, "s");
         }
@@ -1492,6 +1536,9 @@ fn handle_key_git(key: KeyEvent, app: &mut App) {
         }
         KeyCode::Char('f') => {
             app.toggle_diff_mode();
+        }
+        KeyCode::Enter if app.active_panel == Panel::Files => {
+            app.activate_git_keyboard_focus();
         }
         KeyCode::Char('e') | KeyCode::Enter => {
             // Edit the currently selected changed file. Ignore if nothing's

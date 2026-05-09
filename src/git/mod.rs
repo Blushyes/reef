@@ -5,6 +5,35 @@ use git2::{DiffOptions, Repository, Sort, StatusOptions};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Default)]
+pub struct StashPushOptions {
+    pub message: String,
+    pub include_untracked: bool,
+    pub keep_index: bool,
+    pub staged_only: bool,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StashEntry {
+    pub index: usize,
+    pub stash_ref: String,
+    pub message: String,
+    pub created: String,
+    pub branch: String,
+    pub files_changed: usize,
+    pub insertions: u32,
+    pub deletions: u32,
+    pub includes_untracked: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct StashDetail {
+    pub entry: StashEntry,
+    pub files: Vec<FileEntry>,
+    pub patch: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     pub path: String,
@@ -744,6 +773,235 @@ pub fn publish_branch_at(workdir: &Path) -> Result<(), String> {
         });
     }
     Ok(())
+}
+
+fn run_git_command(workdir: &Path, args: &[&str]) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .current_dir(workdir)
+        .args(args)
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "git executable not found on PATH".to_string()
+            } else {
+                format!("failed to run git: {e}")
+            }
+        })?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Err(if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("git {} failed", args.join(" "))
+        })
+    }
+}
+
+fn parse_stash_branch(message: &str) -> String {
+    message
+        .strip_prefix("WIP on ")
+        .or_else(|| message.strip_prefix("On "))
+        .and_then(|rest| rest.split(':').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn stash_stats_at(workdir: &Path, stash_ref: &str) -> (usize, u32, u32, bool) {
+    let out = run_git_command(
+        workdir,
+        &[
+            "stash",
+            "show",
+            "--numstat",
+            "--include-untracked",
+            stash_ref,
+        ],
+    )
+    .unwrap_or_default();
+    let mut files = 0;
+    let mut insertions = 0;
+    let mut deletions = 0;
+    for line in out.lines() {
+        let mut parts = line.split('\t');
+        let add = parts.next().unwrap_or("0");
+        let del = parts.next().unwrap_or("0");
+        if parts.next().is_some() {
+            files += 1;
+            insertions += add.parse::<u32>().unwrap_or(0);
+            deletions += del.parse::<u32>().unwrap_or(0);
+        }
+    }
+    let names = run_git_command(
+        workdir,
+        &[
+            "stash",
+            "show",
+            "--name-status",
+            "--include-untracked",
+            stash_ref,
+        ],
+    )
+    .unwrap_or_default();
+    let includes_untracked = names.lines().any(|line| line.starts_with("A\t"));
+    (files, insertions, deletions, includes_untracked)
+}
+
+pub fn list_stashes_at(workdir: &Path) -> Result<Vec<StashEntry>, String> {
+    Repository::discover(workdir).map_err(|e| e.message().to_string())?;
+    let out = run_git_command(workdir, &["stash", "list", "--format=%gd%x00%gs%x00%cr"])?;
+    let mut entries = Vec::new();
+    for (index, line) in out.lines().enumerate() {
+        let mut parts = line.split('\0');
+        let stash_ref = parts.next().unwrap_or_default().to_string();
+        if stash_ref.is_empty() {
+            continue;
+        }
+        let message = parts.next().unwrap_or_default().to_string();
+        let created = parts.next().unwrap_or_default().to_string();
+        let (files_changed, insertions, deletions, includes_untracked) =
+            stash_stats_at(workdir, &stash_ref);
+        entries.push(StashEntry {
+            index,
+            stash_ref,
+            branch: parse_stash_branch(&message),
+            message,
+            created,
+            files_changed,
+            insertions,
+            deletions,
+            includes_untracked,
+        });
+    }
+    Ok(entries)
+}
+
+pub fn stash_detail_at(workdir: &Path, stash_ref: &str) -> Result<StashDetail, String> {
+    let entry = list_stashes_at(workdir)?
+        .into_iter()
+        .find(|entry| entry.stash_ref == stash_ref)
+        .ok_or_else(|| format!("stash not found: {stash_ref}"))?;
+    let names = run_git_command(
+        workdir,
+        &[
+            "stash",
+            "show",
+            "--name-status",
+            "--include-untracked",
+            stash_ref,
+        ],
+    )?;
+    let nums = run_git_command(
+        workdir,
+        &[
+            "stash",
+            "show",
+            "--numstat",
+            "--include-untracked",
+            stash_ref,
+        ],
+    )
+    .unwrap_or_default();
+    let mut stats = HashMap::new();
+    for line in nums.lines() {
+        let mut parts = line.split('\t');
+        let add = parts.next().unwrap_or("0").parse::<u32>().unwrap_or(0);
+        let del = parts.next().unwrap_or("0").parse::<u32>().unwrap_or(0);
+        if let Some(path) = parts.next() {
+            stats.insert(path.to_string(), (add, del));
+        }
+    }
+    let mut files = Vec::new();
+    for line in names.lines() {
+        let mut parts = line.split('\t');
+        let status_raw = parts.next().unwrap_or("M");
+        let path = parts.next().unwrap_or_default();
+        if path.is_empty() {
+            continue;
+        }
+        let (additions, deletions) = stats.get(path).copied().unwrap_or((0, 0));
+        let status = match status_raw.chars().next().unwrap_or('M') {
+            'A' => FileStatus::Added,
+            'D' => FileStatus::Deleted,
+            'R' => FileStatus::Renamed,
+            _ => FileStatus::Modified,
+        };
+        files.push(FileEntry {
+            path: path.to_string(),
+            status,
+            additions,
+            deletions,
+        });
+    }
+    let patch = run_git_command(
+        workdir,
+        &["stash", "show", "-p", "--include-untracked", stash_ref],
+    )?;
+    Ok(StashDetail {
+        entry,
+        files,
+        patch,
+    })
+}
+
+pub fn stash_push_at(workdir: &Path, opts: &StashPushOptions) -> Result<(), String> {
+    Repository::discover(workdir).map_err(|e| e.message().to_string())?;
+    let mut owned = vec!["stash".to_string(), "push".to_string()];
+    if opts.include_untracked {
+        owned.push("-u".to_string());
+    }
+    if opts.keep_index {
+        owned.push("--keep-index".to_string());
+    }
+    if opts.staged_only {
+        owned.push("--staged".to_string());
+    }
+    if !opts.message.trim().is_empty() {
+        owned.push("-m".to_string());
+        owned.push(opts.message.clone());
+    }
+    if !opts.paths.is_empty() {
+        owned.push("--".to_string());
+        owned.extend(opts.paths.iter().cloned());
+    }
+    let args: Vec<&str> = owned.iter().map(String::as_str).collect();
+    run_git_command(workdir, &args).map(|_| ())
+}
+
+pub fn stash_apply_at(
+    workdir: &Path,
+    stash_ref: &str,
+    reinstate_index: bool,
+) -> Result<(), String> {
+    let mut args = vec!["stash", "apply"];
+    if reinstate_index {
+        args.push("--index");
+    }
+    args.push(stash_ref);
+    run_git_command(workdir, &args).map(|_| ())
+}
+
+pub fn stash_pop_at(workdir: &Path, stash_ref: &str, reinstate_index: bool) -> Result<(), String> {
+    let mut args = vec!["stash", "pop"];
+    if reinstate_index {
+        args.push("--index");
+    }
+    args.push(stash_ref);
+    run_git_command(workdir, &args).map(|_| ())
+}
+
+pub fn stash_drop_at(workdir: &Path, stash_ref: &str) -> Result<(), String> {
+    run_git_command(workdir, &["stash", "drop", stash_ref]).map(|_| ())
+}
+
+pub fn stash_branch_at(workdir: &Path, stash_ref: &str, branch: &str) -> Result<(), String> {
+    run_git_command(workdir, &["stash", "branch", branch, stash_ref]).map(|_| ())
 }
 
 /// Fast-forward the current branch from its upstream. Uses `--ff-only` so the

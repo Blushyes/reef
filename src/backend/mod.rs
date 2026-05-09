@@ -24,7 +24,10 @@ use std::sync::mpsc;
 
 use crate::file_tree::{PreviewContent, TreeEntry};
 use crate::git::graph::GraphRow;
-use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, RefLabel};
+use crate::git::{
+    CommitDetail, CommitInfo, DiffContent, FileEntry, RefLabel, StashDetail, StashEntry,
+    StashPushOptions,
+};
 use std::collections::{HashMap, HashSet};
 
 pub mod local;
@@ -463,6 +466,43 @@ pub trait Backend: Send + Sync {
         repo_root_rel: &Path,
         branch: &str,
         base: Option<&str>,
+    ) -> Result<(), BackendError>;
+    fn list_stashes(&self) -> Result<Vec<StashEntry>, BackendError>;
+    fn list_stashes_for(&self, repo_root_rel: &Path) -> Result<Vec<StashEntry>, BackendError>;
+    fn stash_detail(&self, stash_ref: &str) -> Result<StashDetail, BackendError>;
+    fn stash_detail_for(
+        &self,
+        repo_root_rel: &Path,
+        stash_ref: &str,
+    ) -> Result<StashDetail, BackendError>;
+    fn stash_push(&self, options: &StashPushOptions) -> Result<(), BackendError>;
+    fn stash_push_for(
+        &self,
+        repo_root_rel: &Path,
+        options: &StashPushOptions,
+    ) -> Result<(), BackendError>;
+    fn stash_apply(&self, stash_ref: &str, reinstate_index: bool) -> Result<(), BackendError>;
+    fn stash_apply_for(
+        &self,
+        repo_root_rel: &Path,
+        stash_ref: &str,
+        reinstate_index: bool,
+    ) -> Result<(), BackendError>;
+    fn stash_pop(&self, stash_ref: &str, reinstate_index: bool) -> Result<(), BackendError>;
+    fn stash_pop_for(
+        &self,
+        repo_root_rel: &Path,
+        stash_ref: &str,
+        reinstate_index: bool,
+    ) -> Result<(), BackendError>;
+    fn stash_drop(&self, stash_ref: &str) -> Result<(), BackendError>;
+    fn stash_drop_for(&self, repo_root_rel: &Path, stash_ref: &str) -> Result<(), BackendError>;
+    fn stash_branch(&self, stash_ref: &str, branch: &str) -> Result<(), BackendError>;
+    fn stash_branch_for(
+        &self,
+        repo_root_rel: &Path,
+        stash_ref: &str,
+        branch: &str,
     ) -> Result<(), BackendError>;
 
     /// Commit the staged index with `message`. Same shell-out rationale

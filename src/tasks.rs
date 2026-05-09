@@ -8,7 +8,7 @@ use crate::app::{CommitFileDiff, DiffHighlighted, HighlightedDiff};
 use crate::backend::{Backend, RepoDiscoverOpts, RepoDiscoverResponse};
 use crate::file_tree::{PreviewContent, TreeEntry};
 use crate::git::graph::GraphRow;
-use crate::git::{CommitDetail, DiffContent, FileEntry, RefLabel};
+use crate::git::{CommitDetail, DiffContent, FileEntry, RefLabel, StashDetail, StashEntry};
 use crate::global_search::MatchHit;
 use crate::paste_conflict::Resolution;
 use crate::ui::highlight;
@@ -79,6 +79,7 @@ pub struct GitStatusPayload {
     pub ahead_behind: Option<(usize, usize)>,
     pub branch_name: String,
     pub branches: Vec<String>,
+    pub stashes: Vec<StashEntry>,
 }
 
 #[derive(Debug)]
@@ -111,6 +112,10 @@ pub enum WorkerResult {
     GitStatus {
         generation: u64,
         result: Result<GitStatusPayload, String>,
+    },
+    StashDetail {
+        generation: u64,
+        result: Result<StashDetail, String>,
     },
     Diff {
         generation: u64,
@@ -461,6 +466,12 @@ enum GitTask {
         /// `LoadCommitFileDiff.dark` / `LoadPreview.dark`.
         dark: bool,
     },
+    LoadStashDetail {
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        repo_root_rel: PathBuf,
+        stash_ref: String,
+    },
 }
 
 enum GlobalSearchTask {
@@ -793,6 +804,21 @@ impl TaskCoordinator {
             staged,
             context_lines,
             dark,
+        });
+    }
+
+    pub fn load_stash_detail(
+        &self,
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        repo_root_rel: PathBuf,
+        stash_ref: String,
+    ) {
+        let _ = self.git_tx.send(GitTask::LoadStashDetail {
+            generation,
+            backend,
+            repo_root_rel,
+            stash_ref,
         });
     }
 
@@ -1605,6 +1631,9 @@ fn spawn_git_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<GitTa
                                 ahead_behind: snap.ahead_behind,
                                 branch_name: snap.branch_name,
                                 branches: branch_names_from_refs(&ref_map),
+                                stashes: backend
+                                    .list_stashes_for(&repo_root_rel)
+                                    .map_err(|e| e.to_string())?,
                             })
                         })();
                         let _ = result_tx.send(WorkerResult::GitStatus { generation, result });
@@ -1629,6 +1658,17 @@ fn spawn_git_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<GitTa
                         .map_err(|e| e.to_string())
                         .map(|opt| opt.map(|diff| build_highlighted_diff(&path, diff, dark)));
                         let _ = result_tx.send(WorkerResult::Diff { generation, result });
+                    }
+                    GitTask::LoadStashDetail {
+                        generation,
+                        backend,
+                        repo_root_rel,
+                        stash_ref,
+                    } => {
+                        let result = backend
+                            .stash_detail_for(&repo_root_rel, &stash_ref)
+                            .map_err(|e| e.to_string());
+                        let _ = result_tx.send(WorkerResult::StashDetail { generation, result });
                     }
                 }
             }

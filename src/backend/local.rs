@@ -691,6 +691,94 @@ impl Backend for LocalBackend {
             .map_err(BackendError::Git)
     }
 
+    fn list_stashes(&self) -> Result<Vec<crate::git::StashEntry>, BackendError> {
+        self.list_stashes_for(Path::new("."))
+    }
+
+    fn list_stashes_for(
+        &self,
+        repo_root_rel: &Path,
+    ) -> Result<Vec<crate::git::StashEntry>, BackendError> {
+        crate::git::list_stashes_at(&self.workdir_at(repo_root_rel)?).map_err(BackendError::Git)
+    }
+
+    fn stash_detail(&self, stash_ref: &str) -> Result<crate::git::StashDetail, BackendError> {
+        self.stash_detail_for(Path::new("."), stash_ref)
+    }
+
+    fn stash_detail_for(
+        &self,
+        repo_root_rel: &Path,
+        stash_ref: &str,
+    ) -> Result<crate::git::StashDetail, BackendError> {
+        crate::git::stash_detail_at(&self.workdir_at(repo_root_rel)?, stash_ref)
+            .map_err(BackendError::Git)
+    }
+
+    fn stash_push(&self, options: &crate::git::StashPushOptions) -> Result<(), BackendError> {
+        self.stash_push_for(Path::new("."), options)
+    }
+
+    fn stash_push_for(
+        &self,
+        repo_root_rel: &Path,
+        options: &crate::git::StashPushOptions,
+    ) -> Result<(), BackendError> {
+        crate::git::stash_push_at(&self.workdir_at(repo_root_rel)?, options)
+            .map_err(BackendError::Git)
+    }
+
+    fn stash_apply(&self, stash_ref: &str, reinstate_index: bool) -> Result<(), BackendError> {
+        self.stash_apply_for(Path::new("."), stash_ref, reinstate_index)
+    }
+
+    fn stash_apply_for(
+        &self,
+        repo_root_rel: &Path,
+        stash_ref: &str,
+        reinstate_index: bool,
+    ) -> Result<(), BackendError> {
+        crate::git::stash_apply_at(&self.workdir_at(repo_root_rel)?, stash_ref, reinstate_index)
+            .map_err(BackendError::Git)
+    }
+
+    fn stash_pop(&self, stash_ref: &str, reinstate_index: bool) -> Result<(), BackendError> {
+        self.stash_pop_for(Path::new("."), stash_ref, reinstate_index)
+    }
+
+    fn stash_pop_for(
+        &self,
+        repo_root_rel: &Path,
+        stash_ref: &str,
+        reinstate_index: bool,
+    ) -> Result<(), BackendError> {
+        crate::git::stash_pop_at(&self.workdir_at(repo_root_rel)?, stash_ref, reinstate_index)
+            .map_err(BackendError::Git)
+    }
+
+    fn stash_drop(&self, stash_ref: &str) -> Result<(), BackendError> {
+        self.stash_drop_for(Path::new("."), stash_ref)
+    }
+
+    fn stash_drop_for(&self, repo_root_rel: &Path, stash_ref: &str) -> Result<(), BackendError> {
+        crate::git::stash_drop_at(&self.workdir_at(repo_root_rel)?, stash_ref)
+            .map_err(BackendError::Git)
+    }
+
+    fn stash_branch(&self, stash_ref: &str, branch: &str) -> Result<(), BackendError> {
+        self.stash_branch_for(Path::new("."), stash_ref, branch)
+    }
+
+    fn stash_branch_for(
+        &self,
+        repo_root_rel: &Path,
+        stash_ref: &str,
+        branch: &str,
+    ) -> Result<(), BackendError> {
+        crate::git::stash_branch_at(&self.workdir_at(repo_root_rel)?, stash_ref, branch)
+            .map_err(BackendError::Git)
+    }
+
     fn commit(&self, message: &str) -> Result<(), BackendError> {
         self.commit_for(Path::new("."), message)
     }

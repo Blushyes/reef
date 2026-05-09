@@ -3,7 +3,10 @@ use crate::backend::{
 };
 use crate::file_tree::{FileTree, PreviewBody, PreviewContent};
 use crate::git::graph::GraphRow;
-use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, GitRepo, RefLabel};
+use crate::git::{
+    CommitDetail, CommitInfo, DiffContent, FileEntry, GitRepo, RefLabel, StashDetail, StashEntry,
+    StashPushOptions,
+};
 use crate::tasks::{AsyncState, TaskCoordinator, WorkerResult};
 use crate::ui::highlight::StyledToken;
 use crate::ui::mouse::{ClickAction, HitTestRegistry};
@@ -40,6 +43,41 @@ pub enum PushOperation {
 impl Default for PushOperation {
     fn default() -> Self {
         Self::Push { force: false }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitKeyboardFocus {
+    Repository,
+    Branch,
+    CommitMessage,
+    CommitButton,
+    StashButton,
+    PushButton,
+    PublishBranchButton,
+    PullButton,
+    Stashes,
+    Files,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingStashAction {
+    Apply {
+        stash_ref: String,
+        reinstate_index: bool,
+    },
+    Pop {
+        stash_ref: String,
+        reinstate_index: bool,
+    },
+    Drop {
+        stash_ref: String,
+    },
+}
+
+impl Default for GitKeyboardFocus {
+    fn default() -> Self {
+        Self::Files
     }
 }
 
@@ -314,6 +352,14 @@ pub struct GitStatusState {
     pub ahead_behind: Option<(usize, usize)>,
     pub branches: Vec<String>,
     pub branch_dropdown_open: bool,
+    pub branch_dropdown_idx: usize,
+    pub repo_selector_idx: usize,
+    pub keyboard_focus: GitKeyboardFocus,
+    pub stashes: Vec<StashEntry>,
+    pub selected_stash_idx: usize,
+    pub stash_detail: Option<StashDetail>,
+    pub stash_error: Option<String>,
+    pub pending_stash_action: Option<PendingStashAction>,
     pub branch_create_dialog: Option<BranchCreateDialog>,
 
     // ─── Commit input (VSCode-style "Source Control" message box) ───
@@ -921,6 +967,7 @@ pub struct App {
     pub file_tree_load: AsyncState,
     pub preview_load: AsyncState,
     pub git_status_load: AsyncState,
+    pub stash_detail_load: AsyncState,
     pub diff_load: AsyncState,
     pub graph_load: AsyncState,
     pub commit_detail_load: AsyncState,
@@ -1211,6 +1258,7 @@ impl App {
             file_tree_load: AsyncState::default(),
             preview_load: AsyncState::default(),
             git_status_load: AsyncState::default(),
+            stash_detail_load: AsyncState::default(),
             diff_load: AsyncState::default(),
             graph_load: AsyncState::default(),
             commit_detail_load: AsyncState::default(),
@@ -1435,6 +1483,8 @@ impl App {
         self.diff_content = None;
         self.git_status.ahead_behind = None;
         self.git_status.branches.clear();
+        self.git_status.stashes.clear();
+        self.git_status.stash_detail = None;
         self.branch_name.clear();
         self.file_tree.refresh_git_statuses(&[], &[]);
     }
@@ -3582,6 +3632,484 @@ impl App {
             && self.branch_name != "(detached)"
     }
 
+    pub fn git_branch_selector_visible(&self) -> bool {
+        if self.repo_catalog.selected_git_repo.is_none() && !self.backend.has_repo() {
+            return false;
+        }
+        !self.branch_name.is_empty() || !self.git_status.branches.is_empty()
+    }
+
+    pub fn git_branch_dropdown_branches(&self) -> Vec<String> {
+        self.git_status
+            .branches
+            .iter()
+            .filter(|branch| branch.as_str() != self.branch_name)
+            .take(6)
+            .cloned()
+            .collect()
+    }
+
+    pub fn git_keyboard_focus_order(&self) -> Vec<GitKeyboardFocus> {
+        let mut order = Vec::new();
+        if !self.repo_catalog.repos.is_empty() && !self.repo_catalog.discover_load.loading {
+            order.push(GitKeyboardFocus::Repository);
+        }
+        if self.git_branch_selector_visible() {
+            order.push(GitKeyboardFocus::Branch);
+        }
+        order.push(GitKeyboardFocus::CommitMessage);
+        order.push(GitKeyboardFocus::CommitButton);
+        if let Some((ahead, behind)) = self.git_status.ahead_behind {
+            if ahead > 0 && behind == 0 && !self.push_in_flight {
+                order.push(GitKeyboardFocus::PushButton);
+            }
+        }
+        if self.should_offer_publish_branch() && !self.push_in_flight {
+            order.push(GitKeyboardFocus::PublishBranchButton);
+        }
+        if let Some((_, _)) = self.git_status.ahead_behind {
+            if !self.pull_in_flight {
+                order.push(GitKeyboardFocus::PullButton);
+            }
+        }
+        order.push(GitKeyboardFocus::StashButton);
+        if !self.git_status.stashes.is_empty() {
+            order.push(GitKeyboardFocus::Stashes);
+        }
+        order.push(GitKeyboardFocus::Files);
+        order
+    }
+
+    fn normalize_git_keyboard_focus(&mut self) {
+        if self.repo_catalog.selected_git_repo.is_none() && !self.repo_catalog.repos.is_empty() {
+            self.git_status.keyboard_focus = GitKeyboardFocus::Repository;
+        }
+        let order = self.git_keyboard_focus_order();
+        if !order.contains(&self.git_status.keyboard_focus) {
+            self.git_status.keyboard_focus = GitKeyboardFocus::Files;
+        }
+        if !self.repo_catalog.repos.is_empty() {
+            let max = self.repo_catalog.repos.len().saturating_sub(1);
+            self.git_status.repo_selector_idx = self.git_status.repo_selector_idx.min(max);
+        }
+        if !self.git_status.stashes.is_empty() {
+            let max = self.git_status.stashes.len().saturating_sub(1);
+            self.git_status.selected_stash_idx = self.git_status.selected_stash_idx.min(max);
+        }
+    }
+
+    pub fn selected_repo_idx(&self) -> Option<usize> {
+        let selected = self.repo_catalog.selected_git_repo.as_ref()?;
+        self.repo_catalog
+            .repos
+            .iter()
+            .position(|repo| &repo.repo_root_rel == selected)
+    }
+
+    fn select_git_repo_at_idx(&mut self, idx: usize) {
+        let Some(repo_root_rel) = self
+            .repo_catalog
+            .repos
+            .get(idx)
+            .map(|repo| repo.repo_root_rel.clone())
+        else {
+            return;
+        };
+        self.repo_catalog.selected_git_repo = Some(repo_root_rel.clone());
+        crate::prefs::set(
+            "status.selected_repo",
+            &crate::backend::repo_key(&repo_root_rel),
+        );
+        self.selected_file = None;
+        self.diff_content = None;
+        self.diff_scroll = 0;
+        self.diff_h_scroll = 0;
+        self.git_status.confirm_discard = None;
+        self.git_status.branch_dropdown_open = false;
+        self.staged_files.clear();
+        self.unstaged_files.clear();
+        self.git_status.ahead_behind = None;
+        self.git_graph.rows.clear();
+        self.git_graph.ref_map.clear();
+        self.git_graph.cache_key = None;
+        self.git_graph.selected_idx = 0;
+        self.git_graph.selected_commit = None;
+        self.git_graph.selection_anchor = None;
+        self.commit_detail.detail = None;
+        self.commit_detail.range_detail = None;
+        self.commit_detail.file_diff = None;
+        self.refresh_status();
+        self.graph_load.invalidate_stale();
+    }
+
+    fn git_selected_file_idx(&self) -> Option<usize> {
+        let sel = self.selected_file.as_ref()?;
+        self.git_selectable_files()
+            .iter()
+            .position(|(path, staged)| path == &sel.path && *staged == sel.is_staged)
+    }
+
+    fn git_selectable_files(&self) -> Vec<(String, bool)> {
+        let mut items = Vec::new();
+        if !self.staged_files.is_empty() && !self.staged_collapsed {
+            for f in &self.staged_files {
+                items.push((f.path.clone(), true));
+            }
+        }
+        if !self.unstaged_collapsed {
+            for f in &self.unstaged_files {
+                items.push((f.path.clone(), false));
+            }
+        }
+        items
+    }
+
+    pub fn move_git_keyboard_focus_vertical(&mut self, delta: i32) {
+        if self.git_status.branch_dropdown_open
+            && self.git_status.keyboard_focus == GitKeyboardFocus::Branch
+        {
+            let max = self.git_branch_dropdown_branches().len();
+            if delta < 0 {
+                self.git_status.branch_dropdown_idx =
+                    self.git_status.branch_dropdown_idx.saturating_sub(1);
+            } else if delta > 0 {
+                self.git_status.branch_dropdown_idx =
+                    (self.git_status.branch_dropdown_idx + 1).min(max);
+            }
+            return;
+        }
+
+        self.normalize_git_keyboard_focus();
+        if self.git_status.keyboard_focus == GitKeyboardFocus::Repository {
+            let repo_count = self.repo_catalog.repos.len();
+            if repo_count > 0 {
+                let idx = self.git_status.repo_selector_idx.min(repo_count - 1);
+                self.git_status.repo_selector_idx = idx;
+                if delta < 0 && idx > 0 {
+                    self.git_status.repo_selector_idx = idx - 1;
+                    return;
+                }
+                if delta > 0 && idx + 1 < repo_count {
+                    self.git_status.repo_selector_idx = idx + 1;
+                    return;
+                }
+            }
+        }
+
+        if self.git_status.keyboard_focus == GitKeyboardFocus::Stashes {
+            let count = self.git_status.stashes.len();
+            if count > 0 {
+                let idx = self.git_status.selected_stash_idx.min(count - 1);
+                if delta < 0 && idx > 0 {
+                    self.git_status.selected_stash_idx = idx - 1;
+                    self.load_selected_stash_detail();
+                    return;
+                }
+                if delta > 0 && idx + 1 < count {
+                    self.git_status.selected_stash_idx = idx + 1;
+                    self.load_selected_stash_detail();
+                    return;
+                }
+            }
+        }
+
+        if self.git_status.keyboard_focus == GitKeyboardFocus::Files {
+            let items = self.git_selectable_files();
+            if !items.is_empty() {
+                let idx = self.git_selected_file_idx().unwrap_or(0);
+                if delta < 0 && idx > 0 {
+                    self.navigate_files(delta);
+                    return;
+                }
+                if delta > 0 && idx + 1 < items.len() {
+                    self.navigate_files(delta);
+                    return;
+                }
+            }
+        }
+
+        let order = self.git_keyboard_focus_order();
+        let current = order
+            .iter()
+            .position(|focus| *focus == self.git_status.keyboard_focus)
+            .unwrap_or_else(|| order.len().saturating_sub(1));
+        let next = if delta < 0 {
+            current.saturating_sub(1)
+        } else if delta > 0 {
+            (current + 1).min(order.len().saturating_sub(1))
+        } else {
+            current
+        };
+        if let Some(focus) = order.get(next).copied() {
+            self.git_status.keyboard_focus = focus;
+            if focus == GitKeyboardFocus::Repository {
+                self.git_status.repo_selector_idx = self.selected_repo_idx().unwrap_or(0);
+            }
+            if focus == GitKeyboardFocus::Files && self.selected_file.is_none() {
+                self.navigate_files(0);
+            }
+        }
+    }
+
+    pub fn move_git_keyboard_focus_horizontal(&mut self, delta: i32) {
+        self.normalize_git_keyboard_focus();
+        let order = self.git_keyboard_focus_order();
+        let action_indices: Vec<usize> = order
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, focus)| match focus {
+                GitKeyboardFocus::CommitButton
+                | GitKeyboardFocus::StashButton
+                | GitKeyboardFocus::PushButton
+                | GitKeyboardFocus::PublishBranchButton
+                | GitKeyboardFocus::PullButton => Some(idx),
+                _ => None,
+            })
+            .collect();
+        let Some(current_action_pos) = action_indices
+            .iter()
+            .position(|idx| order[*idx] == self.git_status.keyboard_focus)
+        else {
+            return;
+        };
+        let next_action_pos = if delta < 0 {
+            current_action_pos.saturating_sub(1)
+        } else if delta > 0 {
+            (current_action_pos + 1).min(action_indices.len().saturating_sub(1))
+        } else {
+            current_action_pos
+        };
+        if let Some(idx) = action_indices.get(next_action_pos) {
+            self.git_status.keyboard_focus = order[*idx];
+        }
+    }
+
+    pub fn activate_git_keyboard_focus(&mut self) {
+        self.normalize_git_keyboard_focus();
+        self.active_panel = Panel::Files;
+        match self.git_status.keyboard_focus {
+            GitKeyboardFocus::Repository => {
+                self.select_git_repo_at_idx(self.git_status.repo_selector_idx);
+            }
+            GitKeyboardFocus::Branch => {
+                if self.git_status.branch_dropdown_open {
+                    let idx = self.git_status.branch_dropdown_idx;
+                    if idx == 0 {
+                        self.open_branch_create_dialog();
+                    } else if let Some(branch) =
+                        self.git_branch_dropdown_branches().get(idx - 1).cloned()
+                    {
+                        self.git_status.branch_dropdown_open = false;
+                        self.checkout_branch(&branch);
+                    }
+                } else if self.branch_name != "(detached)" {
+                    self.git_status.branch_dropdown_open = true;
+                    self.git_status.branch_dropdown_idx = 0;
+                }
+            }
+            GitKeyboardFocus::CommitMessage => {
+                self.git_status.commit_editing = true;
+            }
+            GitKeyboardFocus::CommitButton => self.run_commit(),
+            GitKeyboardFocus::StashButton => self.stash_current_changes(StashPushOptions {
+                message: self.default_stash_message(),
+                include_untracked: true,
+                keep_index: false,
+                staged_only: false,
+                paths: Vec::new(),
+            }),
+            GitKeyboardFocus::PushButton => {
+                self.git_status.confirm_push = true;
+                self.git_status.confirm_force_push = false;
+                self.git_status.push_error = None;
+            }
+            GitKeyboardFocus::PublishBranchButton => {
+                self.git_status.push_error = None;
+                self.run_publish_branch();
+            }
+            GitKeyboardFocus::PullButton => {
+                self.git_status.pull_error = None;
+                self.run_pull();
+            }
+            GitKeyboardFocus::Stashes => {
+                if let Some(stash_ref) = self.selected_stash_ref() {
+                    self.prepare_stash_apply(stash_ref, false, false);
+                }
+            }
+            GitKeyboardFocus::Files => {
+                if let Some(sel) = &self.selected_file {
+                    let workdir = self.backend.workdir_path();
+                    self.pending_edit = Some(workdir.join(&sel.path));
+                }
+            }
+        }
+    }
+
+    pub fn selected_stash_ref(&self) -> Option<String> {
+        self.git_status
+            .stashes
+            .get(self.git_status.selected_stash_idx)
+            .map(|entry| entry.stash_ref.clone())
+    }
+
+    pub fn default_stash_message(&self) -> String {
+        let branch = if self.branch_name.is_empty() {
+            "unknown"
+        } else {
+            &self.branch_name
+        };
+        format!("reef stash on {branch}")
+    }
+
+    fn refresh_after_stash_op(&mut self) {
+        self.selected_file = None;
+        self.diff_content = None;
+        self.git_status.stash_detail = None;
+        self.git_status_load.mark_stale();
+        self.diff_load.mark_stale();
+        self.graph_load.mark_stale();
+    }
+
+    pub fn load_selected_stash_detail(&mut self) {
+        let Some(stash_ref) = self.selected_stash_ref() else {
+            self.git_status.stash_detail = None;
+            return;
+        };
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
+            return;
+        };
+        let generation = self.stash_detail_load.begin();
+        self.tasks.load_stash_detail(
+            generation,
+            Arc::clone(&self.backend),
+            repo_root_rel,
+            stash_ref,
+        );
+    }
+
+    pub fn stash_current_changes(&mut self, options: StashPushOptions) {
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
+            return;
+        };
+        match self.backend.stash_push_for(&repo_root_rel, &options) {
+            Ok(()) => {
+                self.git_status.stash_error = None;
+                self.toasts.push(Toast::info("Stashed changes".to_string()));
+                self.refresh_after_stash_op();
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                self.git_status.stash_error = Some(msg.clone());
+                self.toasts
+                    .push(Toast::error(format!("Stash failed: {msg}")));
+            }
+        }
+    }
+
+    pub fn prepare_stash_apply(&mut self, stash_ref: String, pop: bool, reinstate_index: bool) {
+        let action = if pop {
+            PendingStashAction::Pop {
+                stash_ref,
+                reinstate_index,
+            }
+        } else {
+            PendingStashAction::Apply {
+                stash_ref,
+                reinstate_index,
+            }
+        };
+        if !self.staged_files.is_empty() || !self.unstaged_files.is_empty() {
+            self.git_status.pending_stash_action = Some(action);
+        } else {
+            self.run_stash_action(action);
+        }
+    }
+
+    pub fn confirm_stash_action(&mut self) {
+        if let Some(action) = self.git_status.pending_stash_action.take() {
+            self.run_stash_action(action);
+        }
+    }
+
+    pub fn cancel_stash_action(&mut self) {
+        self.git_status.pending_stash_action = None;
+    }
+
+    pub fn prepare_stash_drop(&mut self, stash_ref: String) {
+        self.git_status.pending_stash_action = Some(PendingStashAction::Drop { stash_ref });
+    }
+
+    fn run_stash_action(&mut self, action: PendingStashAction) {
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
+            return;
+        };
+        let result = match &action {
+            PendingStashAction::Apply {
+                stash_ref,
+                reinstate_index,
+            } => self
+                .backend
+                .stash_apply_for(&repo_root_rel, stash_ref, *reinstate_index),
+            PendingStashAction::Pop {
+                stash_ref,
+                reinstate_index,
+            } => self
+                .backend
+                .stash_pop_for(&repo_root_rel, stash_ref, *reinstate_index),
+            PendingStashAction::Drop { stash_ref } => {
+                self.backend.stash_drop_for(&repo_root_rel, stash_ref)
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.git_status.stash_error = None;
+                let label = match action {
+                    PendingStashAction::Apply { .. } => "Applied stash",
+                    PendingStashAction::Pop { .. } => "Popped stash",
+                    PendingStashAction::Drop { .. } => "Dropped stash",
+                };
+                self.toasts.push(Toast::info(label.to_string()));
+                self.refresh_after_stash_op();
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                self.git_status.stash_error = Some(msg.clone());
+                self.toasts
+                    .push(Toast::error(format!("Stash operation failed: {msg}")));
+                self.git_status_load.mark_stale();
+            }
+        }
+    }
+
+    pub fn stash_branch_selected(&mut self, branch: &str) {
+        let branch = branch.trim();
+        if branch.is_empty() {
+            return;
+        }
+        let Some(stash_ref) = self.selected_stash_ref() else {
+            return;
+        };
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
+            return;
+        };
+        match self
+            .backend
+            .stash_branch_for(&repo_root_rel, &stash_ref, branch)
+        {
+            Ok(()) => {
+                self.toasts
+                    .push(Toast::info(format!("Created branch {branch} from stash")));
+                self.refresh_after_stash_op();
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                self.git_status.stash_error = Some(msg.clone());
+                self.toasts
+                    .push(Toast::error(format!("Stash branch failed: {msg}")));
+            }
+        }
+    }
+
     pub fn run_publish_branch(&mut self) {
         if self.push_in_flight || !self.should_offer_publish_branch() {
             return;
@@ -4147,6 +4675,10 @@ impl App {
                         self.unstaged_files = payload.unstaged;
                         self.git_status.ahead_behind = payload.ahead_behind;
                         self.git_status.branches = payload.branches;
+                        self.git_status.stashes = payload.stashes;
+                        if self.git_status.selected_stash_idx >= self.git_status.stashes.len() {
+                            self.git_status.selected_stash_idx = 0;
+                        }
                         self.branch_name = payload.branch_name;
 
                         self.file_tree
@@ -4168,10 +4700,27 @@ impl App {
                         if before != self.selected_file {
                             self.load_diff();
                         }
+                        if !self.git_status.stashes.is_empty() {
+                            self.load_selected_stash_detail();
+                        } else {
+                            self.git_status.stash_detail = None;
+                        }
                     }
                 }
                 Err(error) => {
                     self.git_status_load.complete_err(generation, error);
+                }
+            },
+            WorkerResult::StashDetail { generation, result } => match result {
+                Ok(detail) => {
+                    if self.stash_detail_load.complete_ok(generation) {
+                        self.git_status.stash_detail = Some(detail);
+                    }
+                }
+                Err(error) => {
+                    self.stash_detail_load
+                        .complete_err(generation, error.clone());
+                    self.git_status.stash_error = Some(error);
                 }
             },
             WorkerResult::Diff { generation, result } => match result {
@@ -4532,6 +5081,9 @@ impl App {
         // 3-col diff column share this state, and tab-switching between
         // them (or to Files/Search) should start fresh.
         self.clear_diff_selection();
+        if tab == Tab::Git {
+            self.active_panel = Panel::Files;
+        }
         match tab {
             Tab::Git => self.git_status_load.mark_stale(),
             Tab::Graph => self.graph_load.mark_stale(),
@@ -4857,6 +5409,7 @@ impl App {
         let (path, staged) = items[new_idx].clone();
         // Defer `load_diff()` to main.rs after the event-drain loop so rapid
         // key repeats coalesce into a single diff load.
+        self.git_status.keyboard_focus = GitKeyboardFocus::Files;
         self.selected_file = Some(SelectedFile {
             path,
             is_staged: staged,

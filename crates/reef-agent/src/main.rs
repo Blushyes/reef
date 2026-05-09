@@ -425,6 +425,122 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
                 Err(e) => Err(backend_err(e)),
             }
         }
+        Request::ListStashes => match backend.list_stashes() {
+            Ok(entries) => Ok(serde_json::to_value(
+                entries
+                    .into_iter()
+                    .map(reef_proto::StashEntryDto::from)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::ListStashesFor { repo_root_rel } => {
+            match backend.list_stashes_for(&PathBuf::from(repo_root_rel)) {
+                Ok(entries) => Ok(serde_json::to_value(
+                    entries
+                        .into_iter()
+                        .map(reef_proto::StashEntryDto::from)
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap()),
+                Err(e) => Err(backend_err(e)),
+            }
+        }
+        Request::StashDetail { stash_ref } => match backend.stash_detail(&stash_ref) {
+            Ok(detail) => {
+                Ok(serde_json::to_value(reef_proto::StashDetailDto::from(detail)).unwrap())
+            }
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::StashDetailFor {
+            repo_root_rel,
+            stash_ref,
+        } => match backend.stash_detail_for(&PathBuf::from(repo_root_rel), &stash_ref) {
+            Ok(detail) => {
+                Ok(serde_json::to_value(reef_proto::StashDetailDto::from(detail)).unwrap())
+            }
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::StashPush { options } => {
+            let options: reef::git::StashPushOptions = options.into();
+            match backend.stash_push(&options) {
+                Ok(()) => Ok(serde_json::json!({"ok": true})),
+                Err(e) => Err(backend_err(e)),
+            }
+        }
+        Request::StashPushFor {
+            repo_root_rel,
+            options,
+        } => {
+            let options: reef::git::StashPushOptions = options.into();
+            match backend.stash_push_for(&PathBuf::from(repo_root_rel), &options) {
+                Ok(()) => Ok(serde_json::json!({"ok": true})),
+                Err(e) => Err(backend_err(e)),
+            }
+        }
+        Request::StashApply {
+            stash_ref,
+            reinstate_index,
+        } => match backend.stash_apply(&stash_ref, reinstate_index) {
+            Ok(()) => Ok(serde_json::json!({"ok": true})),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::StashApplyFor {
+            repo_root_rel,
+            stash_ref,
+            reinstate_index,
+        } => match backend.stash_apply_for(
+            &PathBuf::from(repo_root_rel),
+            &stash_ref,
+            reinstate_index,
+        ) {
+            Ok(()) => Ok(serde_json::json!({"ok": true})),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::StashPop {
+            stash_ref,
+            reinstate_index,
+        } => match backend.stash_pop(&stash_ref, reinstate_index) {
+            Ok(()) => Ok(serde_json::json!({"ok": true})),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::StashPopFor {
+            repo_root_rel,
+            stash_ref,
+            reinstate_index,
+        } => {
+            match backend.stash_pop_for(&PathBuf::from(repo_root_rel), &stash_ref, reinstate_index)
+            {
+                Ok(()) => Ok(serde_json::json!({"ok": true})),
+                Err(e) => Err(backend_err(e)),
+            }
+        }
+        Request::StashDrop { stash_ref } => match backend.stash_drop(&stash_ref) {
+            Ok(()) => Ok(serde_json::json!({"ok": true})),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::StashDropFor {
+            repo_root_rel,
+            stash_ref,
+        } => match backend.stash_drop_for(&PathBuf::from(repo_root_rel), &stash_ref) {
+            Ok(()) => Ok(serde_json::json!({"ok": true})),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::StashBranch { stash_ref, branch } => {
+            match backend.stash_branch(&stash_ref, &branch) {
+                Ok(()) => Ok(serde_json::json!({"ok": true})),
+                Err(e) => Err(backend_err(e)),
+            }
+        }
+        Request::StashBranchFor {
+            repo_root_rel,
+            stash_ref,
+            branch,
+        } => match backend.stash_branch_for(&PathBuf::from(repo_root_rel), &stash_ref, &branch) {
+            Ok(()) => Ok(serde_json::json!({"ok": true})),
+            Err(e) => Err(backend_err(e)),
+        },
         Request::Commit { message } => match backend.commit(&message) {
             Ok(()) => Ok(serde_json::json!({"ok": true})),
             Err(e) => Err(backend_err(e)),

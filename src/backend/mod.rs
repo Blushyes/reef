@@ -451,6 +451,8 @@ pub trait Backend: Send + Sync {
 
     fn push(&self, force: bool) -> Result<(), BackendError>;
     fn push_for(&self, repo_root_rel: &Path, force: bool) -> Result<(), BackendError>;
+    fn publish_branch(&self) -> Result<(), BackendError>;
+    fn publish_branch_for(&self, repo_root_rel: &Path) -> Result<(), BackendError>;
     fn pull(&self) -> Result<(), BackendError>;
     fn pull_for(&self, repo_root_rel: &Path) -> Result<(), BackendError>;
     fn checkout_branch(&self, branch: &str) -> Result<(), BackendError>;

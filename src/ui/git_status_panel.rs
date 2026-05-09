@@ -6,7 +6,7 @@
 //! go through `App`'s methods (`stage_file`, `confirm_discard`, `run_push`,
 //! …) which keeps host side state coherent.
 
-use crate::app::{App, DiscardTarget, Panel, SelectedFile, Tab};
+use crate::app::{App, DiscardTarget, Panel, PushOperation, SelectedFile, Tab};
 use crate::backend::{normalize_repo_root_rel, repo_key};
 use crate::git::tree::{self as gtree, Node};
 use crate::git::{FileEntry, FileStatus};
@@ -532,6 +532,14 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             app.git_status.push_error = None;
             true
         }
+        "git.publishBranch" => {
+            if !can_perform_git_writes(app) || app.push_in_flight {
+                return true;
+            }
+            app.git_status.push_error = None;
+            app.run_publish_branch();
+            true
+        }
         "git.dismissPullError" => {
             app.git_status.pull_error = None;
             true
@@ -686,7 +694,11 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     // Non-interactive: user just waits for tick() to drain the result.
     if allow_git_writes && app.push_in_flight {
         rows.push(Row::new(vec![RowSpan::styled(
-            t(Msg::PushingHint),
+            if app.push_in_flight_kind == PushOperation::PublishBranch {
+                t(Msg::PublishingBranchHint)
+            } else {
+                t(Msg::PushingHint)
+            },
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -711,7 +723,11 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
         rows.push(
             Row::new(vec![
                 RowSpan::styled(
-                    t(Msg::PushFailedPrefix),
+                    if status.push_error_kind == PushOperation::PublishBranch {
+                        t(Msg::PublishBranchFailedPrefix)
+                    } else {
+                        t(Msg::PushFailedPrefix)
+                    },
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ),
                 RowSpan::styled(msg, Style::default().fg(theme.fg_primary)),
@@ -1782,6 +1798,20 @@ fn push_commit_box(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Them
                 .on_click("git.pushPrompt", Value::Null),
             );
         }
+    }
+
+    if app.should_offer_publish_branch() && !app.push_in_flight {
+        action_spans.push(RowSpan::plain("  "));
+        action_spans.push(
+            RowSpan::styled(
+                crate::i18n::publish_branch_button(),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .on_click("git.publishBranch", Value::Null),
+        );
     }
 
     if !app.pull_in_flight

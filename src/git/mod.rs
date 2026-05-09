@@ -710,6 +710,42 @@ pub fn push_at(workdir: &Path, force: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Publish the current local branch to `origin` and set upstream tracking.
+/// Equivalent to `git push -u origin HEAD`.
+pub fn publish_branch_at(workdir: &Path) -> Result<(), String> {
+    let repo = Repository::discover(workdir).map_err(|e| e.message().to_string())?;
+    let head = repo.head().map_err(|e| e.message().to_string())?;
+    if !head.is_branch() {
+        return Err("cannot publish detached HEAD".to_string());
+    }
+    if repo.find_remote("origin").is_err() {
+        return Err("remote 'origin' not found".to_string());
+    }
+    let output = std::process::Command::new("git")
+        .current_dir(workdir)
+        .args(["push", "-u", "origin", "HEAD"])
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "git executable not found on PATH - publish requires a `git` binary".to_string()
+            } else {
+                format!("failed to run git: {e}")
+            }
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Err(if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            "publish failed".to_string()
+        });
+    }
+    Ok(())
+}
+
 /// Fast-forward the current branch from its upstream. Uses `--ff-only` so the
 /// TUI never triggers an interactive merge commit editor.
 pub fn pull_at(workdir: &Path) -> Result<(), String> {

@@ -77,6 +77,12 @@ fn configure_upstream(path: &Path, remote_path: &Path) {
         .unwrap();
 }
 
+fn configure_origin(path: &Path, remote_path: &Path) {
+    let repo = git2::Repository::open(path).unwrap();
+    repo.remote("origin", remote_path.to_str().unwrap())
+        .unwrap();
+}
+
 fn push_remote_commit(remote_path: &Path, file: &str, contents: &str, message: &str) {
     let updater = TempDir::new().unwrap();
     std::process::Command::new("git")
@@ -154,6 +160,18 @@ fn wait_for_pull(app: &mut App) {
         thread::sleep(Duration::from_millis(10));
     }
     panic!("timed out waiting for pull");
+}
+
+fn wait_for_push(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        app.tick();
+        if !app.push_in_flight {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for push");
 }
 
 fn wait_for_diff(app: &mut App) {
@@ -602,5 +620,46 @@ fn app_pulls_selected_child_repo() {
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("only/remote.txt")).unwrap(),
         "remote\n"
+    );
+}
+
+#[test]
+fn app_publishes_selected_child_branch() {
+    let _lock = APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let _home = HomeGuard::enter(tmp.path());
+    init_bare_repo(&tmp.path().join("remote.git"));
+    init_repo(&tmp.path().join("only"));
+    configure_identity(&tmp.path().join("only"));
+    write_file(&tmp.path().join("only/base.txt"), "base\n");
+    commit_all(&tmp.path().join("only"), "base commit");
+    configure_origin(&tmp.path().join("only"), &tmp.path().join("remote.git"));
+
+    let mut app = app_for(tmp.path());
+    app.set_active_tab(Tab::Git);
+    wait_for_repo_catalog(&mut app);
+    wait_for_git_status(&mut app);
+    assert!(app.should_offer_publish_branch());
+    assert!(git_status_panel::handle_command(
+        &mut app,
+        "git.publishBranch",
+        &serde_json::json!({})
+    ));
+    wait_for_push(&mut app);
+
+    let repo = git2::Repository::open(tmp.path().join("only")).unwrap();
+    let branch = repo.head().unwrap().shorthand().unwrap().to_string();
+    assert_eq!(
+        repo.config()
+            .unwrap()
+            .get_string(&format!("branch.{branch}.remote"))
+            .unwrap(),
+        "origin"
+    );
+    assert!(
+        git2::Repository::open_bare(tmp.path().join("remote.git"))
+            .unwrap()
+            .find_reference(&format!("refs/heads/{branch}"))
+            .is_ok()
     );
 }

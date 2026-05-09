@@ -85,6 +85,7 @@ pub enum Msg {
     // Toasts
     PushSuccess,
     ForcePushSuccess,
+    PublishBranchSuccess,
     PullSuccess,
     PullThreadCrashed,
     PushThreadCrashed,
@@ -101,9 +102,11 @@ pub enum Msg {
     NoReposFound,
     RepoSelectPrompt,
     PushingHint,
+    PublishingBranchHint,
     PullingHint,
     PullFailedPrefix,
     PushFailedPrefix,
+    PublishBranchFailedPrefix,
     DismissClose,
     ForcePushPrompt,
     ForcePushWarning,
@@ -307,6 +310,7 @@ fn t_zh(m: Msg) -> &'static str {
         SearchReplaceTitle => " 🔎 查找与替换 ",
         PushSuccess => "推送成功",
         ForcePushSuccess => "强制推送成功",
+        PublishBranchSuccess => "分支已发布",
         PullSuccess => "拉取成功",
         PullThreadCrashed => "拉取线程异常退出，请重试",
         PushThreadCrashed => "推送线程异常退出，请重试",
@@ -321,9 +325,11 @@ fn t_zh(m: Msg) -> &'static str {
         NoReposFound => "  未发现仓库",
         RepoSelectPrompt => "  选择一个仓库",
         PushingHint => "  ⋯ 推送中…",
+        PublishingBranchHint => "  ⋯ 发布分支中…",
         PullingHint => "  ⋯ 拉取中…",
         PullFailedPrefix => "  ✖ 拉取失败: ",
         PushFailedPrefix => "  ✖ 推送失败: ",
+        PublishBranchFailedPrefix => "  ✖ 发布分支失败: ",
         DismissClose => "  [关闭]",
         ForcePushPrompt => "  ⚠ 强制推送？",
         ForcePushWarning => "（会覆盖远端，使用 --force-with-lease）",
@@ -489,6 +495,7 @@ fn t_en(m: Msg) -> &'static str {
         SearchReplaceTitle => " 🔎 Find & Replace ",
         PushSuccess => "Push succeeded",
         ForcePushSuccess => "Force push succeeded",
+        PublishBranchSuccess => "Branch published",
         PullSuccess => "Pull succeeded",
         PullThreadCrashed => "Pull worker crashed, please retry",
         PushThreadCrashed => "Push worker crashed, please retry",
@@ -503,9 +510,11 @@ fn t_en(m: Msg) -> &'static str {
         NoReposFound => "  no repositories found",
         RepoSelectPrompt => "  select a repository",
         PushingHint => "  ⋯ Pushing…",
+        PublishingBranchHint => "  ⋯ Publishing branch…",
         PullingHint => "  ⋯ Pulling…",
         PullFailedPrefix => "  ✖ Pull failed: ",
         PushFailedPrefix => "  ✖ Push failed: ",
+        PublishBranchFailedPrefix => "  ✖ Publish branch failed: ",
         DismissClose => "  [dismiss]",
         ForcePushPrompt => "  ⚠ Force push?",
         ForcePushWarning => "(overwrites remote, uses --force-with-lease)",
@@ -712,6 +721,25 @@ pub fn pull_button(behind: usize) -> String {
         Lang::En if behind > 0 => format!(" ↓ Pull ({behind}) "),
         Lang::Zh => " ↓ 拉取 ".to_string(),
         Lang::En => " ↓ Pull ".to_string(),
+    }
+}
+
+pub fn publish_branch_button() -> String {
+    match lang() {
+        Lang::Zh => " ↑ 发布分支 ".to_string(),
+        Lang::En => " ↑ Publish Branch ".to_string(),
+    }
+}
+
+pub fn publish_branch_failed_toast(e: &str) -> String {
+    let first = e
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or(e);
+    match lang() {
+        Lang::Zh => format!("发布分支失败: {first}"),
+        Lang::En => format!("Publish branch failed: {first}"),
     }
 }
 

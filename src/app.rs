@@ -31,6 +31,18 @@ pub struct BuiltProtocol {
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(80);
 const SELECTED_GIT_REPO_PREF: &str = "status.selected_repo";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushOperation {
+    Push { force: bool },
+    PublishBranch,
+}
+
+impl Default for PushOperation {
+    fn default() -> Self {
+        Self::Push { force: false }
+    }
+}
+
 /// Pagination + table-selection state for the SQLite preview card.
 /// Lives `Some` for as long as the current `preview_content` is a
 /// `PreviewBody::Database`; rebuilt from `info.initial_page` whenever
@@ -296,6 +308,7 @@ pub struct GitStatusState {
     /// because the banner stays visible across re-renders whereas toasts are
     /// ephemeral.
     pub push_error: Option<String>,
+    pub push_error_kind: PushOperation,
     pub pull_error: Option<String>,
     pub scroll: usize,
     pub ahead_behind: Option<(usize, usize)>,
@@ -776,9 +789,10 @@ pub struct App {
     /// `true` while a background `git push` is in flight. Blocks additional
     /// pushes and lets the status panel render a "推送中…" indicator.
     pub push_in_flight: bool,
-    /// Receives `(force, result)` from the push worker thread. Drained in
+    pub push_in_flight_kind: PushOperation,
+    /// Receives `(operation, result)` from the push worker thread. Drained in
     /// `App::tick`; once the result is consumed we drop the channel.
-    pub push_rx: Option<mpsc::Receiver<(bool, Result<(), String>)>>,
+    pub push_rx: Option<mpsc::Receiver<(PushOperation, Result<(), String>)>>,
 
     pub pull_in_flight: bool,
     pub pull_rx: Option<mpsc::Receiver<Result<(), String>>>,
@@ -1162,6 +1176,7 @@ impl App {
             },
             toasts: Vec::new(),
             push_in_flight: false,
+            push_in_flight_kind: PushOperation::default(),
             push_rx: None,
             pull_in_flight: false,
             pull_rx: None,
@@ -3545,17 +3560,46 @@ impl App {
         let Some(repo_root_rel) = self.status_repo_root_rel() else {
             return;
         };
+        let operation = PushOperation::Push { force };
         let backend = Arc::clone(&self.backend);
         let (tx, rx) = mpsc::channel();
         self.push_rx = Some(rx);
         self.push_in_flight = true;
+        self.push_in_flight_kind = operation;
         std::thread::spawn(move || {
             let result = backend
                 .push_for(&repo_root_rel, force)
                 .map_err(|e| e.to_string());
             // Recv side may have been dropped by the time we finish (e.g.
             // user quit mid-push); ignore the send error.
-            let _ = tx.send((force, result));
+            let _ = tx.send((operation, result));
+        });
+    }
+
+    pub fn should_offer_publish_branch(&self) -> bool {
+        self.git_status.ahead_behind.is_none()
+            && !self.branch_name.trim().is_empty()
+            && self.branch_name != "(detached)"
+    }
+
+    pub fn run_publish_branch(&mut self) {
+        if self.push_in_flight || !self.should_offer_publish_branch() {
+            return;
+        }
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
+            return;
+        };
+        let operation = PushOperation::PublishBranch;
+        let backend = Arc::clone(&self.backend);
+        let (tx, rx) = mpsc::channel();
+        self.push_rx = Some(rx);
+        self.push_in_flight = true;
+        self.push_in_flight_kind = operation;
+        std::thread::spawn(move || {
+            let result = backend
+                .publish_branch_for(&repo_root_rel)
+                .map_err(|e| e.to_string());
+            let _ = tx.send((operation, result));
         });
     }
 
@@ -3703,23 +3747,29 @@ impl App {
             return;
         };
         match rx.try_recv() {
-            Ok((force, result)) => {
+            Ok((operation, result)) => {
                 self.push_in_flight = false;
                 self.push_rx = None;
                 match result {
                     Ok(()) => {
                         use crate::i18n::{Msg, t};
                         self.git_status.push_error = None;
-                        self.toasts.push(Toast::info(if force {
-                            t(Msg::ForcePushSuccess)
-                        } else {
-                            t(Msg::PushSuccess)
+                        self.toasts.push(Toast::info(match operation {
+                            PushOperation::Push { force: true } => t(Msg::ForcePushSuccess),
+                            PushOperation::Push { force: false } => t(Msg::PushSuccess),
+                            PushOperation::PublishBranch => t(Msg::PublishBranchSuccess),
                         }));
                     }
                     Err(e) => {
+                        self.git_status.push_error_kind = operation;
                         self.git_status.push_error = Some(e.clone());
-                        self.toasts
-                            .push(Toast::error(crate::i18n::push_failed_toast(&e)));
+                        let toast = match operation {
+                            PushOperation::PublishBranch => {
+                                crate::i18n::publish_branch_failed_toast(&e)
+                            }
+                            PushOperation::Push { .. } => crate::i18n::push_failed_toast(&e),
+                        };
+                        self.toasts.push(Toast::error(toast));
                     }
                 }
                 // Push advances remote-tracking refs — mark git/graph data

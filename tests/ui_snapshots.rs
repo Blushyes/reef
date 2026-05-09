@@ -169,6 +169,15 @@ fn pull_button_stays_visible_when_dirty_or_synced() {
             .any(|line| line.contains("Commit") && line.contains("↑ Push")),
         "push button should share the commit action row when local commits are ahead"
     );
+
+    app.git_status.ahead_behind = None;
+    let no_upstream_output = render_app(&mut app, 120, 20);
+    assert!(
+        no_upstream_output
+            .lines()
+            .any(|line| line.contains("Commit") && line.contains("↑ Publish Branch")),
+        "publish button should share the commit action row when the branch has no upstream"
+    );
 }
 
 #[test]

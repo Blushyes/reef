@@ -652,6 +652,14 @@ impl Backend for LocalBackend {
         crate::git::push_at(&self.workdir_at(repo_root_rel)?, force).map_err(BackendError::Git)
     }
 
+    fn publish_branch(&self) -> Result<(), BackendError> {
+        self.publish_branch_for(Path::new("."))
+    }
+
+    fn publish_branch_for(&self, repo_root_rel: &Path) -> Result<(), BackendError> {
+        crate::git::publish_branch_at(&self.workdir_at(repo_root_rel)?).map_err(BackendError::Git)
+    }
+
     fn pull(&self) -> Result<(), BackendError> {
         self.pull_for(Path::new("."))
     }

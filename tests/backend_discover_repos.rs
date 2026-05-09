@@ -54,6 +54,12 @@ fn configure_upstream(path: &Path, remote_path: &Path) -> String {
     branch
 }
 
+fn configure_origin(path: &Path, remote_path: &Path) {
+    let repo = git2::Repository::open(path).unwrap();
+    repo.remote("origin", remote_path.to_str().unwrap())
+        .unwrap();
+}
+
 fn create_branch(path: &Path, branch: &str) {
     let repo = git2::Repository::open(path).unwrap();
     let head = repo.head().unwrap().peel_to_commit().unwrap();
@@ -608,6 +614,51 @@ fn create_branch_for_child_repo_remote_matches_local() {
             .unwrap()
             .branch_name,
         "remote-new"
+    );
+    assert!(git2::Repository::open(tmp.path()).unwrap().head().is_err());
+}
+
+#[test]
+fn publish_branch_for_child_repo_remote_matches_local() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    init_repo(tmp.path());
+    init_bare_repo(&tmp.path().join("remote.git"));
+    init_repo(&tmp.path().join("alpha"));
+    configure_identity(&tmp.path().join("alpha"));
+    write_file(&tmp.path().join("alpha/a.txt"), "alpha\n");
+    commit_all(&tmp.path().join("alpha"), "alpha commit");
+    configure_origin(&tmp.path().join("alpha"), &tmp.path().join("remote.git"));
+
+    let local = LocalBackend::open_at(tmp.path().to_path_buf());
+    local.publish_branch_for(Path::new("alpha")).unwrap();
+    let alpha = git2::Repository::open(tmp.path().join("alpha")).unwrap();
+    let branch = alpha.head().unwrap().shorthand().unwrap().to_string();
+    assert_eq!(
+        alpha
+            .config()
+            .unwrap()
+            .get_string(&format!("branch.{branch}.remote"))
+            .unwrap(),
+        "origin"
+    );
+    assert!(
+        git2::Repository::open_bare(tmp.path().join("remote.git"))
+            .unwrap()
+            .find_reference(&format!("refs/heads/{branch}"))
+            .is_ok()
+    );
+
+    local
+        .create_branch_for(Path::new("alpha"), "remote-new", None)
+        .unwrap();
+    let remote = spawn_remote(tmp.path());
+    remote.publish_branch_for(Path::new("alpha")).unwrap();
+    assert!(
+        git2::Repository::open_bare(tmp.path().join("remote.git"))
+            .unwrap()
+            .find_reference("refs/heads/remote-new")
+            .is_ok()
     );
     assert!(git2::Repository::open(tmp.path()).unwrap().head().is_err());
 }

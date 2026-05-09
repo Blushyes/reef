@@ -80,7 +80,8 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 /// - v16: adds repo-scoped branch checkout.
 /// - v17: adds repo-scoped pull.
 /// - v18: adds repo-scoped branch creation.
-pub const PROTOCOL_VERSION: u32 = 18;
+/// - v19: adds repo-scoped branch publishing.
+pub const PROTOCOL_VERSION: u32 = 19;
 
 /// Encode a single envelope-level value to `writer` using the
 /// length-prefixed framing. The caller is expected to flush.
@@ -253,6 +254,10 @@ pub enum Request {
     PushFor {
         repo_root_rel: String,
         force: bool,
+    },
+    PublishBranch,
+    PublishBranchFor {
+        repo_root_rel: String,
     },
     Pull,
     PullFor {

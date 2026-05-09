@@ -808,8 +808,9 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
         rows.push(Row::blank());
     }
 
-    // Push indicator. Pull lives on the commit action row so the two primary
-    // Git actions share one horizontal control strip.
+    // Dangerous divergent push stays as an explicit warning row. Normal Push
+    // and Pull live on the commit action row so primary Git actions share one
+    // horizontal control strip.
     if allow_git_writes
         && !status.confirm_push
         && !status.confirm_force_push
@@ -817,7 +818,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
         && !app.pull_in_flight
     {
         if let Some((ahead, behind)) = app.git_status.ahead_behind {
-            if let Some(row) = push_indicator_row(ahead, behind) {
+            if let Some(row) = force_push_indicator_row(ahead, behind) {
                 rows.push(row);
                 rows.push(Row::blank());
             }
@@ -864,7 +865,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
         // staged/unstaged sections to mirror VSCode's Source Control
         // layout. Editing is routed through `git.commit*` commands so
         // mouse and keyboard paths share the same buffer mutation code.
-        push_commit_box(&mut rows, app, max_path, theme);
+        push_commit_box(&mut rows, app, width as usize, theme);
         rows.push(Row::blank());
     }
 
@@ -1694,19 +1695,13 @@ fn push_commit_box(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Them
             // message line doesn't overflow the sidebar — each
             // ideograph counts as 2 cells on most terminals.
             let budget = max_path.saturating_sub(4).max(1);
-            let display = truncate_to_width(line, budget);
             let mut spans = vec![RowSpan::styled(
                 " │ ".to_string(),
                 Style::default().fg(border_color),
             )];
             if cursor_in_line {
                 let col_bytes = cursor - line_start;
-                // Convert byte offset to char offset so the caret
-                // lands on a grapheme boundary in the displayed line.
-                let before_chars = line[..col_bytes.min(line.len())]
-                    .chars()
-                    .count()
-                    .min(budget);
+                let (display, before_chars) = commit_line_view(line, col_bytes, budget);
                 let (before, after) = split_chars(&display, before_chars);
                 spans.push(RowSpan::plain(before));
                 // Caret glyph: reverse-video space so it shows at
@@ -1724,10 +1719,13 @@ fn push_commit_box(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Them
                     Style::default().add_modifier(Modifier::REVERSED),
                 ));
                 spans.push(RowSpan::plain(rest));
-            } else if display.is_empty() {
-                spans.push(RowSpan::plain(" "));
             } else {
-                spans.push(RowSpan::plain(display));
+                let display = truncate_to_width(line, budget);
+                if display.is_empty() {
+                    spans.push(RowSpan::plain(" "));
+                } else {
+                    spans.push(RowSpan::plain(display));
+                }
             }
             let used: usize = spans
                 .iter()
@@ -1770,6 +1768,22 @@ fn push_commit_box(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Them
         },
     ];
 
+    if let Some((ahead, behind)) = app.git_status.ahead_behind {
+        if ahead > 0 && behind == 0 && !app.push_in_flight {
+            action_spans.push(RowSpan::plain("  "));
+            action_spans.push(
+                RowSpan::styled(
+                    crate::i18n::push_button(ahead),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .on_click("git.pushPrompt", Value::Null),
+            );
+        }
+    }
+
     if !app.pull_in_flight
         && let Some((_, behind)) = app.git_status.ahead_behind
     {
@@ -1806,6 +1820,86 @@ fn split_chars(s: &str, n: usize) -> (String, String) {
     (before, after)
 }
 
+/// Return the visible slice of a commit-message line plus the cursor's char
+/// offset inside that slice. Unlike `truncate_to_width`, this follows the
+/// cursor so moving right reveals text after the ellipsis instead of pinning
+/// the view to the start of the line.
+fn commit_line_view(line: &str, cursor_byte: usize, max_cols: usize) -> (String, usize) {
+    use unicode_width::UnicodeWidthChar;
+
+    if max_cols == 0 {
+        return (String::new(), 0);
+    }
+    if UnicodeWidthStr::width(line) <= max_cols {
+        let cursor_chars = line[..cursor_byte.min(line.len())].chars().count();
+        return (line.to_string(), cursor_chars);
+    }
+    if max_cols <= 2 {
+        let display = truncate_to_width(line, max_cols);
+        let cursor_chars = line[..cursor_byte.min(line.len())].chars().count();
+        return (display, cursor_chars.min(max_cols));
+    }
+
+    let chars: Vec<char> = line.chars().collect();
+    let cursor_char = line[..cursor_byte.min(line.len())]
+        .chars()
+        .count()
+        .min(chars.len());
+    let prefix_width: usize = chars[..cursor_char]
+        .iter()
+        .map(|c| UnicodeWidthChar::width(*c).unwrap_or(0))
+        .sum();
+
+    let mut start = 0usize;
+    if prefix_width >= max_cols {
+        start = cursor_char;
+        let mut used = 0usize;
+        // Reserve one column for the leading ellipsis and one for either the
+        // cursor cell or trailing ellipsis. This keeps the insertion point on
+        // screen when the user navigates into the right side of a long line.
+        let cap_left = max_cols.saturating_sub(2);
+        while start > 0 {
+            let w = UnicodeWidthChar::width(chars[start - 1]).unwrap_or(0);
+            if used + w > cap_left {
+                break;
+            }
+            used += w;
+            start -= 1;
+        }
+    }
+
+    let mut out = String::new();
+    let mut used = 0usize;
+    if start > 0 {
+        out.push('…');
+        used += 1;
+    }
+
+    let mut cursor_display = out.chars().count();
+    let mut idx = start;
+    while idx < chars.len() {
+        if idx == cursor_char {
+            cursor_display = out.chars().count();
+        }
+        let w = UnicodeWidthChar::width(chars[idx]).unwrap_or(0);
+        let reserve_trailing = usize::from(idx + 1 < chars.len());
+        if used + w + reserve_trailing > max_cols {
+            break;
+        }
+        out.push(chars[idx]);
+        used += w;
+        idx += 1;
+    }
+    if cursor_char >= idx {
+        cursor_display = out.chars().count();
+    }
+    if idx < chars.len() {
+        out.push('…');
+    }
+
+    (out, cursor_display)
+}
+
 /// Clip `s` so its rendered width is ≤ `max_cols` display columns
 /// (via `UnicodeWidthStr`). Appends an `…` when truncation happens.
 /// Used by `push_commit_box` instead of char-count clipping so
@@ -1834,21 +1928,10 @@ fn truncate_to_width(s: &str, max_cols: usize) -> String {
     out
 }
 
-fn push_indicator_row(ahead: usize, behind: usize) -> Option<Row> {
+fn force_push_indicator_row(ahead: usize, behind: usize) -> Option<Row> {
     match (ahead, behind) {
         (0, 0) => None,
-        (a, 0) => Some(Row::new(vec![
-            RowSpan::plain("  "),
-            RowSpan {
-                text: crate::i18n::push_button(a),
-                style: Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-                click: Some(("git.pushPrompt".into(), Value::Null)),
-                dbl: None,
-            },
-        ])),
+        (_, 0) => None,
         (0, _) => None,
         (a, b) => Some(Row::new(vec![
             RowSpan::plain("  "),

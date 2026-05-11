@@ -4603,7 +4603,7 @@ impl App {
 
         match self.active_tab {
             Tab::Files => {
-                if self.preview_load.should_request() {
+                if self.preview_load.should_request() && self.preview_schedule.is_none() {
                     self.load_preview();
                 }
             }
@@ -4651,6 +4651,7 @@ impl App {
                 // whatever the Files tab was looking at last, not at the
                 // current hit.
                 if self.preview_load.should_request()
+                    && self.preview_schedule.is_none()
                     && let Some(hit) = self
                         .global_search
                         .results
@@ -4702,7 +4703,11 @@ fn save_prefs(layout: DiffLayout, mode: DiffMode) {
 
 #[cfg(test)]
 mod tests {
-    use super::{GitGraphState, folder_contains};
+    use super::{App, GitGraphState, folder_contains};
+    use crate::backend::LocalBackend;
+    use crate::ui::theme::Theme;
+    use std::sync::Arc;
+    use test_support::{HOME_LOCK, HomeGuard, commit_file, tempdir_repo};
 
     #[test]
     fn graph_state_selected_range_single_without_anchor() {
@@ -4792,6 +4797,39 @@ mod tests {
         // which makes an empty target a safe no-op rather than a
         // "revert everything" footgun.
         assert!(!folder_contains("", "anything.rs"));
+    }
+
+    #[test]
+    fn stale_preview_refresh_keeps_pending_debounce_deadline() {
+        let _home_lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::TempDir::new().expect("home tempdir");
+        let _home = HomeGuard::enter(home.path());
+        let (tmp, repo) = tempdir_repo();
+        commit_file(&repo, "a.txt", "hello\n", "add a");
+        let backend = Arc::new(LocalBackend::open_at(tmp.path().to_path_buf()));
+        let mut app = App::new_with_backend(Theme::dark(), backend, None);
+        app.fs_watcher_rx = None;
+
+        let file_idx = app
+            .file_tree
+            .entries
+            .iter()
+            .position(|entry| entry.path == std::path::Path::new("a.txt"))
+            .expect("a.txt entry");
+        app.file_tree.selected = file_idx;
+        app.load_preview();
+
+        let (scheduled_path, scheduled_deadline) =
+            app.preview_schedule.clone().expect("preview scheduled");
+        app.preview_load.mark_stale();
+        app.kick_active_tab_work();
+
+        assert_eq!(
+            app.preview_schedule,
+            Some((scheduled_path, scheduled_deadline))
+        );
+        assert!(app.preview_load.stale);
+        assert!(!app.preview_load.loading);
     }
 
     // ── Graph layout math ────────────────────────────────────────────────

@@ -3705,8 +3705,11 @@ impl App {
                             // Preserve the user's staged/unstaged choice when the file
                             // exists in both sections — flipping it would swap the diff
                             // out from under them right after they clicked.
-                            let still_in_current =
-                                if sel.is_staged { in_staged } else { in_unstaged };
+                            let still_in_current = if sel.is_staged {
+                                in_staged
+                            } else {
+                                in_unstaged
+                            };
                             if !still_in_current {
                                 if in_staged {
                                     sel.is_staged = true;

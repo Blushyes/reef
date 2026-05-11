@@ -3702,13 +3702,20 @@ impl App {
                             let in_staged = self.staged_files.iter().any(|f| f.path == sel.path);
                             let in_unstaged =
                                 self.unstaged_files.iter().any(|f| f.path == sel.path);
-                            if in_staged {
-                                sel.is_staged = true;
-                            } else if in_unstaged {
-                                sel.is_staged = false;
-                            } else {
-                                self.selected_file = None;
-                                self.diff_content = None;
+                            // Preserve the user's staged/unstaged choice when the file
+                            // exists in both sections — flipping it would swap the diff
+                            // out from under them right after they clicked.
+                            let still_in_current =
+                                if sel.is_staged { in_staged } else { in_unstaged };
+                            if !still_in_current {
+                                if in_staged {
+                                    sel.is_staged = true;
+                                } else if in_unstaged {
+                                    sel.is_staged = false;
+                                } else {
+                                    self.selected_file = None;
+                                    self.diff_content = None;
+                                }
                             }
                         }
                         if before != self.selected_file {

@@ -2,11 +2,9 @@
 //! event-drain loop to `handle_key` and `handle_mouse` here, so the binary
 //! entry point stays focused on terminal bootstrap.
 //!
-//! The one exception is the `v` (select mode toggle) and `show_help`
-//! dismiss — those stay inline in `main.rs` because the first needs
-//! `execute!(terminal.backend_mut(), ...)` to flip crossterm's mouse
-//! capture mode, and both are simple enough that splitting them out would
-//! just add indirection.
+//! The one exception is the `show_help` dismiss, which stays inline in
+//! `main.rs` because it's simple enough that splitting it out would just
+//! add indirection.
 
 use crate::app::{App, DbNav, Panel, Tab, ViewMode};
 use crate::clipboard;

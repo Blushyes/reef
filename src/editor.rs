@@ -61,16 +61,8 @@ pub(crate) fn resolve_editor() -> Option<(String, Vec<String>)> {
 }
 
 /// Suspend the TUI, run the user's editor on `path`, then restore the TUI.
-///
-/// `mouse_capture_was_on` tells us whether to re-enable mouse capture on
-/// resume — the caller tracks this because `v` (select mode) may have
-/// disabled it before the user triggered the edit.
 #[allow(dead_code)]
-pub fn launch<B: Backend>(
-    terminal: &mut Terminal<B>,
-    path: &Path,
-    mouse_capture_was_on: bool,
-) -> io::Result<()> {
+pub fn launch<B: Backend>(terminal: &mut Terminal<B>, path: &Path) -> io::Result<()> {
     let (prog, extra_args) = resolve_editor().ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, "no editor set (VISUAL / EDITOR)")
     })?;
@@ -90,10 +82,7 @@ pub fn launch<B: Backend>(
     // mode on the regular buffer — unusable.
     let restore = (|| -> io::Result<()> {
         enable_raw_mode()?;
-        execute!(stdout, EnterAlternateScreen)?;
-        if mouse_capture_was_on {
-            execute!(stdout, EnableMouseCapture)?;
-        }
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         // `B::Error` isn't guaranteed to convert to io::Error without a
         // bound; stringify it so this stays generic over backends.
         terminal
@@ -121,7 +110,6 @@ pub fn launch<B: Backend>(
 pub fn launch_spec<B: Backend>(
     terminal: &mut Terminal<B>,
     spec: &EditorLaunchSpec,
-    mouse_capture_was_on: bool,
 ) -> io::Result<()> {
     disable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -131,10 +119,7 @@ pub fn launch_spec<B: Backend>(
 
     let restore = (|| -> io::Result<()> {
         enable_raw_mode()?;
-        execute!(stdout, EnterAlternateScreen)?;
-        if mouse_capture_was_on {
-            execute!(stdout, EnableMouseCapture)?;
-        }
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         terminal
             .clear()
             .map_err(|e| io::Error::other(format!("{e:?}")))?;

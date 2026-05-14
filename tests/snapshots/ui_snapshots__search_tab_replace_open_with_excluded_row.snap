@@ -1,6 +1,5 @@
 ---
 source: tests/ui_snapshots.rs
-assertion_line: 631
 expression: output
 ---
  reef  [TMPDIR]  ⎇ master
@@ -18,4 +17,4 @@ expression: output
 │                            │
 │1 / 2 · 1 to replace ·  Apply
 └────────────────────────────┘
-                                     q:quit Tab:switch s:stage u:unstage r:refresh h:help  [Search]
+                                  ⚙  q:quit Tab:switch s:stage u:unstage r:refresh h:help  [Search]

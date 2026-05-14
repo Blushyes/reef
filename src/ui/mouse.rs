@@ -18,6 +18,10 @@ pub enum ClickAction {
     StartDragGraphDiffSplit,
     /// 标签栏右侧的侧边栏可见性切换按钮。等价于 Ctrl+B,但鼠标可点。
     ToggleSidebar,
+    /// 状态栏右侧的设置按钮。等价于 Ctrl+,,给找不到快捷键
+    /// 或终端吞掉 Ctrl+, 的用户兜底。仅在常规状态栏分支注册,
+    /// 各类模态接管(搜索/select/place/paste-conflict 等)期间不出现。
+    OpenSettings,
     SwitchTab(Tab),
     TreeClick(usize),
     /// Click on a row in the quick-open palette. The `usize` indexes

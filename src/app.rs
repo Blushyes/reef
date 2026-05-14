@@ -4149,6 +4149,9 @@ impl App {
             ClickAction::ToggleSidebar => {
                 self.toggle_sidebar();
             }
+            ClickAction::OpenSettings => {
+                self.open_settings();
+            }
             ClickAction::TreeClick(index) => {
                 self.file_tree.selected = index;
                 if let Some(entry) = self.file_tree.entries.get(index) {

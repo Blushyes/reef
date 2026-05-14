@@ -498,29 +498,11 @@ fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    if app.select_mode {
-        let hint = Line::from(vec![
-            Span::styled(
-                " SELECT ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                t(Msg::SelectModeHint),
-                Style::default().fg(Color::Yellow).bg(th.chrome_bg),
-            ),
-        ]);
-        f.render_widget(hint, area);
-        return;
-    }
-
-    // Place-mode modal indicator. Mirrors the select-mode pattern: a loud
-    // badge in the accent color so the user can't miss that a mode is
-    // active, plus a hint describing how to commit or cancel. When a
-    // copy is actively running the hint swaps to a copying indicator so
-    // the status bar proves the worker is still alive on big transfers.
+    // Place-mode modal indicator: a loud badge in the accent color so the
+    // user can't miss that a mode is active, plus a hint describing how
+    // to commit or cancel. When a copy is actively running the hint
+    // swaps to a copying indicator so the status bar proves the worker
+    // is still alive on big transfers.
     if app.place_mode.active {
         let copying = app.file_copy_load.loading;
         let (badge_text, hint_text) = if copying {
@@ -861,7 +843,6 @@ fn render_help(f: &mut Frame, app: &App, screen: Rect) {
         ("f", t(Msg::HelpDiffMode)),
         ("t", t(Msg::HelpToggleView)),
         ("r", t(Msg::HelpRefresh)),
-        ("v", t(Msg::HelpSelectMode)),
         ("h", t(Msg::HelpShowHelp)),
         ("Ctrl+B", t(Msg::HelpToggleSidebar)),
         ("Ctrl+,", t(Msg::HelpOpenSettings)),

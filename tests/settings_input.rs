@@ -111,20 +111,3 @@ fn esc_in_inline_editor_cancels_without_writing_prefs() {
     input::handle_key(esc(), &mut app);
     assert_eq!(app.view_mode, ViewMode::Main);
 }
-
-/// Regression: bare `v` is intercepted in `main.rs` as the select-mode
-/// toggle. The Settings page must override that interception so `v`
-/// reaches the inline editor as a literal char.
-#[test]
-fn typing_v_in_inline_editor_inserts_literal() {
-    let (_lock, _h, _g, _home, _cwd, mut app) = isolated_app();
-    input::handle_key(ctrl_comma(), &mut app);
-    app.settings.select(editor_command_idx());
-    input::handle_key(enter(), &mut app);
-
-    for c in "nvim".chars() {
-        input::handle_key(char_key(c), &mut app);
-    }
-    let edit = app.settings.editor_edit.as_ref().unwrap();
-    assert_eq!(edit.buffer, "nvim");
-}

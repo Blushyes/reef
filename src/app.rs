@@ -684,7 +684,6 @@ pub struct App {
 
     // Control
     pub should_quit: bool,
-    pub select_mode: bool,
     pub show_help: bool,
 
     /// Set by the input layer when the user asks to edit a file. Consumed
@@ -1053,7 +1052,6 @@ impl App {
             commit_rx: None,
             fs_watcher_rx,
             should_quit: false,
-            select_mode: false,
             show_help: false,
             pending_edit: None,
             theme,
@@ -1292,23 +1290,12 @@ impl App {
     /// `input::handle_paste` when a paste payload resolves to existing
     /// on-disk paths.
     ///
-    /// Refuses the transition in two situations that would otherwise
-    /// leave the user stranded:
-    ///
-    /// - `select_mode` is active — mouse capture is off in that mode,
-    ///   so the user would have no way to click a drop target. The
-    ///   toast points them at the `v` escape hatch.
-    /// - a place-mode copy is already in flight — overwriting
-    ///   `sources` would invalidate the worker's generation and the
-    ///   previous copy's completion result (including the success
-    ///   toast and tree refresh) would be silently dropped.
+    /// Refuses the transition when a place-mode copy is already in
+    /// flight — overwriting `sources` would invalidate the worker's
+    /// generation and the previous copy's completion result (including
+    /// the success toast and tree refresh) would be silently dropped.
     pub fn enter_place_mode(&mut self, sources: Vec<PathBuf>) {
         if sources.is_empty() {
-            return;
-        }
-        if self.select_mode {
-            self.toasts
-                .push(Toast::warn(crate::i18n::place_mode_blocked_by_select_mode()));
             return;
         }
         if self.file_copy_load.loading {

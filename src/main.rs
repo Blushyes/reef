@@ -1,7 +1,7 @@
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
         PushKeyboardEnhancementFlags,
     },
     execute,
@@ -305,30 +305,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
 
-                        // `v` toggles select mode, which flips crossterm's mouse capture
-                        // so the terminal's native text-selection works. Kept inline
-                        // because it's the only input that needs to poke the terminal
-                        // backend mid-loop.
-                        //
-                        // When any palette (quick-open or global-search) is active,
-                        // or while the full-screen Settings page is up, it owns every
-                        // key unconditionally — 'v' must land as a literal in the
-                        // query / editor.command buffer, and 'any key' must not
-                        // dismiss help — so route to handle_key first and let it
-                        // delegate to the page.
+                        // Palettes (quick-open / global-search / hosts-picker) and
+                        // the full-screen Settings page own every key unconditionally —
+                        // 'any key' must not dismiss help while one of them is up — so
+                        // route to handle_key first and let it delegate to the page.
                         if app.quick_open.active
                             || app.global_search.active
                             || app.hosts_picker.active
                             || app.view_mode == ViewMode::Settings
                         {
                             input::handle_key(key, &mut app);
-                        } else if key.code == KeyCode::Char('v') && key.modifiers.is_empty() {
-                            app.select_mode = !app.select_mode;
-                            if app.select_mode {
-                                execute!(terminal.backend_mut(), DisableMouseCapture)?;
-                            } else {
-                                execute!(terminal.backend_mut(), EnableMouseCapture)?;
-                            }
                         } else if app.show_help {
                             app.show_help = false;
                         } else {
@@ -336,9 +322,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     Event::Mouse(mouse) => {
-                        if !app.select_mode {
-                            input::handle_mouse(mouse, &mut app, &terminal);
-                        }
+                        input::handle_mouse(mouse, &mut app, &terminal);
                     }
                     Event::Paste(s) => {
                         input::handle_paste(s, &mut app);
@@ -363,10 +347,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Handle an edit request *after* event drain so the terminal is
             // idle. Suspends the TUI, runs `$EDITOR` (or `ssh -t host
-            // $EDITOR rel` for remote), resumes. Mouse capture tracks
-            // `select_mode` — off in select mode, on otherwise.
+            // $EDITOR rel` for remote), resumes.
             if let Some(path) = app.pending_edit.take() {
-                let mouse_was_on = !app.select_mode;
                 // Convert an absolute path (input.rs synthesises
                 // `file_tree.root.join(entry.path)`) back to a workdir-
                 // relative form so the backend's remote variant can ship the
@@ -379,7 +361,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or_else(|_| path.clone());
                 match app.backend.editor_launch_spec(&rel_for_spec) {
                     Ok(spec) => {
-                        if let Err(e) = editor::launch_spec(&mut terminal, &spec, mouse_was_on) {
+                        if let Err(e) = editor::launch_spec(&mut terminal, &spec) {
                             app.toasts
                                 .push(Toast::error(i18n::edit_open_failed(&e.to_string())));
                         }

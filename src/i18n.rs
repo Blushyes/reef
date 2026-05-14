@@ -53,7 +53,6 @@ pub enum Msg {
 
     // Chrome
     StatusBarHint,
-    SelectModeHint,
     HelpTitle,
 
     // No-repo panel
@@ -202,7 +201,6 @@ pub enum Msg {
     HelpDiffMode,
     HelpToggleView,
     HelpRefresh,
-    HelpSelectMode,
     HelpShowHelp,
     HelpQuickOpen,
     HelpGlobalSearch,
@@ -282,7 +280,6 @@ fn t_zh(m: Msg) -> &'static str {
         TabGraph => " ⑂ 图表 ",
         TabBarHint => " 1:文件 2:搜索 3:Git 4:图表",
         StatusBarHint => " q:退出 Tab:切换 s:暂存 u:取消 r:刷新 h:帮助 ",
-        SelectModeHint => "  拖拽鼠标选择文字，按 v 退出选择模式",
         HelpTitle => " 快捷键帮助 ",
         NoRepoTitle => "不在 git 仓库中",
         NoRepoHint => "运行 `git init` 初始化，或在 git 仓库里打开 reef。",
@@ -388,7 +385,6 @@ fn t_zh(m: Msg) -> &'static str {
         HelpDiffMode => "切换 Diff 模式（局部 ↔ 全量）",
         HelpToggleView => "切换列表 / 树形视图",
         HelpRefresh => "刷新",
-        HelpSelectMode => "文字选择模式",
         HelpShowHelp => "显示 / 关闭此帮助",
         HelpQuickOpen => "打开 / 关闭快速打开浮层（全局模糊搜索）",
         HelpGlobalSearch => "打开全局内容搜索浮层",
@@ -454,7 +450,6 @@ fn t_en(m: Msg) -> &'static str {
         TabGraph => " ⑂ Graph ",
         TabBarHint => " 1:Files 2:Search 3:Git 4:Graph",
         StatusBarHint => " q:quit Tab:switch s:stage u:unstage r:refresh h:help ",
-        SelectModeHint => "  Drag to select text, press v to exit select mode",
         HelpTitle => " Keybindings ",
         NoRepoTitle => "Not a git repository",
         NoRepoHint => "Run `git init` to initialise one, or open reef inside a git repo.",
@@ -560,7 +555,6 @@ fn t_en(m: Msg) -> &'static str {
         HelpDiffMode => "Toggle diff mode (compact ↔ full)",
         HelpToggleView => "Toggle list / tree view",
         HelpRefresh => "Refresh",
-        HelpSelectMode => "Text selection mode",
         HelpShowHelp => "Show / close this help",
         HelpQuickOpen => "Toggle quick-open palette (global fuzzy search)",
         HelpGlobalSearch => "Open global content-search palette",
@@ -787,16 +781,6 @@ pub fn place_mode_copy_failed(e: &str) -> String {
     match lang() {
         Lang::Zh => format!("复制失败: {e}"),
         Lang::En => format!("Copy failed: {e}"),
-    }
-}
-
-/// Warning when a drop arrives while the user is in select-mode. Mouse
-/// capture is off in that state, so entering place mode would leave
-/// the user with no way to click a target.
-pub fn place_mode_blocked_by_select_mode() -> String {
-    match lang() {
-        Lang::Zh => "拖拽被选择模式拦住了：按 v 退出选择模式后再试".to_string(),
-        Lang::En => "Drop blocked by select mode — press v to exit, then retry".to_string(),
     }
 }
 

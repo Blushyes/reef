@@ -480,7 +480,7 @@ fn render_title_bar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(title, area);
 }
 
-fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
+fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
 
     // Search prompt has the highest priority — while active it fully owns the
@@ -685,17 +685,39 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let chip_w = UnicodeWidthStr::width(chip.as_str()) as u16;
     let notif_w = UnicodeWidthStr::width(notif.as_str()) as u16;
 
+    // Mouse-only settings entry — Ctrl+, fallback for terminals that
+    // swallow the chord. Glyph mirrors `SettingsTitle` so the icon is
+    // visually self-explanatory.
+    let settings_btn = " ⚙ ";
+    let settings_btn_w = UnicodeWidthStr::width(settings_btn) as u16;
+
     let pad_w = area
         .width
         .saturating_sub(notif_w)
+        .saturating_sub(settings_btn_w)
         .saturating_sub(hint_w)
         .saturating_sub(chip_w);
+
+    let settings_btn_x = area.x + notif_w + pad_w;
+    app.hit_registry.register_row(
+        settings_btn_x,
+        area.y,
+        settings_btn_w,
+        ClickAction::OpenSettings,
+    );
 
     let status = Line::from(vec![
         Span::styled(notif, Style::default().fg(notif_color).bg(th.chrome_bg)),
         Span::styled(
             " ".repeat(pad_w as usize),
             Style::default().bg(th.chrome_bg),
+        ),
+        Span::styled(
+            settings_btn,
+            Style::default()
+                .fg(th.chrome_muted_fg)
+                .bg(th.chrome_bg)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             hint_text,

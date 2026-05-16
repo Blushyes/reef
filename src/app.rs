@@ -629,6 +629,18 @@ pub struct App {
     /// 连击计数器:diff 面板的 Down(Left) 序列,和 `preview_click_state`
     /// 语义一致,但分开存以防两个 tab 之间的点击串扰。
     pub diff_click_state: Option<(Instant, u16, u16, u8)>,
+    /// 拖拽选中过程中,上一次观察到的鼠标 `(column, row)`。终端在鼠标
+    /// 不动时不会再发 Drag 事件,所以 VSCode 风格的"鼠标移出视口后
+    /// 自动滚动"必须每帧重放最后已知位置——`tick_drag_autoscroll`
+    /// 读这个字段。Down/Drag 时由 selection handler 写入,Up 时清空;
+    /// 没有进行中的拖拽时为 None。
+    pub last_drag_mouse: Option<(u16, u16)>,
+    /// 上一次 preview / diff 自动滚动触发的时刻,用作速率限制。距离视口边缘
+    /// 越远 `tick_drag_autoscroll` 取的间隔越短,但单帧最快也不超过这个节流
+    /// 闸,避免 60Hz tick 把视口直接甩飞。None 表示当前帧首次触发。两个
+    /// 面板各持一份,避免 Up 丢事件时两边互相干扰彼此的节流。
+    pub preview_autoscroll_at: Option<Instant>,
+    pub diff_autoscroll_at: Option<Instant>,
 
     // Layout
     pub split_percent: u16,
@@ -1032,6 +1044,9 @@ impl App {
             last_diff_rect: None,
             last_diff_hit: None,
             diff_click_state: None,
+            last_drag_mouse: None,
+            preview_autoscroll_at: None,
+            diff_autoscroll_at: None,
             split_percent: 30,
             sidebar_visible: true,
             sidebar_hide_hint_shown: false,
@@ -4513,6 +4528,7 @@ impl App {
         self.kick_active_tab_work();
         self.tick_place_mode_auto_expand();
         self.tick_tree_drag_auto_expand();
+        crate::input::tick_drag_autoscroll(self);
         self.drain_task_results();
     }
 

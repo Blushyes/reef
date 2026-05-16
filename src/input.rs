@@ -2461,6 +2461,10 @@ fn handle_preview_selection(mouse: &MouseEvent, app: &mut App) -> bool {
                 _ => PreviewSelection::new((file_line, byte_offset)),
             };
             app.preview_selection = Some(sel);
+            // Seed the drag-autoscroll tracker so the first tick after
+            // Down can fire if the user clicks at the very edge.
+            app.last_drag_mouse = Some((mouse.column, mouse.row));
+            app.preview_autoscroll_at = None;
             true
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -2468,6 +2472,10 @@ fn handle_preview_selection(mouse: &MouseEvent, app: &mut App) -> bool {
             if !dragging {
                 return false;
             }
+            // Refresh the autoscroll tracker even if origin is missing —
+            // the tick will guard on origin separately and we still want
+            // the latest mouse position for the next valid frame.
+            app.last_drag_mouse = Some((mouse.column, mouse.row));
             let Some(origin) = content_origin else {
                 return true; // swallow even without update — the drag is ours
             };
@@ -2486,6 +2494,9 @@ fn handle_preview_selection(mouse: &MouseEvent, app: &mut App) -> bool {
                 return false;
             }
             sel.dragging = false;
+            // Drag ended — stop the autoscroll loop.
+            app.last_drag_mouse = None;
+            app.preview_autoscroll_at = None;
             let sel_snapshot = *sel;
             if !sel_snapshot.is_empty() {
                 if let Some(preview) = app.preview_content.as_ref() {
@@ -2585,6 +2596,8 @@ fn handle_diff_selection(mouse: &MouseEvent, app: &mut App) -> bool {
                 _ => PreviewSelection::new((row_idx, byte_offset)),
             };
             app.diff_selection = Some(DiffSelection { sel, side });
+            app.last_drag_mouse = Some((mouse.column, mouse.row));
+            app.diff_autoscroll_at = None;
             true
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -2592,6 +2605,7 @@ fn handle_diff_selection(mouse: &MouseEvent, app: &mut App) -> bool {
             if !dragging {
                 return false;
             }
+            app.last_drag_mouse = Some((mouse.column, mouse.row));
             let Some(hit) = app.last_diff_hit.as_ref() else {
                 return true;
             };
@@ -2615,6 +2629,8 @@ fn handle_diff_selection(mouse: &MouseEvent, app: &mut App) -> bool {
                 return false;
             }
             sel.sel.dragging = false;
+            app.last_drag_mouse = None;
+            app.diff_autoscroll_at = None;
             let snap = *sel;
             if !snap.sel.is_empty() {
                 if let Some(hit) = app.last_diff_hit.as_ref() {
@@ -2688,6 +2704,206 @@ fn mouse_to_file_coord(
     let byte_offset = col_to_byte_offset(line, visible_col);
 
     Some((file_line, byte_offset))
+}
+
+// ─── Drag-select auto-scroll ────────────────────────────────────────────────
+//
+// VSCode-style: while the left button is held and the cursor leaves the
+// preview / diff viewport vertically, scroll the view toward the cursor and
+// extend the selection along with it. Terminals don't deliver Drag events
+// when the mouse is idle, so we replay the last known mouse position from
+// `App::tick` and let the scroll edge "pull" the selection.
+//
+// Step size scales gently with distance — at the boundary one line per
+// step, farther out up to four — so a hovering "just outside" reads as
+// smooth and a deliberate "drag way past the panel" feels deliberate.
+// A short throttle keeps a 60Hz tick loop from running away.
+
+/// Number of lines to scroll per step, signed (negative = up). Zero when
+/// the cursor is inside `[content_top, content_bottom)`.
+fn autoscroll_step(mouse_y: u16, content_top: u16, content_bottom: u16) -> i32 {
+    if mouse_y < content_top {
+        let dist = (content_top - mouse_y) as i32;
+        -((1 + dist / 3).min(4))
+    } else if mouse_y >= content_bottom {
+        let dist = (mouse_y - content_bottom + 1) as i32;
+        (1 + dist / 3).min(4)
+    } else {
+        0
+    }
+}
+
+/// Min wall-clock spacing between autoscroll steps. Distance is how far
+/// the cursor sits past the nearest viewport edge — close = slow, far =
+/// fast. The 15ms floor keeps a sustained "drag way off" capped near
+/// 60-some lines/sec even when the tick loop runs at full 60Hz, so the
+/// viewport doesn't slingshot.
+fn autoscroll_interval(distance: u16) -> Duration {
+    let denom = 1 + (distance as u64) / 2;
+    let ms = (90 / denom).max(15);
+    Duration::from_millis(ms)
+}
+
+/// `true` when a tick at `distance` from the viewport edge should be
+/// throttled out — the previous step is still inside its cool-off
+/// window. `None` last_at always passes (first step after Down).
+fn autoscroll_throttled(last_at: Option<Instant>, distance: u16, now: Instant) -> bool {
+    last_at.is_some_and(|at| now.duration_since(at) < autoscroll_interval(distance))
+}
+
+/// Distance (in terminal rows) between `mouse_y` and the viewport edge it
+/// has crossed. 0 when inside the viewport. Used to scale step size and
+/// throttle.
+fn autoscroll_distance(mouse_y: u16, content_top: u16, content_bottom: u16) -> u16 {
+    if mouse_y < content_top {
+        content_top - mouse_y
+    } else if mouse_y >= content_bottom {
+        mouse_y - content_bottom + 1
+    } else {
+        0
+    }
+}
+
+/// Run autoscroll for whichever panel currently owns a dragging selection.
+/// Invoked from `App::tick`. No-op when no drag is active or when the
+/// frozen mouse position sits inside the viewport.
+pub fn tick_drag_autoscroll(app: &mut App) {
+    tick_preview_drag_autoscroll(app);
+    tick_diff_drag_autoscroll(app);
+}
+
+fn tick_preview_drag_autoscroll(app: &mut App) {
+    let dragging = app.preview_selection.is_some_and(|s| s.dragging);
+    if !dragging {
+        return;
+    }
+    let Some(origin) = app.last_preview_content_origin else {
+        return;
+    };
+    let Some((mx, my)) = app.last_drag_mouse else {
+        return;
+    };
+    let view_h = app.last_preview_view_h;
+    if view_h == 0 {
+        return;
+    }
+    let content_top = origin.1;
+    let content_bottom = content_top.saturating_add(view_h);
+    let step = autoscroll_step(my, content_top, content_bottom);
+    if step == 0 {
+        return;
+    }
+
+    // Throttle: skip if the previous step is too recent for the current
+    // distance. First step after Down/edge entry passes immediately
+    // (preview_autoscroll_at cleared on Down / on Up).
+    let now = Instant::now();
+    let dist = autoscroll_distance(my, content_top, content_bottom);
+    if autoscroll_throttled(app.preview_autoscroll_at, dist, now) {
+        return;
+    }
+
+    // Clamp the scroll target to the line count, accounting for the
+    // viewport height (you can't scroll the last line off the top).
+    let Some(preview) = app.preview_content.as_ref() else {
+        return;
+    };
+    let line_count = match &preview.body {
+        crate::file_tree::PreviewBody::Text { lines, .. } => lines.len(),
+        _ => return,
+    };
+    let max_scroll = line_count.saturating_sub(view_h as usize);
+    let new_scroll = if step < 0 {
+        app.preview_scroll
+            .saturating_sub(step.unsigned_abs() as usize)
+    } else {
+        (app.preview_scroll + step as usize).min(max_scroll)
+    };
+    if new_scroll == app.preview_scroll {
+        return;
+    }
+    app.preview_scroll = new_scroll;
+    app.preview_autoscroll_at = Some(now);
+
+    // Re-translate the frozen mouse against the new scroll — this is what
+    // makes the selection extend with the viewport as it scrolls.
+    if let Some(coord) = mouse_to_file_coord(app, mx, my, origin) {
+        if let Some(s) = app.preview_selection.as_mut() {
+            s.active = coord;
+        }
+    }
+}
+
+fn tick_diff_drag_autoscroll(app: &mut App) {
+    let dsel = match app.diff_selection {
+        Some(d) if d.sel.dragging => d,
+        _ => return,
+    };
+    let Some((mx, my)) = app.last_drag_mouse else {
+        return;
+    };
+    let view_h = app.last_diff_view_h;
+    if view_h == 0 {
+        return;
+    }
+    // Snapshot what we need from the cached DiffHit before we take a
+    // mut borrow on the scroll field below.
+    let Some((content_top, rows_len)) = app
+        .last_diff_hit
+        .as_ref()
+        .map(|h| (h.content_y, h.rows.len()))
+    else {
+        return;
+    };
+    if rows_len == 0 {
+        return;
+    }
+    let content_bottom = content_top.saturating_add(view_h);
+    let step = autoscroll_step(my, content_top, content_bottom);
+    if step == 0 {
+        return;
+    }
+
+    let now = Instant::now();
+    let dist = autoscroll_distance(my, content_top, content_bottom);
+    if autoscroll_throttled(app.diff_autoscroll_at, dist, now) {
+        return;
+    }
+
+    // Which scroll field backs the active diff panel — Git tab and Graph
+    // tab keep their own offsets, mirroring `dispatch_vertical_scroll`.
+    let scroll_field: &mut usize = match app.active_tab {
+        Tab::Git => &mut app.diff_scroll,
+        Tab::Graph => &mut app.commit_detail.file_diff_scroll,
+        _ => return,
+    };
+    let max_scroll = rows_len.saturating_sub(view_h as usize);
+    let new_scroll = if step < 0 {
+        scroll_field.saturating_sub(step.unsigned_abs() as usize)
+    } else {
+        (*scroll_field + step as usize).min(max_scroll)
+    };
+    if new_scroll == *scroll_field {
+        return;
+    }
+    *scroll_field = new_scroll;
+    app.diff_autoscroll_at = Some(now);
+
+    // Sync the cached hit's scroll snapshot in place so `coord_for` picks
+    // up the new value this tick — otherwise selection.active lags by a
+    // frame and looks like a stutter against the smooth scroll.
+    if let Some(hit) = app.last_diff_hit.as_mut() {
+        hit.scroll = new_scroll;
+    }
+
+    if let Some(hit) = app.last_diff_hit.as_ref() {
+        let clamped_col = clamp_col_to_side(hit, mx, dsel.side);
+        if let Some(pos) = hit.coord_for(clamped_col, my, dsel.side) {
+            if let Some(s) = app.diff_selection.as_mut() {
+                s.sel.active = pos;
+            }
+        }
+    }
 }
 
 /// `true` when a cursor at `column` lands on the left half of an SBS panel
@@ -3385,6 +3601,102 @@ mod axis_lock_tests {
         // And after the swipe ends, the lock decays within
         // AXIS_LOCK_WINDOW after the final event (285 + 120 = 405).
         assert!(!lock.locked_at(at(410)));
+    }
+}
+
+#[cfg(test)]
+mod autoscroll_tests {
+    use super::*;
+
+    // ── autoscroll_step ─────────────────────────────────────────────────
+
+    #[test]
+    fn step_zero_inside_viewport() {
+        // Viewport rows [10, 30). Mouse comfortably inside.
+        assert_eq!(autoscroll_step(15, 10, 30), 0);
+        assert_eq!(autoscroll_step(10, 10, 30), 0); // top edge inclusive
+        assert_eq!(autoscroll_step(29, 10, 30), 0); // bottom edge inclusive
+    }
+
+    #[test]
+    fn step_one_just_above_top() {
+        // 1 row above the top → minimum step of -1.
+        assert_eq!(autoscroll_step(9, 10, 30), -1);
+    }
+
+    #[test]
+    fn step_one_just_below_bottom() {
+        // content_bottom is exclusive, so row 30 itself is "1 outside".
+        assert_eq!(autoscroll_step(30, 10, 30), 1);
+    }
+
+    #[test]
+    fn step_caps_at_four_far_above() {
+        // Very far above the viewport — distance grows but step caps at 4.
+        assert_eq!(autoscroll_step(0, 100, 130), -4);
+    }
+
+    #[test]
+    fn step_caps_at_four_far_below() {
+        // distance = my - bottom + 1 = 200 - 30 + 1 = 171, step = (1 + 57).min(4) = 4
+        assert_eq!(autoscroll_step(200, 10, 30), 4);
+    }
+
+    #[test]
+    fn step_scales_gently_near_edge() {
+        // dist 3 (mouse_y = top-3): step = -(1 + 3/3).min(4) = -2
+        assert_eq!(autoscroll_step(7, 10, 30), -2);
+        // dist 6: step = -(1 + 6/3).min(4) = -3
+        assert_eq!(autoscroll_step(4, 10, 30), -3);
+        // dist 9: step = -(1 + 9/3).min(4) = -4 (cap)
+        assert_eq!(autoscroll_step(1, 10, 30), -4);
+    }
+
+    // ── autoscroll_distance ─────────────────────────────────────────────
+
+    #[test]
+    fn distance_zero_when_inside() {
+        assert_eq!(autoscroll_distance(15, 10, 30), 0);
+        assert_eq!(autoscroll_distance(10, 10, 30), 0);
+        assert_eq!(autoscroll_distance(29, 10, 30), 0);
+    }
+
+    #[test]
+    fn distance_above_top_counts_rows_up() {
+        assert_eq!(autoscroll_distance(9, 10, 30), 1);
+        assert_eq!(autoscroll_distance(0, 10, 30), 10);
+    }
+
+    #[test]
+    fn distance_below_bottom_counts_rows_down() {
+        // content_bottom = 30 exclusive: row 30 is "1 below".
+        assert_eq!(autoscroll_distance(30, 10, 30), 1);
+        assert_eq!(autoscroll_distance(40, 10, 30), 11);
+    }
+
+    // ── autoscroll_interval ─────────────────────────────────────────────
+
+    #[test]
+    fn interval_at_boundary_is_around_90ms() {
+        // distance 1 → denom = 1 + 0 = 1 → 90 ms.
+        assert_eq!(autoscroll_interval(1), Duration::from_millis(90));
+    }
+
+    #[test]
+    fn interval_shrinks_with_distance() {
+        // distance grows → interval shrinks (faster scroll).
+        let a = autoscroll_interval(1);
+        let b = autoscroll_interval(5);
+        let c = autoscroll_interval(20);
+        assert!(b < a);
+        assert!(c < b);
+    }
+
+    #[test]
+    fn interval_floors_at_15ms() {
+        // Way past the viewport — must not run away faster than 15ms/step.
+        assert_eq!(autoscroll_interval(500), Duration::from_millis(15));
+        assert_eq!(autoscroll_interval(u16::MAX), Duration::from_millis(15));
     }
 }
 

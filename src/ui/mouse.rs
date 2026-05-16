@@ -104,6 +104,14 @@ pub enum ClickAction {
     /// keyboard-only, mirroring the file tree where double-click /
     /// Enter is the deliberate-action gate.
     SettingsRow(usize),
+    /// Click on the primary (e.g. "Delete") button of the generic
+    /// `ConfirmModal`. Dispatched to `App::fire_confirm_primary`,
+    /// which `take()`s the modal and fires its `on_confirm` closure.
+    ConfirmModalPrimary,
+    /// Click on the Cancel button, or anywhere outside the
+    /// `ConfirmModal`. Fires `on_cancel` (usually a no-op) and clears
+    /// the modal.
+    ConfirmModalCancel,
 }
 
 #[derive(Debug, Clone)]

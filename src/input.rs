@@ -164,11 +164,12 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         return;
     }
 
-    // Delete confirmation status-bar prompt: Y confirms, N / Esc
-    // cancels. Every other key is ignored so the user can't
-    // accidentally trigger something else while the confirm is up.
-    if app.tree_delete_confirm.is_some() {
-        handle_key_tree_delete_confirm(key, app);
+    // Generic confirm modal owns the keyboard while up. Matches the
+    // paste-conflict / context-menu pattern: explicit early-return
+    // before any global hotkeys so e.g. `q` can't fall through to
+    // "quit" while a "discard changes?" confirm is on screen.
+    if app.confirm_modal.is_some() {
+        handle_key_confirm_modal(key, app);
         return;
     }
 
@@ -1819,13 +1820,49 @@ fn handle_key_hosts_picker(key: KeyEvent, app: &mut App) {
     }
 }
 
-/// Y/Esc handler for the status-bar delete confirm.
-fn handle_key_tree_delete_confirm(key: KeyEvent, app: &mut App) {
-    match key.code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_tree_delete(),
-        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('c') => {
-            app.cancel_tree_delete()
+/// Keyboard handler for the generic `ConfirmModal`.
+///
+/// Routing:
+/// - Any char in `confirm_keys` → primary callback (e.g. `Y` for delete).
+/// - `Esc` / `n` / `N` / `c` / `C` → cancel callback.
+/// - `Ctrl+C` keeps its global "force quit" meaning (mirrors paste-conflict).
+/// - **`Enter` is intentionally ignored** so a stray return can't fire a
+///   destructive primary action. Confirmation must be deliberate (typed
+///   shortcut or a click).
+/// - Modified chars (`Ctrl+*`, `Alt+*`) are *not* treated as the bare
+///   letter — `Ctrl+Y` must not silently fire the destructive primary.
+///   Shift is allowed: capital `Y` is the same intent as lowercase `y`
+///   and matches via the `confirm_keys` list (which contains both).
+/// - Other keys swallowed so they don't fall through to global hotkeys.
+fn handle_key_confirm_modal(key: KeyEvent, app: &mut App) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    if let KeyCode::Char('c') = key.code {
+        if ctrl {
+            app.should_quit = true;
+            return;
         }
+    }
+    // Any ctrl/alt-modified char is not a confirm/cancel shortcut.
+    // We still swallow it (no `_ => {}` fall-through to global keys)
+    // since the modal owns the keyboard while up.
+    if ctrl || alt {
+        return;
+    }
+    match key.code {
+        KeyCode::Char(c) => {
+            let confirms = app
+                .confirm_modal
+                .as_ref()
+                .map(|m| m.confirm_keys.contains(&c))
+                .unwrap_or(false);
+            if confirms {
+                app.fire_confirm_primary();
+            } else if matches!(c, 'n' | 'N' | 'c' | 'C') {
+                app.fire_confirm_cancel();
+            }
+        }
+        KeyCode::Esc => app.fire_confirm_cancel(),
         _ => {}
     }
 }
@@ -2045,6 +2082,32 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
         return;
     }
 
+    // Generic confirm modal fully owns mouse. Left-clicks dispatch via
+    // the hit_registry (Cancel/Primary button zones + a full-screen
+    // fallthrough Cancel zone registered in `confirm_modal::render`);
+    // every other event is swallowed so scrolls / drags / right-clicks
+    // can't leak to the panels underneath while the modal is up.
+    //
+    // Action filter: the registry from the *previous* frame may still
+    // be live if the user clicks before the modal's first render lands
+    // (key-then-immediate-mouse). In that window a click could resolve
+    // to e.g. `TreeClick(n)`, silently mutating the file tree under
+    // the overlay. We restrict dispatch to the two modal-owned
+    // variants; any other hit (or no hit) collapses to "cancel" —
+    // same semantics as clicking outside the rendered modal.
+    if app.confirm_modal.is_some() {
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            match app.hit_registry.hit_test(mouse.column, mouse.row) {
+                Some(action @ ui::mouse::ClickAction::ConfirmModalPrimary)
+                | Some(action @ ui::mouse::ClickAction::ConfirmModalCancel) => {
+                    app.handle_action(action);
+                }
+                _ => app.fire_confirm_cancel(),
+            }
+        }
+        return;
+    }
+
     // Intra-tree drag in progress: route Drag→hover-update,
     // Up→commit, Right-click→cancel. Scroll wheel falls through so
     // the user can scroll the tree to reach a deep destination
@@ -2091,10 +2154,7 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
     // the empty space below rows (root-flavoured menu). Every other
     // hit (toolbar buttons, preview content, no-op areas) bails out.
     if let MouseEventKind::Down(MouseButton::Right) = mouse.kind {
-        if app.active_tab == Tab::Files
-            && !app.tree_edit.active
-            && app.tree_delete_confirm.is_none()
-        {
+        if app.active_tab == Tab::Files && !app.tree_edit.active && app.confirm_modal.is_none() {
             // Second right-click while the menu is already open
             // dismisses it (Finder / VSCode behaviour).
             if app.tree_context_menu.active {

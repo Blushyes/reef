@@ -1034,12 +1034,7 @@ fn graph_scroll_right_panel(app: &mut App, delta: i32) {
         Panel::Commit => commit_detail_panel::scroll(app, delta),
         Panel::Diff => {
             if app.graph_uses_three_col() {
-                let s = &mut app.commit_detail.file_diff_scroll;
-                *s = if delta < 0 {
-                    s.saturating_sub((-delta) as usize)
-                } else {
-                    s.saturating_add(delta as usize)
-                };
+                apply_scroll_delta(&mut app.commit_detail.file_diff_scroll, delta);
             } else {
                 commit_detail_panel::scroll(app, delta);
             }
@@ -2320,136 +2315,18 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
                 }
             }
         }
-        MouseEventKind::ScrollUp => {
-            let total_width = terminal.size().map(|s| s.width).unwrap_or(80);
-            // Shift + 滚轮 = 横向滚动（兼容不发 ScrollLeft/Right 的终端）
-            if mouse.modifiers.contains(KeyModifiers::SHIFT) {
-                apply_horizontal_scroll(app, mouse.column, total_width, -3);
-                app.horizontal_scroll_lock.observe();
-                return;
-            }
-            // Drop bare vertical events that arrive during the tail
-            // of an in-progress horizontal swipe (trackpad noise on
-            // the orthogonal axis). Streak-gated so a single
-            // horizontal noise event doesn't lock vertical out.
-            if app.horizontal_scroll_lock.locked() {
-                return;
-            }
-            app.vertical_scroll_lock.observe();
-            // Use the shared clamp + sidebar-hidden short-circuit so wheel
-            // routing lines up with hit-testing. With sidebar hidden
-            // `graph_sidebar_width` returns 0 and `is_left` never fires.
-            let split_x = app.graph_sidebar_width(total_width);
-            let is_left = mouse.column < split_x;
-            match app.active_tab {
-                Tab::Git => {
-                    if is_left {
-                        ui::git_status_panel::scroll(app, -3);
-                    } else {
-                        app.diff_scroll = app.diff_scroll.saturating_sub(3);
-                    }
-                }
-                Tab::Files => {
-                    if is_left {
-                        app.tree_scroll = app.tree_scroll.saturating_sub(3);
-                    } else {
-                        app.preview_scroll = app.preview_scroll.saturating_sub(3);
-                    }
-                }
-                Tab::Graph => {
-                    if is_left {
-                        ui::git_graph_panel::scroll(app, -3);
-                    } else if let Some(diff_start) = graph_diff_column_start(app, total_width)
-                        && mouse.column >= diff_start
-                    {
-                        // 3-col diff column — scroll only the diff viewport
-                        // so commit metadata under the cursor's path stays put.
-                        app.commit_detail.file_diff_scroll =
-                            app.commit_detail.file_diff_scroll.saturating_sub(3);
-                    } else {
-                        ui::commit_detail_panel::scroll(app, -3);
-                    }
-                }
-                Tab::Search => {
-                    if is_left {
-                        // Scroll the results list by moving selection — the
-                        // left column IS the result list, not a separate
-                        // scroll surface.
-                        global_search::move_selection_by(app, -3);
-                    } else {
-                        app.preview_scroll = app.preview_scroll.saturating_sub(3);
-                    }
-                }
-            }
+        // Shift + 滚轮 = 横向滚动（兼容不发 ScrollLeft/Right 的终端）。
+        // 路由在 dispatcher 之外是为了让每个 dispatcher 只负责一条轴。
+        MouseEventKind::ScrollUp if mouse.modifiers.contains(KeyModifiers::SHIFT) => {
+            dispatch_horizontal_scroll(-1, mouse, app, terminal);
         }
-        MouseEventKind::ScrollDown => {
-            let total_width = terminal.size().map(|s| s.width).unwrap_or(80);
-            if mouse.modifiers.contains(KeyModifiers::SHIFT) {
-                apply_horizontal_scroll(app, mouse.column, total_width, 3);
-                app.horizontal_scroll_lock.observe();
-                return;
-            }
-            if app.horizontal_scroll_lock.locked() {
-                return;
-            }
-            app.vertical_scroll_lock.observe();
-            let split_x = app.graph_sidebar_width(total_width);
-            let is_left = mouse.column < split_x;
-            match app.active_tab {
-                Tab::Git => {
-                    if is_left {
-                        ui::git_status_panel::scroll(app, 3);
-                    } else {
-                        app.diff_scroll += 3;
-                    }
-                }
-                Tab::Files => {
-                    if is_left {
-                        app.tree_scroll += 3;
-                    } else {
-                        app.preview_scroll += 3;
-                    }
-                }
-                Tab::Graph => {
-                    if is_left {
-                        ui::git_graph_panel::scroll(app, 3);
-                    } else if let Some(diff_start) = graph_diff_column_start(app, total_width)
-                        && mouse.column >= diff_start
-                    {
-                        app.commit_detail.file_diff_scroll += 3;
-                    } else {
-                        ui::commit_detail_panel::scroll(app, 3);
-                    }
-                }
-                Tab::Search => {
-                    if is_left {
-                        global_search::move_selection_by(app, 3);
-                    } else {
-                        app.preview_scroll += 3;
-                    }
-                }
-            }
+        MouseEventKind::ScrollDown if mouse.modifiers.contains(KeyModifiers::SHIFT) => {
+            dispatch_horizontal_scroll(1, mouse, app, terminal);
         }
-        MouseEventKind::ScrollLeft => {
-            // Axis lock: drop horizontal events that arrive during
-            // an active vertical swipe. Streak-gated so a single
-            // vertical noise event from a trackpad doesn't lock
-            // horizontal out.
-            if app.vertical_scroll_lock.locked() {
-                return;
-            }
-            let total_width = terminal.size().map(|s| s.width).unwrap_or(80);
-            apply_horizontal_scroll(app, mouse.column, total_width, -3);
-            app.horizontal_scroll_lock.observe();
-        }
-        MouseEventKind::ScrollRight => {
-            if app.vertical_scroll_lock.locked() {
-                return;
-            }
-            let total_width = terminal.size().map(|s| s.width).unwrap_or(80);
-            apply_horizontal_scroll(app, mouse.column, total_width, 3);
-            app.horizontal_scroll_lock.observe();
-        }
+        MouseEventKind::ScrollUp => dispatch_vertical_scroll(-1, mouse, app, terminal),
+        MouseEventKind::ScrollDown => dispatch_vertical_scroll(1, mouse, app, terminal),
+        MouseEventKind::ScrollLeft => dispatch_horizontal_scroll(-1, mouse, app, terminal),
+        MouseEventKind::ScrollRight => dispatch_horizontal_scroll(1, mouse, app, terminal),
         MouseEventKind::Moved => {
             app.hover_row = Some(mouse.row);
             app.hover_col = Some(mouse.column);
@@ -2789,7 +2666,7 @@ fn sbs_cursor_on_left(panel_start: u16, panel_w: u16, column: u16) -> bool {
 /// in the locked direction, so a continuous swipe holds the lock for
 /// its entire duration; an intentional axis change just needs a
 /// brief pause longer than this window.
-const AXIS_LOCK_WINDOW: Duration = Duration::from_millis(200);
+const AXIS_LOCK_WINDOW: Duration = Duration::from_millis(120);
 
 /// Time gap after which a streak counter resets to zero. Trackpad
 /// scrolling fires ~60-90 events per second during a sustained
@@ -2853,6 +2730,83 @@ impl AxisLock {
                     && self.streak >= AXIS_LOCK_STREAK_THRESHOLD
             }
             None => false,
+        }
+    }
+}
+
+/// Threshold separating "trackpad cadence" from "wheel cadence". macOS
+/// trackpads deliver scroll events every ~12-16 ms during a swipe;
+/// detent mouse wheels deliver them every ~100 ms or sparser. 60 ms
+/// gives ample margin both ways without misclassifying decelerating
+/// trackpad fade-outs.
+const TRACKPAD_INTERVAL_THRESHOLD: Duration = Duration::from_millis(60);
+
+/// Lines advanced per event at wheel cadence.
+const SPARSE_STEP: usize = 3;
+
+/// Base lines per event when scrolling at "trackpad cadence". `1`
+/// keeps a gentle trackpad swipe roughly in line with native macOS
+/// scroll throughput (~70 events/s × 1 line ≈ same lines/s as the
+/// browser/`less`).
+const DENSE_STEP_BASE: usize = 1;
+
+/// After this many consecutive dense events, the per-event step
+/// bumps from 1→2. At ~12-16 ms cadence, 8 events ≈ 100 ms of
+/// sustained swipe — the user has clearly committed to a long
+/// scroll, so we mildly accelerate.
+const DENSE_ACCEL_AT_2: u32 = 8;
+
+/// After this many consecutive dense events, the per-event step
+/// caps at 3 (matches sparse). At ~15 ms cadence that's ~360 ms of
+/// sustained trackpad swipe — long-haul navigation.
+const DENSE_ACCEL_AT_3: u32 = 24;
+
+/// Step-size pacer for wheel/trackpad scroll. Reads inter-event
+/// intervals to distinguish dense trackpad streams (step = 1, with
+/// mild acceleration on sustained swipes) from sparse wheel notches
+/// (step = 3). Returns *magnitude only*; the dispatcher applies the
+/// sign based on ScrollUp vs ScrollDown.
+///
+/// Two instances live on `App` — one for the vertical axis, one for
+/// horizontal — so simultaneous V+H scrolling doesn't cross-pollute
+/// streak state.
+///
+/// Like [`AxisLock`], the `step_at(now)` variant exists for unit
+/// tests with injected time; production paths use [`Self::step`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ScrollPacer {
+    last_at: Option<Instant>,
+    dense_streak: u32,
+}
+
+impl ScrollPacer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn step(&mut self) -> usize {
+        self.step_at(Instant::now())
+    }
+
+    fn step_at(&mut self, now: Instant) -> usize {
+        let dense = self
+            .last_at
+            .map(|at| now.duration_since(at) < TRACKPAD_INTERVAL_THRESHOLD)
+            .unwrap_or(false);
+        self.last_at = Some(now);
+
+        if dense {
+            self.dense_streak = self.dense_streak.saturating_add(1);
+            if self.dense_streak >= DENSE_ACCEL_AT_3 {
+                3
+            } else if self.dense_streak >= DENSE_ACCEL_AT_2 {
+                2
+            } else {
+                DENSE_STEP_BASE
+            }
+        } else {
+            self.dense_streak = 0;
+            SPARSE_STEP
         }
     }
 }
@@ -2932,10 +2886,105 @@ fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: 
     let Some(target) = target else {
         return;
     };
-    *target = if delta < 0 {
-        target.saturating_sub(delta.unsigned_abs() as usize)
+    apply_scroll_delta(target, delta);
+}
+
+/// Handle a vertical wheel/trackpad scroll event. `sign` is -1 for
+/// `ScrollUp`, +1 for `ScrollDown`. Shift + wheel is routed to the
+/// horizontal dispatcher upstream — this function only sees the
+/// bare vertical axis.
+fn dispatch_vertical_scroll<B: Backend>(
+    sign: i32,
+    mouse: MouseEvent,
+    app: &mut App,
+    terminal: &Terminal<B>,
+) {
+    let total_width = terminal.size().map(|s| s.width).unwrap_or(80);
+    // Drop bare vertical events that arrive during the tail of an
+    // in-progress horizontal swipe (trackpad noise on the orthogonal
+    // axis). Streak-gated so a single horizontal noise event doesn't
+    // lock vertical out.
+    if app.horizontal_scroll_lock.locked() {
+        return;
+    }
+    app.vertical_scroll_lock.observe();
+    let step_i = sign * (app.vertical_scroll_pacer.step() as i32);
+    // Use the shared clamp + sidebar-hidden short-circuit so wheel
+    // routing lines up with hit-testing. With sidebar hidden
+    // `graph_sidebar_width` returns 0 and `is_left` never fires.
+    let split_x = app.graph_sidebar_width(total_width);
+    let is_left = mouse.column < split_x;
+    match app.active_tab {
+        Tab::Git => {
+            if is_left {
+                ui::git_status_panel::scroll(app, step_i);
+            } else {
+                apply_scroll_delta(&mut app.diff_scroll, step_i);
+            }
+        }
+        Tab::Files => {
+            if is_left {
+                apply_scroll_delta(&mut app.tree_scroll, step_i);
+            } else {
+                apply_scroll_delta(&mut app.preview_scroll, step_i);
+            }
+        }
+        Tab::Graph => {
+            if is_left {
+                ui::git_graph_panel::scroll(app, step_i);
+            } else if let Some(diff_start) = graph_diff_column_start(app, total_width)
+                && mouse.column >= diff_start
+            {
+                // 3-col diff column — scroll only the diff viewport
+                // so commit metadata under the cursor's path stays put.
+                apply_scroll_delta(&mut app.commit_detail.file_diff_scroll, step_i);
+            } else {
+                ui::commit_detail_panel::scroll(app, step_i);
+            }
+        }
+        Tab::Search => {
+            if is_left {
+                // Left column IS the result list — move selection
+                // rather than mutating a scroll offset.
+                global_search::move_selection_by(app, step_i);
+            } else {
+                apply_scroll_delta(&mut app.preview_scroll, step_i);
+            }
+        }
+    }
+}
+
+/// Handle a horizontal wheel/trackpad scroll event. `sign` is -1
+/// for `ScrollLeft`, +1 for `ScrollRight`. Trackpad noise on the
+/// orthogonal axis during an active vertical swipe is dropped via
+/// the same axis-lock as the vertical path.
+fn dispatch_horizontal_scroll<B: Backend>(
+    sign: i32,
+    mouse: MouseEvent,
+    app: &mut App,
+    terminal: &Terminal<B>,
+) {
+    // Axis lock: drop horizontal events that arrive during an
+    // active vertical swipe. Streak-gated so a single vertical
+    // noise event from a trackpad doesn't lock horizontal out.
+    if app.vertical_scroll_lock.locked() {
+        return;
+    }
+    let total_width = terminal.size().map(|s| s.width).unwrap_or(80);
+    let step = app.horizontal_scroll_pacer.step() as i32;
+    apply_horizontal_scroll(app, mouse.column, total_width, sign * step);
+    app.horizontal_scroll_lock.observe();
+}
+
+/// Apply a signed delta to a `usize` scroll-state field. Saturates
+/// at zero on upward scroll; raw `saturating_add` on downward scroll
+/// — the panel's render path clamps to content length, not us.
+#[inline]
+fn apply_scroll_delta(field: &mut usize, delta: i32) {
+    *field = if delta < 0 {
+        field.saturating_sub(delta.unsigned_abs() as usize)
     } else {
-        target.saturating_add(delta as usize)
+        field.saturating_add(delta as usize)
     };
 }
 
@@ -2986,10 +3035,12 @@ fn handle_mouse_hosts_picker(mouse: MouseEvent, app: &mut App) {
             };
         }
         MouseEventKind::ScrollUp if inside => {
-            app.hosts_picker.move_selection(-3);
+            let step = app.vertical_scroll_pacer.step() as i32;
+            app.hosts_picker.move_selection(-step);
         }
         MouseEventKind::ScrollDown if inside => {
-            app.hosts_picker.move_selection(3);
+            let step = app.vertical_scroll_pacer.step() as i32;
+            app.hosts_picker.move_selection(step);
         }
         _ => {}
     }
@@ -3024,10 +3075,12 @@ fn handle_mouse_place_mode(mouse: MouseEvent, app: &mut App) {
             app.exit_place_mode();
         }
         MouseEventKind::ScrollUp => {
-            app.tree_scroll = app.tree_scroll.saturating_sub(3);
+            let step = app.vertical_scroll_pacer.step();
+            app.tree_scroll = app.tree_scroll.saturating_sub(step);
         }
         MouseEventKind::ScrollDown => {
-            app.tree_scroll = app.tree_scroll.saturating_add(3);
+            let step = app.vertical_scroll_pacer.step();
+            app.tree_scroll = app.tree_scroll.saturating_add(step);
         }
         _ => {}
     }
@@ -3205,19 +3258,20 @@ fn hex_digit(b: u8) -> Option<u8> {
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
+/// Anchor every time-injection test on a single base instant so
+/// durations line up with module constants. `Instant` has no public
+/// `ZERO`, so the test helper caches one `Instant::now()` and adds
+/// offsets — used by both `axis_lock_tests` and `scroll_pacer_tests`.
+#[cfg(test)]
+fn at(ms: u64) -> Instant {
+    static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let base = *BASE.get_or_init(Instant::now);
+    base + Duration::from_millis(ms)
+}
+
 #[cfg(test)]
 mod axis_lock_tests {
     use super::*;
-
-    fn at(ms: u64) -> Instant {
-        // Anchor every test on a single base instant so durations
-        // line up with the constants. `Instant::now()` once at the
-        // start gives a stable reference; `+ Duration` to advance.
-        // (Std doesn't expose an `Instant::ZERO`, hence the helper.)
-        static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-        let base = *BASE.get_or_init(Instant::now);
-        base + Duration::from_millis(ms)
-    }
 
     #[test]
     fn empty_lock_is_unlocked() {
@@ -3264,15 +3318,17 @@ mod axis_lock_tests {
 
     #[test]
     fn lock_decays_after_window() {
-        // After arming, the lock holds for AXIS_LOCK_WINDOW (200 ms)
+        // After arming, the lock holds for AXIS_LOCK_WINDOW (120 ms)
         // past the most recent event. Beyond that, even with a high
         // streak count, the lock is considered released.
         let mut lock = AxisLock::new();
         lock.observe_at(at(0));
         lock.observe_at(at(50));
         assert!(lock.locked_at(at(50)));
-        // 50 + 250 = 300 ms after last event; window is 200 ms.
-        assert!(!lock.locked_at(at(300)));
+        // Still inside the 120 ms window (110 ms since last event).
+        assert!(lock.locked_at(at(160)));
+        // Past the 120 ms window (130 ms since last event) — released.
+        assert!(!lock.locked_at(at(180)));
     }
 
     #[test]
@@ -3288,8 +3344,102 @@ mod axis_lock_tests {
         // armed because each event renewed `last_at`.
         assert!(lock.locked_at(at(285)));
         // And after the swipe ends, the lock decays within
-        // AXIS_LOCK_WINDOW after the final event (285 + 200 = 485).
-        assert!(!lock.locked_at(at(490)));
+        // AXIS_LOCK_WINDOW after the final event (285 + 120 = 405).
+        assert!(!lock.locked_at(at(410)));
+    }
+}
+
+#[cfg(test)]
+mod scroll_pacer_tests {
+    use super::*;
+
+    /// Sub-threshold inter-event interval used to simulate trackpad
+    /// cadence — must stay well below `TRACKPAD_INTERVAL_THRESHOLD`.
+    const DENSE_MS: u64 = 15;
+
+    #[test]
+    fn first_event_returns_sparse_step() {
+        let mut p = ScrollPacer::new();
+        assert_eq!(p.step_at(at(0)), SPARSE_STEP);
+    }
+
+    #[test]
+    fn dense_cadence_returns_base_step() {
+        let mut p = ScrollPacer::new();
+        p.step_at(at(0));
+        assert_eq!(p.step_at(at(30)), DENSE_STEP_BASE);
+    }
+
+    #[test]
+    fn sparse_cadence_after_pause_returns_sparse() {
+        let mut p = ScrollPacer::new();
+        p.step_at(at(0));
+        p.step_at(at(30));
+        assert_eq!(p.step_at(at(230)), SPARSE_STEP);
+    }
+
+    #[test]
+    fn dense_streak_accelerates_to_2() {
+        // Streak counts dense events. Event 0 is sparse (no prior
+        // interval) so streak stays at 0; events 1..=7 grow it to 7
+        // (still base); event 8 hits DENSE_ACCEL_AT_2 and bumps to 2.
+        let mut p = ScrollPacer::new();
+        p.step_at(at(0));
+        for i in 1..DENSE_ACCEL_AT_2 {
+            let s = p.step_at(at(i as u64 * DENSE_MS));
+            assert_eq!(s, DENSE_STEP_BASE, "event {i} should still be base");
+        }
+        let s = p.step_at(at(DENSE_ACCEL_AT_2 as u64 * DENSE_MS));
+        assert_eq!(s, 2);
+    }
+
+    #[test]
+    fn dense_streak_caps_at_3() {
+        let mut p = ScrollPacer::new();
+        p.step_at(at(0));
+        let mut last = 0;
+        for i in 1..=100 {
+            last = p.step_at(at(i * DENSE_MS));
+        }
+        assert_eq!(last, 3);
+    }
+
+    #[test]
+    fn sparse_event_resets_dense_streak() {
+        let mut p = ScrollPacer::new();
+        p.step_at(at(0));
+        for i in 1..=30 {
+            p.step_at(at(i * DENSE_MS));
+        }
+        // A >threshold gap should drop streak back to 0 — without it,
+        // the next dense event would carry over the accelerated step.
+        let sparse = p.step_at(at(30 * DENSE_MS + 200));
+        assert_eq!(sparse, SPARSE_STEP);
+        let dense = p.step_at(at(30 * DENSE_MS + 200 + DENSE_MS));
+        assert_eq!(dense, DENSE_STEP_BASE);
+    }
+
+    #[test]
+    fn accelerates_to_3_at_exact_boundary() {
+        // The accel curve uses `>=`, so streak = DENSE_ACCEL_AT_3 is
+        // exactly where step bumps to 3. Locks in the boundary so a
+        // future refactor to `>` would be caught here.
+        let mut p = ScrollPacer::new();
+        p.step_at(at(0));
+        for i in 1..DENSE_ACCEL_AT_3 {
+            p.step_at(at(i as u64 * DENSE_MS));
+        }
+        let s = p.step_at(at(DENSE_ACCEL_AT_3 as u64 * DENSE_MS));
+        assert_eq!(s, 3);
+    }
+
+    #[test]
+    fn interval_exactly_at_threshold_is_sparse() {
+        // Comparison is strict `<`, so 60 ms exactly = sparse — guards
+        // against a future refactor flipping to `<=`.
+        let mut p = ScrollPacer::new();
+        p.step_at(at(0));
+        assert_eq!(p.step_at(at(60)), SPARSE_STEP);
     }
 }
 

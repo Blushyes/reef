@@ -190,8 +190,6 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
                 ClickAction::GitCommand {
                     command: cmd,
                     args: args.unwrap_or(Value::Null),
-                    dbl_command: None,
-                    dbl_args: None,
                 },
             );
         }

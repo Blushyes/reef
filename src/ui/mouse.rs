@@ -10,8 +10,6 @@ pub enum ClickAction {
     },
     StageFile(String),
     UnstageFile(String),
-    ToggleStaged,
-    ToggleUnstaged,
     StartDragSplit,
     /// Graph tab 3-col 布局下,中间 commit 列与右侧 diff 列之间的拖拽
     /// 分界。跟 `StartDragSplit` 互不干扰。
@@ -60,12 +58,9 @@ pub enum ClickAction {
     /// replace mode is open. Commits the replace batch.
     SearchApplyReplace,
     /// Invoke an inline Git panel command (`git.stage`, `git.selectCommit`, …).
-    /// `dbl_command`/`dbl_args`, if present, are fired on double-click instead.
     GitCommand {
         command: String,
         args: serde_json::Value,
-        dbl_command: Option<String>,
-        dbl_args: Option<serde_json::Value>,
     },
     /// Place-mode destination: dropping onto a specific folder row.
     /// Index into `file_tree.entries`; must point at a directory entry.
@@ -177,14 +172,14 @@ mod tests {
     #[test]
     fn hit_test_returns_registered_action() {
         let mut r = HitTestRegistry::new();
-        r.register_row(10, 5, 20, ClickAction::ToggleStaged);
-        assert!(matches!(r.hit_test(15, 5), Some(ClickAction::ToggleStaged)));
+        r.register_row(10, 5, 20, ClickAction::OpenSettings);
+        assert!(matches!(r.hit_test(15, 5), Some(ClickAction::OpenSettings)));
     }
 
     #[test]
     fn hit_test_misses_outside_rect() {
         let mut r = HitTestRegistry::new();
-        r.register_row(10, 5, 20, ClickAction::ToggleStaged);
+        r.register_row(10, 5, 20, ClickAction::OpenSettings);
         assert!(r.hit_test(9, 5).is_none(), "col just to the left");
         assert!(r.hit_test(30, 5).is_none(), "col at right edge (exclusive)");
         assert!(r.hit_test(15, 4).is_none(), "row above");
@@ -194,19 +189,16 @@ mod tests {
     #[test]
     fn hit_test_later_region_takes_priority() {
         let mut r = HitTestRegistry::new();
-        r.register_row(0, 0, 10, ClickAction::ToggleStaged);
-        r.register_row(0, 0, 10, ClickAction::ToggleUnstaged);
+        r.register_row(0, 0, 10, ClickAction::OpenSettings);
+        r.register_row(0, 0, 10, ClickAction::ToggleSidebar);
         // Later registration should win on overlap
-        assert!(matches!(
-            r.hit_test(5, 0),
-            Some(ClickAction::ToggleUnstaged)
-        ));
+        assert!(matches!(r.hit_test(5, 0), Some(ClickAction::ToggleSidebar)));
     }
 
     #[test]
     fn clear_removes_all_regions() {
         let mut r = HitTestRegistry::new();
-        r.register_row(0, 0, 10, ClickAction::ToggleStaged);
+        r.register_row(0, 0, 10, ClickAction::OpenSettings);
         r.clear();
         assert!(r.hit_test(5, 0).is_none());
     }
@@ -214,7 +206,7 @@ mod tests {
     #[test]
     fn hit_test_inclusive_left_exclusive_right() {
         let mut r = HitTestRegistry::new();
-        r.register_row(10, 0, 5, ClickAction::ToggleStaged); // cols 10..15
+        r.register_row(10, 0, 5, ClickAction::OpenSettings); // cols 10..15
         assert!(r.hit_test(10, 0).is_some(), "left edge is inclusive");
         assert!(r.hit_test(14, 0).is_some(), "last valid col");
         assert!(r.hit_test(15, 0).is_none(), "right edge is exclusive");

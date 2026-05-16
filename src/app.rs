@@ -4214,19 +4214,13 @@ impl App {
             ClickAction::UnstageFile(path) => {
                 self.unstage_file(&path);
             }
-            ClickAction::ToggleStaged => {
-                self.staged_collapsed = !self.staged_collapsed;
-            }
-            ClickAction::ToggleUnstaged => {
-                self.unstaged_collapsed = !self.unstaged_collapsed;
-            }
             ClickAction::StartDragSplit => {
                 self.dragging_split = true;
             }
             ClickAction::StartDragGraphDiffSplit => {
                 self.dragging_graph_diff_split = true;
             }
-            ClickAction::GitCommand { command, args, .. } => {
+            ClickAction::GitCommand { command, args } => {
                 // Try each panel's dispatcher in turn. Unknown commands are
                 // silently dropped — no external handler to fall through to.
                 if crate::ui::git_status_panel::handle_command(self, &command, &args) {

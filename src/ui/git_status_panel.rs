@@ -89,21 +89,14 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
                 (None, Some(r)) => (Some(r.0.clone()), Some(r.1.clone())),
                 (None, None) => (None, None),
             };
-            let (dbl, dbl_args) = match (&span.dbl, &row.row_dbl) {
-                (Some(c), _) => (Some(c.0.clone()), Some(c.1.clone())),
-                (None, Some(r)) => (Some(r.0.clone()), Some(r.1.clone())),
-                (None, None) => (None, None),
-            };
-            if cmd.is_some() || dbl.is_some() {
+            if let Some(command) = cmd {
                 app.hit_registry.register_row(
                     x,
                     y,
                     w,
                     ClickAction::GitCommand {
-                        command: cmd.unwrap_or_default(),
+                        command,
                         args: args.unwrap_or(Value::Null),
-                        dbl_command: dbl,
-                        dbl_args,
                     },
                 );
             }
@@ -433,14 +426,12 @@ struct RowSpan {
     style: Style,
     /// Single-click command for just this span. Takes precedence over row-level.
     click: Option<(String, Value)>,
-    dbl: Option<(String, Value)>,
 }
 
 #[derive(Debug, Default)]
 struct Row {
     spans: Vec<RowSpan>,
     row_click: Option<(String, Value)>,
-    row_dbl: Option<(String, Value)>,
     /// When this row is a file row, its index into the unified
     /// staged-then-unstaged file list — lines up with `collect_rows` in
     /// `crate::search` for `SearchTarget::GitStatus`. Lets the render loop
@@ -454,7 +445,6 @@ impl RowSpan {
             text: text.into(),
             style: Style::default(),
             click: None,
-            dbl: None,
         }
     }
 
@@ -463,7 +453,6 @@ impl RowSpan {
             text: text.into(),
             style,
             click: None,
-            dbl: None,
         }
     }
 
@@ -478,7 +467,6 @@ impl Row {
         Self {
             spans,
             row_click: None,
-            row_dbl: None,
             search_row_idx: None,
         }
     }
@@ -489,11 +477,6 @@ impl Row {
 
     fn on_click(mut self, cmd: &str, args: Value) -> Self {
         self.row_click = Some((cmd.to_string(), args));
-        self
-    }
-
-    fn on_dbl_click(mut self, cmd: &str, args: Value) -> Self {
-        self.row_dbl = Some((cmd.to_string(), args));
         self
     }
 
@@ -950,7 +933,6 @@ fn dir_row(
                 .fg(stage_color)
                 .add_modifier(Modifier::BOLD),
             click: Some((stage_cmd.into(), serde_json::json!({ "path": path }))),
-            dbl: None,
         },
         RowSpan::plain(" "),
     ];
@@ -966,7 +948,6 @@ fn dir_row(
                 "git.discardFolderPrompt".into(),
                 serde_json::json!({ "path": path, "staged": is_staged }),
             )),
-            dbl: None,
         });
     }
     Row::new(spans).on_click(
@@ -1088,7 +1069,6 @@ fn file_row(
             "git.revealInTree".to_string(),
             serde_json::json!({ "path": file.path }),
         )),
-        dbl: None,
     });
     spans.push(RowSpan::styled(
         " ".to_string(),
@@ -1106,7 +1086,6 @@ fn file_row(
             button_cmd.to_string(),
             serde_json::json!({ "path": file.path }),
         )),
-        dbl: None,
     });
     spans.push(RowSpan::styled(
         " ".to_string(),
@@ -1128,7 +1107,6 @@ fn file_row(
                     "git.discardPrompt".to_string(),
                     serde_json::json!({ "path": file.path }),
                 )),
-                dbl: None,
             });
             spans.push(RowSpan::styled(
                 " ".to_string(),
@@ -1137,12 +1115,10 @@ fn file_row(
         }
     }
 
-    Row::new(spans)
-        .on_click(
-            "git.selectFile",
-            serde_json::json!({ "path": file.path, "staged": ctx.is_staged }),
-        )
-        .on_dbl_click(button_cmd, serde_json::json!({ "path": file.path }))
+    Row::new(spans).on_click(
+        "git.selectFile",
+        serde_json::json!({ "path": file.path, "staged": ctx.is_staged }),
+    )
 }
 
 fn apply_bg(style: Style, bg: Option<Color>) -> Style {
@@ -1201,7 +1177,6 @@ fn section_header(
                 .fg(action.color)
                 .add_modifier(Modifier::BOLD),
             click: Some((action.cmd.clone(), action.args.clone())),
-            dbl: None,
         });
     }
 
@@ -1351,7 +1326,6 @@ fn push_commit_box(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Them
                     .bg(btn_bg)
                     .add_modifier(Modifier::BOLD),
                 click: Some(("git.commitSubmit".into(), Value::Null)),
-                dbl: None,
             },
             RowSpan::plain("  "),
             RowSpan::styled(
@@ -1414,7 +1388,6 @@ fn push_indicator_row(ahead: usize, behind: usize) -> Option<Row> {
                     .bg(Color::Green)
                     .add_modifier(Modifier::BOLD),
                 click: Some(("git.pushPrompt".into(), Value::Null)),
-                dbl: None,
             },
         ])),
         (0, b) => Some(Row::new(vec![RowSpan::styled(
@@ -1430,7 +1403,6 @@ fn push_indicator_row(ahead: usize, behind: usize) -> Option<Row> {
                     .bg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
                 click: Some(("git.forcePushPrompt".into(), Value::Null)),
-                dbl: None,
             },
         ])),
     }
@@ -1488,7 +1460,6 @@ fn push_inline_confirm_spans(spans: &mut Vec<RowSpan>, theme: &Theme, base_bg: O
             base_bg,
         ),
         click: Some(("git.discardConfirm".to_string(), Value::Null)),
-        dbl: None,
     });
     spans.push(RowSpan::styled(
         " ".to_string(),
@@ -1503,7 +1474,6 @@ fn push_inline_confirm_spans(spans: &mut Vec<RowSpan>, theme: &Theme, base_bg: O
             base_bg,
         ),
         click: Some(("git.discardCancel".to_string(), Value::Null)),
-        dbl: None,
     });
 }
 

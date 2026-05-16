@@ -2229,27 +2229,7 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
                     app.last_click = None;
                     return;
                 }
-                // On double-click: if the region carries a dbl action, swap to it
-                // and run through handle_action so host-side side effects fire.
-                let effective = if is_double {
-                    if let ui::mouse::ClickAction::GitCommand {
-                        dbl_command: Some(ref cmd),
-                        ref dbl_args,
-                        ..
-                    } = action
-                    {
-                        ui::mouse::ClickAction::GitCommand {
-                            command: cmd.clone(),
-                            args: dbl_args.clone().unwrap_or(serde_json::Value::Null),
-                            dbl_command: None,
-                            dbl_args: None,
-                        }
-                    } else {
-                        action
-                    }
-                } else {
-                    action
-                };
+                let effective = action;
                 // Shift+Click on a graph row = extend the range, for
                 // terminals that actually forward Shift+Click to the app.
                 // Most macOS terminals intercept this for text selection;
@@ -2257,7 +2237,7 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
                 // click normally instead — the in-visual-mode click path
                 // lives in `git_graph_panel::handle_command`.
                 if mouse.modifiers.contains(KeyModifiers::SHIFT)
-                    && let ui::mouse::ClickAction::GitCommand { command, args, .. } = &effective
+                    && let ui::mouse::ClickAction::GitCommand { command, args } = &effective
                     && command == "git.selectCommit"
                     && let Some(oid) = args.get("oid").and_then(|v| v.as_str())
                     && let Some(target_idx) = app.git_graph.find_row_by_oid(oid)
@@ -2272,9 +2252,8 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
                     return;
                 }
                 // Files-tab tree multi-select / drag-arm overlay.
-                // Modifier handling sits between the generic
-                // double-click swap and the standard `handle_action`
-                // dispatch:
+                // Modifier handling sits before the standard
+                // `handle_action` dispatch:
                 //   Shift+Click → extend the selection range
                 //   Ctrl+Click  → toggle a single row in/out
                 //   plain click → arm a tree-drag press; clear any

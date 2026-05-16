@@ -10,6 +10,7 @@ pub mod editor;
 pub mod file_clipboard;
 pub mod file_selection;
 pub mod file_tree;
+pub mod find_widget;
 pub mod fs_watcher;
 pub mod git;
 pub mod global_search;

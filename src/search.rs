@@ -419,13 +419,13 @@ pub(crate) fn unified_display_rows(diff: &crate::git::DiffContent) -> Vec<String
 
 // ─── Matching ─────────────────────────────────────────────────────────────────
 
-fn smart_case(query: &str) -> bool {
+pub(crate) fn smart_case(query: &str) -> bool {
     query.chars().all(|c| !c.is_uppercase())
 }
 
 /// All byte-range matches of `needle` in `haystack`, non-overlapping, with
 /// smart-case folding. Needle must be non-empty.
-fn find_all(haystack: &str, needle: &str, case_insensitive: bool) -> Vec<Range<usize>> {
+pub(crate) fn find_all(haystack: &str, needle: &str, case_insensitive: bool) -> Vec<Range<usize>> {
     if needle.is_empty() {
         return Vec::new();
     }
@@ -529,7 +529,7 @@ fn baseline_row(target: SearchTarget, snap: &Snapshot) -> usize {
 
 // ─── Snapshot / restore ───────────────────────────────────────────────────────
 
-fn take_snapshot(app: &App) -> Snapshot {
+pub(crate) fn take_snapshot(app: &App) -> Snapshot {
     Snapshot {
         preview_scroll: app.preview_scroll,
         preview_h_scroll: app.preview_h_scroll,
@@ -546,7 +546,7 @@ fn take_snapshot(app: &App) -> Snapshot {
     }
 }
 
-fn restore_snapshot(app: &mut App, snap: &Snapshot) {
+pub(crate) fn restore_snapshot(app: &mut App, snap: &Snapshot) {
     app.preview_scroll = snap.preview_scroll;
     app.preview_h_scroll = snap.preview_h_scroll;
     app.diff_scroll = snap.diff_scroll;

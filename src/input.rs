@@ -8,6 +8,7 @@
 
 use crate::app::{App, DbNav, Panel, Tab, ViewMode};
 use crate::clipboard;
+use crate::find_widget;
 use crate::global_search;
 use crate::i18n::{Msg, t};
 use crate::quick_open;
@@ -74,15 +75,21 @@ pub fn leader_decision(
     // Any chord target character fires the pending leader. The caller
     // inspects `key.code` at Fire time to decide which palette to open,
     // so the verdict itself stays a unit variant.
-    let is_chord_target = matches!(
+    //
+    // Lowercase letters arm on the bare key. Uppercase variants accept
+    // either no modifier (CapsLock-style) or just SHIFT — without the
+    // SHIFT branch most terminals would never deliver a `Space+Shift+F`
+    // chord because crossterm reports the SHIFT modifier alongside the
+    // uppercase char.
+    let is_lower_chord = matches!(
         key.code,
-        KeyCode::Char('p')
-            | KeyCode::Char('P')
-            | KeyCode::Char('f')
-            | KeyCode::Char('F')
-            | KeyCode::Char('h')
-            | KeyCode::Char('H')
+        KeyCode::Char('p') | KeyCode::Char('f') | KeyCode::Char('h')
     ) && key.modifiers.is_empty();
+    let is_upper_chord = matches!(
+        key.code,
+        KeyCode::Char('P') | KeyCode::Char('F') | KeyCode::Char('H')
+    ) && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT);
+    let is_chord_target = is_lower_chord || is_upper_chord;
 
     // Fresh-arm path: no leader pending, space pressed, context allows.
     if allow_arm && leader_at.is_none() && is_bare_space {
@@ -122,6 +129,15 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // as the other overlays.
     if app.hosts_picker.active {
         handle_key_hosts_picker(key, app);
+        return;
+    }
+
+    // VSCode-style find widget — fully owns input while active. Sits
+    // above the global-search palette because the widget is opened by
+    // a Space leader chord (`Space+F`) and is the most-recently-opened
+    // overlay; routing should land here before any persistent palette.
+    if app.find_widget.active {
+        find_widget::handle_key(key, app);
         return;
     }
 
@@ -283,7 +299,13 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             app.global_search.active = false;
             match key.code {
                 KeyCode::Char('p') | KeyCode::Char('P') => quick_open::begin(app),
-                KeyCode::Char('f') | KeyCode::Char('F') => global_search::begin(app),
+                // Space+F = VSCode-style find widget (selection-seeded,
+                // floating in the active content panel's upper-right).
+                // Space+Shift+F = global ripgrep search (VSCode
+                // Cmd+Shift+F). Case differentiation makes these distinct
+                // entry points.
+                KeyCode::Char('f') => find_widget::begin_with_selection(app),
+                KeyCode::Char('F') => global_search::begin(app),
                 KeyCode::Char('h') | KeyCode::Char('H') => {
                     // Open Tab::Search with the replace input pre-expanded
                     // and focused. Mirrors VSCode's Ctrl+Shift+H — the
@@ -2174,6 +2196,32 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
     // (The fallthrough-close region is registered by the menu renderer
     // underneath the menu panel, so it goes through handle_action.)
 
+    // Find widget mouse intercept: when the user clicks a widget hit
+    // zone (close `×`, prev/next arrows, Aa/ab/.* toggles), route
+    // straight to `handle_action` BEFORE the preview/diff drag-select
+    // fast-paths grab the Down event. Without this, every widget click
+    // would silently start a text selection on the panel underneath.
+    //
+    // Non-widget clicks fall through — the widget is non-modal for
+    // mouse, matching VSCode's behavior where clicking outside the
+    // find widget doesn't dismiss it but does interact with the editor.
+    if app.find_widget.active
+        && let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+        && let Some(action) = app.hit_registry.hit_test(mouse.column, mouse.row)
+        && matches!(
+            action,
+            ui::mouse::ClickAction::FindWidgetClose
+                | ui::mouse::ClickAction::FindWidgetNext
+                | ui::mouse::ClickAction::FindWidgetPrev
+                | ui::mouse::ClickAction::FindWidgetToggleCase
+                | ui::mouse::ClickAction::FindWidgetToggleWord
+                | ui::mouse::ClickAction::FindWidgetToggleRegex
+        )
+    {
+        app.handle_action(action);
+        return;
+    }
+
     // Preview drag-selection fast-path. Owns Down/Drag/Up(Left) when the
     // gesture starts inside the preview panel. Scroll wheel, right-click,
     // and Down outside the panel fall through to the normal match below.
@@ -3866,6 +3914,34 @@ mod leader_tests {
         let f = ke(KeyCode::Char('F'), KeyModifiers::empty());
         let v = leader_decision(&f, true, Some(now), now, LEADER_TIMEOUT);
         assert_eq!(v, LeaderVerdict::Fire);
+    }
+
+    #[test]
+    fn shift_uppercase_f_after_arm_fires_for_global_search() {
+        // Most terminals report SHIFT alongside the uppercase char. The
+        // upper-case chord branch must accept SHIFT, otherwise
+        // `Space+Shift+F` (the global-search chord) is unreachable on
+        // those terminals.
+        let now = Instant::now();
+        let shift_f = ke(KeyCode::Char('F'), KeyModifiers::SHIFT);
+        let v = leader_decision(&shift_f, true, Some(now), now, LEADER_TIMEOUT);
+        assert_eq!(v, LeaderVerdict::Fire);
+    }
+
+    #[test]
+    fn g_is_not_a_chord_target_and_consumes_leader() {
+        // `g` / `G` used to step the find widget; the chord was removed.
+        // Make sure no future commit re-adds it without updating intent —
+        // and make sure today's behavior is "consume the leader, drop the
+        // key" rather than "fire something stale".
+        let now = Instant::now();
+        let g = ke(KeyCode::Char('g'), KeyModifiers::empty());
+        let v = leader_decision(&g, true, Some(now), now, LEADER_TIMEOUT);
+        assert_eq!(v, LeaderVerdict::Consume);
+
+        let shift_g = ke(KeyCode::Char('G'), KeyModifiers::SHIFT);
+        let v = leader_decision(&shift_g, true, Some(now), now, LEADER_TIMEOUT);
+        assert_eq!(v, LeaderVerdict::Consume);
     }
 
     #[test]

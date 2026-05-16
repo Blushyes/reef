@@ -719,6 +719,13 @@ pub struct App {
     /// In-panel vim-style search (`/`, `?`, `n`, `N`). See `crate::search`.
     pub search: crate::search::SearchState,
 
+    /// VSCode-style "Find" widget. Independent of `search` (the vim `/`
+    /// state machine) and mutually exclusive with it — opening either
+    /// clears the other. Floats in the upper-right of the active content
+    /// panel; supports SBS diff (per-side targeting) and Match Case /
+    /// Whole Word / Regex toggles. See `crate::find_widget`.
+    pub find_widget: crate::find_widget::FindWidgetState,
+
     /// VSCode-style quick-open palette. While `active`, input is routed
     /// exclusively to `crate::quick_open::handle_key` (see input.rs).
     pub quick_open: crate::quick_open::QuickOpenState,
@@ -1086,6 +1093,7 @@ impl App {
             pending_edit: None,
             theme,
             search: crate::search::SearchState::default(),
+            find_widget: crate::find_widget::FindWidgetState::default(),
             quick_open: crate::quick_open::QuickOpenState::from_prefs(),
             global_search: crate::global_search::GlobalSearchState::default(),
             hosts_picker: crate::hosts_picker::HostsPickerState::default(),
@@ -4154,6 +4162,11 @@ impl App {
         // 3-col diff column share this state, and tab-switching between
         // them (or to Files/Search) should start fresh.
         self.clear_diff_selection();
+        // The find widget is anchored to whatever content panel was
+        // active when it opened; carrying it across tabs would paint
+        // highlights on rows the user can't see. Close (which also
+        // restores pre-find scroll) before the tab actually changes.
+        crate::find_widget::close(self);
         match tab {
             Tab::Git => self.git_status_load.mark_stale(),
             Tab::Graph => self.graph_load.mark_stale(),
@@ -4371,6 +4384,37 @@ impl App {
             }
             ClickAction::DbGotoPage(page) => {
                 self.db_navigate_to_page(page);
+            }
+            ClickAction::FindWidgetClose => {
+                crate::find_widget::close(self);
+            }
+            ClickAction::FindWidgetNext => {
+                if !self.find_widget.matches.is_empty() {
+                    crate::find_widget::step(self, /*reverse=*/ false);
+                }
+            }
+            ClickAction::FindWidgetPrev => {
+                if !self.find_widget.matches.is_empty() {
+                    crate::find_widget::step(self, /*reverse=*/ true);
+                }
+            }
+            ClickAction::FindWidgetToggleCase => {
+                if self.find_widget.active {
+                    self.find_widget.match_case = !self.find_widget.match_case;
+                    crate::find_widget::recompute(self);
+                }
+            }
+            ClickAction::FindWidgetToggleWord => {
+                if self.find_widget.active {
+                    self.find_widget.whole_word = !self.find_widget.whole_word;
+                    crate::find_widget::recompute(self);
+                }
+            }
+            ClickAction::FindWidgetToggleRegex => {
+                if self.find_widget.active {
+                    self.find_widget.regex = !self.find_widget.regex;
+                    crate::find_widget::recompute(self);
+                }
             }
             ClickAction::SearchToggleReplace => {
                 if self.active_tab == Tab::Search {

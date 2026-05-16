@@ -53,6 +53,11 @@ reef-sqlite-preview = { path = "crates/reef-sqlite-preview" }
 # uses; promoting from dev-dep to runtime so `LocalBackend::write_file`
 # can do the same temp+rename dance the agent does.
 tempfile     = "3"
+# Regex matching for the VSCode-style Find widget's `.*` toggle. Stays
+# disabled by default — only used when `find_widget.regex == true` —
+# but the crate is unavoidable once the toggle exists since literal
+# substring matching can't express word boundaries / alternation.
+regex        = "1"
 
 [dev-dependencies]
 insta        = { version = "1", features = ["filters"] }

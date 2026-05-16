@@ -1,4 +1,5 @@
 use crate::app::{App, DiffHighlighted, DiffLayout, DiffMode, LineTokens};
+use crate::find_widget::{FindTarget, FindWidgetState};
 use crate::git::{DiffContent, DiffHunk, LineTag};
 use crate::i18n::{Msg, t};
 use crate::search::{SearchState, SearchTarget};
@@ -58,6 +59,8 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         app.theme,
         &app.search,
         SearchTarget::Diff,
+        &app.find_widget,
+        FindTarget::DiffUnified,
         selection.as_ref(),
         &mut DiffView {
             scroll: &mut app.diff_scroll,
@@ -89,6 +92,8 @@ pub fn render_diff(
     theme: Theme,
     search: &SearchState,
     search_target: SearchTarget,
+    find_widget: &FindWidgetState,
+    widget_unified_target: FindTarget,
     selection: Option<&DiffSelection>,
     view: &mut DiffView<'_>,
     hit_slot: &mut Option<DiffHit>,
@@ -103,6 +108,8 @@ pub fn render_diff(
             theme,
             search,
             search_target,
+            find_widget,
+            widget_unified_target,
             selection,
             view,
             hit_slot,
@@ -116,10 +123,44 @@ pub fn render_diff(
             theme,
             search,
             search_target,
+            find_widget,
+            widget_unified_target,
             selection,
             view,
             hit_slot,
         ),
+    }
+}
+
+/// Pick which match source owns the highlight overlay for a given row.
+/// Find widget and `/` are mutually exclusive (either side clears the
+/// other on open) so this is a strict "widget if its target matches,
+/// else search" lookup — no merging.
+fn unified_match_ranges_for(
+    row: usize,
+    search: &SearchState,
+    search_target: SearchTarget,
+    widget: &FindWidgetState,
+    widget_target: FindTarget,
+) -> (Vec<Range<usize>>, Option<Range<usize>>) {
+    if widget.target == Some(widget_target) {
+        widget.ranges_on_row(widget_target, row)
+    } else {
+        search.ranges_on_row(search_target, row)
+    }
+}
+
+/// Side-aware target derivation for SBS rendering. Callers pass the
+/// unified variant (`DiffUnified` / `GraphDiffUnified`) and we derive
+/// the corresponding SBS side targets.
+fn sbs_side_targets(unified: FindTarget) -> (FindTarget, FindTarget) {
+    match unified {
+        FindTarget::GraphDiffUnified
+        | FindTarget::GraphDiffSbsLeft
+        | FindTarget::GraphDiffSbsRight => {
+            (FindTarget::GraphDiffSbsLeft, FindTarget::GraphDiffSbsRight)
+        }
+        _ => (FindTarget::DiffSbsLeft, FindTarget::DiffSbsRight),
     }
 }
 
@@ -148,6 +189,8 @@ fn render_unified(
     theme: Theme,
     search: &SearchState,
     search_target: SearchTarget,
+    find_widget: &FindWidgetState,
+    widget_unified_target: FindTarget,
     selection: Option<&DiffSelection>,
     view: &mut DiffView<'_>,
     hit_slot: &mut Option<DiffHit>,
@@ -252,9 +295,16 @@ fn render_unified(
             break;
         }
         let row_idx = scroll + offset;
-        // `collect_rows(Diff)` in `search.rs` uses the exact same
-        // `UnifiedLine` order, so row_idx matches 1:1 with match row indices.
-        let (ranges, cur) = search.ranges_on_row(search_target, row_idx);
+        // `collect_rows(Diff)` in `search.rs` and `find_widget::collect_rows`
+        // for unified targets both use the same `UnifiedLine` order, so
+        // `row_idx` is 1:1 with match row indices on both sides.
+        let (ranges, cur) = unified_match_ranges_for(
+            row_idx,
+            search,
+            search_target,
+            find_widget,
+            widget_unified_target,
+        );
         let sel_range = selection
             .filter(|s| s.side == DiffSide::Unified)
             .and_then(|s| {
@@ -426,6 +476,33 @@ enum SbsDisplayLine {
     Row(SbsRow),
 }
 
+/// Flatten an entire diff into the SBS row layout used by `render_side_by_side`.
+/// Row indices in the returned vec line up 1:1 with `diff_scroll` in SBS mode,
+/// so match positions found by `find_widget` can be jump-targeted by setting
+/// `diff_scroll` directly.
+///
+/// Returns text-only `DiffRowText` entries (no tokens / line numbers); the
+/// find widget only needs the per-side string per row to run its matcher.
+pub(crate) fn build_sbs_row_texts(diff: &DiffContent) -> Vec<DiffRowText> {
+    let mut out: Vec<DiffRowText> = Vec::new();
+    for (hi, hunk) in diff.hunks.iter().enumerate() {
+        if hi > 0 {
+            out.push(DiffRowText::Separator);
+        }
+        for line in build_sbs_lines(hunk, None) {
+            match line {
+                SbsDisplayLine::Separator => out.push(DiffRowText::Separator),
+                SbsDisplayLine::HunkHeader(h) => out.push(DiffRowText::Header(h)),
+                SbsDisplayLine::Row(row) => out.push(DiffRowText::Sbs {
+                    left: row.left_text,
+                    right: row.right_text,
+                }),
+            }
+        }
+    }
+    out
+}
+
 fn build_sbs_lines(hunk: &DiffHunk, hunk_tokens: Option<&Vec<LineTokens>>) -> Vec<SbsDisplayLine> {
     let mut rows: Vec<SbsDisplayLine> = Vec::new();
     // Carry tokens alongside each pending removal so a later Added pairing
@@ -526,6 +603,8 @@ fn render_side_by_side(
     theme: Theme,
     search: &SearchState,
     _search_target: SearchTarget,
+    find_widget: &FindWidgetState,
+    widget_unified_target: FindTarget,
     selection: Option<&DiffSelection>,
     view: &mut DiffView<'_>,
     hit_slot: &mut Option<DiffHit>,
@@ -543,13 +622,16 @@ fn render_side_by_side(
         &mut y,
         max_y,
     );
-    // TODO(search-sbs): SBS layout doesn't overlay `/` match highlights
-    // on its rows — only Unified does. Row index inside `build_sbs_lines`
-    // diverges from `unified_display_rows` (it pairs Removed/Added into
-    // single rows), so wiring search in needs a parallel row collector
-    // before the renderer can light up matches. `search` is threaded
-    // through to keep the signature honest once that lands.
+    // The legacy `/` (`SearchState`) doesn't currently expose a SBS row
+    // collector — `collect_rows(SearchTarget::Diff)` only walks unified
+    // rows. The find widget *does*, via its `DiffSbsLeft` / `DiffSbsRight`
+    // targets, and the two state machines are mutually exclusive (open
+    // either side and the other clears). So SBS highlights flow only
+    // through `find_widget` here; `search` stays bound to keep the
+    // signature symmetric with `render_unified` for future work that
+    // wires `/` into SBS.
     let _ = search;
+    let (widget_left_target, widget_right_target) = sbs_side_targets(widget_unified_target);
 
     // Build all display lines
     let mut all_lines: Vec<SbsDisplayLine> = Vec::new();
@@ -665,6 +747,12 @@ fn render_side_by_side(
             },
             None => (None, None),
         };
+        // Per-side widget-match ranges. `ranges_on_row` filters by
+        // `widget.target`, so at most one side returns a non-empty vec
+        // — they can't double-paint.
+        let (match_left, match_left_cur) = find_widget.ranges_on_row(widget_left_target, row_idx);
+        let (match_right, match_right_cur) =
+            find_widget.ranges_on_row(widget_right_target, row_idx);
         match dl {
             SbsDisplayLine::Separator => {
                 let line = Line::from(Span::styled(
@@ -678,22 +766,72 @@ fn render_side_by_side(
                 f.render_widget(line, Rect::new(area.x, y, area.width, 1));
             }
             SbsDisplayLine::HunkHeader(header) => {
-                let line = Line::from(Span::styled(
-                    format!(" {}", header),
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::DIM),
-                ));
-                f.render_widget(line, Rect::new(area.x, y, area.width, 1));
+                // The widget can target headers too (e.g. searching `@@`).
+                // For SBS, the header is shared across sides; combine left
+                // + right ranges (one of them is always empty) and paint
+                // a single overlay.
+                let combined: Vec<Range<usize>> = match_left
+                    .iter()
+                    .chain(match_right.iter())
+                    .cloned()
+                    .collect();
+                let combined_cur = match_left_cur.clone().or(match_right_cur.clone());
+                let base = Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::DIM);
+                let tokens = if combined.is_empty() {
+                    vec![(base, header.clone())]
+                } else {
+                    overlay_match_highlight(
+                        vec![(base, header.clone())],
+                        &combined,
+                        combined_cur,
+                        theme.search_match,
+                        theme.search_current,
+                    )
+                };
+                let prefix = Span::styled(" ", base);
+                let mut spans = vec![prefix];
+                for (style, text) in tokens {
+                    spans.push(Span::styled(text, style));
+                }
+                f.render_widget(Line::from(spans), Rect::new(area.x, y, area.width, 1));
             }
             SbsDisplayLine::Row(row) => {
                 render_sbs_row(
-                    f, area, y, row, half_w, right_w, h_left, h_right, &theme, sel_left, sel_right,
+                    f,
+                    area,
+                    y,
+                    row,
+                    half_w,
+                    right_w,
+                    h_left,
+                    h_right,
+                    &theme,
+                    SideOverlays {
+                        selection: sel_left,
+                        match_ranges: &match_left,
+                        match_current: match_left_cur.clone(),
+                    },
+                    SideOverlays {
+                        selection: sel_right,
+                        match_ranges: &match_right,
+                        match_current: match_right_cur.clone(),
+                    },
                 );
             }
         }
         y += 1;
     }
+}
+
+/// Per-side overlay payload for `render_sbs_row`. Bundles the row-scoped
+/// selection range and search-match ranges so the renderer's signature
+/// stays compact even with multiple highlight sources.
+pub(crate) struct SideOverlays<'a> {
+    pub selection: Option<Range<usize>>,
+    pub match_ranges: &'a [Range<usize>],
+    pub match_current: Option<Range<usize>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -707,8 +845,8 @@ fn render_sbs_row(
     h_scroll_left: usize,
     h_scroll_right: usize,
     theme: &Theme,
-    sel_left: Option<Range<usize>>,
-    sel_right: Option<Range<usize>>,
+    left: SideOverlays<'_>,
+    right: SideOverlays<'_>,
 ) {
     // Gutter: " XXXXX " = 7 cols
     let gutter = 7usize;
@@ -719,7 +857,20 @@ fn render_sbs_row(
     let left_no = fmt_lineno(row.left_no);
     let left_body =
         build_sbs_body_tokens(&row.left_text, row.left_tokens.as_ref(), left_fg, left_bg);
-    let left_body = match sel_left {
+    // Search-match highlight first (so the drag-selection's REVERSED
+    // modifier composes on top, mirroring `render_unified_line`).
+    let left_body = if left.match_ranges.is_empty() {
+        left_body
+    } else {
+        overlay_match_highlight(
+            left_body,
+            left.match_ranges,
+            left.match_current,
+            theme.search_match,
+            theme.search_current,
+        )
+    };
+    let left_body = match left.selection {
         Some(r) if r.start < r.end => overlay_selection_highlight(left_body, r),
         _ => left_body,
     };
@@ -756,7 +907,18 @@ fn render_sbs_row(
         right_fg,
         right_bg,
     );
-    let right_body = match sel_right {
+    let right_body = if right.match_ranges.is_empty() {
+        right_body
+    } else {
+        overlay_match_highlight(
+            right_body,
+            right.match_ranges,
+            right.match_current,
+            theme.search_match,
+            theme.search_current,
+        )
+    };
+    let right_body = match right.selection {
         Some(r) if r.start < r.end => overlay_selection_highlight(right_body, r),
         _ => right_body,
     };

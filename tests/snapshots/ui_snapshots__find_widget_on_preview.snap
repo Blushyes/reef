@@ -1,0 +1,28 @@
+---
+source: tests/ui_snapshots.rs
+expression: output
+---
+ reef  [TMPDIR]  ⎇ master
+ 📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph                            ⊟  1:Files 2:Search 3:Git 4:Graph
+ + New File   📁  New Folder  │ scra
+   scratch.txt               │ ────  bar                          Aa  ab  .*     1/2     ↑  ↓  ×
+                             │
+                             │     2     bar();
+                             │     3     bar();
+                             │     4 }
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                                 ⚙  q:quit Tab:switch s:stage u:unstage r:refresh h:help  [Preview]

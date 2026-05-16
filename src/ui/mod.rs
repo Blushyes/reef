@@ -5,6 +5,7 @@ pub mod db_preview;
 pub mod diff_panel;
 pub mod file_preview_panel;
 pub mod file_tree_panel;
+pub mod find_widget_panel;
 pub mod focus;
 pub mod git_graph_panel;
 pub mod git_status_panel;
@@ -192,6 +193,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     render_status_bar(f, app, main_layout[3]);
 
+    // VSCode-style find widget overlays its host panel after status bar
+    // so its borders and hit zones sit above any panel chrome. Skips
+    // itself when not active.
+    find_widget_panel::render(f, app);
+
     if app.show_help {
         render_help(f, app, size);
     }
@@ -355,6 +361,8 @@ fn render_graph_diff_column(f: &mut Frame, app: &mut App, area: Rect) {
         app.theme,
         &app.search,
         crate::search::SearchTarget::GraphDiff,
+        &app.find_widget,
+        crate::find_widget::FindTarget::GraphDiffUnified,
         selection.as_ref(),
         &mut diff_panel::DiffView {
             scroll: &mut app.commit_detail.file_diff_scroll,

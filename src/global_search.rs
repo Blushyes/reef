@@ -336,7 +336,11 @@ pub fn begin(app: &mut App) {
 /// trim leading/trailing whitespace: the global-search prompt is
 /// single-line and feeding it raw indentation produces zero matches
 /// for anything but the first line of a function.
-fn current_text_selection(app: &App) -> Option<String> {
+///
+/// Shared with `search::begin_with_selection` so both entry points
+/// (`Space+F` in-panel find, `Space+Shift+F` global search) interpret
+/// the selection identically.
+pub(crate) fn current_text_selection(app: &App) -> Option<String> {
     if let (Some(sel), Some(preview)) =
         (app.preview_selection.as_ref(), app.preview_content.as_ref())
         && !sel.is_empty()
@@ -358,7 +362,7 @@ fn current_text_selection(app: &App) -> Option<String> {
     None
 }
 
-fn first_nonempty_trimmed_line(s: &str) -> Option<String> {
+pub(crate) fn first_nonempty_trimmed_line(s: &str) -> Option<String> {
     s.lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
@@ -455,10 +459,12 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         }
         crate::input::LeaderVerdict::Fire => {
             app.global_search.space_leader_at = None;
-            // Only close when the follow-up matches OUR chord target (`f`/`F`).
-            // Other chord targets (`p`/`P`) fall through to Consume so Space
-            // inside the palette stays a literal char in those cases.
-            if matches!(key.code, KeyCode::Char('f' | 'F')) && !ctrl && !alt {
+            // Only close when the follow-up matches OUR chord target — the
+            // palette's open chord moved to `Space+Shift+F`, so `Char('F')`
+            // is now the only key that toggles us off. Lower-case `f`
+            // (Space+F) is in-panel find and doesn't belong to this
+            // overlay; other chord targets fall through quietly.
+            if key.code == KeyCode::Char('F') && !ctrl && !alt {
                 app.global_search.active = false;
             }
             return;

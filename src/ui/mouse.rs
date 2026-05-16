@@ -93,6 +93,20 @@ pub enum ClickAction {
     /// Jump directly to a 1-based page index. Clicking the `[5]` chip
     /// dispatches `DbGotoPage(5)`.
     DbGotoPage(u64),
+
+    // ── Find widget (VSCode-style floating find, src/find_widget.rs) ──
+    /// Click the `×` close button on the find widget.
+    FindWidgetClose,
+    /// Click the `↓` next-match button.
+    FindWidgetNext,
+    /// Click the `↑` previous-match button.
+    FindWidgetPrev,
+    /// Click the `Aa` Match Case toggle.
+    FindWidgetToggleCase,
+    /// Click the `ab` Whole Word toggle.
+    FindWidgetToggleWord,
+    /// Click the `.*` Regex toggle.
+    FindWidgetToggleRegex,
     /// Click on a row in the Settings page. The `usize` indexes into
     /// `crate::settings::SettingItem::ALL`. Clicking just moves the
     /// selection cursor — activation (toggle / open inline editor) is

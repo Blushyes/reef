@@ -1,5 +1,6 @@
 use crate::app::App;
 use crate::file_tree::{BinaryInfo, BinaryReason, ImagePreview, PreviewBody, PreviewContent};
+use crate::find_widget::FindTarget;
 use crate::i18n::{Msg, t};
 use crate::search::SearchTarget;
 use crate::ui::focus::header_title_style;
@@ -395,9 +396,16 @@ fn render_text(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewConten
                 Some(tokens) => tokens.clone(),
                 None => vec![(Style::default().fg(th.fg_primary), line.clone())],
             };
-        let (mut ranges, mut cur) = app
-            .search
-            .ranges_on_row(SearchTarget::FilePreview, real_idx);
+        // Find widget owns highlights when it targets the preview; the
+        // legacy `/` search is mutually exclusive (either side clears
+        // the other on open), so the order is "widget else search".
+        let (mut ranges, mut cur) = if app.find_widget.target == Some(FindTarget::FilePreview) {
+            app.find_widget
+                .ranges_on_row(FindTarget::FilePreview, real_idx)
+        } else {
+            app.search
+                .ranges_on_row(SearchTarget::FilePreview, real_idx)
+        };
         // `global_search::accept` stashes a single-row highlight at the
         // matching line so we can light it up once the async preview lands.
         // Applied alongside the `/` search ranges using the same overlay

@@ -181,7 +181,7 @@ pub fn delete_word_backward(text: &mut String, cursor: &mut usize) {
     *cursor = start;
 }
 
-fn is_word_char(c: char) -> bool {
+pub(crate) fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 

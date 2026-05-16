@@ -190,17 +190,31 @@ fn styled_segment(
 ) -> (Style, String) {
     let style = match kind {
         MatchKind::None => base,
-        MatchKind::Match => apply_search_bg(base, match_bg),
-        MatchKind::Current => apply_search_bg(base, current_bg),
+        MatchKind::Match => apply_search_bg(base, match_bg, /*is_current=*/ false),
+        MatchKind::Current => apply_search_bg(base, current_bg, /*is_current=*/ true),
     };
     (style, text.to_string())
 }
 
-fn apply_search_bg(base: Style, bg: Color) -> Style {
-    if base.bg.is_none() {
+fn apply_search_bg(base: Style, bg: Color, is_current: bool) -> Style {
+    // Color-only distinction (no modifiers like UNDERLINED): the two
+    // theme colors `search_match` / `search_current` carry the visual
+    // difference between match and active-match.
+    //
+    // - Current match: set bg = current_bg AND force fg to pure black.
+    //   Syntect tokens (keyword purple, string green, …) would otherwise
+    //   land on the bright amber/yellow `search_current` with weak
+    //   contrast; both themes' current-bg colors pop against black so
+    //   one hardcoded fg works for both presets.
+    // - Non-current match on a clean row (base has no bg): just set bg.
+    //   The dim `search_match` color tolerates the original syntect fg.
+    // - Non-current match on a diff row (base has bg): REVERSED so the
+    //   diff add/remove color stays visible under the highlight.
+    if is_current {
+        base.bg(bg).fg(Color::Rgb(0, 0, 0))
+    } else if base.bg.is_none() {
         base.bg(bg)
     } else {
-        // Diff rows already carry a bg — flip fg/bg so the match stays visible.
         base.add_modifier(Modifier::REVERSED)
     }
 }
@@ -505,6 +519,8 @@ mod tests {
 
     #[test]
     fn overlay_reverses_when_bg_already_set() {
+        // Non-current match on a diff (bg-bearing) row uses REVERSED so
+        // the diff add/remove color stays visible under the highlight.
         let base = Style::default().bg(ratatui::style::Color::Green);
         let tokens = vec![(base, "abcdef".to_string())];
         let r = 2..4;
@@ -517,6 +533,52 @@ mod tests {
         );
         assert_eq!(out[1].0.bg, Some(ratatui::style::Color::Green));
         assert!(out[1].0.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn overlay_current_match_uses_current_color_and_forces_black_fg() {
+        // Clean (no-bg) base + current match: bg = current_bg, fg gets
+        // hardcoded to pure black so syntect token colors don't leave
+        // the active match unreadable on the amber highlight.
+        let tokens = vec![(
+            Style::default().fg(ratatui::style::Color::Magenta),
+            "foobar".to_string(),
+        )];
+        let r = 0..3;
+        let out = overlay_match_highlight(
+            tokens,
+            std::slice::from_ref(&r),
+            Some(r.clone()),
+            ratatui::style::Color::Yellow,
+            ratatui::style::Color::Red,
+        );
+        assert_eq!(out[0].0.bg, Some(ratatui::style::Color::Red));
+        assert_eq!(out[0].0.fg, Some(ratatui::style::Color::Rgb(0, 0, 0)));
+        assert!(!out[0].0.add_modifier.contains(Modifier::BOLD));
+        assert!(!out[0].0.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn overlay_current_match_overrides_bg_and_fg_on_diff_row() {
+        // Diff rows already carry a bg — current match hard-overrides
+        // both bg and fg so the active hit is unmistakable. Non-current
+        // matches still go through REVERSED to keep the diff color.
+        let base = Style::default()
+            .bg(ratatui::style::Color::Green)
+            .fg(ratatui::style::Color::Magenta);
+        let tokens = vec![(base, "abcdef".to_string())];
+        let r = 2..4;
+        let out = overlay_match_highlight(
+            tokens,
+            std::slice::from_ref(&r),
+            Some(r.clone()),
+            ratatui::style::Color::Yellow,
+            ratatui::style::Color::Red,
+        );
+        assert_eq!(out[1].0.bg, Some(ratatui::style::Color::Red));
+        assert_eq!(out[1].0.fg, Some(ratatui::style::Color::Rgb(0, 0, 0)));
+        assert!(!out[1].0.add_modifier.contains(Modifier::REVERSED));
+        assert!(!out[1].0.add_modifier.contains(Modifier::UNDERLINED));
     }
 
     #[test]

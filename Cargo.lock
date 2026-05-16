@@ -2321,6 +2321,7 @@ dependencies = [
  "ratatui-image",
  "reef-proto",
  "reef-sqlite-preview",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

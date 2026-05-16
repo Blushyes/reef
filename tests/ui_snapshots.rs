@@ -677,3 +677,59 @@ fn snapshot_settings_page_editing_editor_command() {
         insta::assert_snapshot!("settings_page_editing_editor_command", output)
     });
 }
+
+#[test]
+fn snapshot_find_widget_on_preview() {
+    // Locks in the floating Find widget's layout: bordered popup
+    // anchored to the upper-right of the file-preview panel, query
+    // pre-seeded from selection, Aa/ab/.* toggles + counter + ↑↓×
+    // buttons on the same row. If this regresses, the widget would
+    // either misalign over the panel chrome or lose one of its
+    // controls.
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
+    let (tmp, raw) = tempdir_repo();
+    commit_file(
+        &raw,
+        "scratch.txt",
+        "fn foo() {\n    bar();\n    bar();\n}\n",
+        "init",
+    );
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    wait_for_file_tree(&mut app);
+    // Drive the preview pane: select the scratch file, wait for the
+    // worker to land the body, then drop a selection on row 1 so
+    // `begin_with_selection` has something to seed from.
+    if let Some(idx) = app
+        .file_tree
+        .entries
+        .iter()
+        .position(|e| e.name == "scratch.txt")
+    {
+        app.file_tree.selected = idx;
+        app.load_preview();
+        wait_for_preview(&mut app);
+    } else {
+        panic!("scratch.txt missing from tree");
+    }
+    app.set_active_tab(reef::app::Tab::Files);
+    app.active_panel = reef::app::Panel::Diff;
+    // Run a frame so `last_preview_rect` lands — `find_widget_panel`
+    // reads it to anchor the popup. With no rect cached, the widget
+    // skips rendering.
+    let _ = render_app(&mut app, 100, 24);
+    let mut sel = reef::ui::selection::PreviewSelection::new((1, 4));
+    sel.active = (1, 7);
+    sel.dragging = false;
+    app.preview_selection = Some(sel);
+    reef::find_widget::begin_with_selection(&mut app);
+
+    let output = render_app(&mut app, 100, 24);
+    with_filters(&[], || {
+        insta::assert_snapshot!("find_widget_on_preview", output)
+    });
+}

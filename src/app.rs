@@ -597,6 +597,14 @@ pub struct App {
     /// + gap rules.
     pub vertical_scroll_lock: crate::input::AxisLock,
     pub horizontal_scroll_lock: crate::input::AxisLock,
+    /// Per-axis step-size pacers for wheel/trackpad input. Detect
+    /// trackpad-cadence (~12-16 ms inter-event) vs wheel-cadence
+    /// (~100 ms+) and return 1 vs 3 lines per event respectively,
+    /// with mild acceleration on sustained trackpad swipes. Keeps a
+    /// gentle two-finger swipe from flying 30-90 lines per gesture.
+    /// See [`crate::input::ScrollPacer`].
+    pub vertical_scroll_pacer: crate::input::ScrollPacer,
+    pub horizontal_scroll_pacer: crate::input::ScrollPacer,
     /// 上一帧 preview 内容行的起点(content_x, content_y)与 gutter 宽度。
     /// mouse handler 据此把终端列行坐标映射回文件行/列。
     pub last_preview_content_origin: Option<(u16, u16, u16)>,
@@ -1016,6 +1024,8 @@ impl App {
             db_goto_input: None,
             vertical_scroll_lock: crate::input::AxisLock::new(),
             horizontal_scroll_lock: crate::input::AxisLock::new(),
+            vertical_scroll_pacer: crate::input::ScrollPacer::new(),
+            horizontal_scroll_pacer: crate::input::ScrollPacer::new(),
             last_preview_content_origin: None,
             preview_click_state: None,
             diff_selection: None,

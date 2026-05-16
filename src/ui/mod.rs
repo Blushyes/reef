@@ -1,4 +1,5 @@
 pub mod commit_detail_panel;
+pub mod confirm_modal;
 pub mod context_menu_panel;
 pub mod db_preview;
 pub mod diff_panel;
@@ -11,6 +12,7 @@ pub mod global_search_panel;
 pub mod highlight;
 pub mod hosts_picker_panel;
 pub mod hover;
+pub mod layout;
 pub mod mouse;
 pub mod quick_open_panel;
 pub mod search_tab;
@@ -219,6 +221,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // check only looks at `tree_context_menu.active`.
     if app.tree_context_menu.active {
         context_menu_panel::render(f, app, size);
+    }
+    // ConfirmModal sits on top of everything — including context menu —
+    // because once the user has committed to a destructive choice, the
+    // confirm must be the only thing eligible to receive input.
+    if app.confirm_modal.is_some() {
+        confirm_modal::render(f, app, size);
     }
 }
 
@@ -554,45 +562,6 @@ fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
             ),
             Span::styled(
                 text,
-                Style::default()
-                    .fg(th.fg_primary)
-                    .bg(th.chrome_bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " ".repeat(area.width.saturating_sub(80) as usize),
-                Style::default().bg(th.chrome_bg),
-            ),
-        ]);
-        f.render_widget(hint, area);
-        return;
-    }
-
-    // Tree delete-confirm: status bar becomes a red ⚠ prompt. Mirrors
-    // the select/place mode takeover pattern. Confirm key routing
-    // lives in `input::handle_key_tree_delete_confirm` — here we
-    // just draw.
-    if let Some(pending) = app.tree_delete_confirm.as_ref() {
-        let prompt = crate::i18n::tree_delete_confirm_prompt(
-            &pending.display_name,
-            pending.is_dir,
-            pending.hard,
-        );
-        let badge = if pending.hard {
-            " ⚠ DELETE "
-        } else {
-            " 🗑 TRASH "
-        };
-        let hint = Line::from(vec![
-            Span::styled(
-                badge,
-                Style::default()
-                    .fg(Color::White)
-                    .bg(th.error_bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                prompt,
                 Style::default()
                     .fg(th.fg_primary)
                     .bg(th.chrome_bg)

@@ -3,6 +3,7 @@ use crate::file_tree::{FileTree, PreviewBody, PreviewContent};
 use crate::git::graph::GraphRow;
 use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, GitRepo, RefLabel};
 use crate::tasks::{AsyncState, TaskCoordinator, WorkerResult};
+use crate::ui::confirm_modal::ConfirmModal;
 use crate::ui::highlight::StyledToken;
 use crate::ui::mouse::{ClickAction, HitTestRegistry};
 use crate::ui::theme::Theme;
@@ -745,10 +746,10 @@ pub struct App {
     /// full input ownership while visible.
     pub tree_context_menu: crate::tree_context_menu::ContextMenuState,
 
-    /// Pending Move-to-Trash / Hard-Delete confirmation. The status
-    /// bar takes over with `⚠ Delete foo? (y / Esc)` while this is
-    /// `Some`. Cleared on confirm or cancel.
-    pub tree_delete_confirm: Option<TreeDeletePending>,
+    /// Generic centered yes/no confirm modal. Owns mouse + keyboard
+    /// input while `Some`. Built by callers via `App::show_confirm` —
+    /// see e.g. `prompt_tree_delete` for the delete-file consumer.
+    pub confirm_modal: Option<ConfirmModal>,
 
     /// VS Code-style internal file clipboard. Holds the paths and the
     /// move-vs-copy intent set by the latest `Cut` / `Copy`. Consumed
@@ -829,15 +830,19 @@ pub struct App {
     next_graph_revalidate_at: Instant,
 }
 
-/// What the user is about to delete once they confirm the status-bar
-/// prompt. `hard` distinguishes Shift+Delete (permanent) from the
-/// default Delete (Trash).
+/// What the user is about to delete once they confirm. Passed by value
+/// through the modal's `on_confirm` closure rather than stored on
+/// `App` directly — keeping it module-private and out of the App struct
+/// avoids a second source of truth for "is a delete pending" alongside
+/// `confirm_modal`. The Clone bound lets `execute_tree_delete` re-open
+/// the modal with the same payload when it has to back off ("operation
+/// still running" toast).
 #[derive(Debug, Clone)]
-pub struct TreeDeletePending {
-    pub path: PathBuf,
-    pub display_name: String,
-    pub is_dir: bool,
-    pub hard: bool,
+struct TreeDeletePending {
+    path: PathBuf,
+    display_name: String,
+    is_dir: bool,
+    hard: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1065,7 +1070,7 @@ impl App {
             place_mode: crate::place_mode::PlaceModeState::default(),
             tree_edit: crate::tree_edit::TreeEditState::default(),
             tree_context_menu: crate::tree_context_menu::ContextMenuState::default(),
-            tree_delete_confirm: None,
+            confirm_modal: None,
             file_clipboard: crate::file_clipboard::FileClipboard::default(),
             file_selection: crate::file_selection::SelectionSet::default(),
             tree_drag: crate::tree_drag::TreeDragState::default(),
@@ -1322,7 +1327,7 @@ impl App {
         // have a pending delete confirm taking over the status bar.
         self.tree_edit.clear();
         self.tree_context_menu.close();
-        self.tree_delete_confirm = None;
+        self.dismiss_confirm();
         self.set_active_tab(Tab::Files);
         self.place_mode.active = true;
         self.place_mode.sources = sources;
@@ -1901,7 +1906,7 @@ impl App {
         }
         // Close competing modals so tree-edit owns the screen.
         self.tree_context_menu.close();
-        self.tree_delete_confirm = None;
+        self.dismiss_confirm();
         self.exit_place_mode();
         self.set_active_tab(Tab::Files);
 
@@ -2273,43 +2278,57 @@ impl App {
         }
     }
 
-    /// Pop the status-bar delete-confirm prompt. `hard` controls
-    /// Trash vs. `fs::remove_*`; the prompt text adjusts accordingly.
+    /// Pop the centered delete-confirm modal. `hard` controls Trash
+    /// vs. `fs::remove_*`; the primary-button label adjusts accordingly,
+    /// while the title is a generic "Confirm" framing (the tone +
+    /// button color carry the severity cue, not the title text).
+    /// The `on_confirm` closure captures the path/is_dir/hard tuple so
+    /// the modal doesn't need a side-channel struct on `App`.
     pub fn prompt_tree_delete(&mut self, path: PathBuf, is_dir: bool, hard: bool) {
+        use crate::ui::confirm_modal::{ConfirmModal, ModalTone};
         let display_name = path
             .file_name()
             .and_then(|n| n.to_str())
             .map(crate::tree_edit::sanitize_filename)
             .unwrap_or_else(|| path.to_string_lossy().to_string());
         self.tree_context_menu.close();
-        self.tree_delete_confirm = Some(TreeDeletePending {
+        let body = crate::i18n::tree_delete_body(&display_name, is_dir, hard);
+        let primary_label = if hard {
+            crate::i18n::confirm_delete_label()
+        } else {
+            crate::i18n::confirm_trash_label()
+        };
+        let pending = TreeDeletePending {
             path,
             display_name,
             is_dir,
             hard,
+        };
+        self.show_confirm(ConfirmModal {
+            title: crate::i18n::confirm_destructive_title(),
+            tone: ModalTone::Danger,
+            body,
+            primary_label,
+            cancel_label: crate::i18n::confirm_cancel_label(),
+            confirm_keys: vec!['y', 'Y'],
+            on_confirm: Box::new(move |app| app.execute_tree_delete(pending)),
+            on_cancel: Box::new(|_| {}),
         });
     }
 
-    /// User pressed Y on the delete confirm. Dispatches the matching
-    /// worker task and clears the prompt.
-    pub fn confirm_tree_delete(&mut self) {
-        // Same generation-bump race as commit_tree_edit: a previous
-        // trash/hard-delete might still be running. Keep the confirm
-        // in place (don't `.take()`) so the user's Y press isn't
-        // lost — they can retry when the prior op completes.
+    /// Run the actual delete after the user confirmed. If a previous
+    /// fs mutation is still in flight, re-open the modal with the same
+    /// pending so the user can retry once the worker drains (matches
+    /// the original `confirm_tree_delete` retry semantics — Y wasn't
+    /// silently lost).
+    fn execute_tree_delete(&mut self, pending: TreeDeletePending) {
         if self.fs_mutation_load.loading {
             self.toasts
                 .push(Toast::warn(crate::i18n::tree_op_blocked_by_in_flight()));
+            self.prompt_tree_delete(pending.path, pending.is_dir, pending.hard);
             return;
         }
-        let Some(pending) = self.tree_delete_confirm.take() else {
-            return;
-        };
         let generation = self.fs_mutation_load.begin();
-        // Convert the (absolute) selection path to a workdir-relative
-        // PathBuf for the Backend call. The UI still stores `abs` because
-        // it came from `file_tree.root.join(entry.path)` — the display
-        // name is derived before we lose the absolute form.
         let first_name = pending.display_name.clone();
         let rel = pending
             .path
@@ -2329,8 +2348,43 @@ impl App {
         }
     }
 
-    pub fn cancel_tree_delete(&mut self) {
-        self.tree_delete_confirm = None;
+    // ── Confirm modal (generic yes/no overlay) ───────────────────────────
+
+    /// Show the centered `ConfirmModal`. If another modal is already
+    /// up, its `on_cancel` fires first so the caller can rely on
+    /// "every modal that opens eventually resolves via one of its
+    /// callbacks". Without this, opening modal B over modal A would
+    /// silently drop A's cancel closure — a leak for any caller that
+    /// uses cancel for cleanup.
+    pub fn show_confirm(&mut self, modal: ConfirmModal) {
+        if self.confirm_modal.is_some() {
+            self.fire_confirm_cancel();
+        }
+        self.confirm_modal = Some(modal);
+    }
+
+    /// Force-close the modal without firing any callback. Used by
+    /// "competing modal opens" paths (place mode, tree edit, tab
+    /// switch) and by successful/failed mutation completion.
+    pub fn dismiss_confirm(&mut self) {
+        self.confirm_modal = None;
+    }
+
+    /// Fire the primary callback. The modal is `take`n first so the
+    /// closure receives a clean `&mut App` (the closure may e.g.
+    /// `show_confirm` again to retry).
+    pub fn fire_confirm_primary(&mut self) {
+        if let Some(modal) = self.confirm_modal.take() {
+            (modal.on_confirm)(self);
+        }
+    }
+
+    /// Fire the cancel callback. Same `take`-first contract as
+    /// `fire_confirm_primary`.
+    pub fn fire_confirm_cancel(&mut self) {
+        if let Some(modal) = self.confirm_modal.take() {
+            (modal.on_cancel)(self);
+        }
     }
 
     // ── Hosts picker (Ctrl+O) ────────────────────────────────────────────
@@ -2688,7 +2742,7 @@ impl App {
         if self.place_mode.active
             || self.tree_edit.active
             || self.tree_context_menu.active
-            || self.tree_delete_confirm.is_some()
+            || self.confirm_modal.is_some()
         {
             return;
         }
@@ -3931,7 +3985,7 @@ impl App {
                         // tree rebuild runs so the renderer doesn't briefly
                         // show a stale cursor on a row that's about to move.
                         self.tree_edit.clear();
-                        self.tree_delete_confirm = None;
+                        self.dismiss_confirm();
                         // Select the newly-created / renamed entry if we
                         // stashed one on dispatch. Delete paths leave
                         // `fs_mutation_select_on_done` as `None` so the
@@ -3955,7 +4009,7 @@ impl App {
                         // fix the buffer and retry. Same as the drag-drop
                         // path: clear stale/error flags so activity_message
                         // doesn't double-surface the toast after it fades.
-                        self.tree_delete_confirm = None;
+                        self.dismiss_confirm();
                         // Drop the pending auto-select — the target path
                         // was never created / renamed, so trying to focus
                         // it would be a stale lookup at best.
@@ -4064,7 +4118,7 @@ impl App {
         if was_files {
             self.tree_edit.clear();
             self.tree_context_menu.close();
-            self.tree_delete_confirm = None;
+            self.dismiss_confirm();
         }
         // Preview selection is scoped to the Files/Search tabs that render
         // the preview panel. Switching away clears it so no stale highlight
@@ -4328,6 +4382,12 @@ impl App {
                 if self.view_mode == ViewMode::Settings {
                     self.settings.select(idx);
                 }
+            }
+            ClickAction::ConfirmModalPrimary => {
+                self.fire_confirm_primary();
+            }
+            ClickAction::ConfirmModalCancel => {
+                self.fire_confirm_cancel();
             }
         }
     }
@@ -4952,5 +5012,182 @@ mod tests {
         assert_eq!(g + c + d, 200);
         assert_eq!(d, 120);
         assert_eq!(c, 80);
+    }
+
+    // ── ConfirmModal lifecycle ───────────────────────────────────────────
+
+    use crate::ui::confirm_modal::{ConfirmModal, ModalTone};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// Build a barebones `ConfirmModal` whose two callbacks each tick a
+    /// shared counter so the test can assert which one fired (and how
+    /// many times). `confirm_keys` is empty — the tests drive the modal
+    /// through the public `App::fire_*` entry points directly, not via
+    /// keyboard.
+    fn modal_with_counters(primary: Rc<Cell<u32>>, cancel: Rc<Cell<u32>>) -> ConfirmModal {
+        ConfirmModal {
+            title: "t".into(),
+            tone: ModalTone::Danger,
+            body: "b".into(),
+            primary_label: "P".into(),
+            cancel_label: "C".into(),
+            confirm_keys: vec![],
+            on_confirm: Box::new(move |_app| primary.set(primary.get() + 1)),
+            on_cancel: Box::new(move |_app| cancel.set(cancel.get() + 1)),
+        }
+    }
+
+    /// Holds the HOME lock + tempdirs alongside the App so each test
+    /// gets a clean isolated environment. Drop order matters: the App
+    /// (and its tasks worker) gets cleaned up before the tempdirs.
+    struct ConfirmFixture {
+        app: App,
+        // Listed after `app` so they outlive it (Rust drops fields top-
+        // down, so these fields drop *after* `app` only because they
+        // appear after it in the struct definition — fine in practice).
+        _home_guard: test_support::HomeGuard,
+        _home: tempfile::TempDir,
+        _repo: tempfile::TempDir,
+        _home_lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn make_fixture() -> ConfirmFixture {
+        let lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::TempDir::new().expect("home tempdir");
+        let home_guard = HomeGuard::enter(home.path());
+        let (repo, _) = tempdir_repo();
+        let backend = Arc::new(LocalBackend::open_at(repo.path().to_path_buf()));
+        let mut app = App::new_with_backend(Theme::dark(), backend, None);
+        app.fs_watcher_rx = None;
+        ConfirmFixture {
+            app,
+            _home_guard: home_guard,
+            _home: home,
+            _repo: repo,
+            _home_lock: lock,
+        }
+    }
+
+    #[test]
+    fn fire_confirm_primary_runs_closure_and_clears_modal() {
+        let primary = Rc::new(Cell::new(0));
+        let cancel = Rc::new(Cell::new(0));
+        let mut fx = make_fixture();
+
+        fx.app
+            .show_confirm(modal_with_counters(primary.clone(), cancel.clone()));
+        assert!(fx.app.confirm_modal.is_some(), "modal opens");
+
+        fx.app.fire_confirm_primary();
+        assert_eq!(primary.get(), 1, "on_confirm fired exactly once");
+        assert_eq!(cancel.get(), 0, "on_cancel must not fire");
+        assert!(
+            fx.app.confirm_modal.is_none(),
+            "modal cleared after primary"
+        );
+    }
+
+    #[test]
+    fn fire_confirm_cancel_runs_closure_and_clears_modal() {
+        let primary = Rc::new(Cell::new(0));
+        let cancel = Rc::new(Cell::new(0));
+        let mut fx = make_fixture();
+
+        fx.app
+            .show_confirm(modal_with_counters(primary.clone(), cancel.clone()));
+        fx.app.fire_confirm_cancel();
+
+        assert_eq!(primary.get(), 0);
+        assert_eq!(cancel.get(), 1);
+        assert!(fx.app.confirm_modal.is_none());
+    }
+
+    #[test]
+    fn dismiss_confirm_skips_callbacks() {
+        let primary = Rc::new(Cell::new(0));
+        let cancel = Rc::new(Cell::new(0));
+        let mut fx = make_fixture();
+
+        fx.app
+            .show_confirm(modal_with_counters(primary.clone(), cancel.clone()));
+        fx.app.dismiss_confirm();
+
+        // dismiss is the "force-close, drop callbacks" path — used by
+        // competing modal opens, tab switches, mutation completion.
+        assert_eq!(primary.get(), 0);
+        assert_eq!(cancel.get(), 0);
+        assert!(fx.app.confirm_modal.is_none());
+    }
+
+    #[test]
+    fn show_confirm_over_existing_fires_cancel_on_old_modal() {
+        let primary_a = Rc::new(Cell::new(0));
+        let cancel_a = Rc::new(Cell::new(0));
+        let primary_b = Rc::new(Cell::new(0));
+        let cancel_b = Rc::new(Cell::new(0));
+        let mut fx = make_fixture();
+
+        fx.app
+            .show_confirm(modal_with_counters(primary_a.clone(), cancel_a.clone()));
+        // B opens while A is still up — A's on_cancel should fire so its
+        // caller can clean up; A's on_confirm must NOT fire.
+        fx.app
+            .show_confirm(modal_with_counters(primary_b.clone(), cancel_b.clone()));
+
+        assert_eq!(primary_a.get(), 0);
+        assert_eq!(cancel_a.get(), 1, "A's cancel fires on replace");
+        assert_eq!(primary_b.get(), 0);
+        assert_eq!(cancel_b.get(), 0);
+        assert!(fx.app.confirm_modal.is_some(), "B is now the active modal");
+
+        // Drive B to completion to verify it's independent.
+        fx.app.fire_confirm_primary();
+        assert_eq!(primary_b.get(), 1);
+        assert_eq!(cancel_b.get(), 0);
+        assert!(fx.app.confirm_modal.is_none());
+    }
+
+    #[test]
+    fn callback_can_reopen_modal_without_recursion_or_leak() {
+        // A closure that calls `show_confirm` again is the documented
+        // "keep modal open" pattern (mirrors `execute_tree_delete`
+        // backing off on `fs_mutation_load.loading`). Verify it doesn't
+        // stack-overflow and that the second modal is the one left
+        // standing.
+        let counter = Rc::new(Cell::new(0));
+        let mut fx = make_fixture();
+
+        let counter_inner = counter.clone();
+        fx.app.show_confirm(ConfirmModal {
+            title: "t".into(),
+            tone: ModalTone::Danger,
+            body: "b".into(),
+            primary_label: "P".into(),
+            cancel_label: "C".into(),
+            confirm_keys: vec![],
+            on_confirm: Box::new(move |app| {
+                counter_inner.set(counter_inner.get() + 1);
+                // Re-open with a fresh, no-op modal.
+                app.show_confirm(ConfirmModal {
+                    title: "t2".into(),
+                    tone: ModalTone::Danger,
+                    body: "b2".into(),
+                    primary_label: "P".into(),
+                    cancel_label: "C".into(),
+                    confirm_keys: vec![],
+                    on_confirm: Box::new(|_| {}),
+                    on_cancel: Box::new(|_| {}),
+                });
+            }),
+            on_cancel: Box::new(|_| {}),
+        });
+
+        fx.app.fire_confirm_primary();
+        assert_eq!(counter.get(), 1, "first closure ran once");
+        assert!(
+            fx.app.confirm_modal.is_some(),
+            "second modal is still up after the closure re-opened"
+        );
     }
 }

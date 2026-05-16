@@ -898,19 +898,65 @@ pub fn tree_edit_error(err: &crate::tree_edit::TreeEditError) -> String {
     }
 }
 
-/// Status-bar takeover while a delete is pending confirmation. `hard`
-/// switches the wording so the user sees that Shift+Delete is
-/// permanent, not just trash.
-pub fn tree_delete_confirm_prompt(name: &str, is_dir: bool, hard: bool) -> String {
+/// Body text shown inside the file-tree delete-confirm modal. The
+/// keyboard hint (`Y` / `Esc`) lives on the dedicated hint row
+/// rendered by `confirm_modal`, and the title row is generic ("Confirm"
+/// / "确认"), so the body carries the actual question.
+pub fn tree_delete_body(name: &str, is_dir: bool, hard: bool) -> String {
     let kind_zh = if is_dir { "文件夹" } else { "文件" };
     let kind_en = if is_dir { "folder" } else { "file" };
     match (lang(), hard) {
-        (Lang::Zh, true) => format!("  ⚠ 永久删除{kind_zh} `{name}`？(不可恢复) (y / Esc)  "),
+        (Lang::Zh, true) => format!("永久删除{kind_zh} `{name}`？\n此操作不可恢复。"),
         (Lang::En, true) => {
-            format!("  ⚠ Permanently delete {kind_en} `{name}`? (cannot be undone) (y / Esc)  ")
+            format!("Permanently delete {kind_en} `{name}`?\nThis cannot be undone.")
         }
-        (Lang::Zh, false) => format!("  ⚠ 把{kind_zh} `{name}` 移到废纸篓？(y / Esc)  "),
-        (Lang::En, false) => format!("  ⚠ Move {kind_en} `{name}` to Trash? (y / Esc)  "),
+        (Lang::Zh, false) => format!("把{kind_zh} `{name}` 移到废纸篓？"),
+        (Lang::En, false) => format!("Move {kind_en} `{name}` to Trash?"),
+    }
+}
+
+/// Cancel button label for the generic confirm modal.
+pub fn confirm_cancel_label() -> String {
+    match lang() {
+        Lang::Zh => "取消".to_string(),
+        Lang::En => "Cancel".to_string(),
+    }
+}
+
+/// Primary-button label for a hard-delete (Shift+Delete) confirm.
+pub fn confirm_delete_label() -> String {
+    match lang() {
+        Lang::Zh => "永久删除".to_string(),
+        Lang::En => "Delete".to_string(),
+    }
+}
+
+/// Primary-button label for the Move-to-Trash (Delete) confirm.
+pub fn confirm_trash_label() -> String {
+    match lang() {
+        Lang::Zh => "移到废纸篓".to_string(),
+        Lang::En => "Move to Trash".to_string(),
+    }
+}
+
+/// Generic title for destructive confirm modals. Deliberately distinct
+/// from the primary-button verb so the title functions as "this is a
+/// confirmation dialog" framing, not a copy of the action. The tone
+/// (red accent for `Danger`) carries the severity cue.
+pub fn confirm_destructive_title() -> String {
+    match lang() {
+        Lang::Zh => "确认".to_string(),
+        Lang::En => "Confirm".to_string(),
+    }
+}
+
+/// Keyboard hint row shown under the buttons in the confirm modal.
+/// Tells the user what the shortcuts are without bloating the button
+/// labels themselves.
+pub fn confirm_modal_hint() -> String {
+    match lang() {
+        Lang::Zh => "Y 确认 · Esc 取消".to_string(),
+        Lang::En => "Y to confirm · Esc to cancel".to_string(),
     }
 }
 

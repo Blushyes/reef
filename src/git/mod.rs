@@ -383,12 +383,17 @@ impl GitRepo {
             let _ = idx.read(true);
         }
 
-        // Check if file is untracked — use similar for full-file diff
-        let statuses = self.repo.statuses(None).ok()?;
-        for entry in statuses.iter() {
-            if entry.path() == Some(path) && entry.status().contains(git2::Status::WT_NEW) {
-                return self.get_untracked_diff(path);
-            }
+        // Check if file is untracked — use similar for full-file diff.
+        // `status_file` scopes the check to this one path; the previous
+        // `statuses(None)` enumerated the whole worktree on every keystroke,
+        // costing hundreds of ms on large repos.
+        let is_untracked = self
+            .repo
+            .status_file(Path::new(path))
+            .map(|st| st.contains(git2::Status::WT_NEW))
+            .unwrap_or(false);
+        if is_untracked {
+            return self.get_untracked_diff(path);
         }
 
         // Unstaged: compare index to workdir

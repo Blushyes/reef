@@ -261,20 +261,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.open_hosts_picker();
         }
 
-        // First-run heuristic: if the user launched reef without `--ssh`
-        // and the cwd isn't a repo, auto-open the hosts picker so they
-        // have a visible path to an ssh connection instead of staring at
-        // the "Not a git repository" placeholder. Skipped on the subsequent
-        // session swaps — those always have a backend picked already.
-        if parsed.ssh_target.is_none()
-            && parsed.agent_exec.is_none()
-            && parsed.path.is_none()
-            && !app.backend.has_repo()
-            && app.hosts_picker.all_hosts.is_empty()
-        {
-            app.open_hosts_picker();
-        }
-
         // Main loop
         loop {
             app.tick();

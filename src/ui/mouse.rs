@@ -20,6 +20,10 @@ pub enum ClickAction {
     /// 或终端吞掉 Ctrl+, 的用户兜底。仅在常规状态栏分支注册,
     /// 各类模态接管(搜索/select/place/paste-conflict 等)期间不出现。
     OpenSettings,
+    /// 状态栏左侧的 SSH 按钮。等价于 Ctrl+O,给鼠标用户一条
+    /// 进入 hosts picker 的路径。注册位置与 `OpenSettings` 一致 ——
+    /// 只在常规状态栏分支出现,模态接管期间隐藏。
+    OpenHostsPicker,
     SwitchTab(Tab),
     TreeClick(usize),
     /// Click on a row in the quick-open palette. The `usize` indexes

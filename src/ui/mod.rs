@@ -644,6 +644,12 @@ fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let chip_w = UnicodeWidthStr::width(chip.as_str()) as u16;
     let notif_w = UnicodeWidthStr::width(notif.as_str()) as u16;
 
+    // Mouse-only hosts-picker entry — Ctrl+O fallback. Sits at the very
+    // leftmost cell of the status bar so it stays reachable even when
+    // the notification text is empty.
+    let hosts_btn = " 🔗 SSH ";
+    let hosts_btn_w = UnicodeWidthStr::width(hosts_btn) as u16;
+
     // Mouse-only settings entry — Ctrl+, fallback for terminals that
     // swallow the chord. Glyph mirrors `SettingsTitle` so the icon is
     // visually self-explanatory.
@@ -652,12 +658,16 @@ fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
 
     let pad_w = area
         .width
+        .saturating_sub(hosts_btn_w)
         .saturating_sub(notif_w)
         .saturating_sub(settings_btn_w)
         .saturating_sub(hint_w)
         .saturating_sub(chip_w);
 
-    let settings_btn_x = area.x + notif_w + pad_w;
+    app.hit_registry
+        .register_row(area.x, area.y, hosts_btn_w, ClickAction::OpenHostsPicker);
+
+    let settings_btn_x = area.x + hosts_btn_w + notif_w + pad_w;
     app.hit_registry.register_row(
         settings_btn_x,
         area.y,
@@ -666,6 +676,13 @@ fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     );
 
     let status = Line::from(vec![
+        Span::styled(
+            hosts_btn,
+            Style::default()
+                .fg(th.accent)
+                .bg(th.chrome_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(notif, Style::default().fg(notif_color).bg(th.chrome_bg)),
         Span::styled(
             " ".repeat(pad_w as usize),

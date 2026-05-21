@@ -4231,6 +4231,9 @@ impl App {
             ClickAction::OpenSettings => {
                 self.open_settings();
             }
+            ClickAction::OpenHostsPicker => {
+                self.open_hosts_picker();
+            }
             ClickAction::TreeClick(index) => {
                 self.file_tree.selected = index;
                 if let Some(entry) = self.file_tree.entries.get(index) {

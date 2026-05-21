@@ -9,6 +9,10 @@ When AI writes your code, 90% of an IDE becomes dead weight. Reef is the other 1
 
 A single-binary terminal workbench for browsing, reviewing, and shipping — locally or over SSH. No editor, no language server, no autocomplete. Write with your AI of choice; come here for the rest.
 
+<p align="center">
+  <img src="https://github.com/Blushyes/reef/releases/download/v0.33.0/reef.png" alt="Reef" width="900">
+</p>
+
 ## Features
 
 - **Files** — tree + read-only preview; syntax highlighting, inline images (Kitty / iTerm2 / halfblocks).

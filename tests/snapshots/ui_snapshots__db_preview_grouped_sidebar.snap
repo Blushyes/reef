@@ -1,0 +1,29 @@
+---
+source: tests/ui_snapshots.rs
+assertion_line: 811
+expression: output
+---
+ reef  [TMPDIR]  ⎇ (detached)
+ 📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph                                      ⊟  1:Files 2:Search 3:Git 4:Graph
+ + New File   📁  New Folder   ↻ │ fixture.db
+   fixture.db U                 │ ───────────────────────────────────────────────────────────────────────────
+                                │ sqlite · 3 tables · 20.0 KB
+                                │
+                                │ ▾ main · fixture.db       id   body
+                                │   Tables (2)              INT  TEXT
+                                │ ▎   posts               2   1  hi
+                                │     users               4   2  world
+                                │   Views (1)
+                                │     active_users        —
+                                │   Indexes (2)
+                                │     users_email_idx     —
+                                │     users_named_idx     —
+                                │   Triggers (1)
+                                │     users_audit         —
+                                │
+                                │
+                                │
+                                │
+                                │
+                                │ page  ‹  [1]  › ·  row 1-2 / 2  ·  posts (1/3)
+ 🔗  SSH                                      ⚙  q:quit Tab:switch s:stage u:unstage r:refresh h:help  [Files]

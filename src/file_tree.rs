@@ -34,11 +34,13 @@ pub enum PreviewBody {
     },
     Image(ImagePreview),
     Binary(BinaryInfo),
-    /// SQLite read-only preview — a list of tables with row counts plus
-    /// the first page of rows for the smallest non-empty table. Built
-    /// by `reef-sqlite-preview` either locally (LocalBackend) or
-    /// agent-side (RemoteBackend's `LoadDbInitial` RPC).
-    Database(reef_sqlite_preview::DatabaseInfo),
+    /// SQLite read-only preview — the full schema graph (every schema
+    /// from `PRAGMA database_list` with its tables / views / indexes /
+    /// triggers) plus the first page of rows for the default
+    /// selection. Built by `reef-sqlite-preview` either locally
+    /// (LocalBackend) or agent-side (RemoteBackend's `LoadDbInitialV2`
+    /// RPC).
+    Database(reef_sqlite_preview::DatabaseInfoV2),
 }
 
 impl PreviewContent {
@@ -676,7 +678,7 @@ pub fn load_preview(
         && reef_sqlite_preview::has_sqlite_magic(&probe)
     {
         use reef_sqlite_preview::PreviewError as SqlitePreviewError;
-        match reef_sqlite_preview::read_initial(&full, INITIAL_DB_PAGE_ROWS) {
+        match reef_sqlite_preview::read_initial_v2(&full, INITIAL_DB_PAGE_ROWS) {
             Ok(info) => {
                 return Some(PreviewContent {
                     file_path: rel_str,

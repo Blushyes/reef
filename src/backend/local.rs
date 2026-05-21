@@ -404,7 +404,7 @@ impl Backend for LocalBackend {
     fn db_load_page(
         &self,
         rel_path: &Path,
-        table: &str,
+        key: &reef_sqlite_preview::DbObjectKey,
         offset: u64,
         limit: u32,
     ) -> Result<reef_sqlite_preview::DbPage, BackendError> {
@@ -414,7 +414,24 @@ impl Backend for LocalBackend {
         // contents of a sensitive DB outside the workdir if we followed
         // a symlink without checking.
         let full = canonical_child_within(self.canonical_workdir()?, rel_path)?;
-        reef_sqlite_preview::load_page(&full, table, offset, limit)
+        reef_sqlite_preview::load_page_qualified(
+            &full,
+            &key.schema,
+            key.kind,
+            &key.name,
+            offset,
+            limit,
+        )
+        .map_err(|e| BackendError::Other(format!("sqlite: {e}")))
+    }
+
+    fn db_load_object_detail(
+        &self,
+        rel_path: &Path,
+        key: &reef_sqlite_preview::DbObjectKey,
+    ) -> Result<reef_sqlite_preview::DbObjectDetail, BackendError> {
+        let full = canonical_child_within(self.canonical_workdir()?, rel_path)?;
+        reef_sqlite_preview::read_object_detail_at(&full, &key.schema, key.kind, &key.name)
             .map_err(|e| BackendError::Other(format!("sqlite: {e}")))
     }
 

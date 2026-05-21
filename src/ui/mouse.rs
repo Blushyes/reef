@@ -97,6 +97,18 @@ pub enum ClickAction {
     /// Jump directly to a 1-based page index. Clicking the `[5]` chip
     /// dispatches `DbGotoPage(5)`.
     DbGotoPage(u64),
+    /// Click on an object row in the SQLite preview sidebar (e.g. a
+    /// table, view, index, or trigger name). Switches the current
+    /// selection to the named object, schema-qualified.
+    DbSelectObject {
+        schema: String,
+        name: String,
+        kind: reef_sqlite_preview::DbObjectKind,
+    },
+    /// Click on a schema header in the SQLite preview sidebar
+    /// (`▾ main` / `▸ temp` / …). Toggles the expanded / collapsed
+    /// state for that schema's object list.
+    DbToggleSchema(String),
 
     // ── Find widget (VSCode-style floating find, src/find_widget.rs) ──
     /// Click the `×` close button on the find widget.

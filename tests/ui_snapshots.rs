@@ -733,3 +733,123 @@ fn snapshot_find_widget_on_preview() {
         insta::assert_snapshot!("find_widget_on_preview", output)
     });
 }
+
+/// Build a SQLite fixture with the four object kinds + a virtual table
+/// so the new grouped sidebar has something to render. Returns the
+/// path within `tmp` that the file tree will pick up.
+fn seed_sqlite_fixture_full(tmp_path: &std::path::Path) -> std::path::PathBuf {
+    let db_path = tmp_path.join("fixture.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE users (
+            id INTEGER PRIMARY KEY,
+            email TEXT NOT NULL,
+            display_name TEXT
+        );
+        INSERT INTO users(id, email, display_name) VALUES
+            (1, 'alice@example.io', 'Alice'),
+            (2, 'bob@example.io',   'Bob'),
+            (3, 'carol@example.io', 'Carol'),
+            (4, 'dave@example.io',  NULL);
+
+        CREATE TABLE posts (id INTEGER PRIMARY KEY, body TEXT);
+        INSERT INTO posts(body) VALUES ('hi'), ('world');
+
+        CREATE VIEW active_users AS
+            SELECT id, email FROM users WHERE display_name IS NOT NULL;
+
+        CREATE UNIQUE INDEX users_email_idx ON users(email);
+        CREATE INDEX users_named_idx ON users(display_name)
+            WHERE display_name IS NOT NULL;
+
+        CREATE TRIGGER users_audit
+            AFTER INSERT ON users
+            BEGIN
+                SELECT 1;
+            END;
+        "#,
+    )
+    .unwrap();
+    drop(conn);
+    db_path
+}
+
+#[test]
+fn snapshot_db_preview_grouped_sidebar() {
+    // The redesigned SQLite preview: grouped objects sidebar
+    // (▾ main / Tables (2) / Views (1) / Indexes (2) / Triggers (1))
+    // + borderless data grid with zebra striping + affinity-colored
+    // type chips + the existing footer chip row. This snapshot is the
+    // single end-to-end regression guard for the rewrite — width
+    // 110×24 gives both the sidebar (~24 cells) and the data area
+    // enough room to land without the sidebar collapsing.
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
+    let (tmp, _raw) = tempdir_repo();
+    seed_sqlite_fixture_full(tmp.path());
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    app.refresh_file_tree();
+    wait_for_file_tree(&mut app);
+
+    let idx = app
+        .file_tree
+        .entries
+        .iter()
+        .position(|e| e.name == "fixture.db")
+        .expect("fixture.db in tree");
+    app.file_tree.selected = idx;
+    app.load_preview();
+    wait_for_preview(&mut app);
+
+    let output = render_app(&mut app, 110, 24);
+    with_filters(&[], || {
+        insta::assert_snapshot!("db_preview_grouped_sidebar", output)
+    });
+}
+
+#[test]
+fn snapshot_db_preview_index_detail() {
+    // Selecting an Index in the sidebar swaps the data grid for a
+    // detail card: object name + [index] tag + UNIQUE / PARTIAL chips
+    // + Table line + Columns line + optional WHERE.
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
+    let (tmp, _raw) = tempdir_repo();
+    seed_sqlite_fixture_full(tmp.path());
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    app.refresh_file_tree();
+    wait_for_file_tree(&mut app);
+
+    let idx = app
+        .file_tree
+        .entries
+        .iter()
+        .position(|e| e.name == "fixture.db")
+        .expect("fixture.db in tree");
+    app.file_tree.selected = idx;
+    app.load_preview();
+    wait_for_preview(&mut app);
+
+    // Switch selection to the partial index — exercises both the
+    // UNIQUE branch off (this index isn't unique) and the PARTIAL
+    // chip + WHERE line on.
+    app.db_select_object(reef_sqlite_preview::DbObjectKey {
+        schema: "main".to_string(),
+        name: "users_named_idx".to_string(),
+        kind: reef_sqlite_preview::DbObjectKind::Index,
+    });
+
+    let output = render_app(&mut app, 110, 24);
+    with_filters(&[], || {
+        insta::assert_snapshot!("db_preview_index_detail", output)
+    });
+}

@@ -134,6 +134,14 @@ fn seed_sqlite_db(path: &std::path::Path) {
     drop(conn);
 }
 
+fn users_key() -> reef_sqlite_preview::DbObjectKey {
+    reef_sqlite_preview::DbObjectKey {
+        schema: "main".to_string(),
+        name: "users".to_string(),
+        kind: reef_sqlite_preview::DbObjectKind::Table,
+    }
+}
+
 #[test]
 fn load_preview_parity_for_sqlite_database() {
     use reef::file_tree::PreviewBody;
@@ -159,24 +167,33 @@ fn load_preview_parity_for_sqlite_database() {
         unreachable!("shape_of asserted Database above");
     };
 
-    // Table list parity — names + row counts must match. Without
-    // this guard a divergence in the agent's `list_tables` filter
-    // (e.g. accidentally including `sqlite_sequence`) would slip
-    // through silently.
-    let l_names: Vec<_> = li
-        .tables
-        .iter()
-        .map(|t| (t.name.clone(), t.row_count))
-        .collect();
-    let r_names: Vec<_> = ri
-        .tables
-        .iter()
-        .map(|t| (t.name.clone(), t.row_count))
-        .collect();
-    assert_eq!(l_names, r_names, "table list / counts");
+    // Object list parity for the default (main) schema — names +
+    // kinds + row counts must match. Without this guard a divergence
+    // in the agent's `list_objects` filter (e.g. accidentally including
+    // `sqlite_sequence`) would slip through silently.
+    fn main_objects(
+        info: &reef_sqlite_preview::DatabaseInfoV2,
+    ) -> Vec<(String, reef_sqlite_preview::DbObjectKind, Option<u64>)> {
+        info.schemas
+            .iter()
+            .find(|s| s.name == "main")
+            .map(|s| {
+                s.objects
+                    .iter()
+                    .map(|o| (o.name.clone(), o.kind, o.row_count))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    assert_eq!(
+        main_objects(li),
+        main_objects(ri),
+        "main schema object list / counts",
+    );
 
-    // Selected table + initial page row count parity.
-    assert_eq!(li.selected_table, ri.selected_table, "selected_table");
+    // Default schema + selected object + initial page row count parity.
+    assert_eq!(li.default_schema, ri.default_schema, "default_schema");
+    assert_eq!(li.default_object, ri.default_object, "default_object");
     assert_eq!(
         li.initial_page.rows.len(),
         ri.initial_page.rows.len(),
@@ -196,10 +213,10 @@ fn db_load_page_parity_across_backends() {
 
     // Page from offset 0, limit 2 — should give two rows.
     let lp = local
-        .db_load_page(Path::new("fixture.db"), "users", 0, 2)
+        .db_load_page(Path::new("fixture.db"), &users_key(), 0, 2)
         .expect("local db_load_page");
     let rp = remote
-        .db_load_page(Path::new("fixture.db"), "users", 0, 2)
+        .db_load_page(Path::new("fixture.db"), &users_key(), 0, 2)
         .expect("remote db_load_page");
 
     assert_eq!(lp.rows.len(), 2, "local row count");
@@ -227,10 +244,10 @@ fn db_load_page_offset_works_across_backends() {
 
     // users has 3 rows; OFFSET 2 LIMIT 2 must return exactly 1 row.
     let lp = local
-        .db_load_page(Path::new("fixture.db"), "users", 2, 2)
+        .db_load_page(Path::new("fixture.db"), &users_key(), 2, 2)
         .expect("local db_load_page");
     let rp = remote
-        .db_load_page(Path::new("fixture.db"), "users", 2, 2)
+        .db_load_page(Path::new("fixture.db"), &users_key(), 2, 2)
         .expect("remote db_load_page");
 
     assert_eq!(lp.rows.len(), 1);

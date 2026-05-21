@@ -69,7 +69,16 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 ///       their bytes. A v7 agent would respond `Unknown op` to either,
 ///       so a hard bump surfaces the stale agent as a toast and
 ///       triggers auto-redeploy.
-pub const PROTOCOL_VERSION: u32 = 8;
+/// - v9: SQLite preview goes multi-schema. Adds `LoadDbInitialV2`,
+///       `LoadDbPageV2`, and `LoadDbObjectDetail` alongside the v7
+///       single-schema requests. The new variants carry schema +
+///       object-kind qualifiers (the V1 ones assumed `main` + table).
+///       A v8 agent would respond `Unknown op` on a v9 request; the
+///       client downgrades to V1 when handshake reports
+///       `protocol_version < 9` (or on `Unimplemented`) and wraps the
+///       single-schema result back into the V2 shape so the renderer
+///       stays unified.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Encode a single envelope-level value to `writer` using the
 /// length-prefixed framing. The caller is expected to flush.
@@ -356,6 +365,42 @@ pub enum Request {
         table: String,
         offset: u64,
         limit: u32,
+    },
+    // ── M5+v9: SQLite preview, multi-schema variant ────
+    /// V2 of `LoadDbInitial`. Returns the full schema graph
+    /// (`PRAGMA database_list` + tables/views/indexes/triggers across
+    /// all schemas) plus the first page of rows for the default
+    /// selection. Response is `Option<DatabaseInfoV2Dto>` — `None`
+    /// when the agent's magic-bytes probe rejects the file. v8-and-
+    /// older agents respond `Unimplemented`; the client downgrades to
+    /// `LoadDbInitial`.
+    LoadDbInitialV2 {
+        rel_path: String,
+        page_size: u32,
+    },
+    /// V2 of `LoadDbPage`. `schema` + `kind` qualify the object so the
+    /// agent can route to the correct schema-qualified `SELECT`. The
+    /// response is `DbPageDto`; on `kind = Index | Trigger` the agent
+    /// returns `ErrorCode::Other` with `UnsupportedObjectKind`
+    /// stringified — callers should route those to
+    /// [`LoadDbObjectDetail`] instead.
+    LoadDbPageV2 {
+        rel_path: String,
+        schema: String,
+        kind: DbObjectKindDto,
+        name: String,
+        offset: u64,
+        limit: u32,
+    },
+    /// Structural detail for a single schema-qualified object. Used by
+    /// the UI when the user selects an index / trigger (data pane swaps
+    /// for a definition card). Tables / views also work — they return
+    /// their `CREATE` SQL.
+    LoadDbObjectDetail {
+        rel_path: String,
+        schema: String,
+        kind: DbObjectKindDto,
+        name: String,
     },
 }
 
@@ -789,6 +834,16 @@ pub struct ColumnInfoDto {
     /// empty for typeless columns or non-standard like
     /// `"VARCHAR(255)"`).
     pub decl_type: String,
+    /// `true` when the column has a `NOT NULL` constraint. Defaulted on
+    /// the wire so a v8 agent's payload (which doesn't include this
+    /// field) deserialises cleanly into the v9 client's struct.
+    #[serde(default)]
+    pub notnull: bool,
+    /// `true` when the column participates in the primary key (matches
+    /// `PRAGMA table_info.pk != 0`). Same defaulting story as
+    /// `notnull` — see above.
+    #[serde(default)]
+    pub pk: bool,
 }
 
 /// One page of rows from a table. Each inner Vec aligns positionally
@@ -821,6 +876,127 @@ pub enum SqliteValueDto {
     },
     Blob {
         len: u64,
+    },
+}
+
+// ── v9: multi-schema preview DTOs ──────────────────────────────────────────
+//
+// Mirrors the V2 type set in `reef-sqlite-preview` 1:1. The `From<Domain>`
+// impls live alongside the V1 ones in `src/backend/remote.rs`.
+
+/// Kind tag used in [`LoadDbPageV2`] / [`LoadDbObjectDetail`] payloads
+/// and inside [`DbObjectDto`]. Mirror of
+/// `reef_sqlite_preview::DbObjectKind`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum DbObjectKindDto {
+    Table,
+    View,
+    Index,
+    Trigger,
+}
+
+/// Classification of a row in `PRAGMA database_list`. Mirror of
+/// `reef_sqlite_preview::SchemaKind`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaKindDto {
+    Main,
+    Temp,
+    Attached,
+}
+
+/// Identifier for one schema-qualified object. Hashable so client-side
+/// state can key on it (e.g. selection caches, generation tokens).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct DbObjectKeyDto {
+    pub schema: String,
+    pub name: String,
+    pub kind: DbObjectKindDto,
+}
+
+/// One object discovered in a schema's `sqlite_master`. Wire mirror of
+/// `reef_sqlite_preview::DbObject` — see that doc comment for field
+/// semantics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbObjectDto {
+    pub schema: String,
+    pub name: String,
+    pub kind: DbObjectKindDto,
+    pub tbl_name: Option<String>,
+    pub row_count: Option<u64>,
+    pub columns: Vec<ColumnInfoDto>,
+    pub is_virtual: bool,
+    pub is_without_rowid: bool,
+    pub is_strict: bool,
+}
+
+/// One schema's worth of objects plus identifying metadata. Mirror of
+/// `reef_sqlite_preview::SchemaSummary`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaSummaryDto {
+    pub name: String,
+    pub kind: SchemaKindDto,
+    pub file: Option<String>,
+    pub objects: Vec<DbObjectDto>,
+    pub truncated: bool,
+}
+
+/// Top-level v9 payload. Wire mirror of
+/// `reef_sqlite_preview::DatabaseInfoV2`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseInfoV2Dto {
+    pub schemas: Vec<SchemaSummaryDto>,
+    pub default_schema: String,
+    pub default_object: Option<DbObjectKeyDto>,
+    pub initial_page: DbPageDto,
+    pub bytes_on_disk: u64,
+}
+
+/// Trigger timing mirror.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerTimingDto {
+    Before,
+    After,
+    InsteadOf,
+    Unknown,
+}
+
+/// Trigger DML event mirror.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerEventDto {
+    Insert,
+    Update,
+    Delete,
+    Unknown,
+}
+
+/// Detail-pane payload. Tag-style enum so the client can dispatch on
+/// the `kind` discriminator. Mirror of
+/// `reef_sqlite_preview::DbObjectDetail`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DbObjectDetailDto {
+    Table {
+        create_sql: Option<String>,
+    },
+    View {
+        create_sql: Option<String>,
+    },
+    Index {
+        unique: bool,
+        columns: Vec<String>,
+        partial_where: Option<String>,
+        tbl_name: String,
+        create_sql: Option<String>,
+    },
+    Trigger {
+        timing: TriggerTimingDto,
+        event: TriggerEventDto,
+        tbl_name: String,
+        sql: String,
     },
 }
 

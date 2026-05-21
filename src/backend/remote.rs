@@ -18,8 +18,8 @@ use std::thread;
 use std::time::Duration;
 
 use reef_proto::{
-    ContentSearchCompletedDto, ContentSearchRequestDto, DatabaseInfoDto, DirEntryDto, Envelope,
-    MatchHitDto, Notification, ReadFileResponse, Request, Response, TrashResponseDto, WalkOptsDto,
+    ContentSearchCompletedDto, ContentSearchRequestDto, DirEntryDto, Envelope, MatchHitDto,
+    Notification, ReadFileResponse, Request, Response, TrashResponseDto, WalkOptsDto,
     WalkResponseDto, decode_frame, encode_frame,
 };
 
@@ -494,16 +494,17 @@ impl Backend for RemoteBackend {
         // schema + first page of rows. On RPC failure or agent's
         // "not actually sqlite" reply, fall through to the standard
         // ReadFile path so the file still gets a binary card.
-        if reef_sqlite_preview::has_sqlite_extension(rel_path) {
-            if let Ok(Some(dto)) = self.request::<Option<DatabaseInfoDto>>(Request::LoadDbInitial {
-                rel_path: rel_str.clone(),
-                page_size: crate::file_tree::INITIAL_DB_PAGE_ROWS,
-            }) {
-                return Some(PreviewContent {
-                    file_path: rel_str,
-                    body: PreviewBody::Database(database_info_from_dto(dto)),
-                });
-            }
+        if reef_sqlite_preview::has_sqlite_extension(rel_path)
+            && let Ok(Some(dto)) =
+                self.request::<Option<reef_proto::DatabaseInfoV2Dto>>(Request::LoadDbInitialV2 {
+                    rel_path: rel_str.clone(),
+                    page_size: crate::file_tree::INITIAL_DB_PAGE_ROWS,
+                })
+        {
+            return Some(PreviewContent {
+                file_path: rel_str,
+                body: PreviewBody::Database(database_info_v2_from_dto(dto)),
+            });
         }
         let resp: ReadFileResponse = self
             .request(Request::ReadFile {
@@ -571,18 +572,35 @@ impl Backend for RemoteBackend {
     fn db_load_page(
         &self,
         rel_path: &Path,
-        table: &str,
+        key: &reef_sqlite_preview::DbObjectKey,
         offset: u64,
         limit: u32,
     ) -> Result<reef_sqlite_preview::DbPage, BackendError> {
         let rel_str = rel_path.to_string_lossy().to_string();
-        let dto: reef_proto::DbPageDto = self.request(Request::LoadDbPage {
+        let dto: reef_proto::DbPageDto = self.request(Request::LoadDbPageV2 {
             rel_path: rel_str,
-            table: table.to_string(),
+            schema: key.schema.clone(),
+            kind: db_object_kind_to_dto(key.kind),
+            name: key.name.clone(),
             offset,
             limit,
         })?;
         Ok(db_page_from_dto(dto))
+    }
+
+    fn db_load_object_detail(
+        &self,
+        rel_path: &Path,
+        key: &reef_sqlite_preview::DbObjectKey,
+    ) -> Result<reef_sqlite_preview::DbObjectDetail, BackendError> {
+        let rel_str = rel_path.to_string_lossy().to_string();
+        let dto: reef_proto::DbObjectDetailDto = self.request(Request::LoadDbObjectDetail {
+            rel_path: rel_str,
+            schema: key.schema.clone(),
+            kind: db_object_kind_to_dto(key.kind),
+            name: key.name.clone(),
+        })?;
+        Ok(db_object_detail_from_dto(dto))
     }
 
     fn git_status(&self) -> Result<StatusSnapshot, BackendError> {
@@ -1242,27 +1260,136 @@ impl From<reef_proto::RefLabelDto> for RefLabel {
 // here. Free functions instead — slightly noisier at the call site but
 // keeps reef-sqlite-preview wire-agnostic (no reef-proto dep).
 
-fn database_info_from_dto(v: reef_proto::DatabaseInfoDto) -> reef_sqlite_preview::DatabaseInfo {
-    reef_sqlite_preview::DatabaseInfo {
-        tables: v.tables.into_iter().map(table_summary_from_dto).collect(),
-        selected_table: v.selected_table as usize,
+fn column_info_from_dto(v: reef_proto::ColumnInfoDto) -> reef_sqlite_preview::ColumnInfo {
+    reef_sqlite_preview::ColumnInfo {
+        name: v.name,
+        decl_type: v.decl_type,
+        notnull: v.notnull,
+        pk: v.pk,
+    }
+}
+
+// ── v9: multi-schema DTO → domain converters ──────────────────────────────
+
+fn database_info_v2_from_dto(
+    v: reef_proto::DatabaseInfoV2Dto,
+) -> reef_sqlite_preview::DatabaseInfoV2 {
+    reef_sqlite_preview::DatabaseInfoV2 {
+        schemas: v.schemas.into_iter().map(schema_summary_from_dto).collect(),
+        default_schema: v.default_schema,
+        default_object: v.default_object.map(db_object_key_from_dto),
         initial_page: db_page_from_dto(v.initial_page),
         bytes_on_disk: v.bytes_on_disk,
     }
 }
 
-fn table_summary_from_dto(v: reef_proto::TableSummaryDto) -> reef_sqlite_preview::TableSummary {
-    reef_sqlite_preview::TableSummary {
+fn schema_summary_from_dto(v: reef_proto::SchemaSummaryDto) -> reef_sqlite_preview::SchemaSummary {
+    reef_sqlite_preview::SchemaSummary {
         name: v.name,
-        columns: v.columns.into_iter().map(column_info_from_dto).collect(),
-        row_count: v.row_count,
+        kind: schema_kind_from_dto(v.kind),
+        file: v.file,
+        objects: v.objects.into_iter().map(db_object_from_dto).collect(),
+        truncated: v.truncated,
     }
 }
 
-fn column_info_from_dto(v: reef_proto::ColumnInfoDto) -> reef_sqlite_preview::ColumnInfo {
-    reef_sqlite_preview::ColumnInfo {
+fn db_object_from_dto(v: reef_proto::DbObjectDto) -> reef_sqlite_preview::DbObject {
+    reef_sqlite_preview::DbObject {
+        schema: v.schema,
         name: v.name,
-        decl_type: v.decl_type,
+        kind: db_object_kind_from_dto(v.kind),
+        tbl_name: v.tbl_name,
+        row_count: v.row_count,
+        columns: v.columns.into_iter().map(column_info_from_dto).collect(),
+        is_virtual: v.is_virtual,
+        is_without_rowid: v.is_without_rowid,
+        is_strict: v.is_strict,
+    }
+}
+
+fn db_object_key_from_dto(v: reef_proto::DbObjectKeyDto) -> reef_sqlite_preview::DbObjectKey {
+    reef_sqlite_preview::DbObjectKey {
+        schema: v.schema,
+        name: v.name,
+        kind: db_object_kind_from_dto(v.kind),
+    }
+}
+
+fn db_object_kind_to_dto(k: reef_sqlite_preview::DbObjectKind) -> reef_proto::DbObjectKindDto {
+    match k {
+        reef_sqlite_preview::DbObjectKind::Table => reef_proto::DbObjectKindDto::Table,
+        reef_sqlite_preview::DbObjectKind::View => reef_proto::DbObjectKindDto::View,
+        reef_sqlite_preview::DbObjectKind::Index => reef_proto::DbObjectKindDto::Index,
+        reef_sqlite_preview::DbObjectKind::Trigger => reef_proto::DbObjectKindDto::Trigger,
+    }
+}
+
+fn db_object_kind_from_dto(v: reef_proto::DbObjectKindDto) -> reef_sqlite_preview::DbObjectKind {
+    match v {
+        reef_proto::DbObjectKindDto::Table => reef_sqlite_preview::DbObjectKind::Table,
+        reef_proto::DbObjectKindDto::View => reef_sqlite_preview::DbObjectKind::View,
+        reef_proto::DbObjectKindDto::Index => reef_sqlite_preview::DbObjectKind::Index,
+        reef_proto::DbObjectKindDto::Trigger => reef_sqlite_preview::DbObjectKind::Trigger,
+    }
+}
+
+fn schema_kind_from_dto(v: reef_proto::SchemaKindDto) -> reef_sqlite_preview::SchemaKind {
+    match v {
+        reef_proto::SchemaKindDto::Main => reef_sqlite_preview::SchemaKind::Main,
+        reef_proto::SchemaKindDto::Temp => reef_sqlite_preview::SchemaKind::Temp,
+        reef_proto::SchemaKindDto::Attached => reef_sqlite_preview::SchemaKind::Attached,
+    }
+}
+
+fn db_object_detail_from_dto(
+    v: reef_proto::DbObjectDetailDto,
+) -> reef_sqlite_preview::DbObjectDetail {
+    use reef_proto::DbObjectDetailDto as D;
+    match v {
+        D::Table { create_sql } => reef_sqlite_preview::DbObjectDetail::Table { create_sql },
+        D::View { create_sql } => reef_sqlite_preview::DbObjectDetail::View { create_sql },
+        D::Index {
+            unique,
+            columns,
+            partial_where,
+            tbl_name,
+            create_sql,
+        } => reef_sqlite_preview::DbObjectDetail::Index {
+            unique,
+            columns,
+            partial_where,
+            tbl_name,
+            create_sql,
+        },
+        D::Trigger {
+            timing,
+            event,
+            tbl_name,
+            sql,
+        } => reef_sqlite_preview::DbObjectDetail::Trigger {
+            timing: trigger_timing_from_dto(timing),
+            event: trigger_event_from_dto(event),
+            tbl_name,
+            sql,
+        },
+    }
+}
+
+fn trigger_timing_from_dto(v: reef_proto::TriggerTimingDto) -> reef_sqlite_preview::TriggerTiming {
+    match v {
+        reef_proto::TriggerTimingDto::Before => reef_sqlite_preview::TriggerTiming::Before,
+        reef_proto::TriggerTimingDto::After => reef_sqlite_preview::TriggerTiming::After,
+        reef_proto::TriggerTimingDto::InsteadOf => reef_sqlite_preview::TriggerTiming::InsteadOf,
+        reef_proto::TriggerTimingDto::Unknown => reef_sqlite_preview::TriggerTiming::Unknown,
+    }
+}
+
+fn trigger_event_from_dto(v: reef_proto::TriggerEventDto) -> reef_sqlite_preview::TriggerEvent {
+    match v {
+        reef_proto::TriggerEventDto::Insert => reef_sqlite_preview::TriggerEvent::Insert,
+        reef_proto::TriggerEventDto::Update => reef_sqlite_preview::TriggerEvent::Update,
+        reef_proto::TriggerEventDto::Delete => reef_sqlite_preview::TriggerEvent::Delete,
+        reef_proto::TriggerEventDto::Unknown => reef_sqlite_preview::TriggerEvent::Unknown,
     }
 }
 

@@ -292,23 +292,30 @@ pub trait Backend: Send + Sync {
     /// doesn't resolve to a regular file under the workdir.
     fn file_size(&self, rel_path: &Path) -> Result<u64, BackendError>;
 
-    /// Load one page of rows from a table inside a SQLite database at
-    /// `rel_path`. Used by the Files-tab preview pane's pagination
-    /// flow — `load_preview` builds the initial card with the first
-    /// page bundled in, then `[`/`]`/`PgUp`/`PgDn` route through here
-    /// to reissue with a fresh `(offset, limit)` window.
-    ///
-    /// `offset` and `limit` map directly to `LIMIT N OFFSET M`, with
-    /// the same caveat: cost grows with M for tables without a usable
-    /// index. The reef-sqlite-preview reader documents the keyset
-    /// pagination follow-up if this becomes a real hotspot.
+    /// Load one page of rows from a row-bearing object at `rel_path`.
+    /// `offset` and `limit` map directly to `LIMIT N OFFSET M`; cost
+    /// grows with `offset` on tables without a usable index — see the
+    /// keyset-pagination follow-up note in
+    /// `reef_sqlite_preview::load_page_qualified`. Returns
+    /// `BackendError::Other(...)` for `key.kind = Index | Trigger`;
+    /// callers should route those to [`Self::db_load_object_detail`].
     fn db_load_page(
         &self,
         rel_path: &Path,
-        table: &str,
+        key: &reef_sqlite_preview::DbObjectKey,
         offset: u64,
         limit: u32,
     ) -> Result<reef_sqlite_preview::DbPage, BackendError>;
+
+    /// Detail-pane payload for an index, trigger, table, or view.
+    /// Tables / views return their `CREATE` SQL; indexes return
+    /// uniqueness + column order + partial-WHERE; triggers return
+    /// parsed timing/event + the raw SQL body.
+    fn db_load_object_detail(
+        &self,
+        rel_path: &Path,
+        key: &reef_sqlite_preview::DbObjectKey,
+    ) -> Result<reef_sqlite_preview::DbObjectDetail, BackendError>;
 
     // ─── git: status / diff / stage ─────────────────────────────────────────
     fn git_status(&self) -> Result<StatusSnapshot, BackendError>;

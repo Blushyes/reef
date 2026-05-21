@@ -80,6 +80,15 @@ pub enum PreviewError {
     /// File IO error at the magic-bytes probe stage (file vanished,
     /// permission denied, etc.).
     Io(String),
+    /// Caller asked for row data on a kind that doesn't have rows
+    /// (Index / Trigger). Surfaced as a typed error so the UI can
+    /// route to the detail pane instead of querying a bogus page.
+    UnsupportedObjectKind,
+    /// A specific schema-qualified object wasn't found in `sqlite_master`.
+    /// Happens when the cached UI state refers to an object that has
+    /// been dropped underneath us (rare with `mode=ro`, but possible
+    /// across reconnects).
+    ObjectNotFound { schema: String, name: String },
 }
 
 impl std::fmt::Display for PreviewError {
@@ -90,6 +99,12 @@ impl std::fmt::Display for PreviewError {
             PreviewError::OpenFailed(s) => write!(f, "open failed: {s}"),
             PreviewError::QueryFailed(s) => write!(f, "query failed: {s}"),
             PreviewError::Io(s) => write!(f, "io: {s}"),
+            PreviewError::UnsupportedObjectKind => {
+                f.write_str("object kind has no rows (index/trigger)")
+            }
+            PreviewError::ObjectNotFound { schema, name } => {
+                write!(f, "object not found: {schema}.{name}")
+            }
         }
     }
 }
@@ -101,10 +116,16 @@ impl std::error::Error for PreviewError {}
 /// strict, so the declared type may be empty (no declared type) or
 /// a non-standard string ("VARCHAR(255)", "DATETIME", …). We pass it
 /// through verbatim and let the render layer truncate if needed.
+///
+/// `notnull` and `pk` are populated from the same `PRAGMA table_info`
+/// row; renderers use them for inline column annotations (PK / NOT NULL
+/// chips in detail views) without an extra round-trip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnInfo {
     pub name: String,
     pub decl_type: String,
+    pub notnull: bool,
+    pub pk: bool,
 }
 
 /// One table or view in the database.
@@ -185,6 +206,252 @@ pub struct DatabaseInfo {
     /// here so the reader is the single source of truth for size.
     pub bytes_on_disk: u64,
 }
+
+// ─── V2 multi-schema types ──────────────────────────────────────────────
+//
+// The V1 [`DatabaseInfo`] above assumes a single `main` schema with only
+// tables + views. V2 widens the model to mirror what SQLite actually
+// exposes: `PRAGMA database_list` returns `main` plus `temp` plus any
+// ATTACHed files, each with its own `sqlite_master` table covering
+// tables, views, indexes, triggers, and virtual tables. The wire DTOs
+// in `reef-proto` (V2 variants) mirror these structs 1:1.
+
+/// One kind of database object as recorded in `sqlite_master.type`.
+/// Virtual tables share the `Table` variant — the distinction is
+/// carried separately on [`DbObject::is_virtual`] so existing
+/// kind-based dispatch (has-rows? has-detail-pane?) stays clean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DbObjectKind {
+    Table,
+    View,
+    Index,
+    Trigger,
+}
+
+impl DbObjectKind {
+    /// Tables and views have queryable rows; indexes and triggers don't.
+    /// The renderer routes the data pane vs the detail pane on this
+    /// boolean, and [`load_page_qualified`] rejects non-row kinds.
+    pub fn has_rows(self) -> bool {
+        matches!(self, Self::Table | Self::View)
+    }
+
+    /// Value seen in `sqlite_master.type`.
+    pub fn as_master_type(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::View => "view",
+            Self::Index => "index",
+            Self::Trigger => "trigger",
+        }
+    }
+
+    /// Inverse of [`Self::as_master_type`]. Returns `None` for unknown
+    /// strings so we can gracefully skip any future type SQLite adds.
+    pub fn from_master_type(s: &str) -> Option<Self> {
+        match s {
+            "table" => Some(Self::Table),
+            "view" => Some(Self::View),
+            "index" => Some(Self::Index),
+            "trigger" => Some(Self::Trigger),
+            _ => None,
+        }
+    }
+
+    /// Title-case plural form used by the sidebar's subsection header
+    /// (e.g. `Tables (12)`).
+    pub fn section_label(self) -> &'static str {
+        match self {
+            Self::Table => "Tables",
+            Self::View => "Views",
+            Self::Index => "Indexes",
+            Self::Trigger => "Triggers",
+        }
+    }
+}
+
+/// Classification for a row in `PRAGMA database_list`. The renderer
+/// uses this to group schemas (Main first, then Temp, then Attached).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SchemaKind {
+    /// The default `main` schema — the on-disk file itself.
+    Main,
+    /// The implicit `temp` schema for CREATE TEMP TABLE / VIEW. Only
+    /// populated when the connection has temp objects, but the entry
+    /// itself appears in `PRAGMA database_list` whether or not any
+    /// temp objects exist.
+    Temp,
+    /// A schema attached via `ATTACH DATABASE … AS name`. The reader
+    /// never issues ATTACH itself; this variant exists so a UI feature
+    /// that does (or a connection inherited from an external source)
+    /// renders correctly.
+    Attached,
+}
+
+/// Identifier for a single schema-qualified object. Hashable + Clone
+/// so the UI can use it as a HashMap / BTreeSet key (e.g. for the
+/// "currently selected object" pointer in `DbPreviewState`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DbObjectKey {
+    pub schema: String,
+    pub name: String,
+    pub kind: DbObjectKind,
+}
+
+/// One object discovered in a schema's `sqlite_master`. Carries every
+/// field the UI needs to render its sidebar row + decide whether to
+/// load a page (`kind.has_rows()`) or a detail pane.
+///
+/// `columns` is populated eagerly for Table / View so the initial RPC
+/// payload covers the whole schema in one round-trip; Index / Trigger
+/// leave it empty.
+#[derive(Debug, Clone)]
+pub struct DbObject {
+    pub schema: String,
+    pub name: String,
+    pub kind: DbObjectKind,
+    /// For Index / Trigger: the table they reference. For Table / View:
+    /// `Some(name)` (sqlite_master sets `tbl_name = name` for those).
+    pub tbl_name: Option<String>,
+    /// `None` for non-row kinds and for views (where COUNT(*) might be
+    /// expensive). Tables always populate this eagerly.
+    pub row_count: Option<u64>,
+    /// Empty for Index / Trigger.
+    pub columns: Vec<ColumnInfo>,
+    /// `true` when the table was created via `CREATE VIRTUAL TABLE`
+    /// (FTS, RTree, etc.). The renderer adds a `ⓥ` glyph to the
+    /// sidebar row.
+    pub is_virtual: bool,
+    /// Best-effort: parsed from the trailing `WITHOUT ROWID` modifier
+    /// in `sqlite_master.sql`. Display-only, doesn't affect querying.
+    pub is_without_rowid: bool,
+    /// Best-effort: parsed from a trailing `STRICT` modifier.
+    pub is_strict: bool,
+}
+
+impl DbObject {
+    pub fn key(&self) -> DbObjectKey {
+        DbObjectKey {
+            schema: self.schema.clone(),
+            name: self.name.clone(),
+            kind: self.kind,
+        }
+    }
+}
+
+/// One schema in `PRAGMA database_list`, with its full object inventory.
+#[derive(Debug, Clone)]
+pub struct SchemaSummary {
+    pub name: String,
+    pub kind: SchemaKind,
+    /// File path SQLite reports for this schema. Empty for `temp`
+    /// (in-memory), `Some` for `main` (the opened file) and any
+    /// attached schemas. We expose the raw string; the renderer
+    /// shortens it for display.
+    pub file: Option<String>,
+    pub objects: Vec<DbObject>,
+    /// `true` when [`MAX_OBJECTS_PER_SCHEMA`] kicked in and trimmed
+    /// the list. The renderer shows a "+N more" hint when set.
+    pub truncated: bool,
+}
+
+/// Top-level V2 payload. Built once per `.db` open; pagination still
+/// goes through [`load_page_qualified`].
+#[derive(Debug, Clone)]
+pub struct DatabaseInfoV2 {
+    pub schemas: Vec<SchemaSummary>,
+    /// Schema chosen as the initial selection — `main` when present.
+    pub default_schema: String,
+    /// Object the initial page was read from. `None` only when every
+    /// schema is empty.
+    pub default_object: Option<DbObjectKey>,
+    /// First page of rows for `default_object`, or empty.
+    pub initial_page: DbPage,
+    pub bytes_on_disk: u64,
+}
+
+impl DatabaseInfoV2 {
+    /// Look up an object by its schema-qualified key. Returns `None`
+    /// when the key references a schema or object that's not in the
+    /// graph (stale selection across previews).
+    pub fn lookup(&self, key: &DbObjectKey) -> Option<&DbObject> {
+        self.schemas
+            .iter()
+            .find(|s| s.name == key.schema)?
+            .objects
+            .iter()
+            .find(|o| o.name == key.name && o.kind == key.kind)
+    }
+
+    /// Flat iterator over every row-bearing object (Tables + Views)
+    /// across every schema. Used by the pagination footer to compute
+    /// `(i/N)` and by `db_navigate` to walk the navigation cycle.
+    pub fn iter_row_bearing(&self) -> impl Iterator<Item = &DbObject> {
+        self.schemas
+            .iter()
+            .flat_map(|s| s.objects.iter())
+            .filter(|o| o.kind.has_rows())
+    }
+}
+
+/// When a trigger fires relative to the row event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerTiming {
+    Before,
+    After,
+    /// `INSTEAD OF` triggers, which only attach to views.
+    InsteadOf,
+    /// Couldn't parse the timing from the CREATE TRIGGER SQL. Renderer
+    /// falls back to displaying the raw SQL.
+    Unknown,
+}
+
+/// Which DML event the trigger reacts to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerEvent {
+    Insert,
+    Update,
+    Delete,
+    Unknown,
+}
+
+/// Detail-pane payload for a non-row object (Index / Trigger) or a
+/// schema-level description of a Table / View. Indexes contribute
+/// uniqueness + column ordering + partial-WHERE clause; triggers
+/// contribute parsed timing/event plus the raw SQL body.
+#[derive(Debug, Clone)]
+pub enum DbObjectDetail {
+    Table {
+        create_sql: Option<String>,
+    },
+    View {
+        create_sql: Option<String>,
+    },
+    Index {
+        unique: bool,
+        /// Indexed column names in key order. Entries are `"<expr>"`
+        /// for expression indexes where SQLite can't surface a name.
+        columns: Vec<String>,
+        /// Tail of `CREATE INDEX … WHERE <expr>` when this is a
+        /// partial index. Best-effort string slice.
+        partial_where: Option<String>,
+        /// Table this index belongs to.
+        tbl_name: String,
+        create_sql: Option<String>,
+    },
+    Trigger {
+        timing: TriggerTiming,
+        event: TriggerEvent,
+        tbl_name: String,
+        sql: String,
+    },
+}
+
+/// Per-schema cap on object listing. Most real databases have ≤ a few
+/// hundred objects; this is defensive against pathological auto-generated
+/// schemas (per-tenant tables, ETL staging fan-out, etc.) so a single
+/// browse doesn't allocate a million strings.
+pub const MAX_OBJECTS_PER_SCHEMA: usize = 5_000;
 
 /// `true` when `path` has a SQLite-shaped extension. Cheap pre-filter —
 /// the actual gate is [`probe_magic`].
@@ -298,21 +565,44 @@ fn list_tables(conn: &Connection) -> Result<Vec<TableSummary>, PreviewError> {
     Ok(out)
 }
 
-/// Read column metadata via `PRAGMA table_info`. Order matches the
-/// table's declared column order — same as a `SELECT *` would yield.
+/// Read column metadata for a table in the default `main` schema. Thin
+/// wrapper over [`read_columns_qualified`] kept for the V1 wire path —
+/// internal callers (V2) should use the qualified version directly.
 fn read_columns(conn: &Connection, table: &str) -> Result<Vec<ColumnInfo>, PreviewError> {
-    // `PRAGMA table_info` doesn't accept bound parameters in older
-    // SQLite, but `pragma_table_info` (table-valued function) does.
-    // Use the latter so a malicious table name (none, here, but the
-    // habit is cheap) can't escape its quoting.
+    read_columns_qualified(conn, "main", table)
+}
+
+/// Read column metadata via `PRAGMA <schema>.table_info(<table>)`. Order
+/// matches the table's declared column order — same as a `SELECT *`
+/// would yield. Returns name, declared type, NOT NULL flag, and primary
+/// key flag.
+///
+/// PRAGMA statements don't accept bound parameters in SQLite, so the
+/// schema and table identifiers are interpolated through [`quote_ident`]
+/// — safe by construction (double-quote wrapping with embedded-quote
+/// doubling), and identifiers come from `sqlite_master` / `PRAGMA
+/// database_list` rather than user input.
+pub fn read_columns_qualified(
+    conn: &Connection,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<ColumnInfo>, PreviewError> {
+    let sql = format!(
+        "PRAGMA {}.table_info({})",
+        quote_ident(schema),
+        quote_ident(table)
+    );
     let mut stmt = conn
-        .prepare("SELECT name, type FROM pragma_table_info(?1)")
+        .prepare(&sql)
         .map_err(|e| PreviewError::QueryFailed(e.to_string()))?;
+    // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
     let cols: Vec<ColumnInfo> = stmt
-        .query_map([table], |row| {
+        .query_map([], |row| {
             Ok(ColumnInfo {
-                name: row.get::<_, String>(0)?,
-                decl_type: row.get::<_, String>(1).unwrap_or_default(),
+                name: row.get::<_, String>(1)?,
+                decl_type: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                notnull: row.get::<_, i64>(3)? != 0,
+                pk: row.get::<_, i64>(5)? != 0,
             })
         })
         .map_err(|e| PreviewError::QueryFailed(e.to_string()))?
@@ -321,11 +611,21 @@ fn read_columns(conn: &Connection, table: &str) -> Result<Vec<ColumnInfo>, Previ
     Ok(cols)
 }
 
-/// `SELECT COUNT(*) FROM "table"`. Cheap on small/medium tables; gets
-/// pricier on multi-million-row tables but still fast enough for a
-/// preview load.
+/// `SELECT COUNT(*) FROM "schema"."table"`. Cheap on small/medium
+/// tables; gets pricier on multi-million-row tables but still fast
+/// enough for a preview load.
 fn count_rows(conn: &Connection, table: &str) -> Result<u64, PreviewError> {
-    let sql = format!("SELECT COUNT(*) FROM {}", quote_ident(table));
+    count_rows_qualified(conn, "main", table)
+}
+
+/// Schema-qualified variant of [`count_rows`]. Used by V2 to count rows
+/// in `temp` and attached schemas; V1 wraps this with `schema="main"`.
+pub fn count_rows_qualified(
+    conn: &Connection,
+    schema: &str,
+    table: &str,
+) -> Result<u64, PreviewError> {
+    let sql = format!("SELECT COUNT(*) FROM {}", quote_qualified(schema, table));
     conn.query_row(&sql, [], |row| row.get::<_, i64>(0))
         .map(|n| n.max(0) as u64)
         .map_err(|e| PreviewError::QueryFailed(e.to_string()))
@@ -336,7 +636,7 @@ fn count_rows(conn: &Connection, table: &str) -> Result<u64, PreviewError> {
 /// `https://sqlite.org/lang_keywords.html`. We can't bind table names
 /// as parameters in standard SQL — they're identifiers, not values —
 /// so this is the safe-by-construction path.
-fn quote_ident(ident: &str) -> String {
+pub fn quote_ident(ident: &str) -> String {
     let mut out = String::with_capacity(ident.len() + 2);
     out.push('"');
     for ch in ident.chars() {
@@ -351,6 +651,14 @@ fn quote_ident(ident: &str) -> String {
     out
 }
 
+/// Quote a schema-qualified identifier as `"schema"."name"`. Both halves
+/// go through [`quote_ident`] so a malicious-looking schema or object
+/// name (none in practice — both come from `sqlite_master` / `PRAGMA
+/// database_list`) can't escape the quoting.
+pub fn quote_qualified(schema: &str, name: &str) -> String {
+    format!("{}.{}", quote_ident(schema), quote_ident(name))
+}
+
 /// Read one page of rows from `table`. `offset` and `limit` map
 /// directly to the SQL clauses — note that SQLite's `LIMIT N OFFSET M`
 /// is O(M) for tables without a usable index, so high page numbers
@@ -363,26 +671,52 @@ pub fn load_page(
     offset: u64,
     limit: u32,
 ) -> Result<DbPage, PreviewError> {
+    load_page_qualified(path, "main", DbObjectKind::Table, table, offset, limit)
+}
+
+/// Schema + kind-aware variant of [`load_page`]. Used by the V2 wire
+/// path so the UI can browse `temp` schema tables, attached databases,
+/// and views (which are read identically to tables — `SELECT * FROM
+/// view_name`).
+///
+/// Returns [`PreviewError::UnsupportedObjectKind`] when called with
+/// `kind = Index | Trigger` — those don't have rows and should be
+/// routed through [`read_object_detail`] instead.
+pub fn load_page_qualified(
+    path: &Path,
+    schema: &str,
+    kind: DbObjectKind,
+    name: &str,
+    offset: u64,
+    limit: u32,
+) -> Result<DbPage, PreviewError> {
+    if !kind.has_rows() {
+        return Err(PreviewError::UnsupportedObjectKind);
+    }
     if !probe_magic(path)? {
         return Err(PreviewError::NotSqlite);
     }
     let conn = open_readonly(path)?;
-    read_page(&conn, table, offset, limit)
+    read_page_qualified(&conn, schema, name, offset, limit)
 }
 
-fn read_page(
+fn read_page_qualified(
     conn: &Connection,
-    table: &str,
+    schema: &str,
+    name: &str,
     offset: u64,
     limit: u32,
 ) -> Result<DbPage, PreviewError> {
-    let columns = read_columns(conn, table)?;
+    let columns = read_columns_qualified(conn, schema, name)?;
     if columns.is_empty() {
-        // Either the table doesn't exist or is genuinely zero-column —
+        // Either the object doesn't exist or is genuinely zero-column —
         // both rare and both handled identically (empty page).
         return Ok(DbPage { rows: Vec::new() });
     }
-    let sql = format!("SELECT * FROM {} LIMIT ?1 OFFSET ?2", quote_ident(table));
+    let sql = format!(
+        "SELECT * FROM {} LIMIT ?1 OFFSET ?2",
+        quote_qualified(schema, name)
+    );
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|e| PreviewError::QueryFailed(e.to_string()))?;
@@ -481,7 +815,13 @@ pub fn read_initial(path: &Path, initial_page_size: u32) -> Result<DatabaseInfo,
         .map(|(i, _)| i)
         .unwrap_or(0);
 
-    let initial_page = read_page(&conn, &tables[selected_table].name, 0, initial_page_size)?;
+    let initial_page = read_page_qualified(
+        &conn,
+        "main",
+        &tables[selected_table].name,
+        0,
+        initial_page_size,
+    )?;
 
     Ok(DatabaseInfo {
         tables,
@@ -489,6 +829,525 @@ pub fn read_initial(path: &Path, initial_page_size: u32) -> Result<DatabaseInfo,
         initial_page,
         bytes_on_disk,
     })
+}
+
+// ─── V2 multi-schema reader ─────────────────────────────────────────────
+
+/// List schemas attached to this connection. Always returns at least one
+/// entry (`main`) — `temp` is also always listed even when empty, and
+/// any user-issued `ATTACH DATABASE` shows up here too.
+pub fn list_databases(
+    conn: &Connection,
+) -> Result<Vec<(String, SchemaKind, Option<String>)>, PreviewError> {
+    let mut stmt = conn
+        .prepare("PRAGMA database_list")
+        .map_err(|e| PreviewError::QueryFailed(e.to_string()))?;
+    // Columns: seq (int), name (text), file (text — may be empty for
+    // in-memory / temp). Map empty-string file to `None`.
+    let rows = stmt
+        .query_map([], |row| {
+            let name: String = row.get(1)?;
+            let file: Option<String> = row.get::<_, Option<String>>(2)?;
+            let kind = match name.as_str() {
+                "main" => SchemaKind::Main,
+                "temp" => SchemaKind::Temp,
+                _ => SchemaKind::Attached,
+            };
+            let file_opt = file.filter(|s| !s.is_empty());
+            Ok((name, kind, file_opt))
+        })
+        .map_err(|e| PreviewError::QueryFailed(e.to_string()))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| PreviewError::QueryFailed(e.to_string()))
+}
+
+/// List every user-visible object in one schema, with eagerly-populated
+/// columns + row counts for tables. `max_count` caps the returned `Vec`;
+/// the second element of the returned tuple is `true` when the cap
+/// kicked in.
+///
+/// Filtering rules:
+/// - `name NOT LIKE 'sqlite_%'` excludes internal bookkeeping
+///   (`sqlite_sequence`, `sqlite_autoindex_*`, etc.).
+/// - FTS5 shadow tables (`<vt>_data`, `<vt>_idx`, `<vt>_content`,
+///   `<vt>_docsize`, `<vt>_config`) are hidden when their parent
+///   virtual table appears in the same schema. Modern SQLite populates
+///   `sqlite_master.sql` for these shadows so we can't rely on
+///   `sql IS NULL` as the discriminator.
+/// - Rows with NULL sql that we still can't classify are dropped — they
+///   represent auto-created bookkeeping the user almost never wants.
+/// - Ordering: tables, then views, then indexes, then triggers; within
+///   each, alphabetically.
+pub fn list_objects(
+    conn: &Connection,
+    schema: &str,
+    max_count: usize,
+) -> Result<(Vec<DbObject>, bool), PreviewError> {
+    let master = format!("{}.sqlite_master", quote_ident(schema));
+    let sql = format!(
+        "SELECT type, name, tbl_name, sql FROM {master} \
+         WHERE name NOT LIKE 'sqlite_%' \
+         ORDER BY \
+           CASE type WHEN 'table' THEN 0 WHEN 'view' THEN 1 \
+                     WHEN 'index' THEN 2 WHEN 'trigger' THEN 3 \
+                     ELSE 4 END, \
+           name"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| PreviewError::QueryFailed(e.to_string()))?;
+    let raw: Vec<(String, String, Option<String>, Option<String>)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(|e| PreviewError::QueryFailed(e.to_string()))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| PreviewError::QueryFailed(e.to_string()))?;
+
+    // Collect virtual-table names so we can recognise and drop their
+    // FTS shadow tables in the post-filter below. Modern FTS5 records
+    // shadow tables in sqlite_master with non-NULL sql, so we can't
+    // filter them out in the SQL WHERE clause alone.
+    let virtual_tables: std::collections::HashSet<String> = raw
+        .iter()
+        .filter(|(t, _, _, sql)| {
+            t == "table" && sql.as_deref().is_some_and(is_create_virtual_table)
+        })
+        .map(|(_, name, _, _)| name.clone())
+        .collect();
+
+    let is_fts_shadow = |name: &str| -> bool {
+        const SHADOW_SUFFIXES: &[&str] = &["_data", "_idx", "_content", "_docsize", "_config"];
+        for suffix in SHADOW_SUFFIXES {
+            if let Some(stripped) = name.strip_suffix(suffix)
+                && virtual_tables.contains(stripped)
+            {
+                return true;
+            }
+        }
+        false
+    };
+
+    let filtered: Vec<_> = raw
+        .into_iter()
+        .filter(|(t, name, _, sql)| {
+            // Drop FTS shadows (regardless of sql presence).
+            if t == "table" && is_fts_shadow(name) {
+                return false;
+            }
+            // Drop rows with NULL sql except for genuine virtual tables
+            // (their sql IS populated). NULL-sql rows that survive past
+            // the FTS shadow filter are auto-indexes / other internal
+            // helpers the user can't act on.
+            sql.is_some()
+        })
+        .collect();
+
+    let truncated = filtered.len() > max_count;
+    let mut out = Vec::with_capacity(filtered.len().min(max_count));
+    for (type_str, name, tbl_name, sql) in filtered.into_iter().take(max_count) {
+        let Some(kind) = DbObjectKind::from_master_type(&type_str) else {
+            continue;
+        };
+        let sql_ref = sql.as_deref();
+        let is_virtual = sql_ref.is_some_and(is_create_virtual_table);
+        let is_without_rowid = sql_ref.is_some_and(sql_has_without_rowid_suffix);
+        let is_strict = sql_ref.is_some_and(sql_has_strict_modifier);
+
+        // Eagerly populate columns for table / view so the UI can size
+        // its data grid without a follow-up RPC. For indexes / triggers
+        // we leave the vec empty — they don't have a row schema.
+        let columns = if matches!(kind, DbObjectKind::Table | DbObjectKind::View) {
+            read_columns_qualified(conn, schema, &name).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        // Row counts: tables only. Views might be expensive (arbitrary
+        // SELECT); indexes / triggers don't have rows. Failures here
+        // are soft — we'd rather show the object with `—` count than
+        // hide it.
+        let row_count = if matches!(kind, DbObjectKind::Table) {
+            count_rows_qualified(conn, schema, &name).ok()
+        } else {
+            None
+        };
+
+        out.push(DbObject {
+            schema: schema.to_string(),
+            name,
+            kind,
+            tbl_name,
+            row_count,
+            columns,
+            is_virtual,
+            is_without_rowid,
+            is_strict,
+        });
+    }
+    Ok((out, truncated))
+}
+
+/// Top-level V2 entry. Walks every schema, reads its objects, picks an
+/// initial selection (smallest non-empty table in `main`), and reads
+/// one page of rows. The returned [`DatabaseInfoV2`] is everything the
+/// UI needs to render its first frame.
+pub fn read_initial_v2(
+    path: &Path,
+    initial_page_size: u32,
+) -> Result<DatabaseInfoV2, PreviewError> {
+    let meta = std::fs::metadata(path).map_err(|e| PreviewError::Io(e.to_string()))?;
+    let bytes_on_disk = meta.len();
+    if bytes_on_disk > MAX_PREVIEW_BYTES {
+        return Err(PreviewError::TooLarge {
+            size: bytes_on_disk,
+        });
+    }
+    if !probe_magic(path)? {
+        return Err(PreviewError::NotSqlite);
+    }
+
+    let conn = open_readonly(path)?;
+
+    let dbs = list_databases(&conn)?;
+    let mut schemas = Vec::with_capacity(dbs.len());
+    for (db_name, kind, file) in dbs {
+        let (objects, truncated) = list_objects(&conn, &db_name, MAX_OBJECTS_PER_SCHEMA)?;
+        schemas.push(SchemaSummary {
+            name: db_name,
+            kind,
+            file,
+            objects,
+            truncated,
+        });
+    }
+
+    // Default schema: prefer `main`, then first schema with objects,
+    // then just the first schema.
+    let default_schema = schemas
+        .iter()
+        .find(|s| s.kind == SchemaKind::Main)
+        .map(|s| s.name.clone())
+        .or_else(|| {
+            schemas
+                .iter()
+                .find(|s| !s.objects.is_empty())
+                .map(|s| s.name.clone())
+        })
+        .or_else(|| schemas.first().map(|s| s.name.clone()))
+        .unwrap_or_else(|| "main".to_string());
+
+    // Default object: smallest non-empty table in default schema, else
+    // first table-or-view in default schema. Indexes / triggers never
+    // chosen as initial selection.
+    let default_object = schemas
+        .iter()
+        .find(|s| s.name == default_schema)
+        .and_then(pick_default_object);
+
+    let initial_page = match &default_object {
+        Some(key) if key.kind.has_rows() => {
+            read_page_qualified(&conn, &key.schema, &key.name, 0, initial_page_size)?
+        }
+        _ => DbPage { rows: Vec::new() },
+    };
+
+    Ok(DatabaseInfoV2 {
+        schemas,
+        default_schema,
+        default_object,
+        initial_page,
+        bytes_on_disk,
+    })
+}
+
+/// Path-level convenience: open a read-only connection on the file and
+/// dispatch to [`read_object_detail`]. Mirrors the V1 [`load_page`]
+/// shape so call sites (agent handlers, local backend) don't have to
+/// open the connection themselves.
+pub fn read_object_detail_at(
+    path: &Path,
+    schema: &str,
+    kind: DbObjectKind,
+    name: &str,
+) -> Result<DbObjectDetail, PreviewError> {
+    if !probe_magic(path)? {
+        return Err(PreviewError::NotSqlite);
+    }
+    let conn = open_readonly(path)?;
+    read_object_detail(&conn, schema, kind, name)
+}
+
+/// Dispatch detail-pane reads by object kind. Tables / Views return
+/// their `CREATE` SQL; Indexes / Triggers return parsed structural
+/// detail (see [`DbObjectDetail`]).
+pub fn read_object_detail(
+    conn: &Connection,
+    schema: &str,
+    kind: DbObjectKind,
+    name: &str,
+) -> Result<DbObjectDetail, PreviewError> {
+    match kind {
+        DbObjectKind::Index => read_index_detail(conn, schema, name),
+        DbObjectKind::Trigger => read_trigger_detail(conn, schema, name),
+        DbObjectKind::Table => Ok(DbObjectDetail::Table {
+            create_sql: read_create_sql(conn, schema, name)?,
+        }),
+        DbObjectKind::View => Ok(DbObjectDetail::View {
+            create_sql: read_create_sql(conn, schema, name)?,
+        }),
+    }
+}
+
+/// Read an index's structural detail: unique flag (from `index_list`),
+/// column ordering (from `index_info`), partial-WHERE expression
+/// (sliced from `sqlite_master.sql`).
+pub fn read_index_detail(
+    conn: &Connection,
+    schema: &str,
+    name: &str,
+) -> Result<DbObjectDetail, PreviewError> {
+    let master = format!("{}.sqlite_master", quote_ident(schema));
+    let master_sql = format!("SELECT tbl_name, sql FROM {master} WHERE type='index' AND name=?1");
+    let (tbl_name, create_sql): (String, Option<String>) = conn
+        .query_row(&master_sql, rusqlite::params![name], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => PreviewError::ObjectNotFound {
+                schema: schema.to_string(),
+                name: name.to_string(),
+            },
+            other => PreviewError::QueryFailed(other.to_string()),
+        })?;
+
+    // PRAGMA index_info returns: seqno, cid, name (NULL for expressions).
+    let info_sql = format!(
+        "PRAGMA {}.index_info({})",
+        quote_ident(schema),
+        quote_ident(name)
+    );
+    let mut stmt = conn
+        .prepare(&info_sql)
+        .map_err(|e| PreviewError::QueryFailed(e.to_string()))?;
+    let columns: Vec<String> = stmt
+        .query_map([], |row| {
+            row.get::<_, Option<String>>(2)
+                .map(|n| n.unwrap_or_else(|| "<expr>".to_string()))
+        })
+        .map_err(|e| PreviewError::QueryFailed(e.to_string()))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| PreviewError::QueryFailed(e.to_string()))?;
+
+    // PRAGMA index_list returns: seq, name, unique, origin, partial.
+    // We could pull `partial` directly but the WHERE clause itself
+    // only lives in `sqlite_master.sql`, so parse it from there.
+    let list_sql = format!(
+        "PRAGMA {}.index_list({})",
+        quote_ident(schema),
+        quote_ident(&tbl_name)
+    );
+    let mut stmt = conn
+        .prepare(&list_sql)
+        .map_err(|e| PreviewError::QueryFailed(e.to_string()))?;
+    let unique = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)? != 0))
+        })
+        .map_err(|e| PreviewError::QueryFailed(e.to_string()))?
+        .filter_map(|r| r.ok())
+        .find(|(n, _)| n == name)
+        .map(|(_, u)| u)
+        .unwrap_or(false);
+
+    let partial_where = create_sql.as_deref().and_then(extract_partial_where);
+
+    Ok(DbObjectDetail::Index {
+        unique,
+        columns,
+        partial_where,
+        tbl_name,
+        create_sql,
+    })
+}
+
+/// Read a trigger's structural detail. Timing + event are parsed from
+/// the header tokens of the CREATE TRIGGER SQL (best-effort) and the
+/// raw body is preserved for display.
+pub fn read_trigger_detail(
+    conn: &Connection,
+    schema: &str,
+    name: &str,
+) -> Result<DbObjectDetail, PreviewError> {
+    let master = format!("{}.sqlite_master", quote_ident(schema));
+    let master_sql = format!("SELECT tbl_name, sql FROM {master} WHERE type='trigger' AND name=?1");
+    let (tbl_name, sql): (String, String) = conn
+        .query_row(&master_sql, rusqlite::params![name], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            ))
+        })
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => PreviewError::ObjectNotFound {
+                schema: schema.to_string(),
+                name: name.to_string(),
+            },
+            other => PreviewError::QueryFailed(other.to_string()),
+        })?;
+
+    let (timing, event) = parse_trigger_header(&sql);
+    Ok(DbObjectDetail::Trigger {
+        timing,
+        event,
+        tbl_name,
+        sql,
+    })
+}
+
+/// Helper: read `sqlite_master.sql` for an object, regardless of type.
+/// Used by [`read_object_detail`] for Table / View.
+fn read_create_sql(
+    conn: &Connection,
+    schema: &str,
+    name: &str,
+) -> Result<Option<String>, PreviewError> {
+    let master = format!("{}.sqlite_master", quote_ident(schema));
+    let sql = format!("SELECT sql FROM {master} WHERE name=?1");
+    match conn.query_row(&sql, rusqlite::params![name], |row| {
+        row.get::<_, Option<String>>(0)
+    }) {
+        Ok(s) => Ok(s),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(PreviewError::QueryFailed(e.to_string())),
+    }
+}
+
+// ─── V2 parsing helpers ─────────────────────────────────────────────────
+
+fn pick_default_object(schema: &SchemaSummary) -> Option<DbObjectKey> {
+    // Smallest non-empty table wins. Tied counts → alphabetical (the
+    // object list is already sorted that way, so min_by_key is stable
+    // on ties via insertion order).
+    let smallest_table = schema
+        .objects
+        .iter()
+        .filter(|o| matches!(o.kind, DbObjectKind::Table) && o.row_count.unwrap_or(0) > 0)
+        .min_by_key(|o| o.row_count.unwrap_or(u64::MAX));
+    if let Some(o) = smallest_table {
+        return Some(o.key());
+    }
+    // No non-empty tables → first table-or-view, so the user lands on
+    // something with a (possibly empty) data grid rather than a blank
+    // pane.
+    schema
+        .objects
+        .iter()
+        .find(|o| matches!(o.kind, DbObjectKind::Table | DbObjectKind::View))
+        .map(DbObject::key)
+}
+
+fn is_create_virtual_table(sql: &str) -> bool {
+    // "CREATE VIRTUAL TABLE" is 20 ASCII bytes; compare via byte slice
+    // to avoid the String allocation that `chars().take(20).collect()`
+    // would impose on every list_objects row.
+    const PREFIX: &[u8; 20] = b"CREATE VIRTUAL TABLE";
+    let bytes = sql.trim_start().as_bytes();
+    bytes.len() >= PREFIX.len() && bytes[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
+}
+
+fn sql_has_without_rowid_suffix(sql: &str) -> bool {
+    let trimmed = sql.trim_end_matches(|c: char| c.is_whitespace() || c == ';');
+    // Comparison target is pure ASCII, so we can byte-compare the tail
+    // without touching the UTF-8 boundaries elsewhere in the string —
+    // important because user table comments / column names commonly
+    // contain multi-byte characters (CJK, emoji, accented Latin) and
+    // a naive `&trimmed[trimmed.len()-N..]` slice can land mid-char
+    // and panic.
+    let tail = b"without rowid";
+    let bytes = trimmed.as_bytes();
+    bytes.len() >= tail.len() && bytes[bytes.len() - tail.len()..].eq_ignore_ascii_case(tail)
+}
+
+fn sql_has_strict_modifier(sql: &str) -> bool {
+    // STRICT can appear either at the trailing end (after the closing
+    // paren) or alongside WITHOUT ROWID separated by a comma. Cheap
+    // best-effort scan — display-only, no querying behavior depends on
+    // this.
+    let trimmed = sql.trim_end_matches(|c: char| c.is_whitespace() || c == ';');
+    let lower = trimmed.to_lowercase();
+    lower.ends_with("strict")
+        || lower.contains(", strict")
+        || lower.contains(",strict")
+        || lower.contains(" strict,")
+        || lower.contains(" strict ")
+}
+
+fn extract_partial_where(sql: &str) -> Option<String> {
+    // Last `WHERE` token in the CREATE INDEX is the partial predicate.
+    // Case-insensitive search by lowercasing only the ASCII letters
+    // in-place at the byte level, which preserves byte positions
+    // identical to `sql`'s — so the position from `rfind` can safely
+    // slice back into `sql`. (Calling `str::to_lowercase` would shift
+    // byte indices for non-ASCII chars like 'İ' or 'ß'.)
+    let mut lower_bytes = sql.as_bytes().to_vec();
+    for b in lower_bytes.iter_mut() {
+        b.make_ascii_lowercase();
+    }
+    let key = b" where ";
+    let pos = lower_bytes.windows(key.len()).rposition(|w| w == key)?;
+    let start = pos + key.len();
+    // `start` is guaranteed to be at a UTF-8 char boundary because
+    // it follows the ASCII space character — the byte after a single
+    // ASCII byte is always a boundary.
+    let rest = sql[start..].trim().trim_end_matches(';').trim();
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest.to_string())
+    }
+}
+
+fn parse_trigger_header(sql: &str) -> (TriggerTiming, TriggerEvent) {
+    // Header = everything before the `BEGIN` keyword. Splitting at a
+    // word boundary avoids matching `BEGIN` inside an identifier (rare,
+    // but possible since SQLite tolerates `BEGIN` quoted as an
+    // identifier).
+    let lower = sql.to_lowercase();
+    let header_end = lower
+        .find(" begin ")
+        .or_else(|| lower.find("\nbegin"))
+        .or_else(|| lower.find("\tbegin"))
+        .unwrap_or(lower.len());
+    let header: &str = &lower[..header_end];
+    let tokens: Vec<&str> = header.split_whitespace().collect();
+
+    let timing = if tokens.contains(&"before") {
+        TriggerTiming::Before
+    } else if tokens.contains(&"after") {
+        TriggerTiming::After
+    } else if tokens.windows(2).any(|w| w[0] == "instead" && w[1] == "of") {
+        TriggerTiming::InsteadOf
+    } else {
+        TriggerTiming::Unknown
+    };
+
+    let event = if tokens.contains(&"insert") {
+        TriggerEvent::Insert
+    } else if tokens.contains(&"update") {
+        TriggerEvent::Update
+    } else if tokens.contains(&"delete") {
+        TriggerEvent::Delete
+    } else {
+        TriggerEvent::Unknown
+    };
+
+    (timing, event)
 }
 
 #[cfg(test)]
@@ -790,5 +1649,49 @@ mod tests {
         let fake = tmp.path().join("fake.db");
         std::fs::write(&fake, b"definitely not a database").unwrap();
         assert!(!is_sqlite_file(&fake));
+    }
+
+    #[test]
+    fn read_initial_v2_handles_multibyte_comments_in_ddl() {
+        // Regression: SQL helpers were byte-slicing the trailing bytes
+        // of `sqlite_master.sql` to detect `WITHOUT ROWID`, which
+        // panicked when the boundary landed inside a multi-byte
+        // character. Real-world DBs frequently keep CJK column
+        // comments in their stored DDL (the user's `sofast.db`
+        // surfaced this).
+        let (_tmp, path) = setup_db(&[
+            "CREATE TABLE stars (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL, -- 收藏项的标题
+                description TEXT,    -- 收藏项的描述
+                type TEXT NOT NULL,  -- 内容类型，例如 'link', 'image', 'text'
+                content TEXT,         -- 实际内容
+                created_at INTEGER
+            )",
+            "INSERT INTO stars(id, title, type) VALUES \
+                ('1','示例','link'),('2','another','image')",
+            "CREATE INDEX idx_stars_type ON stars(type) WHERE type = 'link'",
+        ]);
+        let info = read_initial_v2(&path, 5).expect("read_initial_v2 must not panic on CJK DDL");
+        let main = info.schemas.iter().find(|s| s.name == "main").unwrap();
+        let stars = main.objects.iter().find(|o| o.name == "stars").unwrap();
+        assert!(!stars.is_without_rowid);
+        let idx = main
+            .objects
+            .iter()
+            .find(|o| o.name == "idx_stars_type")
+            .expect("partial index should be listed");
+        assert_eq!(idx.kind, DbObjectKind::Index);
+    }
+
+    #[test]
+    fn extract_partial_where_works_with_multibyte_surrounding_text() {
+        // Partial WHERE extraction used to slice the original sql at
+        // a byte index derived from `to_lowercase()` — which can
+        // shift indices for non-ASCII letters. Now we lowercase
+        // bytes in-place to keep positions stable.
+        let sql = "CREATE INDEX i ON stars(type) -- 注释 \n WHERE type = 'link'";
+        let got = extract_partial_where(sql).unwrap();
+        assert!(got.contains("type = 'link'"), "extracted WHERE was {got:?}");
     }
 }

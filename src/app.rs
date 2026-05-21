@@ -29,43 +29,44 @@ pub struct BuiltProtocol {
 /// so rapid scrubbing coalesces into a single load.
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(80);
 
-/// Pagination + table-selection state for the SQLite preview card.
+/// Pagination + object-selection state for the SQLite preview card.
 /// Lives `Some` for as long as the current `preview_content` is a
 /// `PreviewBody::Database`; rebuilt from `info.initial_page` whenever
 /// a new preview lands and the file changed (see
 /// `apply_worker_result`).
 ///
 /// **Cache invariant**: `col_widths` + `total_table_w` are derived
-/// from `(selected_table, current_rows)`. Any mutation of those two
+/// from `(selection, current_rows)`. Any mutation of those two
 /// fields must call [`Self::recompute_layout`] before the next
 /// render, or the cached widths will desync from the data and the
 /// table will visually misalign. Every mutation site in this file
 /// honors that — when adding new ones, follow suit.
 ///
 /// `current_rows` is the rows shown right now. On `[`/`]`/`PgUp`/`PgDn`
-/// we re-issue `Backend::db_load_page` synchronously and replace this
-/// vec on success. SQLite's open + LIMIT/OFFSET is sub-millisecond
-/// locally; over SSH it's an RPC round-trip (~10-50 ms typical) — a
-/// brief stall on flaky links is the accepted trade-off for keeping
-/// the navigation path simple.
+/// we re-issue `Backend::db_load_page_qualified` synchronously and
+/// replace this vec on success. SQLite's open + LIMIT/OFFSET is
+/// sub-millisecond locally; over SSH it's an RPC round-trip (~10-50 ms
+/// typical) — a brief stall on flaky links is the accepted trade-off
+/// for keeping the navigation path simple.
 #[derive(Debug, Clone)]
 pub struct DbPreviewState {
     /// Workdir-relative path of the SQLite file the state belongs to.
     /// Compared against `preview_content.file_path` on every render to
     /// catch the "file changed but state didn't get cleared" race.
     pub path: String,
-    /// Index into `info.tables`. Bounds-checked at every step.
-    pub selected_table: usize,
+    /// Currently selected object addressed by schema-qualified key.
+    pub selection: reef_sqlite_preview::DbObjectKey,
+    /// Schemas the sidebar currently shows expanded.
+    pub expanded: std::collections::BTreeSet<String>,
     /// Zero-based page index. `offset = page * rows_per_page`.
     pub page: u64,
     /// The rows currently visible. Each inner Vec is one row's cells
     /// in column order; length equals
-    /// `min(rows_per_page, table.row_count - offset)`.
+    /// `min(rows_per_page, object.row_count - offset)`.
     pub current_rows: Vec<Vec<reef_sqlite_preview::SqliteValue>>,
-    /// Page-size used to compute `offset` on the next request.
     pub rows_per_page: u32,
     /// Cached natural column widths for the current
-    /// `(selected_table, current_rows)` combo. Recomputed by
+    /// `(selection, current_rows)` combo. Recomputed by
     /// [`Self::recompute_layout`] on every mutation that changes
     /// either input. The render path consults the cache once per
     /// frame instead of re-walking 50 rows × N columns of UTF-8
@@ -74,61 +75,78 @@ pub struct DbPreviewState {
     /// Cached `Σcol_widths + (n−1)·sep_w` paired with `col_widths`.
     /// Used as the upper bound when clamping `preview_h_scroll`.
     pub total_table_w: usize,
+    /// Detail-pane payload for the currently-selected index / trigger,
+    /// or `None` when the current selection is a table / view (data
+    /// grid takes over) or when the detail RPC hasn't landed yet.
+    pub detail: Option<reef_sqlite_preview::DbObjectDetail>,
 }
 
-/// Navigation actions exposed by the SQLite preview keybindings. Kept
-/// as an enum (rather than separate methods) so the input dispatcher
-/// stays a single match arm per key — `db_navigate` does the bounds
-/// math + the RPC round-trip in one place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbNav {
     PrevPage,
     NextPage,
+    /// Previous row-bearing object in the current schema's flat list.
     PrevTable,
+    /// Next row-bearing object in the current schema's flat list.
     NextTable,
     FirstPage,
     LastPage,
 }
 
 impl DbPreviewState {
-    fn from_initial(path: &str, info: &reef_sqlite_preview::DatabaseInfo) -> Self {
+    pub fn from_initial(path: &str, info: &reef_sqlite_preview::DatabaseInfoV2) -> Self {
+        // `default_object` is None only when every schema is empty —
+        // fall back to a synthetic key on the default schema so the
+        // struct is well-formed; renderers branch on `info.lookup()`
+        // returning None to draw the empty state.
+        let selection =
+            info.default_object
+                .clone()
+                .unwrap_or_else(|| reef_sqlite_preview::DbObjectKey {
+                    schema: info.default_schema.clone(),
+                    name: String::new(),
+                    kind: reef_sqlite_preview::DbObjectKind::Table,
+                });
+        let mut expanded = std::collections::BTreeSet::new();
+        expanded.insert(info.default_schema.clone());
+        let columns: &[reef_sqlite_preview::ColumnInfo] = info
+            .lookup(&selection)
+            .map(|o| o.columns.as_slice())
+            .unwrap_or(&[]);
         let mut s = Self {
             path: path.to_string(),
-            selected_table: info.selected_table,
+            selection,
+            expanded,
             page: 0,
             current_rows: info.initial_page.rows.clone(),
             rows_per_page: crate::file_tree::INITIAL_DB_PAGE_ROWS,
             col_widths: Vec::new(),
             total_table_w: 0,
+            detail: None,
         };
-        s.recompute_layout(info);
+        s.recompute_layout(columns);
         s
     }
 
     /// Refresh `col_widths` + `total_table_w` from the current
-    /// `(selected_table, current_rows)` combo. Cheap-ish on its own
-    /// (O(rows × cols × avg_str_len)) but expensive when called per
-    /// frame — this method is the seam where we DO compute, so the
-    /// render path can stay zero-cost on h-scroll.
-    pub fn recompute_layout(&mut self, info: &reef_sqlite_preview::DatabaseInfo) {
-        let columns = info
-            .tables
-            .get(self.selected_table)
-            .map(|t| t.columns.as_slice())
-            .unwrap_or(&[]);
+    /// `(columns, current_rows)` combo. Cheap on its own; called by
+    /// nav helpers right after they swap in fresh rows. Render path
+    /// only reads the cached values, never recomputes.
+    pub fn recompute_layout(&mut self, columns: &[reef_sqlite_preview::ColumnInfo]) {
         self.col_widths = crate::ui::db_preview::natural_column_widths(columns, &self.current_rows);
         self.total_table_w = crate::ui::db_preview::total_table_width(&self.col_widths);
     }
 }
 
-/// Largest valid page index for a table at a given page size. Tables
-/// with zero rows still have one (empty) page, so we floor at 0
-/// rather than letting `(0/N)-1` wrap to `u64::MAX`.
-fn max_page_for(table: &reef_sqlite_preview::TableSummary, page_size: u32) -> u64 {
+/// Largest valid page index for an object at a given page size.
+/// Objects without a populated `row_count` (views, indexes, triggers)
+/// floor to 0 — pagination only meaningful when we know the total.
+fn max_page_for_object(object: &reef_sqlite_preview::DbObject, page_size: u32) -> u64 {
     if page_size == 0 {
         return 0;
     }
-    let pages = table.row_count.div_ceil(page_size as u64);
+    let rows = object.row_count.unwrap_or(0);
+    let pages = rows.div_ceil(page_size as u64);
     pages.saturating_sub(1)
 }
 
@@ -2513,143 +2531,192 @@ impl App {
     /// Navigate the SQLite preview card. Called from the input
     /// dispatcher when the focused panel is the preview pane and
     /// `preview_content.body` is `Database`. Computes the new
-    /// `(table, page)` window, issues a synchronous
-    /// `Backend::db_load_page` round-trip, and replaces
-    /// `db_preview_state.current_rows` on success. Errors land as a
-    /// warning toast.
-    ///
-    /// Runs synchronously on the main thread: locally sub-ms, over
-    /// SSH a single RPC round-trip (~10-50 ms). Brief UI stall on
-    /// flaky links is the accepted trade-off for keeping nav simple.
+    /// `(object, page)` window via the row-bearing flat list and
+    /// delegates to [`Self::db_apply_page`]. Runs synchronously on
+    /// the main thread — local sub-ms, SSH 10-50ms RPC.
     pub fn db_navigate(&mut self, action: DbNav) {
-        // Snapshot the database info we need from the current preview.
-        // We only mutate state when everything below resolves cleanly,
-        // so a stale preview / wrong body / missing state silently
-        // no-ops rather than panicking.
-        let info = match self.preview_content.as_ref().map(|p| &p.body) {
-            Some(PreviewBody::Database(info)) => info.clone(),
-            _ => return,
+        let Some((cur_key, cur_page, rows_per_page)) = self
+            .db_preview_state
+            .as_ref()
+            .map(|s| (s.selection.clone(), s.page, s.rows_per_page))
+        else {
+            return;
         };
-        if info.tables.is_empty() {
+        let Some(info) = self.preview_database_info() else {
+            return;
+        };
+        let visible: Vec<&reef_sqlite_preview::DbObject> = info.iter_row_bearing().collect();
+        if visible.is_empty() {
             return;
         }
-        let state = match self.db_preview_state.as_ref() {
-            Some(s) => s.clone(),
-            None => return,
-        };
-        let max_table = info.tables.len() - 1;
-        let cur_table = state.selected_table.min(max_table);
-
-        // Compute the target (table_idx, page) tuple without touching
-        // self.* yet. `max_page_for` clamps based on the cached
-        // row_count from the initial preview — page totals don't
-        // refresh until a fresh `load_preview` lands, which is fine
-        // because read-only previews can't change row counts under us.
-        let (new_table, new_page) = match action {
-            DbNav::PrevPage => (cur_table, state.page.saturating_sub(1)),
+        let cur_idx = visible
+            .iter()
+            .position(|o| o.name == cur_key.name && o.kind == cur_key.kind)
+            .unwrap_or(0)
+            .min(visible.len() - 1);
+        let max_idx = visible.len() - 1;
+        let (new_idx, new_page) = match action {
+            DbNav::PrevPage => (cur_idx, cur_page.saturating_sub(1)),
             DbNav::NextPage => (
-                cur_table,
-                (state.page + 1).min(max_page_for(&info.tables[cur_table], state.rows_per_page)),
+                cur_idx,
+                (cur_page + 1).min(max_page_for_object(visible[cur_idx], rows_per_page)),
             ),
-            DbNav::PrevTable => (cur_table.saturating_sub(1), 0),
-            DbNav::NextTable => ((cur_table + 1).min(max_table), 0),
-            DbNav::FirstPage => (cur_table, 0),
+            DbNav::PrevTable => (cur_idx.saturating_sub(1), 0),
+            DbNav::NextTable => ((cur_idx + 1).min(max_idx), 0),
+            DbNav::FirstPage => (cur_idx, 0),
             DbNav::LastPage => (
-                cur_table,
-                max_page_for(&info.tables[cur_table], state.rows_per_page),
+                cur_idx,
+                max_page_for_object(visible[cur_idx], rows_per_page),
             ),
         };
-
-        // No-op when the action would land on the same window — keeps
-        // PgUp on page 0 / NextTable at the last table from issuing a
-        // pointless RPC.
-        if new_table == cur_table && new_page == state.page {
+        if new_idx == cur_idx && new_page == cur_page {
             return;
         }
+        let new_key = visible[new_idx].key();
+        self.db_apply_page(
+            new_key,
+            new_page,
+            /* reset_h_scroll = */ new_idx != cur_idx,
+        );
+    }
 
-        let table_name = info.tables[new_table].name.clone();
-        let offset = new_page.saturating_mul(state.rows_per_page as u64);
-        let limit = state.rows_per_page;
-        let path = PathBuf::from(&state.path);
+    /// Toggle the expand / collapse state of one schema in the
+    /// sidebar. No row reload — the data grid keeps its selection.
+    pub fn db_toggle_schema(&mut self, name: &str) {
+        let Some(state) = self.db_preview_state.as_mut() else {
+            return;
+        };
+        if !state.expanded.remove(name) {
+            state.expanded.insert(name.to_string());
+        }
+    }
 
-        let table_changed = new_table != cur_table;
-        match self.backend.db_load_page(&path, &table_name, offset, limit) {
-            Ok(page) => {
-                if let Some(s) = self.db_preview_state.as_mut() {
-                    s.selected_table = new_table;
-                    s.page = new_page;
-                    s.current_rows = page.rows;
-                    s.recompute_layout(&info);
-                }
-                // New page / new table → reset within-page row offset
-                // so the user lands at row 1, not whatever scroll
-                // position they left the previous page at.
-                self.preview_scroll = 0;
-                // Table change → also reset horizontal scroll, since
-                // the new table's natural column widths almost
-                // certainly differ and a leftover h_scroll would land
-                // on a meaningless mid-column position. Page-only
-                // navigation keeps h_scroll so the user can keep
-                // reading the same column across pages.
-                if table_changed {
-                    self.preview_h_scroll = 0;
-                }
-            }
-            Err(e) => {
-                self.toasts
-                    .push(Toast::warn(format!("sqlite page load failed: {e}")));
-            }
+    /// Switch the SQLite preview's selection to a specific
+    /// schema-qualified object. Row-bearing kinds load page 0
+    /// synchronously; non-row kinds (Index / Trigger) stash the
+    /// structural detail in `state.detail` for the detail pane.
+    pub fn db_select_object(&mut self, key: reef_sqlite_preview::DbObjectKey) {
+        let current = self.db_preview_state.as_ref().map(|s| s.selection.clone());
+        if current.as_ref() == Some(&key) {
+            return;
+        }
+        if key.kind.has_rows() {
+            self.db_apply_page(key, 0, /* reset_h_scroll = */ true);
+        } else {
+            self.db_apply_detail(key);
         }
     }
 
     /// Jump to a specific 1-based page in the currently-selected
-    /// table. Used by the `g`-prefix page-jump input. Out-of-range
-    /// pages clamp to the last valid page rather than failing — the
-    /// input prompt enforces that user-typed numbers are well-formed
-    /// before calling this, but range clamping here keeps the contract
-    /// loose enough that a future caller can pass `u64::MAX` and get
-    /// "last page" without an error path.
+    /// object. Out-of-range pages clamp to the last valid page
+    /// rather than failing.
     pub fn db_navigate_to_page(&mut self, page_one_based: u64) {
-        let info = match self.preview_content.as_ref().map(|p| &p.body) {
-            Some(PreviewBody::Database(info)) => info.clone(),
-            _ => return,
+        let Some((selection, cur_page, rows_per_page)) = self
+            .db_preview_state
+            .as_ref()
+            .map(|s| (s.selection.clone(), s.page, s.rows_per_page))
+        else {
+            return;
         };
-        // Empty-tables guard — without it, `info.tables[table_idx]`
-        // below panics on a fresh DB with no user tables that the
-        // user somehow invokes `g`-prefix on.
-        if info.tables.is_empty() {
+        if !selection.kind.has_rows() {
             return;
         }
-        let state = match self.db_preview_state.as_ref() {
-            Some(s) => s.clone(),
-            None => return,
+        let Some(info) = self.preview_database_info() else {
+            return;
         };
-        let table_idx = state.selected_table.min(info.tables.len() - 1);
-        let max_page = max_page_for(&info.tables[table_idx], state.rows_per_page);
+        let Some(object) = info.lookup(&selection) else {
+            return;
+        };
+        let max_page = max_page_for_object(object, rows_per_page);
         let target_page = page_one_based.saturating_sub(1).min(max_page);
-        if target_page == state.page {
+        if target_page == cur_page {
             return;
         }
-        let table_name = info.tables[table_idx].name.clone();
-        let offset = target_page.saturating_mul(state.rows_per_page as u64);
-        let path = PathBuf::from(&state.path);
-        match self
+        self.db_apply_page(selection, target_page, /* reset_h_scroll = */ false);
+    }
+
+    /// Borrow the `DatabaseInfoV2` from the current preview body, or
+    /// `None` when the preview is missing / not a database.
+    fn preview_database_info(&self) -> Option<&reef_sqlite_preview::DatabaseInfoV2> {
+        match self.preview_content.as_ref()?.body {
+            crate::file_tree::PreviewBody::Database(ref info) => Some(info),
+            _ => None,
+        }
+    }
+
+    /// Shared row-load path for `db_navigate*` and `db_select_object`.
+    /// Issues the synchronous backend RPC, updates state on success,
+    /// resets scroll, surfaces errors as a warning toast.
+    fn db_apply_page(
+        &mut self,
+        key: reef_sqlite_preview::DbObjectKey,
+        page: u64,
+        reset_h_scroll: bool,
+    ) {
+        let Some((path, rows_per_page)) = self
+            .db_preview_state
+            .as_ref()
+            .map(|s| (PathBuf::from(&s.path), s.rows_per_page))
+        else {
+            return;
+        };
+        let offset = page.saturating_mul(rows_per_page as u64);
+        let page_data = match self
             .backend
-            .db_load_page(&path, &table_name, offset, state.rows_per_page)
+            .db_load_page(&path, &key, offset, rows_per_page)
         {
-            Ok(page) => {
-                if let Some(s) = self.db_preview_state.as_mut() {
-                    s.page = target_page;
-                    s.current_rows = page.rows;
-                    s.recompute_layout(&info);
-                }
-                self.preview_scroll = 0;
-            }
+            Ok(p) => p,
             Err(e) => {
                 self.toasts
                     .push(Toast::warn(format!("sqlite page load failed: {e}")));
+                return;
             }
+        };
+        // Snapshot column metadata before the &mut self.db_preview_state
+        // borrow so the recompute uses the canonical info-side columns.
+        let columns: Vec<reef_sqlite_preview::ColumnInfo> = self
+            .preview_database_info()
+            .and_then(|info| info.lookup(&key).map(|o| o.columns.clone()))
+            .unwrap_or_default();
+        if let Some(s) = self.db_preview_state.as_mut() {
+            s.selection = key;
+            s.page = page;
+            s.current_rows = page_data.rows;
+            s.detail = None;
+            s.recompute_layout(&columns);
         }
+        self.preview_scroll = 0;
+        if reset_h_scroll {
+            self.preview_h_scroll = 0;
+        }
+    }
+
+    /// Shared detail-load path for Index / Trigger selection clicks.
+    fn db_apply_detail(&mut self, key: reef_sqlite_preview::DbObjectKey) {
+        let Some(path) = self
+            .db_preview_state
+            .as_ref()
+            .map(|s| PathBuf::from(&s.path))
+        else {
+            return;
+        };
+        let detail = match self.backend.db_load_object_detail(&path, &key) {
+            Ok(d) => d,
+            Err(e) => {
+                self.toasts
+                    .push(Toast::warn(format!("sqlite detail load failed: {e}")));
+                return;
+            }
+        };
+        if let Some(s) = self.db_preview_state.as_mut() {
+            s.selection = key;
+            s.detail = Some(detail);
+            s.current_rows.clear();
+            s.col_widths.clear();
+            s.total_table_w = 0;
+        }
+        self.preview_scroll = 0;
+        self.preview_h_scroll = 0;
     }
 
     pub fn load_preview_for_path(&mut self, rel_path: PathBuf) {
@@ -4387,6 +4454,12 @@ impl App {
             }
             ClickAction::DbGotoPage(page) => {
                 self.db_navigate_to_page(page);
+            }
+            ClickAction::DbSelectObject { schema, name, kind } => {
+                self.db_select_object(reef_sqlite_preview::DbObjectKey { schema, name, kind });
+            }
+            ClickAction::DbToggleSchema(name) => {
+                self.db_toggle_schema(&name);
             }
             ClickAction::FindWidgetClose => {
                 crate::find_widget::close(self);

@@ -459,6 +459,26 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
             offset,
             limit,
         } => load_db_page_handler(workdir, &rel_path, &table, offset, limit),
+
+        // ── v9: SQLite preview, multi-schema ────
+        Request::LoadDbInitialV2 {
+            rel_path,
+            page_size,
+        } => load_db_initial_v2_handler(workdir, &rel_path, page_size),
+        Request::LoadDbPageV2 {
+            rel_path,
+            schema,
+            kind,
+            name,
+            offset,
+            limit,
+        } => load_db_page_v2_handler(workdir, &rel_path, &schema, kind, &name, offset, limit),
+        Request::LoadDbObjectDetail {
+            rel_path,
+            schema,
+            kind,
+            name,
+        } => load_db_object_detail_handler(workdir, &rel_path, &schema, kind, &name),
     };
 
     match result {
@@ -838,6 +858,8 @@ fn column_info_to_dto(c: reef_sqlite_preview::ColumnInfo) -> reef_proto::ColumnI
     reef_proto::ColumnInfoDto {
         name: c.name,
         decl_type: c.decl_type,
+        notnull: c.notnull,
+        pk: c.pk,
     }
 }
 
@@ -864,5 +886,227 @@ fn sqlite_value_to_dto(v: reef_sqlite_preview::SqliteValue) -> reef_proto::Sqlit
         reef_sqlite_preview::SqliteValue::Blob { len } => {
             reef_proto::SqliteValueDto::Blob { len: len as u64 }
         }
+    }
+}
+
+// ── v9: SQLite preview, multi-schema handlers ─────────────────────────────
+
+/// V2 of [`load_db_initial_handler`]. Walks every schema (main/temp/
+/// attached) via `read_initial_v2` and returns the full graph.
+fn load_db_initial_v2_handler(
+    workdir: &Path,
+    rel: &str,
+    page_size: u32,
+) -> Result<serde_json::Value, (ErrorCode, String)> {
+    use reef::backend::BackendError;
+    use reef::backend::local::canonical_child_within;
+    let none_value = || {
+        serde_json::to_value(None::<reef_proto::DatabaseInfoV2Dto>)
+            .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}")))
+    };
+    let abs = match canonical_child_within(workdir, Path::new(rel)) {
+        Ok(p) => p,
+        Err(BackendError::NotFound) => return none_value(),
+        Err(e) => return Err(backend_err(e)),
+    };
+    if !abs.is_file() {
+        return none_value();
+    }
+    if !reef_sqlite_preview::has_sqlite_extension(Path::new(rel)) {
+        return none_value();
+    }
+    match reef_sqlite_preview::probe_magic(&abs) {
+        Ok(false) => return none_value(),
+        Err(e) => return Err((ErrorCode::Io, e.to_string())),
+        Ok(true) => {}
+    }
+    match reef_sqlite_preview::read_initial_v2(&abs, page_size) {
+        Ok(info) => serde_json::to_value(Some(database_info_v2_to_dto(info)))
+            .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
+        Err(e) => Err((ErrorCode::Other, format!("sqlite: {e}"))),
+    }
+}
+
+fn load_db_page_v2_handler(
+    workdir: &Path,
+    rel: &str,
+    schema: &str,
+    kind: reef_proto::DbObjectKindDto,
+    name: &str,
+    offset: u64,
+    limit: u32,
+) -> Result<serde_json::Value, (ErrorCode, String)> {
+    use reef::backend::BackendError;
+    use reef::backend::local::canonical_child_within;
+    let abs = match canonical_child_within(workdir, Path::new(rel)) {
+        Ok(p) => p,
+        Err(BackendError::NotFound) => return Err((ErrorCode::NotFound, "file not found".into())),
+        Err(e) => return Err(backend_err(e)),
+    };
+    if !abs.is_file() {
+        return Err((ErrorCode::NotFound, "not a regular file".into()));
+    }
+    match reef_sqlite_preview::load_page_qualified(
+        &abs,
+        schema,
+        db_object_kind_from_dto(kind),
+        name,
+        offset,
+        limit,
+    ) {
+        Ok(page) => serde_json::to_value(db_page_to_dto(page))
+            .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
+        Err(e) => Err((ErrorCode::Other, format!("sqlite: {e}"))),
+    }
+}
+
+fn load_db_object_detail_handler(
+    workdir: &Path,
+    rel: &str,
+    schema: &str,
+    kind: reef_proto::DbObjectKindDto,
+    name: &str,
+) -> Result<serde_json::Value, (ErrorCode, String)> {
+    use reef::backend::BackendError;
+    use reef::backend::local::canonical_child_within;
+    let abs = match canonical_child_within(workdir, Path::new(rel)) {
+        Ok(p) => p,
+        Err(BackendError::NotFound) => return Err((ErrorCode::NotFound, "file not found".into())),
+        Err(e) => return Err(backend_err(e)),
+    };
+    if !abs.is_file() {
+        return Err((ErrorCode::NotFound, "not a regular file".into()));
+    }
+    match reef_sqlite_preview::read_object_detail_at(
+        &abs,
+        schema,
+        db_object_kind_from_dto(kind),
+        name,
+    ) {
+        Ok(detail) => serde_json::to_value(db_object_detail_to_dto(detail))
+            .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
+        Err(e) => Err((ErrorCode::Other, format!("sqlite: {e}"))),
+    }
+}
+
+fn database_info_v2_to_dto(
+    d: reef_sqlite_preview::DatabaseInfoV2,
+) -> reef_proto::DatabaseInfoV2Dto {
+    reef_proto::DatabaseInfoV2Dto {
+        schemas: d.schemas.into_iter().map(schema_summary_to_dto).collect(),
+        default_schema: d.default_schema,
+        default_object: d.default_object.map(db_object_key_to_dto),
+        initial_page: db_page_to_dto(d.initial_page),
+        bytes_on_disk: d.bytes_on_disk,
+    }
+}
+
+fn schema_summary_to_dto(s: reef_sqlite_preview::SchemaSummary) -> reef_proto::SchemaSummaryDto {
+    reef_proto::SchemaSummaryDto {
+        name: s.name,
+        kind: schema_kind_to_dto(s.kind),
+        file: s.file,
+        objects: s.objects.into_iter().map(db_object_to_dto).collect(),
+        truncated: s.truncated,
+    }
+}
+
+fn db_object_to_dto(o: reef_sqlite_preview::DbObject) -> reef_proto::DbObjectDto {
+    reef_proto::DbObjectDto {
+        schema: o.schema,
+        name: o.name,
+        kind: db_object_kind_to_dto(o.kind),
+        tbl_name: o.tbl_name,
+        row_count: o.row_count,
+        columns: o.columns.into_iter().map(column_info_to_dto).collect(),
+        is_virtual: o.is_virtual,
+        is_without_rowid: o.is_without_rowid,
+        is_strict: o.is_strict,
+    }
+}
+
+fn db_object_key_to_dto(k: reef_sqlite_preview::DbObjectKey) -> reef_proto::DbObjectKeyDto {
+    reef_proto::DbObjectKeyDto {
+        schema: k.schema,
+        name: k.name,
+        kind: db_object_kind_to_dto(k.kind),
+    }
+}
+
+fn db_object_kind_to_dto(k: reef_sqlite_preview::DbObjectKind) -> reef_proto::DbObjectKindDto {
+    match k {
+        reef_sqlite_preview::DbObjectKind::Table => reef_proto::DbObjectKindDto::Table,
+        reef_sqlite_preview::DbObjectKind::View => reef_proto::DbObjectKindDto::View,
+        reef_sqlite_preview::DbObjectKind::Index => reef_proto::DbObjectKindDto::Index,
+        reef_sqlite_preview::DbObjectKind::Trigger => reef_proto::DbObjectKindDto::Trigger,
+    }
+}
+
+fn db_object_kind_from_dto(k: reef_proto::DbObjectKindDto) -> reef_sqlite_preview::DbObjectKind {
+    match k {
+        reef_proto::DbObjectKindDto::Table => reef_sqlite_preview::DbObjectKind::Table,
+        reef_proto::DbObjectKindDto::View => reef_sqlite_preview::DbObjectKind::View,
+        reef_proto::DbObjectKindDto::Index => reef_sqlite_preview::DbObjectKind::Index,
+        reef_proto::DbObjectKindDto::Trigger => reef_sqlite_preview::DbObjectKind::Trigger,
+    }
+}
+
+fn schema_kind_to_dto(k: reef_sqlite_preview::SchemaKind) -> reef_proto::SchemaKindDto {
+    match k {
+        reef_sqlite_preview::SchemaKind::Main => reef_proto::SchemaKindDto::Main,
+        reef_sqlite_preview::SchemaKind::Temp => reef_proto::SchemaKindDto::Temp,
+        reef_sqlite_preview::SchemaKind::Attached => reef_proto::SchemaKindDto::Attached,
+    }
+}
+
+fn db_object_detail_to_dto(
+    d: reef_sqlite_preview::DbObjectDetail,
+) -> reef_proto::DbObjectDetailDto {
+    use reef_sqlite_preview::DbObjectDetail as D;
+    match d {
+        D::Table { create_sql } => reef_proto::DbObjectDetailDto::Table { create_sql },
+        D::View { create_sql } => reef_proto::DbObjectDetailDto::View { create_sql },
+        D::Index {
+            unique,
+            columns,
+            partial_where,
+            tbl_name,
+            create_sql,
+        } => reef_proto::DbObjectDetailDto::Index {
+            unique,
+            columns,
+            partial_where,
+            tbl_name,
+            create_sql,
+        },
+        D::Trigger {
+            timing,
+            event,
+            tbl_name,
+            sql,
+        } => reef_proto::DbObjectDetailDto::Trigger {
+            timing: trigger_timing_to_dto(timing),
+            event: trigger_event_to_dto(event),
+            tbl_name,
+            sql,
+        },
+    }
+}
+
+fn trigger_timing_to_dto(t: reef_sqlite_preview::TriggerTiming) -> reef_proto::TriggerTimingDto {
+    match t {
+        reef_sqlite_preview::TriggerTiming::Before => reef_proto::TriggerTimingDto::Before,
+        reef_sqlite_preview::TriggerTiming::After => reef_proto::TriggerTimingDto::After,
+        reef_sqlite_preview::TriggerTiming::InsteadOf => reef_proto::TriggerTimingDto::InsteadOf,
+        reef_sqlite_preview::TriggerTiming::Unknown => reef_proto::TriggerTimingDto::Unknown,
+    }
+}
+
+fn trigger_event_to_dto(e: reef_sqlite_preview::TriggerEvent) -> reef_proto::TriggerEventDto {
+    match e {
+        reef_sqlite_preview::TriggerEvent::Insert => reef_proto::TriggerEventDto::Insert,
+        reef_sqlite_preview::TriggerEvent::Update => reef_proto::TriggerEventDto::Update,
+        reef_sqlite_preview::TriggerEvent::Delete => reef_proto::TriggerEventDto::Delete,
+        reef_sqlite_preview::TriggerEvent::Unknown => reef_proto::TriggerEventDto::Unknown,
     }
 }

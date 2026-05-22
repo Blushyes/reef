@@ -98,7 +98,7 @@ pub struct ScriptReport {
 ///   random hex chars recommended.
 /// - `download_url_template`: URL with `{version}`, `{platform}`, `{arch}`
 ///   placeholders — e.g.
-///   `"https://github.com/reef-tui/reef/releases/download/v{version}/reef-agent-{platform}-{arch}.tar.gz"`
+///   `"https://github.com/Blushyes/reef/releases/download/v{version}/reef-agent-{platform}-{arch}.tar.gz"`
 ///
 /// The returned string is intended to be passed whole as an argument to
 /// `bash -c '...'` (via ssh). It does not start with a shebang.

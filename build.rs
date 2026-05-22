@@ -7,10 +7,13 @@
 //! release download fails) we fall back to streaming this embedded copy
 //! over ssh via `cat >`. See `src/agent_deploy/upload.rs`.
 //!
-//! The embed is best-effort:
+//! The embed is best-effort by default:
 //!   - On a `cargo build -p reef` where `target/{profile}/reef-agent`
 //!     doesn't exist yet (typical first build), we embed an empty slice
-//!     and the fallback simply surfaces `NoEmbeddedBinaryForArch`.
+//!     and the fallback simply surfaces `NoEmbeddedBinary`.
+//!   - Release builds pass `REEF_EMBEDDED_AGENT=/path/to/reef-agent`
+//!     after building the agent. When that explicit path is missing, the
+//!     build fails instead of publishing a `reef` binary with no fallback.
 //!   - Only the host arch of the machine doing the build is embedded — a
 //!     true multi-arch release ships multiple `reef` binaries via CI,
 //!     each with its own matching agent. Cross-arch deployment targets
@@ -38,15 +41,32 @@ fn main() {
         .ancestors()
         .nth(3)
         .map(Path::to_path_buf);
-    let agent_path = profile_dir.as_ref().map(|p| p.join("reef-agent"));
+    let explicit_agent_path = env::var_os("REEF_EMBEDDED_AGENT")
+        .filter(|value| !value.as_os_str().is_empty())
+        .map(|path| make_absolute(PathBuf::from(path)));
+    let explicit_agent = explicit_agent_path.is_some();
+    let agent_path = explicit_agent_path.or_else(|| {
+        profile_dir
+            .as_ref()
+            .map(|p| p.join(agent_binary_name(&target)))
+    });
 
-    let (agent_repr, had_bytes) = match agent_path.as_ref().filter(|p| p.is_file()) {
-        Some(p) => {
+    let (agent_repr, had_bytes) = match agent_path.as_ref() {
+        Some(p) if p.is_file() => {
             let escaped = p.display().to_string();
             // Use `include_bytes!` with a literal path so cargo's dep tracking
             // picks up changes to the file when it's rebuilt.
             println!("cargo:rerun-if-changed={escaped}");
             (format!("include_bytes!({:?}).as_slice()", p), true)
+        }
+        Some(p) => {
+            println!("cargo:rerun-if-changed={}", p.display());
+            assert!(
+                !explicit_agent,
+                "REEF_EMBEDDED_AGENT points to `{}` but no file exists there",
+                p.display(),
+            );
+            ("&[] as &[u8]".to_string(), false)
         }
         None => ("&[] as &[u8]".to_string(), false),
     };
@@ -72,8 +92,26 @@ fn main() {
         println!(
             "cargo:warning=reef-agent binary not found under target/{{debug,release}}/; \
              `reef --ssh` upload fallback will refuse to run until `cargo build -p reef-agent` \
-             is done first."
+             is done first, or REEF_EMBEDDED_AGENT points at a built agent."
         );
+    }
+}
+
+fn make_absolute(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        env::current_dir()
+            .expect("current dir set by cargo")
+            .join(path)
+    }
+}
+
+fn agent_binary_name(target: &str) -> &'static str {
+    if target.contains("windows") {
+        "reef-agent.exe"
+    } else {
+        "reef-agent"
     }
 }
 

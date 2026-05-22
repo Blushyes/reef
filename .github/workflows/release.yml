@@ -21,26 +21,31 @@ jobs:
             target: aarch64-apple-darwin
             os: macos-14
             bin: reef
+            agent_bin: reef-agent
             use_cross: false
           - platform: darwin-x64
             target: x86_64-apple-darwin
             os: macos-14
             bin: reef
+            agent_bin: reef-agent
             use_cross: false
           - platform: linux-x64
             target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
             bin: reef
+            agent_bin: reef-agent
             use_cross: false
           - platform: linux-arm64
             target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04
             bin: reef
+            agent_bin: reef-agent
             use_cross: true
           - platform: win32-x64
             target: x86_64-pc-windows-msvc
             os: windows-latest
             bin: reef.exe
+            agent_bin: reef-agent.exe
             use_cross: false
     steps:
       - uses: actions/checkout@v4
@@ -74,11 +79,15 @@ jobs:
       - name: Build (cargo)
         if: '!matrix.use_cross'
         run: cargo build --release --locked --target ${{ matrix.target }} -p reef
+        env:
+          REEF_EMBEDDED_AGENT: target/${{ matrix.target }}/release/${{ matrix.agent_bin }}
         shell: bash
 
       - name: Build (cross)
         if: matrix.use_cross
         run: cross build --release --locked --target ${{ matrix.target }} -p reef
+        env:
+          REEF_EMBEDDED_AGENT: target/${{ matrix.target }}/release/${{ matrix.agent_bin }}
         shell: bash
 
       - name: Stage binaries
@@ -86,13 +95,7 @@ jobs:
         run: |
           mkdir -p staged-reef staged-agent
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "staged-reef/${{ matrix.bin }}"
-          # On Windows the agent binary has a `.exe` suffix; everywhere else
-          # it's a plain ELF/Mach-O. Compute once and stage.
-          if [[ "${{ matrix.platform }}" == win32-* ]]; then
-            cp "target/${{ matrix.target }}/release/reef-agent.exe" "staged-agent/reef-agent.exe"
-          else
-            cp "target/${{ matrix.target }}/release/reef-agent" "staged-agent/reef-agent"
-          fi
+          cp "target/${{ matrix.target }}/release/${{ matrix.agent_bin }}" "staged-agent/${{ matrix.agent_bin }}"
 
       - name: Upload reef artifact
         uses: actions/upload-artifact@v4

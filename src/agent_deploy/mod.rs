@@ -53,7 +53,7 @@ pub enum InstallPath {
 /// Default URL template for the GitHub Releases download. Substitutes
 /// `{version}`, `{platform}`, `{arch}` at script-execution time on the
 /// remote host.
-pub const DEFAULT_DOWNLOAD_URL_TEMPLATE: &str = "https://github.com/reef-tui/reef/releases/download/v{version}/reef-agent-{platform}-{arch}.tar.gz";
+pub const DEFAULT_DOWNLOAD_URL_TEMPLATE: &str = "https://github.com/Blushyes/reef/releases/download/v{version}/reef-agent-{platform}-{arch}.tar.gz";
 
 /// Convenience wrapper: connect to `host`, ensure `reef-agent` of the
 /// current `reef` version is installed, return where it lives.
@@ -320,3 +320,16 @@ impl std::fmt::Display for DeployError {
 }
 
 impl std::error::Error for DeployError {}
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULT_DOWNLOAD_URL_TEMPLATE;
+
+    #[test]
+    fn default_download_url_points_at_release_repo() {
+        assert_eq!(
+            DEFAULT_DOWNLOAD_URL_TEMPLATE,
+            "https://github.com/Blushyes/reef/releases/download/v{version}/reef-agent-{platform}-{arch}.tar.gz"
+        );
+    }
+}

@@ -7,6 +7,7 @@ pub mod file_preview_panel;
 pub mod file_tree_panel;
 pub mod find_widget_panel;
 pub mod focus;
+pub mod focused_preview_panel;
 pub mod git_graph_panel;
 pub mod git_status_panel;
 pub mod global_search_panel;
@@ -65,6 +66,16 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // draw it.
     if app.view_mode == ViewMode::Settings {
         settings_panel::render(f, app, size);
+        return;
+    }
+
+    // FocusedPreview ("纯预览") is also a full-screen takeover —
+    // strip the tab bar / sidebar / status chrome and give the entire
+    // frame to the active tab's content panel. Implementation lives in
+    // `focused_preview_panel`; we still draw a 1-row bottom hint so
+    // the Esc affordance is always visible.
+    if app.view_mode == ViewMode::FocusedPreview {
+        focused_preview_panel::render(f, app, size);
         return;
     }
 
@@ -842,6 +853,7 @@ fn render_help(f: &mut Frame, app: &App, screen: Rect) {
         ("Ctrl+,", t(Msg::HelpOpenSettings)),
         ("Space p", t(Msg::HelpQuickOpen)),
         ("Space f", t(Msg::HelpGlobalSearch)),
+        ("Space v", t(Msg::HelpFocusedPreview)),
         (t(Msg::HelpKeyDragDrop), t(Msg::HelpDragDrop)),
         ("F2", t(Msg::HelpRenameEntry)),
         ("d / Del / ⌫", t(Msg::HelpDeleteEntry)),

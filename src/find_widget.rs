@@ -185,13 +185,19 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             return;
         }
         input::LeaderVerdict::Fire => {
+            // `leader_decision` Fires on any chord target (p/f/h/v). The
+            // widget's identity is Space+F — only that closes. For
+            // other chord letters we used to `return` here, which
+            // silently dropped the user's keystroke (`v` after Space
+            // typed into an empty query just vanished). Treat them as
+            // Consume instead so the literal char falls through to the
+            // input-dispatch arm and appends to the query buffer.
             app.find_widget.space_leader_at = None;
-            // Plain Space+F closes the widget; other chord targets are
-            // swallowed so the palette behaves like other overlays.
             if key.code == KeyCode::Char('f') && !ctrl && !alt {
                 close(app);
+                return;
             }
-            return;
+            // Fall through — non-F chord lands in the input handler.
         }
         input::LeaderVerdict::Consume => {
             app.find_widget.space_leader_at = None;

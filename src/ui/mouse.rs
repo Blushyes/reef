@@ -137,6 +137,19 @@ pub enum ClickAction {
     /// `ConfirmModal`. Fires `on_cancel` (usually a no-op) and clears
     /// the modal.
     ConfirmModalCancel,
+
+    // ── FocusedPreview floating file picker ──
+    /// Click the ☰ chip in the upper-left of the focused-preview body.
+    /// Toggles the changed-files popup open/closed.
+    ToggleFocusedPreviewFiles,
+    /// Click a row inside the focused-preview file picker. `usize`
+    /// indexes into the entries returned by `App::focused_preview_file_entries`.
+    /// Switches the active diff target and closes the popup.
+    PickFocusedPreviewFile(usize),
+    /// Catch-all click outside the open focused-preview file picker.
+    /// Registered panel-wide underneath the popup so a stray click
+    /// dismisses it without affecting the diff underneath.
+    CloseFocusedPreviewFiles,
 }
 
 #[derive(Debug, Clone)]

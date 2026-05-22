@@ -83,11 +83,17 @@ pub fn leader_decision(
     // uppercase char.
     let is_lower_chord = matches!(
         key.code,
-        KeyCode::Char('p') | KeyCode::Char('f') | KeyCode::Char('h')
+        KeyCode::Char('p')
+            | KeyCode::Char('f')
+            | KeyCode::Char('h')
+            | KeyCode::Char('v')
     ) && key.modifiers.is_empty();
     let is_upper_chord = matches!(
         key.code,
-        KeyCode::Char('P') | KeyCode::Char('F') | KeyCode::Char('H')
+        KeyCode::Char('P')
+            | KeyCode::Char('F')
+            | KeyCode::Char('H')
+            | KeyCode::Char('V')
     ) && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT);
     let is_chord_target = is_lower_chord || is_upper_chord;
 
@@ -248,6 +254,22 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         return;
     }
 
+    // FocusedPreview ("纯预览") strips chrome and gives the whole frame
+    // to the active panel. Only a tiny key set is meaningful inside:
+    // Esc / q exit, Ctrl+C still quits, and a handful of nav keys fall
+    // through to the normal dispatcher so scroll/search continue to
+    // work on the visible diff/preview.
+    if app.view_mode == ViewMode::FocusedPreview {
+        if handle_key_focused_preview(key, app) {
+            return;
+        }
+        // Fallthrough lets navigation/scroll/search keys (↑/↓/PgUp/
+        // PgDn/Home/End/←/→/j/k/g/G/n/N/m/f/`/` etc.) keep their
+        // normal meaning against the visible panel. The Space-leader
+        // chord above already ran for any key reaching here, and
+        // overlays would have early-returned earlier in this fn.
+    }
+
     // Space-leader chord: bare Space primes, bare `p` opens the quick-open
     // palette, bare `f` opens the global-search palette. Bare Space has no
     // other global meaning, so the chord doesn't collide with any existing
@@ -316,6 +338,11 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
                     app.global_search.replace_open = true;
                     app.global_search.focus = crate::global_search::SearchPanelFocus::ReplaceInput;
                 }
+                // Space+V: 纯预览 toggle — maximise the active tab's
+                // content panel (file preview on Files/Search, diff on
+                // Git/Graph) from Main; exit back to Main if already
+                // focused. Esc inside the mode also exits.
+                KeyCode::Char('v') | KeyCode::Char('V') => app.toggle_focused_preview(),
                 _ => {}
             }
             return;
@@ -606,6 +633,171 @@ fn handle_key_db_goto(key: KeyEvent, app: &mut App) {
 ///   selection cursor; Enter cycles the selected enum / toggles the
 ///   selected bool, or opens the inline text editor for the
 ///   `editor.command` row; Esc closes the page.
+/// 纯预览模式的早期闸门 —— 拦截退出语义 + 文件 picker 相关按键。
+/// 返回 `true` 表示已消费,调用方应当 return;返回 `false` 表示让按键继续
+/// 走正常分发,这样↑↓/PgUp/PgDn/jk/`/`/n/N 等滚动 + 搜索键仍对全屏的
+/// preview/diff 面板有效。
+///
+/// picker open 时本闸门**完全接管**按键 —— ↑↓ 选行,Enter 确认,Esc/o
+/// 关闭。这样 picker 期间用户不会意外滚到 diff 上去。
+fn handle_key_focused_preview(key: KeyEvent, app: &mut App) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    // Picker fully owns the keyboard while open.
+    if app.focused_preview_files_open {
+        match key.code {
+            KeyCode::Esc => {
+                app.close_focused_preview_files();
+                return true;
+            }
+            KeyCode::Char('c') if ctrl => {
+                app.should_quit = true;
+                return true;
+            }
+            KeyCode::Up | KeyCode::Char('k') if !ctrl => {
+                app.move_focused_preview_files_selection(-1);
+                return true;
+            }
+            KeyCode::Down | KeyCode::Char('j') if !ctrl => {
+                app.move_focused_preview_files_selection(1);
+                return true;
+            }
+            KeyCode::PageUp | KeyCode::Home => {
+                app.focused_preview_files_selected = 0;
+                return true;
+            }
+            KeyCode::PageDown | KeyCode::End => {
+                let len = app.focused_preview_file_entries().len();
+                app.focused_preview_files_selected = len.saturating_sub(1);
+                return true;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                app.confirm_focused_preview_files_selection();
+                return true;
+            }
+            KeyCode::Char('o') | KeyCode::Char('O') if !ctrl => {
+                app.close_focused_preview_files();
+                return true;
+            }
+            // While picker is up, swallow everything else so accidental
+            // keystrokes can't scroll the diff out from under the popup.
+            _ => return true,
+        }
+    }
+
+    // Explicit handling for FocusedPreview-specific actions.
+    match key.code {
+        KeyCode::Esc => {
+            app.close_focused_preview();
+            return true;
+        }
+        // Bare q quits reef (same convention as Settings / place mode
+        // takeovers). Ctrl+C is the universal quit and is intentionally
+        // handled here too so the user can bail without first Esc'ing.
+        KeyCode::Char('q') if !ctrl => {
+            app.should_quit = true;
+            return true;
+        }
+        KeyCode::Char('c') if ctrl => {
+            app.should_quit = true;
+            return true;
+        }
+        // `o` opens the floating file picker — scoped to focused preview
+        // only (not a global binding), and only where the picker is
+        // actually rendered (Git tab + Graph 3-col). Mirror the
+        // render-side `chip_layout_ok` gate so keyboard and visual
+        // states agree; otherwise pressing `o` on Graph 2-col would
+        // open a picker the renderer refuses to draw and the keyboard
+        // would freeze against an invisible selection.
+        KeyCode::Char('o') | KeyCode::Char('O')
+            if !ctrl
+                && app.space_leader_at.is_none()
+                && app.focused_preview_chip_visible() =>
+        {
+            app.toggle_focused_preview_files();
+            return true;
+        }
+        // Ctrl+, would otherwise reach the global keymap and call
+        // open_settings(), stomping view_mode from FocusedPreview to
+        // Settings — and close_settings always returns to Main, so the
+        // user would lose the 纯预览 context entirely. Swallow here.
+        KeyCode::Char(',') if ctrl => return true,
+        // Ctrl+O would open the hosts picker overlay — swallow for the
+        // same "don't lose 纯预览 context" reason. The user can Esc
+        // first if they really want to swap sessions.
+        KeyCode::Char('o') if ctrl => return true,
+        // Bare v / V — eat it so tab-specific bindings (Graph visual
+        // mode on V, etc.) don't fire against a hidden panel.
+        // Exception: when a Space leader is armed we must fall through
+        // so the chord can reach `leader_decision` →
+        // toggle_focused_preview() and exit.
+        KeyCode::Char('v') | KeyCode::Char('V')
+            if !ctrl && app.space_leader_at.is_none() =>
+        {
+            return true;
+        }
+        _ => {}
+    }
+
+    // Allowlist for falling through to per-tab handlers. The fallthrough
+    // path runs `handle_key_git` / `handle_key_files` etc. without any
+    // view_mode guard, and those handlers have *destructive* bindings on
+    // bare letters: `s/u` stage/unstage, `d` discard, `t/r` toggles,
+    // F2/Delete/Backspace rename/trash. None of those make sense while
+    // the user is "just looking" at a maximised preview — and the tree/
+    // status row they'd act on is invisible, so the action would land on
+    // a row the user can't even see.
+    //
+    // The whitelist below is intentionally narrow: scroll + h-scroll +
+    // search + diff layout/mode + SQLite navigation + readline nav. Any
+    // key not in here is swallowed (`return true`). Add to this list
+    // sparingly — every new entry has to be safe against firing from
+    // an invisible tree/status row.
+    let bare_allowed = !ctrl
+        && !key.modifiers.contains(KeyModifiers::ALT)
+        && matches!(
+            key.code,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::Char(
+                    'j' | 'k'      // vim vertical
+                    | 'h'          // help popup (FocusedPreview is in the
+                                   // takeover list now, so the next key
+                                   // reaches us, not "dismiss help")
+                    | '?' | '/'    // search prompt
+                    | 'n' | 'N'    // search step
+                    | 'm' | 'f'    // diff layout / diff mode toggles
+                    | '[' | ']'    // SQLite preview: prev/next table
+                    | 'g' | 'G',   // SQLite preview: goto-page; vim top/bottom
+                )
+        );
+    // Ctrl-prefixed nav aliases that the per-tab handlers honor and
+    // that are safe in FocusedPreview.
+    let ctrl_allowed = ctrl
+        && matches!(
+            key.code,
+            KeyCode::Char(
+                'p' | 'n'      // readline up/down
+                | 'j' | 'k'    // vim-style with ctrl
+                | 'f'          // VSCode-style find widget
+                | 'b'          // sidebar toggle (no-op visually in
+                               // FocusedPreview but harmless)
+            )
+        );
+
+    if bare_allowed || ctrl_allowed {
+        false // continue normal dispatch — scroll / search / diff toggles
+    } else {
+        true // swallow — destructive or modal-opening key
+    }
+}
+
 /// - **Editor-command edit mode** (`app.settings.editor_edit.is_some()`):
 ///   typing fills the buffer, Enter commits, Esc cancels and reverts.
 ///
@@ -2222,6 +2414,27 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
         return;
     }
 
+    // FocusedPreview chip / picker mouse intercept — sits in front of
+    // the preview/diff drag-select fast-paths because the chip is
+    // painted on top of the diff rect (col 0..3, row 0). Without this,
+    // a click on the chip falls into `handle_diff_selection`'s
+    // point_in_rect gate and starts a text-selection drag instead of
+    // toggling the file picker. Mirror of the find-widget intercept
+    // a few lines up.
+    if app.view_mode == crate::app::ViewMode::FocusedPreview
+        && let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+        && let Some(action) = app.hit_registry.hit_test(mouse.column, mouse.row)
+        && matches!(
+            action,
+            ui::mouse::ClickAction::ToggleFocusedPreviewFiles
+                | ui::mouse::ClickAction::PickFocusedPreviewFile(_)
+                | ui::mouse::ClickAction::CloseFocusedPreviewFiles
+        )
+    {
+        app.handle_action(action);
+        return;
+    }
+
     // Preview drag-selection fast-path. Owns Down/Drag/Up(Left) when the
     // gesture starts inside the preview panel. Scroll wheel, right-click,
     // and Down outside the panel fall through to the normal match below.
@@ -3120,6 +3333,72 @@ impl ScrollPacer {
 /// h-scrolls (the results list) — other tabs' left panels are tree/list
 /// widgets with no long horizontal content.
 fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: i32) {
+    // FocusedPreview collapses the layout to a single content column;
+    // SBS halves still split the diff width, but they start at x=0 now
+    // (no sidebar) so the cursor-side math has to use the full width.
+    if app.view_mode == crate::app::ViewMode::FocusedPreview {
+        match app.active_tab {
+            Tab::Files | Tab::Search => apply_scroll_delta(&mut app.preview_h_scroll, delta),
+            Tab::Git => match app.diff_layout {
+                crate::app::DiffLayout::Unified => {
+                    apply_scroll_delta(&mut app.diff_h_scroll, delta)
+                }
+                crate::app::DiffLayout::SideBySide => {
+                    if sbs_cursor_on_left(0, total_width, column) {
+                        apply_scroll_delta(&mut app.sbs_left_h_scroll, delta)
+                    } else {
+                        apply_scroll_delta(&mut app.sbs_right_h_scroll, delta)
+                    }
+                }
+            },
+            Tab::Graph => {
+                if app.graph_uses_three_col() {
+                    match app.commit_detail.diff_layout {
+                        crate::app::DiffLayout::Unified => {
+                            apply_scroll_delta(&mut app.commit_detail.file_diff_h_scroll, delta)
+                        }
+                        crate::app::DiffLayout::SideBySide => {
+                            if sbs_cursor_on_left(0, total_width, column) {
+                                apply_scroll_delta(
+                                    &mut app.commit_detail.file_diff_sbs_left_h_scroll,
+                                    delta,
+                                )
+                            } else {
+                                apply_scroll_delta(
+                                    &mut app.commit_detail.file_diff_sbs_right_h_scroll,
+                                    delta,
+                                )
+                            }
+                        }
+                    }
+                } else {
+                    // 2-col fallback — commit_detail panel renders inline diff
+                    // and tracks pan via `diff_h_scroll` (SBS uses the same
+                    // sbs_left/right_h_scroll fields the keyboard handler does).
+                    match app.commit_detail.diff_layout {
+                        crate::app::DiffLayout::Unified => {
+                            apply_scroll_delta(&mut app.commit_detail.diff_h_scroll, delta)
+                        }
+                        crate::app::DiffLayout::SideBySide => {
+                            if sbs_cursor_on_left(0, total_width, column) {
+                                apply_scroll_delta(
+                                    &mut app.commit_detail.sbs_left_h_scroll,
+                                    delta,
+                                )
+                            } else {
+                                apply_scroll_delta(
+                                    &mut app.commit_detail.sbs_right_h_scroll,
+                                    delta,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     // Use the shared sidebar clamp so this matches `ui::render` even when
     // `split_percent` lives near its edges on narrow terminals.
     let split_x = app.graph_sidebar_width(total_width);
@@ -3212,6 +3491,27 @@ fn dispatch_vertical_scroll<B: Backend>(
     }
     app.vertical_scroll_lock.observe();
     let step_i = sign * (app.vertical_scroll_pacer.step() as i32);
+
+    // FocusedPreview collapses the layout to a single content column —
+    // the sidebar / commit middle column are hidden, so the usual
+    // `is_left = column < graph_sidebar_width` heuristic would mis-route
+    // wheel scrolls in the leftmost ~30 cols to the hidden tree/status.
+    // Route directly to the panel that 纯预览 actually renders.
+    if app.view_mode == crate::app::ViewMode::FocusedPreview {
+        match app.active_tab {
+            Tab::Files | Tab::Search => apply_scroll_delta(&mut app.preview_scroll, step_i),
+            Tab::Git => apply_scroll_delta(&mut app.diff_scroll, step_i),
+            Tab::Graph => {
+                if app.graph_uses_three_col() {
+                    apply_scroll_delta(&mut app.commit_detail.file_diff_scroll, step_i);
+                } else {
+                    ui::commit_detail_panel::scroll(app, step_i);
+                }
+            }
+        }
+        return;
+    }
+
     // Use the shared clamp + sidebar-hidden short-circuit so wheel
     // routing lines up with hit-testing. With sidebar hidden
     // `graph_sidebar_width` returns 0 and `is_left` never fires.

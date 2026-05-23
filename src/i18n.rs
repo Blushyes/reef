@@ -219,6 +219,16 @@ pub enum Msg {
     SidebarHiddenHint,
     HelpAnyKey,
 
+    // 纯预览 / FocusedPreview
+    /// Bottom-row hint shown while ViewMode::FocusedPreview is active.
+    FocusedPreviewHint,
+    /// Help-popup row describing the `Space v` chord.
+    HelpFocusedPreview,
+    /// Header row of the floating file picker — Git tab variant.
+    FocusedPreviewPickerHeaderGit,
+    /// Header row of the floating file picker — Graph (commit) variant.
+    FocusedPreviewPickerHeaderCommit,
+
     // Status bar panel-focus chip — short labels for the right-aligned
     // indicator showing which panel currently owns focus.
     PanelFiles,
@@ -400,6 +410,10 @@ fn t_zh(m: Msg) -> &'static str {
         HelpEscBackOut => "退出焦点 / 清除搜索",
         SidebarHiddenHint => "侧边栏已隐藏 — Ctrl+B 可恢复",
         HelpAnyKey => "关闭帮助",
+        FocusedPreviewHint => " 纯预览 · Esc 退出 · ↑↓ 滚动 ",
+        HelpFocusedPreview => "纯预览当前文件 / Diff（Esc 退出）",
+        FocusedPreviewPickerHeaderGit => " 改动文件 (Git) ",
+        FocusedPreviewPickerHeaderCommit => " 改动文件 (Commit) ",
         PanelFiles => "文件",
         PanelPreview => "预览",
         PanelCommit => "提交",
@@ -570,6 +584,10 @@ fn t_en(m: Msg) -> &'static str {
         HelpEscBackOut => "Exit focus / clear search",
         SidebarHiddenHint => "Sidebar hidden — Ctrl+B to restore",
         HelpAnyKey => "Close help",
+        FocusedPreviewHint => " Focused preview · Esc to exit · ↑↓ scroll ",
+        HelpFocusedPreview => "Focused preview of current file / diff (Esc exits)",
+        FocusedPreviewPickerHeaderGit => " Changed files (Git) ",
+        FocusedPreviewPickerHeaderCommit => " Changed files (Commit) ",
         PanelFiles => "Files",
         PanelPreview => "Preview",
         PanelCommit => "Commit",

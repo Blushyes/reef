@@ -458,16 +458,17 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             return;
         }
         crate::input::LeaderVerdict::Fire => {
+            // `leader_decision` Fires on any chord target (p/f/h/v).
+            // Only Space+Shift+F is OUR own toggle — anything else is
+            // a stray Space + chord-letter inside an empty query, and
+            // the right thing is to let the literal char fall through
+            // to the input-append arm rather than silently swallow it.
             app.global_search.space_leader_at = None;
-            // Only close when the follow-up matches OUR chord target — the
-            // palette's open chord moved to `Space+Shift+F`, so `Char('F')`
-            // is now the only key that toggles us off. Lower-case `f`
-            // (Space+F) is in-panel find and doesn't belong to this
-            // overlay; other chord targets fall through quietly.
             if key.code == KeyCode::Char('F') && !ctrl && !alt {
                 app.global_search.active = false;
+                return;
             }
-            return;
+            // Fall through — non-Shift-F chord lands in the input handler.
         }
         crate::input::LeaderVerdict::Consume => {
             app.global_search.space_leader_at = None;

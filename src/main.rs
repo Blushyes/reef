@@ -93,7 +93,10 @@ fn print_usage() {
     eprintln!();
     eprintln!("USAGE:");
     eprintln!("    reef                            # open cwd with local backend");
-    eprintln!("    reef <PATH>                     # open PATH (supports ~/)");
+    eprintln!("    reef <DIR>                      # open DIR (supports ~/)");
+    eprintln!(
+        "    reef <FILE>                     # open FILE's parent dir, drop straight into 纯预览"
+    );
     eprintln!(
         "    reef --ssh user@host            # open remote HOME on host (agent auto-installed)"
     );
@@ -132,15 +135,65 @@ fn expand_tilde(raw: &str) -> Result<PathBuf, String> {
 }
 
 /// Resolve a user-supplied local path: expand `~/`, make absolute,
-/// verify it exists and is a directory.
-fn resolve_local_path(raw: &str) -> Result<PathBuf, String> {
+/// verify it exists. `Dir` opens normally; `File` opens the smallest
+/// containing context (repo root if any, file's parent otherwise) and
+/// remembers the workdir-relative path so the caller can drop straight
+/// into FocusedPreview against it (the `reef <file>` quick-look path).
+enum ResolvedPath {
+    Dir(PathBuf),
+    /// File quick-look. `workdir` is set so the Files tab + Git
+    /// tab see the enclosing repo (when present); `rel` is the
+    /// path relative to `workdir`.
+    File {
+        workdir: PathBuf,
+        rel: PathBuf,
+    },
+}
+
+fn resolve_local_path(raw: &str) -> Result<ResolvedPath, String> {
     let expanded = expand_tilde(raw)?;
     let canonical =
         std::fs::canonicalize(&expanded).map_err(|e| format!("cannot open `{raw}`: {e}"))?;
-    if !canonical.is_dir() {
-        return Err(format!("`{raw}` is not a directory"));
+    if canonical.is_dir() {
+        return Ok(ResolvedPath::Dir(canonical));
     }
-    Ok(canonical)
+    if canonical.is_file() {
+        let parent = canonical
+            .parent()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| format!("`{raw}` has no parent directory"))?;
+        // Prefer the enclosing repo root as the workdir so the file
+        // tree + Git tab show the right scope. `Repository::discover`
+        // walks upward looking for `.git`; if none is found we fall
+        // back to the file's immediate parent (loose-file viewing).
+        let workdir = match git2::Repository::discover(&parent) {
+            Ok(repo) => repo
+                .workdir()
+                .map(|p| p.to_path_buf())
+                // Bare repos have no workdir — useless for file
+                // viewing, fall back to the file's parent.
+                .unwrap_or(parent.clone()),
+            Err(_) => parent.clone(),
+        };
+        // `canonical` is absolute; `workdir` is also absolute. Their
+        // shared prefix should always be `workdir` because workdir is
+        // either an ancestor (repo case) or the immediate parent
+        // (loose case). strip_prefix returning Err here means the
+        // discover walked past `canonical`'s ancestor chain, which
+        // canonicalize ensures can't happen for honest filesystems —
+        // fall back to just the file name in the defensive arm.
+        let rel = canonical
+            .strip_prefix(&workdir)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| {
+                canonical
+                    .file_name()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(raw))
+            });
+        return Ok(ResolvedPath::File { workdir, rel });
+    }
+    Err(format!("`{raw}` is neither a file nor a directory"))
 }
 
 /// Split a `[user@]host[:path]` target. Returns `(host_with_user, path)`;
@@ -193,6 +246,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build the backend before terminal setup so any spawn failure surfaces
     // as a normal error (stderr) rather than painting half-initialised on
     // the alt-screen.
+    //
+    // `pending_preview_file` is the relative filename to drop straight into
+    // 纯预览 once the first `App` boots — only set on the `reef <file>`
+    // quick-look path. Carries across the outer 'session loop only on the
+    // very first iteration (subsequent SSH hops shouldn't replay it).
+    let mut pending_preview_file: Option<PathBuf> = None;
     let mut backend: Arc<dyn Backend> = if let Some(target) = parsed.ssh_target.as_deref() {
         Arc::new(build_ssh_backend(target)?)
     } else if let Some(spec) = parsed.agent_exec.as_deref() {
@@ -204,9 +263,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else if let Some(raw) = parsed.path.as_deref() {
         // Switch the process cwd so spawned subprocesses ($EDITOR, git hooks)
         // inherit the same workdir — matches reef-agent's --workdir path.
-        let workdir = resolve_local_path(raw)?;
-        std::env::set_current_dir(&workdir)?;
-        Arc::new(LocalBackend::open_at(workdir))
+        match resolve_local_path(raw)? {
+            ResolvedPath::Dir(workdir) => {
+                std::env::set_current_dir(&workdir)?;
+                Arc::new(LocalBackend::open_at(workdir))
+            }
+            ResolvedPath::File { workdir, rel } => {
+                // Quick-look path: anchor at the enclosing repo root
+                // (or the file's parent when no repo is found, per
+                // resolve_local_path's discover logic). `rel` is the
+                // path relative to that workdir — Files tab tree + Git
+                // tab status both anchor on workdir so the user sees
+                // the file in its repo context, not just a subdir.
+                std::env::set_current_dir(&workdir)?;
+                pending_preview_file = Some(rel);
+                Arc::new(LocalBackend::open_at(workdir))
+            }
+        }
     } else {
         Arc::new(LocalBackend::open_cwd()?)
     };
@@ -260,6 +333,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // — they came here trying to connect to *something*.
             app.open_hosts_picker();
         }
+        // `reef <file>` quick-look: reveal the file in the freshly-built
+        // tree and enter 纯预览 immediately. Consumed on first iteration
+        // so an SSH session swap doesn't try to replay it against a
+        // remote tree that doesn't have the path.
+        if let Some(file) = pending_preview_file.take() {
+            app.enter_focused_preview_with_file(file);
+        }
 
         // Main loop
         loop {
@@ -299,7 +379,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             || app.global_search.active
                             || app.hosts_picker.active
                             || app.view_mode == ViewMode::Settings
+                            || app.view_mode == ViewMode::FocusedPreview
                         {
+                            // Full-screen takeovers + overlays own every key,
+                            // including the would-be "dismiss help" path:
+                            // otherwise a stray j/k inside FocusedPreview
+                            // after `h` would close help instead of reaching
+                            // handle_key_focused_preview's nav fallthrough.
                             input::handle_key(key, &mut app);
                         } else if app.show_help {
                             app.show_help = false;

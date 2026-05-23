@@ -209,9 +209,20 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             return;
         }
         crate::input::LeaderVerdict::Fire => {
+            // `leader_decision` Fires on *any* chord target (p/f/h/v).
+            // But quick-open's chord identity is Space+P — only that
+            // pair should toggle the palette closed. For other chord
+            // letters (`v` from FocusedPreview, `h` from help, etc.)
+            // the user pressed Space-then-letter while the palette
+            // happened to be empty; we don't want to swallow it. Treat
+            // those as Consume so the literal char still appends to the
+            // query below.
             app.quick_open.space_leader_at = None;
-            app.quick_open.active = false;
-            return;
+            if matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P')) {
+                app.quick_open.active = false;
+                return;
+            }
+            // Fall through — non-P chord lands in the char-append arm.
         }
         crate::input::LeaderVerdict::Consume => {
             app.quick_open.space_leader_at = None;

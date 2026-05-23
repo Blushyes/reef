@@ -162,10 +162,16 @@ const PREFETCH_DELAY: Duration = Duration::from_millis(300);
 /// `Settings` is a full-screen takeover that hides the tab bar; the
 /// background work coordinator keeps running so the four-tab snapshots
 /// are fresh on return.
+///
+/// `FocusedPreview` is the "纯预览" mode — same full-screen takeover
+/// pattern as Settings, but the body is the active tab's preview/diff
+/// panel maximised. Entered via `Space+V` or `reef <file>` from CLI;
+/// Esc returns to `Main`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
     Main,
     Settings,
+    FocusedPreview,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +214,23 @@ pub enum Panel {
     /// 右列,通常是 diff 或 preview。Graph tab 三列模式下指最右侧
     /// 的 diff 栏;二列模式下是 commit detail(含内联 diff)。
     Diff,
+}
+
+/// 一行 changed-file 数据,FocusedPreview 文件 picker 用来渲染 + 派发。
+/// 数据源由 [`FocusedPreviewFileSource`] 标注:同样的文件名在 Git tab
+/// 可能同时出现在 staged + unstaged,跟 reef 内部其它面板一致地视作两行。
+#[derive(Debug, Clone)]
+pub struct FocusedPreviewFileRow {
+    pub path: String,
+    pub status: char,
+    pub source: FocusedPreviewFileSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusedPreviewFileSource {
+    GitStaged,
+    GitUnstaged,
+    GraphCommit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -500,6 +523,12 @@ pub struct App {
 
     pub view_mode: ViewMode,
     pub settings: crate::settings::SettingsState,
+
+    /// FocusedPreview 左上角 ☰ 按钮触发的悬浮文件 picker。`open` 控制
+    /// 弹窗显示;`selected` 是高亮行的索引,指向 `focused_preview_file_entries`
+    /// 返回的扁平 Vec。
+    pub focused_preview_files_open: bool,
+    pub focused_preview_files_selected: usize,
 
     // ── Git tab state ──
     pub staged_files: Vec<FileEntry>,
@@ -1026,6 +1055,8 @@ impl App {
             active_panel: Panel::Files,
             view_mode: ViewMode::Main,
             settings: crate::settings::SettingsState::default(),
+            focused_preview_files_open: false,
+            focused_preview_files_selected: 0,
             staged_files: Vec::new(),
             unstaged_files: Vec::new(),
             selected_file: None,
@@ -4204,6 +4235,269 @@ impl App {
         self.settings.editor_edit = None;
     }
 
+    /// Enter "pure preview" (纯预览) — the active tab's preview/diff
+    /// panel takes the whole screen. On entry we move `active_panel`
+    /// onto the content column so scroll keys route the right way;
+    /// `ui::render` decides what to show based on `active_tab`. Esc
+    /// flips `view_mode` back to `Main`.
+    ///
+    /// No-op when not in `Main`. Doesn't validate that there's
+    /// something to show — an empty/loading preview is a normal state
+    /// to render, just maximised.
+    pub fn enter_focused_preview(&mut self) {
+        if self.view_mode != ViewMode::Main {
+            return;
+        }
+        // Pick the panel that owns the content column for this tab. The
+        // Graph tab in 2-col mode draws its inline diff via the Commit
+        // panel; everywhere else the Diff panel is the content column.
+        self.active_panel = match self.active_tab {
+            Tab::Graph if !self.graph_uses_three_col() => Panel::Commit,
+            _ => Panel::Diff,
+        };
+        self.view_mode = ViewMode::FocusedPreview;
+    }
+
+    /// CLI entry point — `reef <file>` lands here after the workdir
+    /// has been opened at the file's parent (or the repo root, when
+    /// the file is inside a git repo — see `resolve_local_path`).
+    /// Drops straight into FocusedPreview against the given
+    /// workdir-relative path.
+    ///
+    /// Race-fix history: `App::new_with_backend` already fires an
+    /// async `refresh_file_tree` with an *empty* `selected_path`
+    /// snapshot. A naïve "reveal then dispatch_preview_load" would
+    /// lose the race — the worker comes back with `selected_idx = 0`,
+    /// `replace_entries` overwrites our selection, and the post-rebuild
+    /// `before != after` check fires a second `load_preview()` that
+    /// clobbers the in-flight foo.rs preview with whatever entries[0]
+    /// happens to be (often README.md).
+    ///
+    /// Fix: re-fire `refresh_file_tree_with_target(Some(rel))`
+    /// *after* setting the expanded ancestors via `reveal`. The new
+    /// task supersedes the prior one (generation bump), the worker
+    /// now captures the right `selected_path` snapshot, and
+    /// `apply_worker_result`'s eventual `load_preview()` for the
+    /// post-rebuild selection lands on the same `rel` path — same
+    /// path means dedupe at the dispatch layer (or a benign redundant
+    /// load against the file we actually want).
+    pub fn enter_focused_preview_with_file(&mut self, rel: PathBuf) {
+        self.set_active_tab(Tab::Files);
+        // Expand ancestor directories so the row is visible once the
+        // tree task lands. `reveal` no-ops the selection move on empty
+        // entries but always populates `self.expanded` — and the new
+        // refresh_file_tree_with_target call below reads from
+        // `file_tree.expanded_paths()` at dispatch time, so the
+        // expanded ancestors do reach the worker.
+        self.file_tree.reveal(&rel);
+        // Supersede the App::new tree task with one that knows the
+        // target path. The worker uses this to pin `selected_idx` and
+        // skips the wrong-file post-rebuild preview load.
+        self.refresh_file_tree_with_target(Some(rel.clone()));
+        // Start the preview immediately so the maximised panel isn't
+        // blank during the (~10ms) tree-rebuild window.
+        self.preview_schedule = None;
+        self.prefetch_schedule = None;
+        self.dispatch_preview_load(rel);
+        self.enter_focused_preview();
+    }
+
+    pub fn close_focused_preview(&mut self) {
+        if self.view_mode != ViewMode::FocusedPreview {
+            return;
+        }
+        self.view_mode = ViewMode::Main;
+        // Defensive: clear picker state so a future view_mode escape
+        // path (toast-driven, fatal-error overlay, etc.) that bypasses
+        // close_focused_preview_files can't leave the bool stuck `true`
+        // and re-paint the picker the next time the user enters
+        // FocusedPreview on a different tab. Today every reachable
+        // close path already runs close_focused_preview_files first,
+        // but the invariant is implicit — make it explicit here.
+        self.focused_preview_files_open = false;
+        self.focused_preview_files_selected = 0;
+    }
+
+    /// Space+V routing: enter from Main, exit from FocusedPreview.
+    /// No-op while Settings owns the screen so a stray chord can't
+    /// silently discard an in-progress settings edit.
+    pub fn toggle_focused_preview(&mut self) {
+        match self.view_mode {
+            ViewMode::Main => self.enter_focused_preview(),
+            ViewMode::FocusedPreview => self.close_focused_preview(),
+            ViewMode::Settings => {}
+        }
+    }
+
+    /// Shared gate for the ☰ chip + file picker: whether the chip
+    /// affordance is visually present right now. The renderer in
+    /// `focused_preview_panel::render` checks this, and the input
+    /// handler's `o` key shortcut checks the same predicate so the
+    /// two states never disagree (the original bug had keyboard
+    /// opening a picker the renderer refused to draw on Graph 2-col).
+    ///
+    /// Graph 2-col uses `commit_detail_panel`'s header (commit
+    /// metadata + inline files tree), which doesn't match the
+    /// `path_display + tag_str` layout the chip's wash math assumes —
+    /// so the chip is deliberately not rendered there, and the `o`
+    /// shortcut likewise no-ops.
+    pub fn focused_preview_chip_visible(&self) -> bool {
+        if !self.backend.has_repo() {
+            return false;
+        }
+        match self.active_tab {
+            Tab::Git => true,
+            Tab::Graph => self.graph_uses_three_col(),
+            _ => false,
+        }
+    }
+
+    // ── FocusedPreview floating file picker ──────────────────────────
+
+    /// Snapshot of the diff-changed file list to render in the popup.
+    /// Built fresh each call from `staged_files + unstaged_files` (Git)
+    /// or `commit_detail.detail.files` (Graph). Sorted by path so the
+    /// indented "tree-ish" layout in the popup is stable.
+    pub fn focused_preview_file_entries(&self) -> Vec<FocusedPreviewFileRow> {
+        match self.active_tab {
+            Tab::Git => {
+                let mut out: Vec<FocusedPreviewFileRow> = Vec::new();
+                for f in &self.staged_files {
+                    out.push(FocusedPreviewFileRow {
+                        path: f.path.clone(),
+                        status: f.status.label().chars().next().unwrap_or(' '),
+                        source: FocusedPreviewFileSource::GitStaged,
+                    });
+                }
+                for f in &self.unstaged_files {
+                    out.push(FocusedPreviewFileRow {
+                        path: f.path.clone(),
+                        status: f.status.label().chars().next().unwrap_or(' '),
+                        source: FocusedPreviewFileSource::GitUnstaged,
+                    });
+                }
+                out.sort_by(|a, b| a.path.cmp(&b.path));
+                out
+            }
+            Tab::Graph => {
+                let Some(detail) = self.commit_detail.detail.as_ref() else {
+                    return Vec::new();
+                };
+                let mut out: Vec<FocusedPreviewFileRow> = detail
+                    .files
+                    .iter()
+                    .map(|f| FocusedPreviewFileRow {
+                        path: f.path.clone(),
+                        status: f.status.label().chars().next().unwrap_or(' '),
+                        source: FocusedPreviewFileSource::GraphCommit,
+                    })
+                    .collect();
+                out.sort_by(|a, b| a.path.cmp(&b.path));
+                out
+            }
+            // Files / Search tabs have no concept of "changed files" —
+            // the chip isn't rendered there, so this returns empty.
+            _ => Vec::new(),
+        }
+    }
+
+    /// Open the floating picker. Snaps the highlighted row to whatever
+    /// file the diff is currently showing, so ↑/↓ navigation feels like
+    /// it picks up where the user already is. Falls back to row 0 if
+    /// the current target isn't in the list (e.g. no diff loaded yet).
+    ///
+    /// Git tab subtlety: a file can legitimately appear in both staged
+    /// and unstaged at the same time (committed + further edited). The
+    /// snap must compare `is_staged` too — otherwise opening the picker
+    /// while viewing the unstaged diff would snap to the staged row
+    /// (sort order puts staged first) and a no-op Enter would silently
+    /// switch the diff target from unstaged to staged.
+    pub fn open_focused_preview_files(&mut self) {
+        let entries = self.focused_preview_file_entries();
+        if entries.is_empty() {
+            return;
+        }
+        let idx = match self.active_tab {
+            Tab::Git => {
+                let sel = self.selected_file.as_ref();
+                sel.and_then(|s| {
+                    let target_src = if s.is_staged {
+                        FocusedPreviewFileSource::GitStaged
+                    } else {
+                        FocusedPreviewFileSource::GitUnstaged
+                    };
+                    entries
+                        .iter()
+                        .position(|e| e.path == s.path && e.source == target_src)
+                })
+                .unwrap_or(0)
+            }
+            Tab::Graph => self
+                .commit_detail
+                .file_diff
+                .as_ref()
+                .and_then(|d| entries.iter().position(|e| e.path == d.path))
+                .unwrap_or(0),
+            _ => 0,
+        };
+        self.focused_preview_files_selected = idx;
+        self.focused_preview_files_open = true;
+    }
+
+    pub fn close_focused_preview_files(&mut self) {
+        self.focused_preview_files_open = false;
+    }
+
+    pub fn toggle_focused_preview_files(&mut self) {
+        if self.focused_preview_files_open {
+            self.close_focused_preview_files();
+        } else {
+            self.open_focused_preview_files();
+        }
+    }
+
+    pub fn move_focused_preview_files_selection(&mut self, delta: i32) {
+        let len = self.focused_preview_file_entries().len();
+        if len == 0 {
+            return;
+        }
+        let cur = self.focused_preview_files_selected as i32;
+        let next = (cur + delta).rem_euclid(len as i32);
+        self.focused_preview_files_selected = next as usize;
+    }
+
+    /// Apply the highlighted row: load the corresponding file's diff
+    /// and close the picker. The diff render path then picks up the
+    /// new target on the next frame.
+    pub fn confirm_focused_preview_files_selection(&mut self) {
+        let entries = self.focused_preview_file_entries();
+        let Some(row) = entries.get(self.focused_preview_files_selected).cloned() else {
+            return;
+        };
+        self.apply_focused_preview_file_pick(&row);
+        self.close_focused_preview_files();
+    }
+
+    /// Mouse-click variant — picks by absolute index, used by the
+    /// `PickFocusedPreviewFile(usize)` action.
+    pub fn pick_focused_preview_file(&mut self, idx: usize) {
+        let entries = self.focused_preview_file_entries();
+        let Some(row) = entries.get(idx).cloned() else {
+            return;
+        };
+        self.focused_preview_files_selected = idx;
+        self.apply_focused_preview_file_pick(&row);
+        self.close_focused_preview_files();
+    }
+
+    fn apply_focused_preview_file_pick(&mut self, row: &FocusedPreviewFileRow) {
+        match row.source {
+            FocusedPreviewFileSource::GitStaged => self.select_file(&row.path, true),
+            FocusedPreviewFileSource::GitUnstaged => self.select_file(&row.path, false),
+            FocusedPreviewFileSource::GraphCommit => self.load_commit_file_diff(&row.path),
+        }
+    }
+
     pub fn set_active_tab(&mut self, tab: Tab) {
         if self.active_tab == tab {
             return;
@@ -4225,6 +4519,12 @@ impl App {
         // appears on return and the click-count resets cleanly.
         self.preview_selection = None;
         self.preview_click_state = None;
+        // FocusedPreview file picker is also tab-scoped (entries come
+        // from the active tab's diff list). Switching tabs while the
+        // picker is open would carry the popup state to a tab whose
+        // changed-file list is unrelated.
+        self.focused_preview_files_open = false;
+        self.focused_preview_files_selected = 0;
         // Same for diff-panel selection — the Git tab and the Graph tab
         // 3-col diff column share this state, and tab-switching between
         // them (or to Files/Search) should start fresh.
@@ -4527,6 +4827,15 @@ impl App {
             }
             ClickAction::ConfirmModalCancel => {
                 self.fire_confirm_cancel();
+            }
+            ClickAction::ToggleFocusedPreviewFiles => {
+                self.toggle_focused_preview_files();
+            }
+            ClickAction::PickFocusedPreviewFile(idx) => {
+                self.pick_focused_preview_file(idx);
+            }
+            ClickAction::CloseFocusedPreviewFiles => {
+                self.close_focused_preview_files();
             }
         }
     }

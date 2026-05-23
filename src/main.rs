@@ -144,7 +144,10 @@ enum ResolvedPath {
     /// File quick-look. `workdir` is set so the Files tab + Git
     /// tab see the enclosing repo (when present); `rel` is the
     /// path relative to `workdir`.
-    File { workdir: PathBuf, rel: PathBuf },
+    File {
+        workdir: PathBuf,
+        rel: PathBuf,
+    },
 }
 
 fn resolve_local_path(raw: &str) -> Result<ResolvedPath, String> {

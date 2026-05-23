@@ -138,7 +138,11 @@ fn git_focused_preview_wheel_in_left_columns_scrolls_diff_not_hidden_sidebar() {
 
     let before = app.diff_scroll;
     // Column 5 sits well inside what would have been the sidebar.
-    input::handle_mouse(wheel(5, 10, MouseEventKind::ScrollDown), &mut app, &terminal);
+    input::handle_mouse(
+        wheel(5, 10, MouseEventKind::ScrollDown),
+        &mut app,
+        &terminal,
+    );
     assert!(
         app.diff_scroll > before,
         "wheel in former-sidebar columns must scroll diff in 纯预览"
@@ -181,7 +185,11 @@ fn focused_preview_horizontal_wheel_routes_to_preview_or_diff() {
     let terminal = Terminal::new(backend).unwrap();
 
     let before = app.preview_h_scroll;
-    input::handle_mouse(wheel(2, 5, MouseEventKind::ScrollRight), &mut app, &terminal);
+    input::handle_mouse(
+        wheel(2, 5, MouseEventKind::ScrollRight),
+        &mut app,
+        &terminal,
+    );
     assert!(
         app.preview_h_scroll > before,
         "horizontal wheel must move preview_h_scroll even in former-sidebar columns"
@@ -193,7 +201,11 @@ fn focused_preview_horizontal_wheel_routes_to_preview_or_diff() {
     app.set_active_tab(Tab::Git);
     app.enter_focused_preview();
     let dh_before = app.diff_h_scroll;
-    input::handle_mouse(wheel(4, 6, MouseEventKind::ScrollRight), &mut app, &terminal);
+    input::handle_mouse(
+        wheel(4, 6, MouseEventKind::ScrollRight),
+        &mut app,
+        &terminal,
+    );
     assert!(app.diff_h_scroll > dh_before);
 }
 
@@ -527,7 +539,10 @@ fn graph_focused_preview_picks_commit_file_via_picker() {
     let entries = app.focused_preview_file_entries();
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].path, "src/app.rs");
-    assert_eq!(entries[0].source, reef::app::FocusedPreviewFileSource::GraphCommit);
+    assert_eq!(
+        entries[0].source,
+        reef::app::FocusedPreviewFileSource::GraphCommit
+    );
 
     // Open picker + pick row 1 (src/input.rs).
     app.open_focused_preview_files();
@@ -573,7 +588,10 @@ fn picker_enter_confirm_switches_diff_target() {
     input::handle_key(key(KeyCode::Enter), &mut app);
 
     assert!(!app.focused_preview_files_open);
-    let sel = app.selected_file.as_ref().expect("Enter should set selected_file");
+    let sel = app
+        .selected_file
+        .as_ref()
+        .expect("Enter should set selected_file");
     assert_eq!(sel.path, "b.txt");
     assert!(!sel.is_staged, "row came from unstaged_files");
 }
@@ -610,9 +628,9 @@ fn picker_selection_wraps_at_boundaries() {
     assert_eq!(app.focused_preview_files_selected, 0);
 }
 
-/// Graph 2-col layout deliberately doesn't show the chip — the
+/// Graph 2-col layout deliberately doesn't show the chip: the
 /// commit_detail_panel renders a different header (commit metadata
-/// + inline file tree) where the chip's path-width math doesn't
+/// plus inline file tree) where the chip's path-width math doesn't
 /// apply. Regression guard so this stays intentional.
 #[test]
 fn graph_two_col_does_not_register_chip_hit_zone() {

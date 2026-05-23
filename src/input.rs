@@ -83,17 +83,11 @@ pub fn leader_decision(
     // uppercase char.
     let is_lower_chord = matches!(
         key.code,
-        KeyCode::Char('p')
-            | KeyCode::Char('f')
-            | KeyCode::Char('h')
-            | KeyCode::Char('v')
+        KeyCode::Char('p') | KeyCode::Char('f') | KeyCode::Char('h') | KeyCode::Char('v')
     ) && key.modifiers.is_empty();
     let is_upper_chord = matches!(
         key.code,
-        KeyCode::Char('P')
-            | KeyCode::Char('F')
-            | KeyCode::Char('H')
-            | KeyCode::Char('V')
+        KeyCode::Char('P') | KeyCode::Char('F') | KeyCode::Char('H') | KeyCode::Char('V')
     ) && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT);
     let is_chord_target = is_lower_chord || is_upper_chord;
 
@@ -627,19 +621,14 @@ fn handle_key_db_goto(key: KeyEvent, app: &mut App) {
     }
 }
 
-/// Settings page key dispatcher. Two modes:
-///
-/// - **List mode** (default): ↑↓/k/j/Home/End/PageUp/PageDown move the
-///   selection cursor; Enter cycles the selected enum / toggles the
-///   selected bool, or opens the inline text editor for the
-///   `editor.command` row; Esc closes the page.
 /// 纯预览模式的早期闸门 —— 拦截退出语义 + 文件 picker 相关按键。
-/// 返回 `true` 表示已消费,调用方应当 return;返回 `false` 表示让按键继续
-/// 走正常分发,这样↑↓/PgUp/PgDn/jk/`/`/n/N 等滚动 + 搜索键仍对全屏的
-/// preview/diff 面板有效。
 ///
-/// picker open 时本闸门**完全接管**按键 —— ↑↓ 选行,Enter 确认,Esc/o
-/// 关闭。这样 picker 期间用户不会意外滚到 diff 上去。
+/// 返回 `true` 表示已消费,调用方应当 return;返回 `false` 表示让按键继续
+/// 走正常分发,这样 ↑↓/PgUp/PgDn/jk 等滚动 + 搜索键仍对全屏的 preview/diff
+/// 面板有效。
+///
+/// picker open 时本闸门完全接管按键 —— ↑↓ 选行,Enter 确认,Esc/o 关闭。
+/// 这样 picker 期间用户不会意外滚到 diff 上去。
 fn handle_key_focused_preview(key: KeyEvent, app: &mut App) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
@@ -710,9 +699,7 @@ fn handle_key_focused_preview(key: KeyEvent, app: &mut App) -> bool {
         // open a picker the renderer refuses to draw and the keyboard
         // would freeze against an invisible selection.
         KeyCode::Char('o') | KeyCode::Char('O')
-            if !ctrl
-                && app.space_leader_at.is_none()
-                && app.focused_preview_chip_visible() =>
+            if !ctrl && app.space_leader_at.is_none() && app.focused_preview_chip_visible() =>
         {
             app.toggle_focused_preview_files();
             return true;
@@ -731,9 +718,7 @@ fn handle_key_focused_preview(key: KeyEvent, app: &mut App) -> bool {
         // Exception: when a Space leader is armed we must fall through
         // so the chord can reach `leader_decision` →
         // toggle_focused_preview() and exit.
-        KeyCode::Char('v') | KeyCode::Char('V')
-            if !ctrl && app.space_leader_at.is_none() =>
-        {
+        KeyCode::Char('v') | KeyCode::Char('V') if !ctrl && app.space_leader_at.is_none() => {
             return true;
         }
         _ => {}
@@ -774,7 +759,7 @@ fn handle_key_focused_preview(key: KeyEvent, app: &mut App) -> bool {
                     | 'n' | 'N'    // search step
                     | 'm' | 'f'    // diff layout / diff mode toggles
                     | '[' | ']'    // SQLite preview: prev/next table
-                    | 'g' | 'G',   // SQLite preview: goto-page; vim top/bottom
+                    | 'g' | 'G', // SQLite preview: goto-page; vim top/bottom
                 )
         );
     // Ctrl-prefixed nav aliases that the per-tab handlers honor and
@@ -786,8 +771,8 @@ fn handle_key_focused_preview(key: KeyEvent, app: &mut App) -> bool {
                 'p' | 'n'      // readline up/down
                 | 'j' | 'k'    // vim-style with ctrl
                 | 'f'          // VSCode-style find widget
-                | 'b'          // sidebar toggle (no-op visually in
-                               // FocusedPreview but harmless)
+                | 'b' // sidebar toggle (no-op visually in
+                      // FocusedPreview but harmless)
             )
         );
 
@@ -798,6 +783,12 @@ fn handle_key_focused_preview(key: KeyEvent, app: &mut App) -> bool {
     }
 }
 
+/// Settings page key dispatcher. Two modes:
+///
+/// - **List mode** (default): ↑↓/k/j/Home/End/PageUp/PageDown move the
+///   selection cursor; Enter cycles the selected enum / toggles the
+///   selected bool, or opens the inline text editor for the
+///   `editor.command` row; Esc closes the page.
 /// - **Editor-command edit mode** (`app.settings.editor_edit.is_some()`):
 ///   typing fills the buffer, Enter commits, Esc cancels and reverts.
 ///
@@ -3381,15 +3372,9 @@ fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: 
                         }
                         crate::app::DiffLayout::SideBySide => {
                             if sbs_cursor_on_left(0, total_width, column) {
-                                apply_scroll_delta(
-                                    &mut app.commit_detail.sbs_left_h_scroll,
-                                    delta,
-                                )
+                                apply_scroll_delta(&mut app.commit_detail.sbs_left_h_scroll, delta)
                             } else {
-                                apply_scroll_delta(
-                                    &mut app.commit_detail.sbs_right_h_scroll,
-                                    delta,
-                                )
+                                apply_scroll_delta(&mut app.commit_detail.sbs_right_h_scroll, delta)
                             }
                         }
                     }

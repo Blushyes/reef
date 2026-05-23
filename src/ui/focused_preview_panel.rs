@@ -312,10 +312,7 @@ fn render_picker(f: &mut Frame, app: &mut App, body: Rect) {
             Line::from(vec![
                 Span::styled(" ", Style::default().fg(fg_row).bg(bg_row)),
                 Span::styled(clipped, style),
-                Span::styled(
-                    " ".repeat(pad_w),
-                    Style::default().fg(fg_row).bg(bg_row),
-                ),
+                Span::styled(" ".repeat(pad_w), Style::default().fg(fg_row).bg(bg_row)),
             ]),
             row_rect,
         );

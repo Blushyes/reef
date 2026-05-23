@@ -1631,9 +1631,7 @@ fn spawn_graph_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Gra
                                 && let GraphScope::Branch(target) = &scope
                                 && ref_present_in_map(&ref_map, target)
                             {
-                                return Err(format!(
-                                    "transient walk failure for {target}"
-                                ));
+                                return Err(format!("transient walk failure for {target}"));
                             }
                             Ok(GraphPayload {
                                 rows,
@@ -1778,10 +1776,7 @@ fn build_file_tree_payload(
 /// genuinely-deleted branch (target missing → fallback to AllRefs)
 /// from a transient walk failure (target still present → return Err
 /// so main keeps the previous rows).
-fn ref_present_in_map(
-    ref_map: &HashMap<String, Vec<RefLabel>>,
-    target: &str,
-) -> bool {
+fn ref_present_in_map(ref_map: &HashMap<String, Vec<RefLabel>>, target: &str) -> bool {
     ref_map.values().any(|labels| {
         labels.iter().any(|label| match label {
             RefLabel::Branch(name) => format!("refs/heads/{name}") == target,

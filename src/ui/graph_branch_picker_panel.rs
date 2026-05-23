@@ -74,8 +74,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
         .graph_branch_picker
         .cursor
         .min(app.graph_branch_picker.filter.len());
-    let cursor_w =
-        UnicodeWidthStr::width(&app.graph_branch_picker.filter[..cursor_byte]) as u16;
+    let cursor_w = UnicodeWidthStr::width(&app.graph_branch_picker.filter[..cursor_byte]) as u16;
     let max_caret_offset = inner.width.saturating_sub(prompt_w + 1);
     let caret_x = inner.x + prompt_w + cursor_w.min(max_caret_offset);
     f.set_cursor_position((caret_x, input_y));
@@ -92,11 +91,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
         let is_selected = row_idx == app.graph_branch_picker.selected_idx;
 
         let (left, right, accent) = match row {
-            BranchPickerRow::AllRefs => (
-                "[ All refs ]".to_string(),
-                "default".to_string(),
-                true,
-            ),
+            BranchPickerRow::AllRefs => ("[ All refs ]".to_string(), "default".to_string(), true),
             BranchPickerRow::Recent(b) => {
                 let prefix = if b.is_head { "* " } else { "  " };
                 let kind = match b.kind {

@@ -79,10 +79,16 @@ pub struct HostsPickerState {
     /// rendered in the "recent" section and omitted from the main list.
     pub recent: Vec<SshTarget>,
     pub filter: String,
+    /// Byte offset into `filter` (UTF-8 char boundary). Maintained by
+    /// [`crate::input_edit`] so word-motion / word-delete chords work
+    /// uniformly with the rest of the input fields.
+    pub filter_cursor: usize,
     pub selected_idx: usize,
     pub input_mode: InputMode,
     /// Raw buffer for the path input mode (typed `[user@]host[:path]`).
     pub path_buffer: String,
+    /// Byte offset into `path_buffer`. Same role as `filter_cursor`.
+    pub path_cursor: usize,
     pub last_popup_area: Option<Rect>,
 }
 
@@ -93,9 +99,11 @@ impl Default for HostsPickerState {
             all_hosts: Vec::new(),
             recent: Vec::new(),
             filter: String::new(),
+            filter_cursor: 0,
             selected_idx: 0,
             input_mode: InputMode::Search,
             path_buffer: String::new(),
+            path_cursor: 0,
             last_popup_area: None,
         }
     }
@@ -118,7 +126,9 @@ impl HostsPickerState {
         self.all_hosts = all_hosts;
         self.recent = recent;
         self.filter.clear();
+        self.filter_cursor = 0;
         self.path_buffer.clear();
+        self.path_cursor = 0;
         self.selected_idx = 0;
         self.input_mode = InputMode::Search;
         self.active = true;
@@ -127,7 +137,9 @@ impl HostsPickerState {
     pub fn close(&mut self) {
         self.active = false;
         self.filter.clear();
+        self.filter_cursor = 0;
         self.path_buffer.clear();
+        self.path_cursor = 0;
         self.input_mode = InputMode::Search;
         self.selected_idx = 0;
     }
@@ -139,6 +151,7 @@ impl HostsPickerState {
         // common "oh this alias isn't here, let me type it" path.
         if self.path_buffer.is_empty() {
             self.path_buffer = self.filter.clone();
+            self.path_cursor = self.path_buffer.len();
         }
     }
 

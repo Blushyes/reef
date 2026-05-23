@@ -477,13 +477,18 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         crate::input::LeaderVerdict::None => {}
     }
 
+    // Phase 1: palette-specific shortcuts. These must precede
+    // `dispatch_key` — the editor vocabulary would otherwise eat e.g.
+    // Ctrl+P as a no-op or Enter as an unhandled key.
     match key.code {
         KeyCode::Esc => {
             app.global_search.active = false;
+            return;
         }
         KeyCode::Char('c') if ctrl => {
             app.global_search.active = false;
             app.should_quit = true;
+            return;
         }
         // Pin to Tab::Search — close the overlay, switch to the persistent
         // search view. Query/results are preserved on `app.global_search`.
@@ -494,145 +499,53 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         // hand-off of the same state.
         KeyCode::Enter if alt || ctrl => {
             app.global_search.active = false;
-            // Land in input mode — the user was typing inside the overlay,
-            // so keeping the input focused is the no-surprise hand-off.
-            // From the other entry paths (digit key, Tab cycle) the tab
-            // starts in list mode; see `handle_key_search`.
             app.global_search.focus = SearchPanelFocus::FindInput;
             app.set_active_tab(Tab::Search);
-            // Sync preview_highlight to the current selection so the tab's
-            // right panel lights up without waiting for another keystroke.
             navigate_to_selected(app);
+            return;
         }
-        KeyCode::Enter => accept(app),
-
-        // ── Deletion ─────────────────────────────────────────────
-        KeyCode::Backspace if alt || ctrl => {
-            input_edit::delete_word_backward(
-                &mut app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-            mark_query_edited(&mut app.global_search);
+        KeyCode::Enter => {
+            accept(app);
+            return;
         }
-        KeyCode::Char('w') if ctrl => {
-            input_edit::delete_word_backward(
-                &mut app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-            mark_query_edited(&mut app.global_search);
+        KeyCode::Up => {
+            move_selection(&mut app.global_search, -1);
+            return;
         }
-        KeyCode::Char('u') if ctrl => {
-            input_edit::clear(&mut app.global_search.query, &mut app.global_search.cursor);
-            mark_query_edited(&mut app.global_search);
+        KeyCode::Down => {
+            move_selection(&mut app.global_search, 1);
+            return;
         }
-        KeyCode::Backspace => {
-            input_edit::backspace(&mut app.global_search.query, &mut app.global_search.cursor);
-            mark_query_edited(&mut app.global_search);
+        KeyCode::Char('p' | 'k') if ctrl => {
+            move_selection(&mut app.global_search, -1);
+            return;
         }
-
-        // ── List navigation ──────────────────────────────────────
-        KeyCode::Up => move_selection(&mut app.global_search, -1),
-        KeyCode::Char('p') if ctrl => move_selection(&mut app.global_search, -1),
-        KeyCode::Char('k') if ctrl => move_selection(&mut app.global_search, -1),
-        KeyCode::Down => move_selection(&mut app.global_search, 1),
-        KeyCode::Char('n') if ctrl => move_selection(&mut app.global_search, 1),
-        KeyCode::Char('j') if ctrl => move_selection(&mut app.global_search, 1),
+        KeyCode::Char('n' | 'j') if ctrl => {
+            move_selection(&mut app.global_search, 1);
+            return;
+        }
         KeyCode::PageUp => {
             let step = app.global_search.last_view_h.max(1) as i32;
             move_selection(&mut app.global_search, -step);
+            return;
         }
         KeyCode::PageDown => {
             let step = app.global_search.last_view_h.max(1) as i32;
             move_selection(&mut app.global_search, step);
-        }
-
-        // ── Cursor movement inside the query ────────────────────
-        // Alt/Ctrl + arrow = jump by word, matching readline (Meta+B/F),
-        // macOS Option+Arrow, and Windows/Linux Ctrl+Arrow conventions.
-        // Must come before the bare-arrow arms so modifier combos win.
-        KeyCode::Left if alt || ctrl => {
-            input_edit::move_cursor_word_backward(
-                &app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-        }
-        KeyCode::Right if alt || ctrl => {
-            input_edit::move_cursor_word_forward(
-                &app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-        }
-        KeyCode::Left => {
-            input_edit::move_cursor(&app.global_search.query, &mut app.global_search.cursor, -1);
-        }
-        KeyCode::Right => {
-            input_edit::move_cursor(&app.global_search.query, &mut app.global_search.cursor, 1);
-        }
-        KeyCode::Home => {
-            app.global_search.cursor = 0;
-        }
-        KeyCode::End => {
-            app.global_search.cursor = app.global_search.query.len();
-        }
-
-        // ── Forward-delete ──────────────────────────────────────
-        // Symmetric with Backspace: plain Delete kills one char, Alt/Ctrl
-        // +Delete kills a word. Both re-run the search via mark_query_edited.
-        KeyCode::Delete if alt || ctrl => {
-            input_edit::delete_word_forward(
-                &mut app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-            mark_query_edited(&mut app.global_search);
-        }
-        KeyCode::Delete => {
-            input_edit::delete_char_forward(
-                &mut app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-            mark_query_edited(&mut app.global_search);
-        }
-
-        // ── Readline aliases ────────────────────────────────────
-        // Reliable fallback for terminals that don't pass Alt/Ctrl+Arrow
-        // through cleanly (the kitty kbd protocol in main.rs helps, but
-        // isn't universally supported). `Alt+b/f/d` and `Ctrl+A/E` are
-        // what bash-readline users type anyway.
-        KeyCode::Char('b') if alt => {
-            input_edit::move_cursor_word_backward(
-                &app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-        }
-        KeyCode::Char('f') if alt => {
-            input_edit::move_cursor_word_forward(
-                &app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-        }
-        KeyCode::Char('d') if alt => {
-            input_edit::delete_word_forward(
-                &mut app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-            mark_query_edited(&mut app.global_search);
-        }
-        KeyCode::Char('a') if ctrl => {
-            app.global_search.cursor = 0;
-        }
-        KeyCode::Char('e') if ctrl => {
-            app.global_search.cursor = app.global_search.query.len();
-        }
-
-        KeyCode::Char(c) if !ctrl => {
-            input_edit::insert_char(
-                &mut app.global_search.query,
-                &mut app.global_search.cursor,
-                c,
-            );
-            mark_query_edited(&mut app.global_search);
+            return;
         }
         _ => {}
+    }
+
+    // Phase 2: shared text-input dispatch. `Edited` triggers a
+    // re-run of the search worker via `mark_query_edited`.
+    let outcome = input_edit::dispatch_key(
+        &key,
+        &mut app.global_search.query,
+        &mut app.global_search.cursor,
+    );
+    if outcome == input_edit::Outcome::Edited {
+        mark_query_edited(&mut app.global_search);
     }
 }
 

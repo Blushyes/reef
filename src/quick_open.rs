@@ -191,7 +191,6 @@ pub fn accept(app: &mut App) {
 /// keyboard close.
 pub fn handle_key(key: KeyEvent, app: &mut App) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     // Space-leader close: mirrors the global open chord. Only armed while
     // `query.is_empty()` so once the user starts typing a path that might
@@ -231,76 +230,60 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         crate::input::LeaderVerdict::None => {}
     }
 
+    // Phase 1: palette-specific shortcuts (Esc / Ctrl+C close, Enter
+    // accept, list nav). These must precede `dispatch_key`, which
+    // would otherwise consume e.g. Ctrl+P as a no-op letter.
     match key.code {
         KeyCode::Esc => {
             app.quick_open.active = false;
+            return;
         }
         KeyCode::Char('c') if ctrl => {
             app.quick_open.active = false;
             app.should_quit = true;
+            return;
         }
-        KeyCode::Enter => accept(app),
-
-        // ── Deletion ─────────────────────────────────────────────
-        // Alt+Backspace (macOS Option+Backspace) and Ctrl+Backspace
-        // (Windows/Linux) both ask for "delete previous word". Crossterm
-        // only surfaces these modifiers when the terminal uses a kitty /
-        // fixterms-style protocol; older terminals collapse Alt+Backspace
-        // onto plain Backspace, so Ctrl+W stays as the reliable fallback.
-        KeyCode::Backspace if alt || ctrl => {
-            input_edit::delete_word_backward(&mut app.quick_open.query, &mut app.quick_open.cursor);
-            filter(&mut app.quick_open);
+        KeyCode::Enter => {
+            accept(app);
+            return;
         }
-        KeyCode::Char('w') if ctrl => {
-            input_edit::delete_word_backward(&mut app.quick_open.query, &mut app.quick_open.cursor);
-            filter(&mut app.quick_open);
+        KeyCode::Up => {
+            move_selection(&mut app.quick_open, -1);
+            return;
         }
-        KeyCode::Char('u') if ctrl => {
-            input_edit::clear(&mut app.quick_open.query, &mut app.quick_open.cursor);
-            filter(&mut app.quick_open);
+        KeyCode::Down => {
+            move_selection(&mut app.quick_open, 1);
+            return;
         }
-        KeyCode::Backspace => {
-            input_edit::backspace(&mut app.quick_open.query, &mut app.quick_open.cursor);
-            filter(&mut app.quick_open);
+        KeyCode::Char('p' | 'k') if ctrl => {
+            move_selection(&mut app.quick_open, -1);
+            return;
         }
-
-        // ── List navigation ──────────────────────────────────────
-        KeyCode::Up => move_selection(&mut app.quick_open, -1),
-        KeyCode::Char('p') if ctrl => move_selection(&mut app.quick_open, -1),
-        KeyCode::Char('k') if ctrl => move_selection(&mut app.quick_open, -1),
-        KeyCode::Down => move_selection(&mut app.quick_open, 1),
-        KeyCode::Char('n') if ctrl => move_selection(&mut app.quick_open, 1),
-        KeyCode::Char('j') if ctrl => move_selection(&mut app.quick_open, 1),
+        KeyCode::Char('n' | 'j') if ctrl => {
+            move_selection(&mut app.quick_open, 1);
+            return;
+        }
         KeyCode::PageUp => {
             let step = app.quick_open.last_view_h.max(1) as i32;
             move_selection(&mut app.quick_open, -step);
+            return;
         }
         KeyCode::PageDown => {
             let step = app.quick_open.last_view_h.max(1) as i32;
             move_selection(&mut app.quick_open, step);
-        }
-
-        // ── Edit-cursor movement ─────────────────────────────────
-        KeyCode::Left => {
-            input_edit::move_cursor(&app.quick_open.query, &mut app.quick_open.cursor, -1);
-        }
-        KeyCode::Right => {
-            input_edit::move_cursor(&app.quick_open.query, &mut app.quick_open.cursor, 1);
-        }
-        KeyCode::Home => {
-            app.quick_open.cursor = 0;
-        }
-        KeyCode::End => {
-            app.quick_open.cursor = app.quick_open.query.len();
-        }
-
-        // Any other Ctrl-combo is a no-op; we don't want Ctrl+A etc.
-        // landing as a literal 'a' in the query.
-        KeyCode::Char(c) if !ctrl => {
-            input_edit::insert_char(&mut app.quick_open.query, &mut app.quick_open.cursor, c);
-            filter(&mut app.quick_open);
+            return;
         }
         _ => {}
+    }
+    // Phase 2: shared text-input dispatch. Any edit refilters the
+    // candidate list — same convention every other reef picker uses.
+    let outcome = input_edit::dispatch_key(
+        &key,
+        &mut app.quick_open.query,
+        &mut app.quick_open.cursor,
+    );
+    if outcome == input_edit::Outcome::Edited {
+        filter(&mut app.quick_open);
     }
 }
 

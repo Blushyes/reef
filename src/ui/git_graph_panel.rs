@@ -2,8 +2,8 @@
 //! ref-label chips.
 
 use crate::app::{App, shorthand_for_full_ref};
-use crate::git::{GraphScope, RefLabel};
 use crate::git::graph::{GraphRow, LaneCell};
+use crate::git::{GraphScope, RefLabel};
 use crate::i18n::{Msg, t};
 use crate::search::SearchTarget;
 use crate::ui::mouse::ClickAction;

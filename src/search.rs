@@ -161,97 +161,32 @@ pub fn exit_cancel(app: &mut App) {
 /// is up).
 pub fn handle_key_in_search_mode(key: KeyEvent, app: &mut App) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
 
-    // Helper: called after any op that mutates `query`. Pure cursor moves
-    // don't need this — they leave matches / wrap_msg untouched.
-    fn after_edit(app: &mut App) {
-        app.search.wrap_msg = None;
-        recompute_and_jump(app, /*from_step=*/ false);
-    }
-
+    // Phase 1: prompt-specific shortcuts. Must precede `dispatch_key`,
+    // which would otherwise treat Enter as Unhandled (no-op) and
+    // Ctrl+C would fall through too.
     match key.code {
-        // ── Exit ────────────────────────────────────────────────
-        KeyCode::Esc => exit_cancel(app),
-        KeyCode::Char('c') if ctrl => exit_cancel(app),
-        KeyCode::Enter => exit_confirm(app),
-
-        // ── Deletion ─────────────────────────────────────────────
-        // Word-delete variants come before plain Backspace so modifier
-        // combos win the match.
-        KeyCode::Backspace if alt || ctrl => {
-            input_edit::delete_word_backward(&mut app.search.query, &mut app.search.cursor);
-            after_edit(app);
+        KeyCode::Esc => {
+            exit_cancel(app);
+            return;
         }
-        KeyCode::Char('w') if ctrl => {
-            input_edit::delete_word_backward(&mut app.search.query, &mut app.search.cursor);
-            after_edit(app);
+        KeyCode::Char('c') if ctrl => {
+            exit_cancel(app);
+            return;
         }
-        KeyCode::Char('u') if ctrl => {
-            input_edit::clear(&mut app.search.query, &mut app.search.cursor);
-            after_edit(app);
-        }
-        KeyCode::Backspace => {
-            input_edit::backspace(&mut app.search.query, &mut app.search.cursor);
-            after_edit(app);
-        }
-
-        // ── Cursor movement ─────────────────────────────────────
-        // Alt/Ctrl + arrow = jump by word; must precede bare-arrow arms.
-        KeyCode::Left if alt || ctrl => {
-            input_edit::move_cursor_word_backward(&app.search.query, &mut app.search.cursor);
-        }
-        KeyCode::Right if alt || ctrl => {
-            input_edit::move_cursor_word_forward(&app.search.query, &mut app.search.cursor);
-        }
-        KeyCode::Left => {
-            input_edit::move_cursor(&app.search.query, &mut app.search.cursor, -1);
-        }
-        KeyCode::Right => {
-            input_edit::move_cursor(&app.search.query, &mut app.search.cursor, 1);
-        }
-        KeyCode::Home => {
-            app.search.cursor = 0;
-        }
-        KeyCode::End => {
-            app.search.cursor = app.search.query.len();
-        }
-
-        // ── Forward-delete ──────────────────────────────────────
-        KeyCode::Delete if alt || ctrl => {
-            input_edit::delete_word_forward(&mut app.search.query, &mut app.search.cursor);
-            after_edit(app);
-        }
-        KeyCode::Delete => {
-            input_edit::delete_char_forward(&mut app.search.query, &mut app.search.cursor);
-            after_edit(app);
-        }
-
-        // ── Readline aliases ────────────────────────────────────
-        // Fallback for terminals that don't forward Alt/Ctrl+Arrow cleanly.
-        KeyCode::Char('b') if alt => {
-            input_edit::move_cursor_word_backward(&app.search.query, &mut app.search.cursor);
-        }
-        KeyCode::Char('f') if alt => {
-            input_edit::move_cursor_word_forward(&app.search.query, &mut app.search.cursor);
-        }
-        KeyCode::Char('d') if alt => {
-            input_edit::delete_word_forward(&mut app.search.query, &mut app.search.cursor);
-            after_edit(app);
-        }
-        KeyCode::Char('a') if ctrl => {
-            app.search.cursor = 0;
-        }
-        KeyCode::Char('e') if ctrl => {
-            app.search.cursor = app.search.query.len();
-        }
-
-        // ── Insertion ───────────────────────────────────────────
-        KeyCode::Char(c) if !ctrl => {
-            input_edit::insert_char(&mut app.search.query, &mut app.search.cursor, c);
-            after_edit(app);
+        KeyCode::Enter => {
+            exit_confirm(app);
+            return;
         }
         _ => {}
+    }
+
+    // Phase 2: shared text-input dispatch. Any edit re-runs
+    // `recompute_and_jump` so the highlight tracks the query.
+    let outcome = input_edit::dispatch_key(&key, &mut app.search.query, &mut app.search.cursor);
+    if outcome == input_edit::Outcome::Edited {
+        app.search.wrap_msg = None;
+        recompute_and_jump(app, /*from_step=*/ false);
     }
 }
 

@@ -1998,47 +1998,30 @@ fn handle_key_tree_edit(key: KeyEvent, app: &mut App) {
         app.tree_edit.error = None;
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // Phase 1: tree-edit-specific shortcuts (Esc/Enter/Ctrl+C).
     match key.code {
-        KeyCode::Esc => app.cancel_tree_edit(),
-        KeyCode::Char('c') if ctrl => app.cancel_tree_edit(),
-        KeyCode::Enter => app.commit_tree_edit(),
-        KeyCode::Backspace => {
-            if ctrl || key.modifiers.contains(KeyModifiers::ALT) {
-                crate::input_edit::delete_word_backward(
-                    &mut app.tree_edit.buffer,
-                    &mut app.tree_edit.cursor,
-                );
-            } else {
-                crate::input_edit::backspace(&mut app.tree_edit.buffer, &mut app.tree_edit.cursor);
-            }
+        KeyCode::Esc => {
+            app.cancel_tree_edit();
+            return;
         }
-        KeyCode::Char('w') if ctrl => {
-            crate::input_edit::delete_word_backward(
-                &mut app.tree_edit.buffer,
-                &mut app.tree_edit.cursor,
-            );
+        KeyCode::Char('c') if ctrl => {
+            app.cancel_tree_edit();
+            return;
         }
-        KeyCode::Char('u') if ctrl => {
-            app.tree_edit.buffer.clear();
-            app.tree_edit.cursor = 0;
-        }
-        KeyCode::Left => {
-            crate::input_edit::move_cursor(&app.tree_edit.buffer, &mut app.tree_edit.cursor, -1);
-        }
-        KeyCode::Right => {
-            crate::input_edit::move_cursor(&app.tree_edit.buffer, &mut app.tree_edit.cursor, 1);
-        }
-        KeyCode::Home => {
-            app.tree_edit.cursor = 0;
-        }
-        KeyCode::End => {
-            app.tree_edit.cursor = app.tree_edit.buffer.len();
-        }
-        KeyCode::Char(c) if !ctrl => {
-            crate::input_edit::insert_char(&mut app.tree_edit.buffer, &mut app.tree_edit.cursor, c);
+        KeyCode::Enter => {
+            app.commit_tree_edit();
+            return;
         }
         _ => {}
     }
+
+    // Phase 2: shared text-input dispatch. No edit-derived side
+    // effect — validation runs on commit, not per-keystroke.
+    let _ = crate::input_edit::dispatch_key(
+        &key,
+        &mut app.tree_edit.buffer,
+        &mut app.tree_edit.cursor,
+    );
 }
 
 /// Keyboard navigation for the right-click context menu popup.
@@ -2061,14 +2044,21 @@ fn handle_key_tree_context_menu(key: KeyEvent, app: &mut App) {
     }
 }
 
-/// Keyboard handler for the Ctrl+O hosts picker overlay. Mirrors the
-/// quick-open contract: Esc / Ctrl+C close, Enter commits, arrows
-/// navigate, printable chars append to the active input (filter or
-/// path). Ctrl+P toggles between the two input modes so the user can
-/// swap from "filter my config" to "type a target literally".
+/// Keyboard handler for the Ctrl+O hosts picker overlay.
+///
+/// Two-phase routing (same shape as `handle_key_graph_branch_picker`):
+///   1. Picker-specific keys — Esc / Ctrl+C close, Enter commits,
+///      Up/Down + Ctrl+J/K + Ctrl+N/P navigate the list, Ctrl+P
+///      enters path mode (literal `[user@]host[:path]` input).
+///   2. Anything left flows into [`input_edit::dispatch_key`] against
+///      whichever buffer is active (filter vs path_buffer), giving
+///      both the same readline / VSCode editor shortcuts as every
+///      other input in reef.
 fn handle_key_hosts_picker(key: KeyEvent, app: &mut App) {
     use crate::hosts_picker::InputMode;
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    // Phase 1: picker-specific shortcuts.
     match key.code {
         KeyCode::Esc => {
             if app.hosts_picker.input_mode == InputMode::Path {
@@ -2077,41 +2067,64 @@ fn handle_key_hosts_picker(key: KeyEvent, app: &mut App) {
                 // the path buffer without losing the picker state.
                 app.hosts_picker.input_mode = InputMode::Search;
                 app.hosts_picker.path_buffer.clear();
+                app.hosts_picker.path_cursor = 0;
             } else {
                 app.close_hosts_picker();
             }
+            return;
         }
         KeyCode::Char('c') if ctrl => {
             app.close_hosts_picker();
             app.should_quit = true;
+            return;
         }
         KeyCode::Char('p') if ctrl => {
             app.hosts_picker.enter_path_mode();
+            return;
         }
-        KeyCode::Enter => app.confirm_hosts_picker(),
-        KeyCode::Up => app.hosts_picker.move_selection(-1),
-        KeyCode::Down => app.hosts_picker.move_selection(1),
-        KeyCode::Char('k') if ctrl => app.hosts_picker.move_selection(-1),
-        KeyCode::Char('j') if ctrl => app.hosts_picker.move_selection(1),
-        KeyCode::Backspace => match app.hosts_picker.input_mode {
-            InputMode::Search => {
-                app.hosts_picker.filter.pop();
-                app.hosts_picker.selected_idx = 0;
-            }
-            InputMode::Path => {
-                app.hosts_picker.path_buffer.pop();
-            }
-        },
-        KeyCode::Char(c) if !ctrl => match app.hosts_picker.input_mode {
-            InputMode::Search => {
-                app.hosts_picker.filter.push(c);
-                app.hosts_picker.selected_idx = 0;
-            }
-            InputMode::Path => {
-                app.hosts_picker.path_buffer.push(c);
-            }
-        },
+        KeyCode::Enter => {
+            app.confirm_hosts_picker();
+            return;
+        }
+        KeyCode::Up => {
+            app.hosts_picker.move_selection(-1);
+            return;
+        }
+        KeyCode::Down => {
+            app.hosts_picker.move_selection(1);
+            return;
+        }
+        // Note: Ctrl+P is consumed above as the path-mode toggle
+        // (hosts_picker's bespoke shortcut), so the list-up alias here
+        // is only Ctrl+K. Ctrl+N (next) is unambiguous as down.
+        KeyCode::Char('k') if ctrl => {
+            app.hosts_picker.move_selection(-1);
+            return;
+        }
+        KeyCode::Char('j' | 'n') if ctrl => {
+            app.hosts_picker.move_selection(1);
+            return;
+        }
         _ => {}
+    }
+
+    // Phase 2: shared text-input dispatch against the active buffer.
+    let (buf, cur) = match app.hosts_picker.input_mode {
+        InputMode::Search => (
+            &mut app.hosts_picker.filter,
+            &mut app.hosts_picker.filter_cursor,
+        ),
+        InputMode::Path => (
+            &mut app.hosts_picker.path_buffer,
+            &mut app.hosts_picker.path_cursor,
+        ),
+    };
+    let outcome = crate::input_edit::dispatch_key(&key, buf, cur);
+    if outcome == crate::input_edit::Outcome::Edited
+        && app.hosts_picker.input_mode == InputMode::Search
+    {
+        // Filter edits reset list cursor (path mode has no list).
+        app.hosts_picker.selected_idx = 0;
     }
 }
 

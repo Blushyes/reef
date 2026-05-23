@@ -28,7 +28,7 @@ use super::{
     EditorLaunchSpec, SearchChunkSink, StatusSnapshot, TrashOutcome, WalkOpts, WalkResponse,
 };
 use crate::file_tree::{PreviewContent, TreeEntry};
-use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, RefLabel};
+use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, GraphScope, RefLabel};
 use std::ops::ControlFlow;
 
 /// Default timeout for a single RPC round-trip. Applied to every `request`
@@ -688,9 +688,14 @@ impl Backend for RemoteBackend {
         Ok(())
     }
 
-    fn list_commits(&self, limit: usize) -> Result<Vec<CommitInfo>, BackendError> {
+    fn list_commits(
+        &self,
+        scope: &GraphScope,
+        limit: usize,
+    ) -> Result<Vec<CommitInfo>, BackendError> {
         let list: Vec<reef_proto::CommitInfoDto> = self.request(Request::ListCommits {
             limit: limit as u64,
+            scope: graph_scope_to_dto(scope),
         })?;
         Ok(list.into_iter().map(Into::into).collect())
     }
@@ -1250,6 +1255,13 @@ impl From<reef_proto::RefLabelDto> for RefLabel {
             reef_proto::RefLabelDto::RemoteBranch(s) => RefLabel::RemoteBranch(s),
             reef_proto::RefLabelDto::Tag(s) => RefLabel::Tag(s),
         }
+    }
+}
+
+fn graph_scope_to_dto(scope: &GraphScope) -> reef_proto::GraphScopeDto {
+    match scope {
+        GraphScope::AllRefs => reef_proto::GraphScopeDto::AllRefs,
+        GraphScope::Branch(s) => reef_proto::GraphScopeDto::Branch(s.clone()),
     }
 }
 

@@ -1,7 +1,7 @@
 use crate::backend::{Backend, LocalBackend};
 use crate::file_tree::{FileTree, PreviewBody, PreviewContent};
 use crate::git::graph::GraphRow;
-use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, GitRepo, RefLabel};
+use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, GitRepo, GraphScope, RefLabel};
 use crate::tasks::{AsyncState, TaskCoordinator, WorkerResult};
 use crate::ui::confirm_modal::ConfirmModal;
 use crate::ui::highlight::StyledToken;
@@ -332,14 +332,26 @@ pub struct GitStatusState {
     pub commit_error: Option<String>,
 }
 
+/// Maximum number of recent branches we keep in `GitGraphState::recent_branches`.
+/// Past this count the picker stops being useful and starts being noise.
+pub(crate) const GRAPH_RECENT_BRANCHES_MAX: usize = 5;
+
 /// State for the inline commit graph sidebar.
 #[derive(Debug, Default)]
 pub struct GitGraphState {
     pub rows: Vec<GraphRow>,
     pub ref_map: HashMap<String, Vec<RefLabel>>,
-    /// `(head_oid, refs_hash)` — revwalk is skipped when these are unchanged,
-    /// so workdir edits don't trigger a full re-walk on large repos.
-    pub cache_key: Option<(String, u64)>,
+    /// `(head_oid, refs_hash, scope_hash)` — revwalk is skipped when these
+    /// are unchanged, so workdir edits don't trigger a full re-walk on
+    /// large repos. The scope component invalidates the cache when the
+    /// user picks a different branch via the picker.
+    pub cache_key: Option<(String, u64, u64)>,
+    /// Active walk scope. Defaults to `AllRefs` (historical behaviour).
+    /// Mutating this should be followed by `cache_key = None` + a refresh.
+    pub scope: GraphScope,
+    /// Most-recently-used fully-qualified refs surfaced at the top of the
+    /// branch picker. Persisted across sessions via `prefs::set`.
+    pub recent_branches: Vec<String>,
     pub selected_idx: usize,
     pub selected_commit: Option<String>,
     /// Anchor index for Shift-extended range selection. `None` = single-select
@@ -787,6 +799,11 @@ pub struct App {
     /// current App and rebuilds it with the new backend.
     pub hosts_picker: crate::hosts_picker::HostsPickerState,
 
+    /// `b` branch picker (Graph tab). Owns keyboard / mouse while
+    /// `active`, picks a fully-qualified ref or `[ All refs ]` →
+    /// `App::set_graph_scope` swaps the scope and refreshes.
+    pub graph_branch_picker: crate::graph_branch_picker::GraphBranchPickerState,
+
     /// Populated by the hosts picker on confirm. `main.rs` inspects this
     /// after `should_quit_session` fires and uses it to build the next
     /// `RemoteBackend`. Cleared once consumed.
@@ -1124,7 +1141,14 @@ impl App {
                 tree_mode: crate::prefs::get_bool("status.tree_mode"),
                 ..GitStatusState::default()
             },
-            git_graph: GitGraphState::default(),
+            git_graph: {
+                let (scope, recent) = load_graph_scope_pref();
+                GitGraphState {
+                    scope,
+                    recent_branches: recent,
+                    ..GitGraphState::default()
+                }
+            },
             commit_detail: CommitDetailState {
                 diff_layout: crate::prefs::get("commit.diff_layout")
                     .as_deref()
@@ -1152,6 +1176,7 @@ impl App {
             quick_open: crate::quick_open::QuickOpenState::from_prefs(),
             global_search: crate::global_search::GlobalSearchState::default(),
             hosts_picker: crate::hosts_picker::HostsPickerState::default(),
+            graph_branch_picker: crate::graph_branch_picker::GraphBranchPickerState::default(),
             pending_ssh_target: None,
             should_quit_session: false,
             preview_highlight: None,
@@ -2513,6 +2538,44 @@ impl App {
         self.should_quit_session = true;
     }
 
+    /// Open the Graph tab's branch picker. Pulls the branch list out
+    /// of the cached `ref_map` (already loaded by `refresh_graph`) and
+    /// seeds the recents from `GitGraphState::recent_branches`.
+    ///
+    /// Refuses to open before the first graph payload has populated
+    /// `ref_map`: at cold start with a persisted `Branch(X)` scope,
+    /// an empty `ref_map` would render the picker as
+    /// `[ All refs ]`-only, and a stray Enter would silently overwrite
+    /// the user's persisted choice via `set_graph_scope(AllRefs)`.
+    /// Toast instead and let the user retry once the first revwalk lands.
+    pub fn open_graph_branch_picker(&mut self) {
+        if self.git_graph.ref_map.is_empty() {
+            self.toasts
+                .push(Toast::info(crate::i18n::graph_picker_not_ready_toast()));
+            return;
+        }
+        let recent = self.git_graph.recent_branches.clone();
+        let scope = self.git_graph.scope.clone();
+        self.graph_branch_picker
+            .open(&self.git_graph.ref_map, recent, &scope);
+    }
+
+    pub fn close_graph_branch_picker(&mut self) {
+        self.graph_branch_picker.close();
+    }
+
+    /// Apply the picker's current selection and close the overlay. A
+    /// `confirm()` of `None` (filter matched zero rows + Enter) also
+    /// closes the overlay so the user can never get input-trapped on
+    /// an empty result list.
+    pub fn confirm_graph_branch_picker(&mut self) {
+        let scope = self.graph_branch_picker.confirm();
+        self.graph_branch_picker.close();
+        if let Some(scope) = scope {
+            self.set_graph_scope(scope);
+        }
+    }
+
     /// Collapse every expanded folder and async-refresh the tree so
     /// the render path picks up the shorter row list.
     pub fn collapse_all_tree_entries(&mut self) {
@@ -3179,8 +3242,9 @@ impl App {
         touched
     }
 
-    /// Rebuild the commit graph iff HEAD or any ref moved since the last build.
-    /// Working-tree fs events do NOT invalidate the cache — see plan pitfall #2.
+    /// Rebuild the commit graph iff HEAD or any ref (or the active scope)
+    /// moved since the last build. Working-tree fs events do NOT
+    /// invalidate the cache — see plan pitfall #2.
     pub fn refresh_graph(&mut self) {
         const GRAPH_COMMIT_LIMIT: usize = 500;
         if !self.backend.has_repo() {
@@ -3190,8 +3254,97 @@ impl App {
             return;
         };
         let generation = self.graph_load.begin();
-        self.tasks
-            .refresh_graph(generation, Arc::clone(&self.backend), GRAPH_COMMIT_LIMIT);
+        self.tasks.refresh_graph(
+            generation,
+            Arc::clone(&self.backend),
+            GRAPH_COMMIT_LIMIT,
+            self.git_graph.scope.clone(),
+        );
+    }
+
+    /// Switch the graph's walk scope to `scope`, push the previous branch
+    /// onto the recents list (newest-first, deduped, capped), reset
+    /// selection / scroll, invalidate the graph cache and trigger a
+    /// refresh. Persists `graph.scope` and `graph.scope.recent` so the
+    /// choice survives across sessions.
+    pub fn set_graph_scope(&mut self, scope: GraphScope) {
+        if self.git_graph.scope == scope {
+            return;
+        }
+        if let GraphScope::Branch(full_ref) = &scope {
+            self.git_graph
+                .recent_branches
+                .retain(|existing| existing != full_ref);
+            self.git_graph
+                .recent_branches
+                .insert(0, full_ref.clone());
+            if self.git_graph.recent_branches.len() > GRAPH_RECENT_BRANCHES_MAX {
+                self.git_graph
+                    .recent_branches
+                    .truncate(GRAPH_RECENT_BRANCHES_MAX);
+            }
+        }
+        self.apply_scope_no_refresh(scope);
+        self.refresh_graph();
+    }
+
+    /// Inner half of [`set_graph_scope`]: swap the scope, reset every
+    /// selection / scroll cursor that's about to become meaningless,
+    /// invalidate the graph cache, and persist. Does NOT trigger a
+    /// refresh — the caller (`set_graph_scope` or the stale-branch
+    /// fallback in the worker-result merge) owns that side-effect.
+    ///
+    /// Resetting selection here is load-bearing: without it the new
+    /// scope's first frame would render with `scroll` / anchor values
+    /// from the old branch, leaving the user staring at empty rows or
+    /// a stale range highlight until the next nav keystroke.
+    ///
+    /// Bumps `commit_detail_load` / `commit_file_diff_load` so any
+    /// in-flight load issued under the previous selection won't pass
+    /// its `complete_ok` generation check on arrival — otherwise a
+    /// late detail payload would repaint the just-cleared right panel
+    /// with the prior commit's metadata.
+    fn apply_scope_no_refresh(&mut self, scope: GraphScope) {
+        self.git_graph.scope = scope;
+        self.git_graph.cache_key = None;
+        // Old rows belong to the previous scope — keeping them around
+        // until the new payload lands paints the wrong tip-of-branch
+        // at `selected_idx = 0`. `ref_map` is intentionally NOT
+        // cleared: it's used to render ref chips on commits as soon
+        // as the new payload arrives, and the picker's cold-start
+        // guard reads from it too.
+        self.git_graph.rows.clear();
+        self.git_graph.selected_idx = 0;
+        self.git_graph.scroll = 0;
+        self.git_graph.selection_anchor = None;
+        self.git_graph.last_rendered_selected = None;
+        self.git_graph.selected_commit = None;
+        self.commit_detail.detail = None;
+        self.commit_detail.range_detail = None;
+        self.commit_detail.file_diff = None;
+        // Invalidate in-flight detail / file-diff loads so a late
+        // payload tied to the previous selection fails its
+        // `complete_ok` check on arrival. Using `invalidate` instead
+        // of `begin` is load-bearing here: `begin` would set
+        // `loading=true` with no follow-up dispatcher (especially for
+        // `commit_file_diff_load`, which only kicks when the user
+        // picks a file), leaving the status bar stuck on
+        // "commit diff refreshing…" indefinitely.
+        self.commit_detail_load.invalidate();
+        self.commit_file_diff_load.invalidate();
+        // Drop any active CommitGraph search overlay — its `matches`
+        // are byte-ranges into the rows we just cleared, so `n` / `N`
+        // would jump to indices that no longer correspond to anything
+        // visible. Searches targeting other panels (file preview,
+        // commit detail body, diff) are unaffected; they don't index
+        // into `git_graph.rows`.
+        if matches!(
+            self.search.target,
+            Some(crate::search::SearchTarget::CommitGraph)
+        ) {
+            self.search.clear();
+        }
+        persist_graph_scope(&self.git_graph.scope, &self.git_graph.recent_branches);
     }
 
     /// (Re)load commit detail for the currently-selected commit. Clears detail
@@ -3930,6 +4083,35 @@ impl App {
             WorkerResult::Graph { generation, result } => match result {
                 Ok(payload) => {
                     if self.graph_load.complete_ok(generation) {
+                        // Stale branch fallback: scope-targeted walk
+                        // returned nothing AND the freshly-walked
+                        // `ref_map` confirms the branch is genuinely
+                        // missing. The extra `ref_map` lookup matters
+                        // because `list_commits` also returns
+                        // `Vec::new()` on transient `revwalk()` errors
+                        // (libgit2 lock contention, fs jitter, …); we
+                        // don't want a one-tick hiccup to drop a
+                        // healthy branch from recents and surface a
+                        // misleading "gone" toast.
+                        if self.git_graph.scope != GraphScope::AllRefs
+                            && payload.rows.is_empty()
+                            && matches!(payload.scope, GraphScope::Branch(_))
+                            && self.git_graph.scope == payload.scope
+                            && payload_scope_ref_missing(&payload)
+                        {
+                            if let GraphScope::Branch(missing) = &payload.scope {
+                                self.git_graph
+                                    .recent_branches
+                                    .retain(|existing| existing != missing);
+                                let short = shorthand_for_full_ref(missing);
+                                self.toasts.push(Toast::info(
+                                    crate::i18n::graph_scope_stale_branch_toast(short),
+                                ));
+                            }
+                            self.apply_scope_no_refresh(GraphScope::AllRefs);
+                            self.refresh_graph();
+                            return;
+                        }
                         let previous_commit = self.git_graph.selected_commit.clone();
                         // Snapshot the anchor's OID before the re-walk
                         // overwrites `rows`. The graph is revalidated every
@@ -4680,6 +4862,9 @@ impl App {
             // double-click distinction needs `last_click` timing that's only
             // available at the input layer.
             ClickAction::QuickOpenSelect(_) => {}
+            // Graph branch picker: overlay-only, dispatched inline in
+            // `input::handle_mouse_graph_branch_picker`, never reaches here.
+            ClickAction::GraphBranchPickerSelect(_) => {}
             // Tab::Search result clicks DO route through here — the tab is
             // not an overlay, so input::handle_mouse lets the click fall
             // through to hit_test + handle_action. Update the selection and
@@ -5296,10 +5481,22 @@ impl App {
             Tab::Graph => {
                 let has_repo = self.backend.has_repo();
                 let should_poll_graph = has_repo && now >= self.next_graph_revalidate_at;
-                if self.graph_load.should_request()
-                    || (has_repo && self.git_graph.rows.is_empty() && !self.graph_load.loading)
-                    || (should_poll_graph && !self.graph_load.loading)
-                {
+                // Refresh policy:
+                //   - "stale w/o error" (e.g. fs-watcher mark_stale, tab
+                //     activation) → immediate
+                //   - "stale w/ error" → throttled by should_poll_graph
+                //     (otherwise persistent worker failures would
+                //     hammer at frame rate as soon as complete_err
+                //     clears `loading`)
+                //   - periodic poll → throttled by should_poll_graph
+                //
+                // The previous "rows.is_empty() && !loading" recovery
+                // arm collapses into the periodic arm: bootstrap fires
+                // on the first tick (next_graph_revalidate_at is in
+                // the past at construction) but errors back off.
+                let stale_no_error =
+                    self.graph_load.stale && self.graph_load.error.is_none();
+                if !self.graph_load.loading && (stale_no_error || should_poll_graph) {
                     self.refresh_graph();
                     self.next_graph_revalidate_at = now + Duration::from_secs(5);
                 }
@@ -5374,10 +5571,85 @@ fn save_prefs(layout: DiffLayout, mode: DiffMode) {
     crate::prefs::set("diff.mode", mode.pref_str());
 }
 
+/// Prefs key for the Graph tab's active scope (one of `all` or
+/// `branch:<full_ref>`).
+pub(crate) const PREF_GRAPH_SCOPE: &str = "graph.scope";
+/// Prefs key for the recent-branch MRU shown at the top of the
+/// branch picker. Tab-separated full ref names.
+pub(crate) const PREF_GRAPH_SCOPE_RECENT: &str = "graph.scope.recent";
+
+/// Decode the persisted `graph.scope` value. Unknown / malformed
+/// values fall back to `AllRefs` rather than erroring — we'd rather
+/// silently lose a stale pref than refuse to boot.
+pub(crate) fn load_graph_scope_pref() -> (GraphScope, Vec<String>) {
+    let scope = match crate::prefs::get(PREF_GRAPH_SCOPE).as_deref() {
+        Some("all") | None => GraphScope::AllRefs,
+        Some(other) => other
+            .strip_prefix("branch:")
+            .filter(|r| !r.is_empty())
+            .map(|r| GraphScope::Branch(r.to_string()))
+            .unwrap_or(GraphScope::AllRefs),
+    };
+    let recent = crate::prefs::get(PREF_GRAPH_SCOPE_RECENT)
+        .map(|raw| {
+            raw.split('\t')
+                .filter(|s| !s.is_empty())
+                .take(GRAPH_RECENT_BRANCHES_MAX)
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    (scope, recent)
+}
+
+/// Persist the Graph tab's scope + recents. Called from
+/// [`App::set_graph_scope`] every time the user accepts a picker
+/// selection (or the stale-branch fallback fires).
+pub(crate) fn persist_graph_scope(scope: &GraphScope, recent: &[String]) {
+    let value = match scope {
+        GraphScope::AllRefs => "all".to_string(),
+        GraphScope::Branch(s) => format!("branch:{s}"),
+    };
+    crate::prefs::set(PREF_GRAPH_SCOPE, &value);
+    crate::prefs::set(PREF_GRAPH_SCOPE_RECENT, &recent.join("\t"));
+}
+
+/// `true` when the payload's scope ref isn't present anywhere in the
+/// payload's `ref_map`. Used by the stale-branch fallback to confirm
+/// "ref really doesn't exist" before swapping scope back to `AllRefs`
+/// — distinguishes a genuinely-deleted branch from a transient
+/// `revwalk()` error (both surface as empty rows in the payload).
+fn payload_scope_ref_missing(payload: &crate::tasks::GraphPayload) -> bool {
+    let GraphScope::Branch(target) = &payload.scope else {
+        return false;
+    };
+    !payload.ref_map.values().any(|labels| {
+        labels.iter().any(|label| match label {
+            RefLabel::Branch(name) => format!("refs/heads/{name}") == *target,
+            RefLabel::RemoteBranch(name) => format!("refs/remotes/{name}") == *target,
+            _ => false,
+        })
+    })
+}
+
+/// Strip the `refs/heads/` or `refs/remotes/` prefix off a fully-qualified
+/// ref for display purposes (toasts, picker rows, panel titles).
+pub(crate) fn shorthand_for_full_ref(full_ref: &str) -> &str {
+    full_ref
+        .strip_prefix("refs/heads/")
+        .or_else(|| full_ref.strip_prefix("refs/remotes/"))
+        .unwrap_or(full_ref)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{App, GitGraphState, folder_contains};
+    use super::{
+        App, GRAPH_RECENT_BRANCHES_MAX, GitGraphState, PREF_GRAPH_SCOPE, PREF_GRAPH_SCOPE_RECENT,
+        folder_contains, load_graph_scope_pref, persist_graph_scope,
+    };
     use crate::backend::LocalBackend;
+    use crate::git::GraphScope;
+    use crate::tasks::{GraphPayload, WorkerResult};
     use crate::ui::theme::Theme;
     use std::sync::Arc;
     use test_support::{HOME_LOCK, HomeGuard, commit_file, tempdir_repo};
@@ -5425,6 +5697,392 @@ mod tests {
         };
         assert_eq!(g.selected_range(), (4, 9));
         assert!(g.is_range());
+    }
+
+    // ── Graph scope: set / fallback / cache ─────────────────────────────
+
+    /// Per-test HOME isolation. `prefs::*` reads/writes
+    /// `~/.config/reef/prefs`, and the scope tests both write (via
+    /// `set_graph_scope` / `apply_scope_no_refresh`) and assert prefs
+    /// state, so we have to redirect HOME for the duration.
+    struct ScopeFixture {
+        app: App,
+        _home_guard: test_support::HomeGuard,
+        _home: tempfile::TempDir,
+        _repo: tempfile::TempDir,
+        _home_lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn make_scope_fixture() -> ScopeFixture {
+        let lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::TempDir::new().expect("home tempdir");
+        let home_guard = HomeGuard::enter(home.path());
+        let (repo, raw) = tempdir_repo();
+        // One commit so HEAD resolves; the worker won't deadlock on us
+        // during App construction (it kicks `refresh_graph` synchronously
+        // dispatched onto the channel).
+        commit_file(&raw, "a.txt", "hello\n", "init");
+        let backend = Arc::new(LocalBackend::open_at(repo.path().to_path_buf()));
+        let mut app = App::new_with_backend(Theme::dark(), backend, None);
+        app.fs_watcher_rx = None;
+        ScopeFixture {
+            app,
+            _home_guard: home_guard,
+            _home: home,
+            _repo: repo,
+            _home_lock: lock,
+        }
+    }
+
+    #[test]
+    fn set_graph_scope_pushes_recents_dedupes_and_caps() {
+        // Drive set_graph_scope past the cap; the recents list should
+        // stay newest-first, deduped, and clamped at GRAPH_RECENT_BRANCHES_MAX.
+        let mut fx = make_scope_fixture();
+        for i in 0..(GRAPH_RECENT_BRANCHES_MAX + 2) {
+            fx.app
+                .set_graph_scope(GraphScope::Branch(format!("refs/heads/b{i}")));
+        }
+        assert_eq!(
+            fx.app.git_graph.recent_branches.len(),
+            GRAPH_RECENT_BRANCHES_MAX
+        );
+        // Newest-first. The most recent push was `b{MAX+1}`.
+        let newest = format!("refs/heads/b{}", GRAPH_RECENT_BRANCHES_MAX + 1);
+        assert_eq!(fx.app.git_graph.recent_branches[0], newest);
+
+        // Re-pushing an existing branch moves it to the front without
+        // duplicating.
+        let oldest_kept = fx.app.git_graph.recent_branches.last().cloned().unwrap();
+        fx.app
+            .set_graph_scope(GraphScope::Branch(oldest_kept.clone()));
+        assert_eq!(fx.app.git_graph.recent_branches[0], oldest_kept);
+        let dup_count = fx
+            .app
+            .git_graph
+            .recent_branches
+            .iter()
+            .filter(|s| **s == oldest_kept)
+            .count();
+        assert_eq!(dup_count, 1, "dedupe must keep exactly one entry");
+        assert_eq!(
+            fx.app.git_graph.recent_branches.len(),
+            GRAPH_RECENT_BRANCHES_MAX
+        );
+    }
+
+    #[test]
+    fn set_graph_scope_invalidates_cache_key_and_resets_selection() {
+        // The cache_key is what gates "skip the revwalk"; scope changes
+        // must bust it. Selection state from the previous scope is
+        // meaningless under the new one and must reset.
+        let mut fx = make_scope_fixture();
+        fx.app.git_graph.cache_key = Some(("dead".into(), 0xCAFE, 0xBABE));
+        fx.app.git_graph.selected_idx = 7;
+        fx.app.git_graph.scroll = 5;
+        fx.app.git_graph.selection_anchor = Some(3);
+        fx.app.git_graph.selected_commit = Some("stale".into());
+
+        fx.app
+            .set_graph_scope(GraphScope::Branch("refs/heads/main".into()));
+
+        assert!(fx.app.git_graph.cache_key.is_none());
+        assert_eq!(fx.app.git_graph.selected_idx, 0);
+        assert_eq!(fx.app.git_graph.scroll, 0);
+        assert!(fx.app.git_graph.selection_anchor.is_none());
+        assert!(fx.app.git_graph.selected_commit.is_none());
+    }
+
+    #[test]
+    fn set_graph_scope_persists_to_prefs() {
+        // Round-trip through the on-disk pref file so the next session
+        // really would land back on the same branch.
+        let mut fx = make_scope_fixture();
+        fx.app
+            .set_graph_scope(GraphScope::Branch("refs/heads/feature".into()));
+
+        let (scope, recent) = load_graph_scope_pref();
+        assert_eq!(scope, GraphScope::Branch("refs/heads/feature".into()));
+        assert_eq!(recent, vec!["refs/heads/feature".to_string()]);
+    }
+
+    #[test]
+    fn set_graph_scope_same_scope_is_noop() {
+        let mut fx = make_scope_fixture();
+        fx.app.git_graph.scope = GraphScope::Branch("refs/heads/main".into());
+        fx.app.git_graph.recent_branches = vec!["refs/heads/main".into()];
+        // Pre-seed a cache_key — the no-op path must NOT bust it (only
+        // a genuine scope change should).
+        fx.app.git_graph.cache_key = Some(("h".into(), 1, 2));
+        fx.app
+            .set_graph_scope(GraphScope::Branch("refs/heads/main".into()));
+        assert!(fx.app.git_graph.cache_key.is_some());
+    }
+
+    #[test]
+    fn stale_branch_payload_falls_back_to_all_refs() {
+        // Drive a Graph WorkerResult whose payload claims the scope is a
+        // branch but returned zero rows. The main thread should detect
+        // the missing-branch case, drop the recent entry, swap scope
+        // back to AllRefs, surface a toast, and persist the rollback.
+        let mut fx = make_scope_fixture();
+        // Stash the scope directly (bypassing `set_graph_scope` so we
+        // don't have to babysit the worker round-trip in this test).
+        fx.app.git_graph.scope = GraphScope::Branch("refs/heads/ghost".into());
+        fx.app.git_graph.recent_branches = vec!["refs/heads/ghost".into()];
+        persist_graph_scope(
+            &fx.app.git_graph.scope,
+            &fx.app.git_graph.recent_branches,
+        );
+
+        let generation = fx.app.graph_load.begin();
+        let payload = GraphPayload {
+            rows: Vec::new(),
+            ref_map: std::collections::HashMap::new(),
+            cache_key: ("h".into(), 0, 0),
+            scope: GraphScope::Branch("refs/heads/ghost".into()),
+        };
+        let toasts_before = fx.app.toasts.len();
+        fx.app.apply_worker_result(WorkerResult::Graph {
+            generation,
+            result: Ok(payload),
+        });
+
+        assert_eq!(fx.app.git_graph.scope, GraphScope::AllRefs);
+        assert!(!fx.app.git_graph.recent_branches.contains(&"refs/heads/ghost".to_string()));
+        assert!(fx.app.toasts.len() > toasts_before);
+        assert!(
+            fx.app.toasts.last().unwrap().message.contains("ghost"),
+            "toast should name the lost branch"
+        );
+
+        // Persisted state matches the fallback.
+        assert_eq!(
+            crate::prefs::get(PREF_GRAPH_SCOPE).as_deref(),
+            Some("all")
+        );
+        assert_eq!(
+            crate::prefs::get(PREF_GRAPH_SCOPE_RECENT)
+                .as_deref()
+                .unwrap_or(""),
+            ""
+        );
+    }
+
+    #[test]
+    fn open_graph_branch_picker_refuses_on_cold_start() {
+        // Cold-start safety: with a persisted Branch scope but no
+        // graph payload yet (ref_map still empty), pressing 'b' must
+        // NOT activate the picker — otherwise visible_rows would only
+        // offer `[ All refs ]` and a stray Enter would overwrite the
+        // user's persisted choice.
+        let mut fx = make_scope_fixture();
+        fx.app.git_graph.scope = GraphScope::Branch("refs/heads/feature".into());
+        fx.app.git_graph.ref_map.clear();
+        let toasts_before = fx.app.toasts.len();
+
+        fx.app.open_graph_branch_picker();
+
+        assert!(
+            !fx.app.graph_branch_picker.active,
+            "picker must not open while ref_map is empty"
+        );
+        assert!(fx.app.toasts.len() > toasts_before, "must surface a hint toast");
+        // Persisted scope untouched.
+        assert_eq!(
+            fx.app.git_graph.scope,
+            GraphScope::Branch("refs/heads/feature".into())
+        );
+    }
+
+    #[test]
+    fn stale_branch_fallback_skipped_when_ref_still_present() {
+        // Walk returned empty (transient revwalk error / lock
+        // contention), but the payload's ref_map still lists the
+        // branch. Fallback must NOT misfire — no toast, no scope flip,
+        // no recents drop.
+        let mut fx = make_scope_fixture();
+        fx.app.git_graph.scope = GraphScope::Branch("refs/heads/feature".into());
+        fx.app.git_graph.recent_branches = vec!["refs/heads/feature".into()];
+
+        let mut ref_map: std::collections::HashMap<String, Vec<crate::git::RefLabel>> =
+            std::collections::HashMap::new();
+        ref_map.insert(
+            "abc123".to_string(),
+            vec![crate::git::RefLabel::Branch("feature".into())],
+        );
+
+        let generation = fx.app.graph_load.begin();
+        let payload = GraphPayload {
+            rows: Vec::new(),
+            ref_map,
+            cache_key: ("h".into(), 0, 0),
+            scope: GraphScope::Branch("refs/heads/feature".into()),
+        };
+        let toasts_before = fx.app.toasts.len();
+        fx.app.apply_worker_result(WorkerResult::Graph {
+            generation,
+            result: Ok(payload),
+        });
+
+        // Scope kept; toast not pushed; recents preserved.
+        assert_eq!(
+            fx.app.git_graph.scope,
+            GraphScope::Branch("refs/heads/feature".into())
+        );
+        assert_eq!(fx.app.toasts.len(), toasts_before);
+        assert!(fx.app.git_graph.recent_branches.contains(&"refs/heads/feature".to_string()));
+    }
+
+    #[test]
+    fn apply_scope_no_refresh_invalidates_detail_loads_without_loading() {
+        // Stale in-flight detail / file-diff loads must NOT repaint
+        // the right panel after a scope swap. We bump generation via
+        // `invalidate` (not `begin`) so the status bar doesn't get
+        // stuck on a phantom "refreshing…" — verify both that the
+        // generation advances AND that `loading` stays false.
+        let mut fx = make_scope_fixture();
+        // Pretend an old load was in flight so we can confirm `loading`
+        // gets cleared, not preserved.
+        fx.app.commit_detail_load.loading = true;
+        fx.app.commit_file_diff_load.loading = true;
+        let before_detail = fx.app.commit_detail_load.generation;
+        let before_diff = fx.app.commit_file_diff_load.generation;
+
+        fx.app
+            .set_graph_scope(GraphScope::Branch("refs/heads/main".into()));
+
+        assert_ne!(
+            fx.app.commit_detail_load.generation, before_detail,
+            "commit_detail_load generation must advance"
+        );
+        assert_ne!(
+            fx.app.commit_file_diff_load.generation, before_diff,
+            "commit_file_diff_load generation must advance"
+        );
+        assert!(
+            !fx.app.commit_detail_load.loading,
+            "commit_detail_load.loading must be cleared (no follow-up dispatcher)"
+        );
+        assert!(
+            !fx.app.commit_file_diff_load.loading,
+            "commit_file_diff_load.loading must be cleared (no follow-up dispatcher)"
+        );
+    }
+
+    #[test]
+    fn set_graph_scope_clears_active_commit_graph_search() {
+        // Search matches index into git_graph.rows; clearing rows
+        // without resetting search would leave `n`/`N` jumping to
+        // rows that no longer correspond to anything visible.
+        let mut fx = make_scope_fixture();
+        // Synthesize an active CommitGraph search.
+        fx.app.search = crate::search::SearchState {
+            target: Some(crate::search::SearchTarget::CommitGraph),
+            matches: vec![crate::search::MatchLoc {
+                row: 0,
+                byte_range: 0..3,
+            }],
+            current: Some(0),
+            query: "foo".into(),
+            ..crate::search::SearchState::default()
+        };
+
+        fx.app
+            .set_graph_scope(GraphScope::Branch("refs/heads/main".into()));
+
+        assert!(
+            fx.app.search.matches.is_empty(),
+            "CommitGraph search must be cleared on scope swap"
+        );
+        assert!(fx.app.search.target.is_none());
+    }
+
+    #[test]
+    fn set_graph_scope_preserves_search_targeting_other_panel() {
+        // Searches on file preview, commit detail body, etc. don't
+        // index into git_graph.rows and should survive a scope swap.
+        let mut fx = make_scope_fixture();
+        fx.app.search = crate::search::SearchState {
+            target: Some(crate::search::SearchTarget::FilePreview),
+            matches: vec![crate::search::MatchLoc {
+                row: 5,
+                byte_range: 0..3,
+            }],
+            current: Some(0),
+            query: "foo".into(),
+            ..crate::search::SearchState::default()
+        };
+
+        fx.app
+            .set_graph_scope(GraphScope::Branch("refs/heads/main".into()));
+
+        assert_eq!(
+            fx.app.search.target,
+            Some(crate::search::SearchTarget::FilePreview),
+            "unrelated search target must not be cleared"
+        );
+        assert_eq!(fx.app.search.matches.len(), 1);
+    }
+
+    #[test]
+    fn confirm_graph_branch_picker_closes_overlay_when_filter_matches_nothing() {
+        // Filter "zzz" matches no branches and is not a substring of
+        // "all refs"; visible_rows is empty → confirm() returns None.
+        // The handler must still close the overlay so input isn't
+        // trapped.
+        let mut fx = make_scope_fixture();
+        // Pretend we already have a populated ref_map so open_graph_branch_picker
+        // succeeds.
+        fx.app
+            .git_graph
+            .ref_map
+            .insert("oid".into(), vec![crate::git::RefLabel::Branch("main".into())]);
+        fx.app.open_graph_branch_picker();
+        assert!(fx.app.graph_branch_picker.active);
+
+        fx.app.graph_branch_picker.filter = "zzz".into();
+        assert!(
+            fx.app.graph_branch_picker.confirm().is_none(),
+            "filter 'zzz' has no rows"
+        );
+
+        fx.app.confirm_graph_branch_picker();
+        assert!(
+            !fx.app.graph_branch_picker.active,
+            "picker must close even when confirm() returned None"
+        );
+    }
+
+    #[test]
+    fn payload_with_matching_scope_and_nonempty_rows_does_not_fall_back() {
+        // Sanity: a Branch-scoped payload that returned rows should be
+        // applied normally (no fallback, no toast).
+        let mut fx = make_scope_fixture();
+        fx.app.git_graph.scope = GraphScope::Branch("refs/heads/feature".into());
+
+        let generation = fx.app.graph_load.begin();
+        let payload = GraphPayload {
+            rows: Vec::new(), // emptiness is fine — the OK case is "scope didn't disappear"
+            ref_map: std::collections::HashMap::new(),
+            cache_key: ("h".into(), 0, 1),
+            // Scope mismatched against current: that's the "stale request" path,
+            // not the "ghost branch" path. The guard requires scope match.
+            scope: GraphScope::Branch("refs/heads/other".into()),
+        };
+        let toasts_before = fx.app.toasts.len();
+        fx.app.apply_worker_result(WorkerResult::Graph {
+            generation,
+            result: Ok(payload),
+        });
+
+        // Scope should NOT have flipped — the payload was for a different
+        // branch than the user is currently looking at.
+        assert!(matches!(
+            fx.app.git_graph.scope,
+            GraphScope::Branch(ref s) if s == "refs/heads/feature"
+        ));
+        assert_eq!(fx.app.toasts.len(), toasts_before);
     }
 
     #[test]

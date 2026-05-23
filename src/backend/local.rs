@@ -17,7 +17,7 @@ use super::{
     EditorLaunchSpec, SearchChunkSink, StatusSnapshot, TrashOutcome, WalkOpts, WalkResponse,
 };
 use crate::file_tree::{self, PreviewContent, TreeEntry};
-use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, GitRepo, RefLabel};
+use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, GitRepo, GraphScope, RefLabel};
 use std::ops::ControlFlow;
 
 /// How many decoded previews to keep around. 8 covers the typical
@@ -513,8 +513,12 @@ impl Backend for LocalBackend {
         crate::git::commit_at(&self.workdir, message).map_err(BackendError::Git)
     }
 
-    fn list_commits(&self, limit: usize) -> Result<Vec<CommitInfo>, BackendError> {
-        Ok(self.repo()?.list_commits(limit))
+    fn list_commits(
+        &self,
+        scope: &GraphScope,
+        limit: usize,
+    ) -> Result<Vec<CommitInfo>, BackendError> {
+        Ok(self.repo()?.list_commits(scope, limit))
     }
 
     fn list_refs(&self) -> Result<HashMap<String, Vec<RefLabel>>, BackendError> {

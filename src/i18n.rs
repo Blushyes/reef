@@ -657,6 +657,28 @@ pub fn push_failed_toast(e: &str) -> String {
     }
 }
 
+/// Toast shown by the Graph tab when the user's persisted branch scope
+/// resolves to a ref that no longer exists. Surfaces the human-readable
+/// branch shorthand and tells the user we fell back to the default
+/// "all refs" view.
+pub fn graph_scope_stale_branch_toast(name: &str) -> String {
+    match lang() {
+        Lang::Zh => format!("分支 '{name}' 已不存在 — 切回显示全部 refs。"),
+        Lang::En => format!("Branch '{name}' is gone — showing all refs."),
+    }
+}
+
+/// Toast shown when the user opens the Graph branch picker before the
+/// first commit-graph load has populated `ref_map`. Without this guard
+/// the picker would only offer `[ All refs ]` and accidentally
+/// overwrite the user's persisted Branch scope.
+pub fn graph_picker_not_ready_toast() -> &'static str {
+    match lang() {
+        Lang::Zh => "分支列表加载中,请稍候…",
+        Lang::En => "Branch list still loading — try again in a moment.",
+    }
+}
+
 /// Toast variant for commit failure. Commit errors are often multi-line
 /// (hook output, rejected commit-msg template, etc.); the toast picks
 /// the first non-empty line so it stays readable next to other status

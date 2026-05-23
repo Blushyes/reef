@@ -41,6 +41,13 @@ pub enum ClickAction {
     /// into `HostsPickerState::visible_rows()`. Handled in
     /// `input::handle_mouse` while the picker owns mouse input.
     HostsPickerSelect(usize),
+    /// Click on a row in the Graph tab's branch picker (`b`). The
+    /// `usize` indexes into
+    /// `GraphBranchPickerState::visible_rows()`. Dispatched inside
+    /// `input::handle_mouse_graph_branch_picker`, not via
+    /// `App::handle_action` — the picker owns mouse exclusively while
+    /// open.
+    GraphBranchPickerSelect(usize),
     /// Click on the input row of the Search tab's left panel while in
     /// list mode. Sets `focus = FindInput` so the user can mouse-drive
     /// the mode switch instead of hunting for `/` or `i`. Only registered

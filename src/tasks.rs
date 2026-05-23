@@ -8,7 +8,7 @@ use crate::app::{CommitFileDiff, DiffHighlighted, HighlightedDiff};
 use crate::backend::Backend;
 use crate::file_tree::{PreviewContent, TreeEntry};
 use crate::git::graph::GraphRow;
-use crate::git::{CommitDetail, DiffContent, FileEntry, RefLabel};
+use crate::git::{CommitDetail, DiffContent, FileEntry, GraphScope, RefLabel};
 use crate::global_search::MatchHit;
 use crate::paste_conflict::Resolution;
 use crate::ui::highlight;
@@ -39,6 +39,24 @@ impl AsyncState {
         self.stale = false;
         self.error = None;
         self.generation
+    }
+
+    /// Cancel any in-flight load and reset the state to "idle" with a
+    /// fresh generation. Use this when the caller's reason for issuing
+    /// the original load no longer holds (e.g. the user changed scope
+    /// so the selected commit is gone) and no follow-up dispatch is
+    /// lined up.
+    ///
+    /// Semantically: "any worker still chewing on the old generation
+    /// will have its result discarded by `complete_ok`'s generation
+    /// check; pretend that already happened." `loading` is forced false
+    /// so the status bar doesn't render a phantom "<label> refreshing…"
+    /// for a load nobody is going to consume.
+    pub fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1).max(1);
+        self.loading = false;
+        self.stale = false;
+        self.error = None;
     }
 
     pub fn complete_ok(&mut self, generation: u64) -> bool {
@@ -84,7 +102,13 @@ pub struct FileTreePayload {
 pub struct GraphPayload {
     pub rows: Vec<GraphRow>,
     pub ref_map: HashMap<String, Vec<RefLabel>>,
-    pub cache_key: (String, u64),
+    /// `(head_oid, refs_hash, scope_hash)` — see `GitGraphState::cache_key`.
+    pub cache_key: (String, u64, u64),
+    /// The scope this payload was built for. The main thread compares
+    /// against the current `git_graph.scope` to detect a fall-through
+    /// fallback opportunity (`Branch(missing)` → empty rows → revert to
+    /// `AllRefs`).
+    pub scope: GraphScope,
 }
 
 #[derive(Debug)]
@@ -459,6 +483,7 @@ enum GraphTask {
         generation: u64,
         backend: Arc<dyn Backend>,
         limit: usize,
+        scope: GraphScope,
     },
     LoadCommitDetail {
         generation: u64,
@@ -752,11 +777,18 @@ impl TaskCoordinator {
         });
     }
 
-    pub fn refresh_graph(&self, generation: u64, backend: Arc<dyn Backend>, limit: usize) {
+    pub fn refresh_graph(
+        &self,
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        limit: usize,
+        scope: GraphScope,
+    ) {
         let _ = self.graph_tx.send(GraphTask::RefreshGraph {
             generation,
             backend,
             limit,
+            scope,
         });
     }
 
@@ -1567,6 +1599,7 @@ fn spawn_graph_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Gra
                         generation,
                         backend,
                         limit,
+                        scope,
                     } => {
                         let result = (|| -> Result<GraphPayload, String> {
                             let head = backend
@@ -1575,12 +1608,38 @@ fn spawn_graph_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Gra
                                 .unwrap_or_default();
                             let ref_map = backend.list_refs().map_err(|e| e.to_string())?;
                             let refs_hash = hash_ref_map(&ref_map);
-                            let commits = backend.list_commits(limit).map_err(|e| e.to_string())?;
+                            let scope_hash = hash_graph_scope(&scope);
+                            let commits = backend
+                                .list_commits(&scope, limit)
+                                .map_err(|e| e.to_string())?;
                             let rows = crate::git::graph::build_graph(&commits);
+                            // Transient-walk-failure detector: a
+                            // `Branch(X)` scope where `X` is still in
+                            // ref_map but `list_commits` returned no
+                            // commits is almost certainly a one-off
+                            // libgit2 hiccup (lock contention, fs
+                            // jitter) rather than a real "empty
+                            // branch". Returning Err here keeps the
+                            // previous rows on screen until the next
+                            // 5s revalidate succeeds, instead of
+                            // letting the main thread replace them
+                            // with the empty set. The genuinely-gone
+                            // case (ref missing from ref_map) still
+                            // lands as a normal payload and trips the
+                            // stale-branch fallback in `app.rs`.
+                            if rows.is_empty()
+                                && let GraphScope::Branch(target) = &scope
+                                && ref_present_in_map(&ref_map, target)
+                            {
+                                return Err(format!(
+                                    "transient walk failure for {target}"
+                                ));
+                            }
                             Ok(GraphPayload {
                                 rows,
                                 ref_map,
-                                cache_key: (head, refs_hash),
+                                cache_key: (head, refs_hash, scope_hash),
+                                scope,
                             })
                         })();
                         let _ = result_tx.send(WorkerResult::Graph { generation, result });
@@ -1711,6 +1770,37 @@ fn build_file_tree_payload(
         entries,
         selected_idx,
     })
+}
+
+/// `true` if `target` (a fully-qualified ref like `refs/heads/main`)
+/// is reachable through any `RefLabel::Branch` / `RefLabel::RemoteBranch`
+/// entry in `ref_map`. Used by the graph worker to distinguish a
+/// genuinely-deleted branch (target missing → fallback to AllRefs)
+/// from a transient walk failure (target still present → return Err
+/// so main keeps the previous rows).
+fn ref_present_in_map(
+    ref_map: &HashMap<String, Vec<RefLabel>>,
+    target: &str,
+) -> bool {
+    ref_map.values().any(|labels| {
+        labels.iter().any(|label| match label {
+            RefLabel::Branch(name) => format!("refs/heads/{name}") == target,
+            RefLabel::RemoteBranch(name) => format!("refs/remotes/{name}") == target,
+            _ => false,
+        })
+    })
+}
+
+fn hash_graph_scope(scope: &GraphScope) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match scope {
+        GraphScope::AllRefs => 0u8.hash(&mut hasher),
+        GraphScope::Branch(s) => {
+            1u8.hash(&mut hasher);
+            s.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
 }
 
 fn hash_ref_map(map: &HashMap<String, Vec<RefLabel>>) -> u64 {
@@ -2931,5 +3021,53 @@ mod preview_panic_guard_tests {
         let result = run_preview_with_panic_guard(Path::new("x.txt"), move || Some(preview));
         let got = result.expect("Ok").expect("Some");
         assert_eq!(got.file_path, "x.txt");
+    }
+}
+
+#[cfg(test)]
+mod graph_worker_helpers_tests {
+    use super::*;
+
+    #[test]
+    fn ref_present_in_map_matches_local_branch() {
+        let mut map: HashMap<String, Vec<RefLabel>> = HashMap::new();
+        map.insert("oid".into(), vec![RefLabel::Branch("main".into())]);
+        assert!(ref_present_in_map(&map, "refs/heads/main"));
+    }
+
+    #[test]
+    fn ref_present_in_map_matches_remote_branch() {
+        let mut map: HashMap<String, Vec<RefLabel>> = HashMap::new();
+        map.insert(
+            "oid".into(),
+            vec![RefLabel::RemoteBranch("origin/main".into())],
+        );
+        assert!(ref_present_in_map(&map, "refs/remotes/origin/main"));
+    }
+
+    #[test]
+    fn ref_present_in_map_rejects_missing_ref() {
+        let mut map: HashMap<String, Vec<RefLabel>> = HashMap::new();
+        map.insert("oid".into(), vec![RefLabel::Branch("main".into())]);
+        assert!(!ref_present_in_map(&map, "refs/heads/feature"));
+    }
+
+    #[test]
+    fn ref_present_in_map_ignores_tags_and_head() {
+        let mut map: HashMap<String, Vec<RefLabel>> = HashMap::new();
+        map.insert(
+            "oid".into(),
+            vec![RefLabel::Head, RefLabel::Tag("v1".into())],
+        );
+        // Even though refs/tags/v1 exists, scope is fully-qualified
+        // refs/heads/ or refs/remotes/ only. Tags / HEAD don't count.
+        assert!(!ref_present_in_map(&map, "refs/heads/v1"));
+        assert!(!ref_present_in_map(&map, "refs/tags/v1"));
+    }
+
+    #[test]
+    fn ref_present_in_map_empty_map_returns_false() {
+        let map: HashMap<String, Vec<RefLabel>> = HashMap::new();
+        assert!(!ref_present_in_map(&map, "refs/heads/anything"));
     }
 }

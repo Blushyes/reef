@@ -138,6 +138,14 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         return;
     }
 
+    // Graph branch picker (`b` on Graph tab) — same exclusive ownership
+    // as the other overlays. Sits next to `hosts_picker` because it's a
+    // peer overlay (filter input + commit-on-Enter + Esc-cancel).
+    if app.graph_branch_picker.active {
+        handle_key_graph_branch_picker(key, app);
+        return;
+    }
+
     // VSCode-style find widget — fully owns input while active. Sits
     // above the global-search palette because the widget is opened by
     // a Space leader chord (`Space+F`) and is the most-recently-opened
@@ -374,6 +382,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         || app.global_search.active
         || app.quick_open.active
         || app.hosts_picker.active
+        || app.graph_branch_picker.active
         || app.tree_edit.active
         || app.db_goto_input.is_some()
         || app.is_sqlite_preview();
@@ -1424,6 +1433,15 @@ fn handle_key_graph(key: KeyEvent, app: &mut App) {
             app.git_graph.cache_key = None;
             app.refresh_graph();
         }
+        // `b` opens the branch picker overlay (see `graph_branch_picker`).
+        // Available from every panel on the Graph tab — the picker is a
+        // tab-level navigation, not a sidebar-local action, so the user
+        // can switch branches while focus is on the commit pane or the
+        // diff column too. (`V`/visual-mode stays gated on Panel::Files
+        // because it's specifically a sidebar-row range selection.)
+        KeyCode::Char('b') if !ctrl => {
+            app.open_graph_branch_picker();
+        }
         // m/f/t target the commit-detail panel regardless of focus.
         // `!ctrl` guards so Ctrl+F/M/T (e.g. VSCode muscle-memory Ctrl+F
         // for find) don't silently flip diff layout/mode — the global
@@ -2097,6 +2115,74 @@ fn handle_key_hosts_picker(key: KeyEvent, app: &mut App) {
     }
 }
 
+/// Keyboard handler for the Graph tab's `b` branch picker.
+///
+/// Routing is two-phase to match the convention shared with
+/// `find_widget` / `quick_open`:
+///
+///   1. Picker-specific keys first — Esc / Ctrl+C close, Enter commits,
+///      Up/Down + Ctrl+J/K + Ctrl+N/P navigate the list.
+///   2. Anything left over flows into [`input_edit::dispatch_key`], which
+///      owns the readline / VSCode text-input vocabulary: Alt/Ctrl+←/→
+///      word-jump, Home/End, Ctrl+A/E, Alt+B/F word-jump, Backspace +
+///      Ctrl+W word-delete, Alt+Backspace / Ctrl+W word-back, Alt+D /
+///      Ctrl+Delete word-forward, Ctrl+U clear, plain char insert.
+///
+/// Edits reset `selected_idx` to 0 so the filtered list always lands
+/// the cursor on the first match (matches the contract of every other
+/// fuzzy picker in reef).
+fn handle_key_graph_branch_picker(key: KeyEvent, app: &mut App) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // Phase 1: picker-specific shortcuts. These must run before
+    // `dispatch_key`, which would otherwise eat e.g. Ctrl+N as a no-op
+    // (it isn't in the editor vocabulary) and `n` would fall through
+    // to the printable-char insert.
+    match key.code {
+        KeyCode::Esc => {
+            app.close_graph_branch_picker();
+            return;
+        }
+        KeyCode::Char('c') if ctrl => {
+            app.close_graph_branch_picker();
+            app.should_quit = true;
+            return;
+        }
+        KeyCode::Enter => {
+            app.confirm_graph_branch_picker();
+            return;
+        }
+        KeyCode::Up => {
+            app.graph_branch_picker.move_selection(-1);
+            return;
+        }
+        KeyCode::Down => {
+            app.graph_branch_picker.move_selection(1);
+            return;
+        }
+        KeyCode::Char('k' | 'p') if ctrl => {
+            app.graph_branch_picker.move_selection(-1);
+            return;
+        }
+        KeyCode::Char('j' | 'n') if ctrl => {
+            app.graph_branch_picker.move_selection(1);
+            return;
+        }
+        _ => {}
+    }
+
+    // Phase 2: shared text-input dispatch. Any `Edited` outcome resets
+    // the list cursor so the filtered view always opens at row 0 —
+    // same UX convention as quick_open / find_widget.
+    let outcome = crate::input_edit::dispatch_key(
+        &key,
+        &mut app.graph_branch_picker.filter,
+        &mut app.graph_branch_picker.cursor,
+    );
+    if outcome == crate::input_edit::Outcome::Edited {
+        app.graph_branch_picker.selected_idx = 0;
+    }
+}
+
 /// Keyboard handler for the generic `ConfirmModal`.
 ///
 /// Routing:
@@ -2315,6 +2401,10 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
     // and scroll wheels inside the popup should move the selection.
     if app.hosts_picker.active {
         handle_mouse_hosts_picker(mouse, app);
+        return;
+    }
+    if app.graph_branch_picker.active {
+        handle_mouse_graph_branch_picker(mouse, app);
         return;
     }
     if app.global_search.active {
@@ -3706,6 +3796,62 @@ fn handle_mouse_hosts_picker(mouse: MouseEvent, app: &mut App) {
         MouseEventKind::ScrollDown if inside => {
             let step = app.vertical_scroll_pacer.step() as i32;
             app.hosts_picker.move_selection(step);
+        }
+        _ => {}
+    }
+}
+
+/// Mouse dispatch for the Graph tab branch picker. Same shape as
+/// `handle_mouse_hosts_picker`: click inside selects (double-click
+/// commits), click outside dismisses, scroll moves the selection.
+fn handle_mouse_graph_branch_picker(mouse: MouseEvent, app: &mut App) {
+    let popup = match app.graph_branch_picker.last_popup_area {
+        Some(r) => r,
+        None => return,
+    };
+    let inside = mouse.column >= popup.x
+        && mouse.column < popup.x + popup.width
+        && mouse.row >= popup.y
+        && mouse.row < popup.y + popup.height;
+
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if !inside {
+                app.close_graph_branch_picker();
+                app.last_click = None;
+                return;
+            }
+            let now = Instant::now();
+            let is_double = matches!(
+                app.last_click,
+                Some((t, c, r))
+                    if c == mouse.column
+                        && r == mouse.row
+                        && now.duration_since(t) < DOUBLE_CLICK_WINDOW
+            );
+            if let Some(ui::mouse::ClickAction::GraphBranchPickerSelect(idx)) =
+                app.hit_registry.hit_test(mouse.column, mouse.row)
+            {
+                app.graph_branch_picker.selected_idx = idx;
+                if is_double {
+                    app.confirm_graph_branch_picker();
+                    app.last_click = None;
+                    return;
+                }
+            }
+            app.last_click = if is_double {
+                None
+            } else {
+                Some((now, mouse.column, mouse.row))
+            };
+        }
+        MouseEventKind::ScrollUp if inside => {
+            let step = app.vertical_scroll_pacer.step() as i32;
+            app.graph_branch_picker.move_selection(-step);
+        }
+        MouseEventKind::ScrollDown if inside => {
+            let step = app.vertical_scroll_pacer.step() as i32;
+            app.graph_branch_picker.move_selection(step);
         }
         _ => {}
     }

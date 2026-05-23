@@ -24,7 +24,7 @@ use std::sync::mpsc;
 
 use crate::file_tree::{PreviewContent, TreeEntry};
 use crate::git::graph::GraphRow;
-use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, RefLabel};
+use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, GraphScope, RefLabel};
 use std::collections::{HashMap, HashSet};
 
 pub mod local;
@@ -352,7 +352,13 @@ pub trait Backend: Send + Sync {
     fn commit(&self, message: &str) -> Result<(), BackendError>;
 
     // ─── git: history ───────────────────────────────────────────────────────
-    fn list_commits(&self, limit: usize) -> Result<Vec<CommitInfo>, BackendError>;
+    /// List commits according to `scope` (all refs vs a single branch).
+    /// `scope = GraphScope::AllRefs` preserves the pre-scope behaviour.
+    fn list_commits(
+        &self,
+        scope: &GraphScope,
+        limit: usize,
+    ) -> Result<Vec<CommitInfo>, BackendError>;
     fn list_refs(&self) -> Result<HashMap<String, Vec<RefLabel>>, BackendError>;
     fn head_oid(&self) -> Result<Option<String>, BackendError>;
     fn commit_detail(&self, oid: &str) -> Result<Option<CommitDetail>, BackendError>;

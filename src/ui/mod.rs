@@ -11,6 +11,7 @@ pub mod focused_preview_panel;
 pub mod git_graph_panel;
 pub mod git_status_panel;
 pub mod global_search_panel;
+pub mod graph_branch_picker_panel;
 pub mod highlight;
 pub mod hosts_picker_panel;
 pub mod hover;
@@ -227,6 +228,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     }
     if app.hosts_picker.active {
         hosts_picker_panel::render(f, app, size);
+    }
+    if app.graph_branch_picker.active {
+        graph_branch_picker_panel::render(f, app, size);
     }
     // Context menu overlay renders last so it sits above the help
     // popup and any other in-panel chrome. The menu itself is scoped

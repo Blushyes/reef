@@ -290,7 +290,9 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
             Err(e) => Err(backend_err(e)),
         },
 
-        Request::ListCommits { limit } => match backend.list_commits(limit as usize) {
+        Request::ListCommits { limit, scope } => match backend
+            .list_commits(&graph_scope_from_dto(scope), limit as usize)
+        {
             Ok(list) => {
                 let dtos: Vec<CommitInfoDto> = list.into_iter().map(commit_info_to_dto).collect();
                 serde_json::to_value(dtos)
@@ -766,6 +768,13 @@ fn ref_label_to_dto(r: reef::git::RefLabel) -> RefLabelDto {
         RefLabel::Branch(s) => RefLabelDto::Branch(s),
         RefLabel::RemoteBranch(s) => RefLabelDto::RemoteBranch(s),
         RefLabel::Tag(s) => RefLabelDto::Tag(s),
+    }
+}
+
+fn graph_scope_from_dto(scope: reef_proto::GraphScopeDto) -> reef::git::GraphScope {
+    match scope {
+        reef_proto::GraphScopeDto::AllRefs => reef::git::GraphScope::AllRefs,
+        reef_proto::GraphScopeDto::Branch(s) => reef::git::GraphScope::Branch(s),
     }
 }
 

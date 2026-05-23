@@ -78,7 +78,16 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 ///       `protocol_version < 9` (or on `Unimplemented`) and wraps the
 ///       single-schema result back into the V2 shape so the renderer
 ///       stays unified.
-pub const PROTOCOL_VERSION: u32 = 9;
+/// - v10: `ListCommits` gains a required `scope` field so the Graph
+///       tab can restrict its walk to a single branch ref. The field
+///       is intentionally NOT `#[serde(default)]`: a v9 agent
+///       receiving a v10 request will reject it with "missing field
+///       `scope`" (and vice versa), surfacing the version drift as
+///       an explicit RPC error instead of silently degrading to
+///       AllRefs-only on whichever side ignored the field. The
+///       install path is expected to redeploy the agent on version
+///       mismatch so this case should be transient.
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// Encode a single envelope-level value to `writer` using the
 /// length-prefixed framing. The caller is expected to flush.
@@ -224,6 +233,17 @@ pub enum Request {
     // ── Git: history ────
     ListCommits {
         limit: u64,
+        /// Walk scope. Required on the wire: a v9 agent decoding a v10
+        /// request will fail loudly ("missing field `scope`") rather
+        /// than silently dropping the field and walking every ref,
+        /// which would mask the version drift entirely.
+        ///
+        /// Going the other way — a v9 client hitting a v10 agent —
+        /// also fails decoding, which is fine: the install path is
+        /// expected to redeploy the agent on version mismatch, so
+        /// mixed-version pairings shouldn't exist in steady state
+        /// and getting an explicit error beats silent misbehaviour.
+        scope: GraphScopeDto,
     },
     ListRefs,
     HeadOid,
@@ -692,6 +712,17 @@ pub enum RefLabelDto {
 
 /// Convenience alias — the ref map is keyed by OID (hex).
 pub type RefMapDto = HashMap<String, Vec<RefLabelDto>>;
+
+/// Wire form of `GraphScope`. `AllRefs` is the default so a missing /
+/// older-protocol message decodes to the historical "all refs" walk.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "name", rename_all = "snake_case")]
+pub enum GraphScopeDto {
+    #[default]
+    AllRefs,
+    /// Fully-qualified ref, e.g. `refs/heads/main`.
+    Branch(String),
+}
 
 // ── M3 Track 1: write-op responses ─────────────────────────────────────────
 

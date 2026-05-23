@@ -14,6 +14,7 @@ pub mod find_widget;
 pub mod fs_watcher;
 pub mod git;
 pub mod global_search;
+pub mod graph_branch_picker;
 pub mod hosts;
 pub mod hosts_picker;
 pub mod i18n;

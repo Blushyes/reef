@@ -630,31 +630,21 @@ fn next_panel(current: Panel, three_col: bool, reverse: bool) -> Panel {
 }
 
 /// SQLite preview page-jump input. While `app.db_goto_input` is
-/// `Some(_)`, this handler fully owns the keyboard. Digits append,
-/// Backspace pops, Enter parses and jumps via
-/// [`App::db_navigate_to_page`], Esc cancels. Anything else is
-/// silently ignored so a stray modifier doesn't accidentally commit
-/// a partial number.
+/// `Some(_)`, this handler fully owns the keyboard.
+///
+/// Two-phase routing matching every other input in reef:
+///   1. Enter parses-and-jumps; Esc cancels.
+///   2. Everything else flows into [`input_edit::dispatch_key_filtered`]
+///      with a digit-only predicate, so the user gets word-motion,
+///      Home/End, Ctrl+U clear, etc. for free while non-digit chars
+///      are silently swallowed.
 fn handle_key_db_goto(key: KeyEvent, app: &mut App) {
     let buf = match app.db_goto_input.as_mut() {
         Some(b) => b,
         None => return,
     };
     match key.code {
-        crossterm::event::KeyCode::Char(c) if c.is_ascii_digit() => {
-            // Cap input length at 18 chars — that's beyond u64::MAX
-            // digit count, so anything longer is the user fat-
-            // fingering rather than a real page number. Silently
-            // dropping the extra keystroke is friendlier than
-            // rejecting the whole buffer.
-            if buf.len() < 18 {
-                buf.push(c);
-            }
-        }
-        crossterm::event::KeyCode::Backspace => {
-            buf.pop();
-        }
-        crossterm::event::KeyCode::Enter => {
+        KeyCode::Enter => {
             // Empty input on Enter → treat as Esc (cancel) rather
             // than parsing "" → 0 → page 0. Keeps the contract
             // friendlier when the user opens the prompt by accident.
@@ -664,17 +654,31 @@ fn handle_key_db_goto(key: KeyEvent, app: &mut App) {
                 buf.parse::<u64>().ok()
             };
             app.db_goto_input = None;
+            app.db_goto_cursor = 0;
             if let Some(page) = parsed {
                 if page > 0 {
                     app.db_navigate_to_page(page);
                 }
             }
+            return;
         }
-        crossterm::event::KeyCode::Esc => {
+        KeyCode::Esc => {
             app.db_goto_input = None;
+            app.db_goto_cursor = 0;
+            return;
         }
         _ => {}
     }
+    // Digit-only + 18-char cap (beyond u64::MAX digit count). The cap
+    // applies only to NEW insertions, not to e.g. Backspace / cursor
+    // motion, hence wrapping it inside the predicate.
+    let current_len = buf.len();
+    let _ = crate::input_edit::dispatch_key_filtered(
+        &key,
+        buf,
+        &mut app.db_goto_cursor,
+        |c| c.is_ascii_digit() && current_len < 18,
+    );
 }
 
 /// 纯预览模式的早期闸门 —— 拦截退出语义 + 文件 picker 相关按键。
@@ -1858,6 +1862,7 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                     .is_some_and(|p| p.is_database()) =>
         {
             app.db_goto_input = Some(String::new());
+            app.db_goto_cursor = 0;
         }
         KeyCode::Left if app.active_panel == Panel::Diff => {
             let step = if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -2015,12 +2020,19 @@ fn handle_key_tree_edit(key: KeyEvent, app: &mut App) {
         _ => {}
     }
 
-    // Phase 2: shared text-input dispatch. No edit-derived side
-    // effect — validation runs on commit, not per-keystroke.
-    let _ = crate::input_edit::dispatch_key(
+    // Phase 2: shared text-input dispatch with inline char filter.
+    // We reject path separators, NUL, and control characters at the
+    // point of insertion — `validate_basename` already rejects them
+    // at commit, but swallowing here gives the user an immediate
+    // signal (no character appears) and keeps the buffer in a
+    // perpetually-valid state. Empty / "." / ".." stay as commit-
+    // time validations since they depend on the full buffer, not a
+    // single char.
+    let _ = crate::input_edit::dispatch_key_filtered(
         &key,
         &mut app.tree_edit.buffer,
         &mut app.tree_edit.cursor,
+        |c| c != '/' && c != '\\' && c != '\0' && !c.is_control(),
     );
 }
 
@@ -2406,6 +2418,7 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
         )
     {
         app.db_goto_input = None;
+        app.db_goto_cursor = 0;
         return;
     }
 

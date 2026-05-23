@@ -39,6 +39,27 @@ pub enum Outcome {
 /// invokes any edit-derived side effect (e.g. `mark_query_edited`)
 /// when the result is `Outcome::Edited`.
 pub fn dispatch_key(key: &KeyEvent, text: &mut String, cursor: &mut usize) -> Outcome {
+    dispatch_key_filtered(key, text, cursor, |_| true)
+}
+
+/// Filtered variant of [`dispatch_key`]: every other op (cursor
+/// motion, word-delete, paste, …) is unchanged, but plain-char
+/// insertion is gated by `accept_char`. Rejected chars are swallowed
+/// (Outcome::Unhandled-like effect: returns
+/// [`Outcome::CursorOnly`] so the caller still recognises the key as
+/// consumed but knows the buffer is untouched).
+///
+/// Use this for inputs where the buffer has a content predicate the
+/// caller wants enforced inline: db_goto's digit-only page number,
+/// tree_edit's reject `/`, `\`, NUL, control chars during rename.
+/// Bracketed-paste payloads are NOT filtered here — call
+/// [`paste_single_line`] manually if needed.
+pub fn dispatch_key_filtered(
+    key: &KeyEvent,
+    text: &mut String,
+    cursor: &mut usize,
+    accept_char: impl Fn(char) -> bool,
+) -> Outcome {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
@@ -114,8 +135,17 @@ pub fn dispatch_key(key: &KeyEvent, text: &mut String, cursor: &mut usize) -> Ou
             Outcome::Edited
         }
         KeyCode::Char(c) if !ctrl => {
-            insert_char(text, cursor, c);
-            Outcome::Edited
+            if accept_char(c) {
+                insert_char(text, cursor, c);
+                Outcome::Edited
+            } else {
+                // Recognised the keystroke as a printable character but
+                // the caller's predicate rejected it. Treat as consumed
+                // (so the key doesn't fall through to global hotkeys)
+                // but report no edit so the caller can avoid spurious
+                // re-search / re-filter.
+                Outcome::CursorOnly
+            }
         }
         _ => Outcome::Unhandled,
     }
@@ -503,6 +533,56 @@ mod tests {
         assert!(!paste_single_line("\n\r\n", &mut t, &mut c));
         assert_eq!(t, "keep");
         assert_eq!(c, 4);
+    }
+
+    #[test]
+    fn dispatch_filtered_inserts_accepted_char() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut t, mut c) = state("", 0);
+        let outcome = dispatch_key_filtered(
+            &KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE),
+            &mut t,
+            &mut c,
+            |c| c.is_ascii_digit(),
+        );
+        assert_eq!(outcome, Outcome::Edited);
+        assert_eq!(t, "5");
+        assert_eq!(c, 1);
+    }
+
+    #[test]
+    fn dispatch_filtered_swallows_rejected_char() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        // Predicate rejects non-digit: 'a' is swallowed but treated
+        // as consumed (CursorOnly, not Unhandled) so it doesn't fall
+        // through to global hotkeys.
+        let (mut t, mut c) = state("12", 2);
+        let outcome = dispatch_key_filtered(
+            &KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            &mut t,
+            &mut c,
+            |c| c.is_ascii_digit(),
+        );
+        assert_eq!(outcome, Outcome::CursorOnly);
+        assert_eq!(t, "12", "buffer untouched");
+        assert_eq!(c, 2, "cursor untouched");
+    }
+
+    #[test]
+    fn dispatch_filtered_still_routes_editor_keys() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        // Predicate-rejection only gates Char(c) inserts; word-motion,
+        // delete, Home/End, etc. still route through unchanged.
+        let (mut t, mut c) = state("123", 3);
+        let outcome = dispatch_key_filtered(
+            &KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            &mut t,
+            &mut c,
+            |_| false, // predicate doesn't matter for non-Char keys
+        );
+        assert_eq!(outcome, Outcome::Edited);
+        assert_eq!(t, "12");
+        assert_eq!(c, 2);
     }
 
     #[test]

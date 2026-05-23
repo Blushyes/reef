@@ -648,6 +648,11 @@ pub struct App {
     /// cancels. While `Some`, the input dispatcher (see `handle_key`)
     /// fully owns the keyboard — no other binding fires.
     pub db_goto_input: Option<String>,
+    /// Cursor byte-offset into `db_goto_input` when it's `Some`. Only
+    /// meaningful in tandem with `db_goto_input`; reset to 0 each time
+    /// the input opens. Allows mid-buffer editing (Left/Right, Home/End,
+    /// Ctrl+A/E, etc.) via [`crate::input_edit`].
+    pub db_goto_cursor: usize,
     /// Vertical / horizontal scroll axis-lock state. The dispatcher
     /// `observe()`s the firing axis and `locked()`-checks the
     /// orthogonal one — single-event trackpad noise on the
@@ -1113,6 +1118,7 @@ impl App {
             last_preview_rect: None,
             db_preview_state: None,
             db_goto_input: None,
+            db_goto_cursor: 0,
             vertical_scroll_lock: crate::input::AxisLock::new(),
             horizontal_scroll_lock: crate::input::AxisLock::new(),
             vertical_scroll_pacer: crate::input::ScrollPacer::new(),
@@ -3985,6 +3991,7 @@ impl App {
                         // any preview transition so a half-typed page
                         // number doesn't survive a file switch.
                         self.db_goto_input = None;
+                        self.db_goto_cursor = 0;
                         // If `global_search::accept` stashed a highlight for
                         // this file, re-center once the preview actually
                         // lands. `load_preview_for_path` runs async, so the

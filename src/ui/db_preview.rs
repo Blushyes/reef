@@ -240,26 +240,34 @@ pub(in crate::ui) fn render(
             // Pagination footer.
             if body_max_y < max_y {
                 if let Some(buf) = app.db_goto_input.as_ref() {
+                    let prompt_text = format!("{}: ", t(Msg::DbGotoPagePrompt));
+                    let prompt_w =
+                        unicode_width::UnicodeWidthStr::width(prompt_text.as_str()) as u16;
                     let prompt_line = Line::from(vec![
                         Span::styled(
-                            format!("{}: ", t(Msg::DbGotoPagePrompt)),
+                            prompt_text,
                             Style::default()
                                 .fg(th.fg_primary)
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(buf.clone(), Style::default().fg(th.fg_primary)),
                         Span::styled(
-                            "▏",
-                            Style::default()
-                                .fg(th.fg_primary)
-                                .add_modifier(Modifier::DIM),
-                        ),
-                        Span::styled(
                             format!("  {}", t(Msg::DbGotoPageHint)),
                             Style::default().fg(th.fg_secondary),
                         ),
                     ]);
-                    f.render_widget(prompt_line, Rect::new(area.x, body_max_y, area.width, 1));
+                    let prompt_rect = Rect::new(area.x, body_max_y, area.width, 1);
+                    f.render_widget(prompt_line, prompt_rect);
+                    // Caret. Cursor is a byte offset into `buf` — same
+                    // convention used by every other input in reef. The
+                    // 18-char cap means this is always a valid char
+                    // boundary on ASCII digits.
+                    let cursor_byte = app.db_goto_cursor.min(buf.len());
+                    let cursor_w =
+                        unicode_width::UnicodeWidthStr::width(&buf[..cursor_byte]) as u16;
+                    let caret_x =
+                        prompt_rect.x + prompt_w + cursor_w.min(area.width.saturating_sub(prompt_w));
+                    f.set_cursor_position((caret_x, body_max_y));
                 } else {
                     let footer_idx = position_in_row_bearing(info, o).unwrap_or(0);
                     render_pagination_footer(

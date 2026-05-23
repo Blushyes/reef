@@ -856,6 +856,12 @@ pub struct App {
     /// can't interfere across mode transitions.
     pub space_leader_at: Option<std::time::Instant>,
 
+    /// Timestamp of the last bare `g` keystroke. `Some(t)` means a vim-style
+    /// `gg` chord is primed and waiting for the second `g` within 500ms; on
+    /// the second hit we scroll the active preview to the top. Suppressed in
+    /// search / overlay / SQLite-preview contexts — see `handle_key`.
+    pub g_pending_at: Option<std::time::Instant>,
+
     /// Last-rendered content height (in rows) for each right-side panel.
     /// Search jumps read these to center the match in view. Written by the
     /// panel's render fn every frame; defaults to 0 until the first render.
@@ -1158,6 +1164,7 @@ impl App {
             tree_drag: crate::tree_drag::TreeDragState::default(),
             paste_conflict: None,
             space_leader_at: None,
+            g_pending_at: None,
             last_preview_view_h: 0,
             last_diff_view_h: 0,
             last_commit_detail_view_h: 0,
@@ -2778,6 +2785,14 @@ impl App {
     fn dispatch_preview_load(&mut self, rel_path: PathBuf) {
         let generation = self.preview_load.begin();
         self.preview_in_flight_path = Some(rel_path.clone());
+        // A new preview is incoming — drop any in-flight `gg` chord so a
+        // bare `g` that lands while `preview_content` still holds the
+        // *previous* body can't be misinterpreted. Specifically: when
+        // the new body is a .db, `is_sqlite_preview()` (which reads the
+        // old preview_content) returns false during the load window, so
+        // the chord arms instead of opening db_goto. Clearing here makes
+        // the very next `g` after a navigation always re-arm cleanly.
+        self.g_pending_at = None;
         // Skip the image decode when we can't render pixels anyway —
         // the worker will return a metadata-only `ImagePreview` with
         // dims + format + size, and the render path shows the
@@ -4256,6 +4271,12 @@ impl App {
             _ => Panel::Diff,
         };
         self.view_mode = ViewMode::FocusedPreview;
+        // Chord state is scoped to a view mode in users' mental model —
+        // entering 纯预览 with `gg` half-pressed and resuming it on a
+        // different panel would feel like a glitch. Clear on the
+        // boundary.
+        self.g_pending_at = None;
+        self.space_leader_at = None;
     }
 
     /// CLI entry point — `reef <file>` lands here after the workdir
@@ -4307,6 +4328,11 @@ impl App {
             return;
         }
         self.view_mode = ViewMode::Main;
+        // Mirror `enter_focused_preview`: clear chord state on the
+        // view-mode boundary so a `gg` half-press doesn't carry from
+        // Main into FocusedPreview or vice versa.
+        self.g_pending_at = None;
+        self.space_leader_at = None;
         // Defensive: clear picker state so a future view_mode escape
         // path (toast-driven, fatal-error overlay, etc.) that bypasses
         // close_focused_preview_files can't leave the bool stuck `true`
@@ -4504,6 +4530,15 @@ impl App {
         }
         let was_files = self.active_tab == Tab::Files;
         self.active_tab = tab;
+        // Drop any in-flight chord state. Without this, "press `g` →
+        // mouse-click another tab within 500 ms → press `g`" would fire
+        // `scroll_active_preview_to_top` against the *new* tab, which
+        // can resync diff scroll / commit selection unexpectedly.
+        // Symmetric `space_leader_at` reset for the same reason: a
+        // primed leader that crosses a tab boundary no longer maps to
+        // the chord targets the user intended.
+        self.g_pending_at = None;
+        self.space_leader_at = None;
         // Leaving the Files tab cancels any Files-tab-scoped modal —
         // tree edit row, context menu, delete confirm. Those modals
         // are invisible on other tabs, so leaving them armed would
@@ -4919,6 +4954,135 @@ impl App {
         self.diff_h_scroll = 0;
         self.sbs_left_h_scroll = 0;
         self.sbs_right_h_scroll = 0;
+    }
+
+    /// Vim `gg` — jump the active content panel to its top. List panels
+    /// (file tree, git status, commit graph) move their selection to the
+    /// first row; content panels (Diff/Commit) reset the vertical scroll.
+    /// SQLite preview is a no-op so the bare `g` keystroke can still open
+    /// the goto-page input.
+    ///
+    /// **Side effects on list panels** — list-mode `gg` is not a pure
+    /// cursor move:
+    /// - Git Files: `navigate_files` also resets `diff_scroll` /
+    ///   `diff_h_scroll` / `sbs_left/right_h_scroll` and triggers a
+    ///   deferred `load_diff()` for the new selection, so the right
+    ///   pane reloads to file #1's diff.
+    /// - Graph Files: `move_graph_selection` clears any visual range
+    ///   (when no anchor is set; when an anchor exists we delegate to
+    ///   `extend_graph_selection` and preserve the range — matching
+    ///   vim's behaviour) and triggers `load_commit_detail()` for the
+    ///   new selection.
+    pub fn scroll_active_preview_to_top(&mut self) {
+        if self.is_sqlite_preview() {
+            return;
+        }
+        // Symmetric sentinel for the two directions. `i32::MIN` would
+        // overflow in the `(-delta) as usize` paths inside
+        // `file_tree::navigate` / `navigate_files` / `move_graph_selection`
+        // (debug-build panic); pick a value that's far larger than any
+        // realistic entry count but safe to negate.
+        const NAV_FAR: i32 = 1_000_000;
+        match (self.active_tab, self.active_panel) {
+            (Tab::Files, Panel::Files) => {
+                if !self.file_tree.entries.is_empty() {
+                    self.file_tree.navigate(-NAV_FAR);
+                }
+            }
+            (Tab::Files, Panel::Diff) | (Tab::Search, Panel::Diff) => {
+                self.preview_scroll = 0;
+            }
+            (Tab::Search, Panel::Files) => {
+                // Search-tab left column owns its own list cursor via the
+                // global_search overlay — leave it alone here.
+            }
+            (Tab::Git, Panel::Files) => {
+                self.navigate_files(-NAV_FAR);
+            }
+            (Tab::Git, Panel::Diff) => {
+                self.diff_scroll = 0;
+            }
+            (Tab::Graph, Panel::Files) => {
+                // Preserve any Shift-extended visual range: vim's `gg`
+                // in visual mode extends the selection to the top, so
+                // delegate to `extend_graph_selection` (which keeps
+                // `selection_anchor` intact). Without this, the chord
+                // would call `move_graph_selection` and silently
+                // collapse the range to a single commit.
+                if self.git_graph.selection_anchor.is_some() {
+                    self.extend_graph_selection(-NAV_FAR);
+                } else {
+                    self.move_graph_selection(-NAV_FAR);
+                }
+            }
+            (Tab::Graph, Panel::Commit) => {
+                self.commit_detail.scroll = 0;
+            }
+            (Tab::Graph, Panel::Diff) => {
+                self.commit_detail.file_diff_scroll = 0;
+            }
+            _ => {}
+        }
+    }
+
+    /// Vim `G` — jump the active content panel to its bottom. List panels
+    /// move selection to the last row; content panels set the scroll to
+    /// `usize::MAX` and rely on the render-layer clamp
+    /// (file_preview_panel / diff_panel / commit_detail_panel all clamp
+    /// against `lines.len() - viewport`).
+    pub fn scroll_active_preview_to_bottom(&mut self) {
+        if self.is_sqlite_preview() {
+            return;
+        }
+        const NAV_FAR: i32 = 1_000_000;
+        match (self.active_tab, self.active_panel) {
+            (Tab::Files, Panel::Files) => {
+                if !self.file_tree.entries.is_empty() {
+                    self.file_tree.navigate(NAV_FAR);
+                }
+            }
+            (Tab::Files, Panel::Diff) | (Tab::Search, Panel::Diff) => {
+                self.preview_scroll = usize::MAX;
+            }
+            (Tab::Search, Panel::Files) => {}
+            (Tab::Git, Panel::Files) => {
+                self.navigate_files(NAV_FAR);
+            }
+            (Tab::Git, Panel::Diff) => {
+                self.diff_scroll = usize::MAX;
+            }
+            (Tab::Graph, Panel::Files) => {
+                // Mirror scroll_active_preview_to_top: keep visual-range
+                // anchors so `G` extends rather than collapses.
+                if self.git_graph.selection_anchor.is_some() {
+                    self.extend_graph_selection(NAV_FAR);
+                } else {
+                    self.move_graph_selection(NAV_FAR);
+                }
+            }
+            (Tab::Graph, Panel::Commit) => {
+                self.commit_detail.scroll = usize::MAX;
+            }
+            (Tab::Graph, Panel::Diff) => {
+                self.commit_detail.file_diff_scroll = usize::MAX;
+            }
+            _ => {}
+        }
+    }
+
+    /// True when the active content panel is rendering a SQLite database
+    /// preview *in a tab whose handler actually wires bare `g` to the
+    /// goto-page input*. Only `Tab::Files` qualifies — `handle_key_search`
+    /// has no `g` → `db_goto_input` branch, so suppressing `gg` there
+    /// would silence both the chord and the per-tab fallback, leaving
+    /// bare `g` as a no-op against a .db preview opened from Search.
+    pub fn is_sqlite_preview(&self) -> bool {
+        self.active_panel == Panel::Diff
+            && self.active_tab == Tab::Files
+            && self
+                .preview_content
+                .as_ref()
+                .is_some_and(|p| p.is_database())
     }
 
     /// Called every frame: drain fs-watcher events and the push worker's

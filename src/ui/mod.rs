@@ -736,7 +736,7 @@ fn panel_chip_text(tab: crate::app::Tab, panel: crate::app::Panel) -> &'static s
     }
 }
 
-fn render_search_prompt(f: &mut Frame, app: &App, area: Rect) {
+pub(crate) fn render_search_prompt(f: &mut Frame, app: &App, area: Rect) {
     let th = app.theme;
     let prefix = if app.search.backwards { '?' } else { '/' };
     let query = app.search.query.as_str();
@@ -794,7 +794,7 @@ fn render_search_prompt(f: &mut Frame, app: &App, area: Rect) {
     f.set_cursor_position((cursor_x, area.y));
 }
 
-fn render_search_dormant(f: &mut Frame, app: &App, area: Rect) {
+pub(crate) fn render_search_dormant(f: &mut Frame, app: &App, area: Rect) {
     let th = app.theme;
     let prefix = if app.search.backwards { '?' } else { '/' };
     let counter = match app.search.current {

@@ -850,3 +850,361 @@ fn picker_open_swallows_scroll_keys_so_diff_stays_put() {
     assert!(!app.focused_preview_files_open);
     assert_eq!(app.view_mode, ViewMode::FocusedPreview);
 }
+
+// ─── `/` 底部输入框 / Ctrl+F noop / Space+F / vim gg-G ──────────────────
+
+#[test]
+fn focused_preview_slash_renders_prompt_at_bottom() {
+    // Regression target: pressing `/` in FocusedPreview used to flip
+    // `search.active=true` but the prompt row was never painted because
+    // FocusedPreview replaces the normal status bar. focused_preview_panel
+    // now mirrors render_status_bar's priority for the bottom row.
+    use reef::ui;
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("a.txt"), "abc\ndef\nghi\n").unwrap();
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    app.enter_focused_preview();
+
+    input::handle_key(key(KeyCode::Char('/')), &mut app);
+    assert!(app.search.active, "`/` must arm vim search");
+
+    let backend = TestBackend::new(40, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+    // hint_row is the last row (y = height - 1).
+    let bottom_first = terminal.backend().buffer()[(0, 9)].symbol().to_string();
+    assert_eq!(
+        bottom_first, "/",
+        "FocusedPreview bottom row should show the search prompt `/`"
+    );
+}
+
+#[test]
+fn focused_preview_ctrl_f_is_noop() {
+    // Ctrl+F was removed in favour of Space+F (FindWidget). Pressing it
+    // in FocusedPreview must not arm vim search and must not open the
+    // find widget — it's a fully unbound key now.
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("a.txt"), "abc\n").unwrap();
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    app.enter_focused_preview();
+    let view_before = app.view_mode;
+
+    input::handle_key(
+        key_with(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        &mut app,
+    );
+    assert!(!app.search.active, "Ctrl+F must not arm vim search");
+    assert!(
+        !app.find_widget.active,
+        "Ctrl+F must not open the FindWidget"
+    );
+    assert_eq!(app.view_mode, view_before, "view_mode must be unchanged");
+}
+
+#[test]
+fn focused_preview_space_f_opens_find_widget() {
+    // Space+F is the only path into the FindWidget overlay. Make sure it
+    // still works from FocusedPreview — the Space-leader gate runs after
+    // handle_key_focused_preview's fallthrough.
+    use reef::ui;
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("a.txt"), "abc\n".repeat(40)).unwrap();
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    app.enter_focused_preview();
+
+    // Drive a frame so the preview body publishes `last_preview_rect`;
+    // without that the find widget anchors to None and silently no-op
+    // renders, which would defeat the visibility check below.
+    let backend = TestBackend::new(100, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+    input::handle_key(key(KeyCode::Char(' ')), &mut app);
+    assert!(
+        app.space_leader_at.is_some(),
+        "Space must arm the leader chord"
+    );
+    input::handle_key(key(KeyCode::Char('f')), &mut app);
+    assert!(
+        app.find_widget.active,
+        "Space+F must open the FindWidget overlay"
+    );
+
+    // Render again and assert the widget actually painted itself.
+    // Without focused_preview_panel calling find_widget_panel::render,
+    // `last_widget_rect` stays `None` even though `find_widget.active`
+    // is true — the overlay would be invisible to the user.
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+    assert!(
+        app.find_widget.last_widget_rect.is_some(),
+        "FindWidget overlay must paint a rect in FocusedPreview, not just \
+         flip the active flag"
+    );
+}
+
+#[test]
+fn gg_scrolls_files_focused_preview_to_top() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("a.txt"), "x\n".repeat(200)).unwrap();
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    app.enter_focused_preview();
+    app.preview_scroll = 80;
+
+    input::handle_key(key(KeyCode::Char('g')), &mut app);
+    assert!(app.g_pending_at.is_some(), "first `g` arms the chord");
+    assert_eq!(app.preview_scroll, 80, "first `g` must not move yet");
+
+    input::handle_key(key(KeyCode::Char('g')), &mut app);
+    assert_eq!(app.preview_scroll, 0, "second `g` jumps to top");
+    assert!(
+        app.g_pending_at.is_none(),
+        "fired chord clears the pending slot"
+    );
+}
+
+#[test]
+fn gg_scrolls_git_diff_focused_preview_to_top() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    app.set_active_tab(Tab::Git);
+    app.enter_focused_preview();
+    app.diff_scroll = 42;
+
+    input::handle_key(key(KeyCode::Char('g')), &mut app);
+    input::handle_key(key(KeyCode::Char('g')), &mut app);
+    assert_eq!(app.diff_scroll, 0);
+}
+
+#[test]
+fn capital_g_scrolls_files_focused_preview_to_bottom() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("a.txt"), "x\n".repeat(200)).unwrap();
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    app.enter_focused_preview();
+    app.preview_scroll = 5;
+
+    input::handle_key(key_with(KeyCode::Char('G'), KeyModifiers::SHIFT), &mut app);
+    assert_eq!(
+        app.preview_scroll,
+        usize::MAX,
+        "G sets preview_scroll to the saturation sentinel; render clamps"
+    );
+}
+
+#[test]
+fn gg_timeout_does_not_trigger() {
+    use std::time::{Duration, Instant};
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("a.txt"), "x\n".repeat(200)).unwrap();
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    app.enter_focused_preview();
+    app.preview_scroll = 50;
+
+    input::handle_key(key(KeyCode::Char('g')), &mut app);
+    // Backdate the pending arm past the 500ms window.
+    app.g_pending_at = Some(Instant::now() - Duration::from_millis(800));
+    input::handle_key(key(KeyCode::Char('g')), &mut app);
+    assert_eq!(
+        app.preview_scroll, 50,
+        "stale `g` must not fire scroll-to-top"
+    );
+    assert!(
+        app.g_pending_at.is_some(),
+        "expired chord re-arms instead of firing"
+    );
+}
+
+#[test]
+fn gg_suppressed_inside_slash_search() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("a.txt"), "x\n".repeat(200)).unwrap();
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    app.enter_focused_preview();
+    app.preview_scroll = 25;
+
+    input::handle_key(key(KeyCode::Char('/')), &mut app);
+    assert!(app.search.active);
+    input::handle_key(key(KeyCode::Char('g')), &mut app);
+    input::handle_key(key(KeyCode::Char('g')), &mut app);
+    assert_eq!(
+        app.preview_scroll, 25,
+        "while `/` owns input, `gg` must feed the query instead of scrolling"
+    );
+    assert_eq!(
+        app.search.query, "gg",
+        "the two `g` keystrokes should land in the search buffer"
+    );
+}
+
+// ─── Ctrl+F regression guard for Main mode ──────────────────────────────
+
+#[test]
+fn ctrl_f_in_main_mode_git_tab_does_not_toggle_diff_mode() {
+    // Removing the global Ctrl+F binding could leak the keystroke into
+    // `handle_key_git`'s bare-`f` arm (which toggles diff_mode). Guard
+    // against that regression by sending Ctrl+F in Main mode + Tab::Git
+    // and asserting nothing observable changes.
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, _repo) = test_support::tempdir_repo();
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    app.set_active_tab(Tab::Git);
+
+    let layout_before = app.diff_layout;
+    let mode_before = app.diff_mode;
+    input::handle_key(
+        key_with(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        &mut app,
+    );
+    assert_eq!(
+        app.diff_layout, layout_before,
+        "Ctrl+F must not call toggle_diff_layout in Git tab"
+    );
+    assert_eq!(
+        app.diff_mode, mode_before,
+        "Ctrl+F must not call toggle_diff_mode in Git tab"
+    );
+    assert!(!app.search.active);
+    assert!(!app.find_widget.active);
+}
+
+#[test]
+fn ctrl_f_in_main_mode_graph_tab_does_not_reach_commit_detail() {
+    // Same guard for the Graph tab's bare-`f` arm at handle_key_graph's
+    // commit_detail dispatch. The commit_detail diff_mode is the
+    // observable side effect.
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, _repo) = test_support::tempdir_repo();
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    app.set_active_tab(Tab::Graph);
+
+    let cd_mode_before = app.commit_detail.diff_mode;
+    let cd_layout_before = app.commit_detail.diff_layout;
+    input::handle_key(
+        key_with(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        &mut app,
+    );
+    assert_eq!(
+        app.commit_detail.diff_mode, cd_mode_before,
+        "Ctrl+F must not flip commit_detail diff_mode in Graph tab"
+    );
+    assert_eq!(
+        app.commit_detail.diff_layout, cd_layout_before,
+        "Ctrl+F must not flip commit_detail diff_layout in Graph tab"
+    );
+}
+
+#[test]
+fn space_f_force_focuses_diff_panel_from_file_tree() {
+    // Regression for the Ctrl+F deletion: the removed global arm used
+    // to set `active_panel = Diff` before calling search::begin, so
+    // pressing find from the file tree would always land on the diff.
+    // The replacement (Space+F → find_widget) needs the same force-
+    // focus, otherwise Space+F is a silent no-op when focus is on the
+    // file tree (the default state).
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("a.txt"), "abc\n").unwrap();
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    assert_eq!(app.active_panel, reef::app::Panel::Files);
+
+    input::handle_key(key(KeyCode::Char(' ')), &mut app);
+    input::handle_key(key(KeyCode::Char('f')), &mut app);
+
+    assert!(
+        app.find_widget.active,
+        "Space+F must open the FindWidget even with file-tree focus"
+    );
+    assert_eq!(
+        app.active_panel,
+        reef::app::Panel::Diff,
+        "Space+F must force-focus the Diff panel before opening"
+    );
+}
+
+// ─── Stale-leader / chord-state hygiene ─────────────────────────────────
+
+#[test]
+fn stale_space_leader_does_not_bypass_focused_preview_whitelist() {
+    // The FocusedPreview leader-armed bypass must check LEADER_TIMEOUT,
+    // otherwise a Space pressed minutes ago would keep the bypass on
+    // forever and let destructive Git keys (`d` for discard, etc.)
+    // reach per-tab dispatch against an invisible status row.
+    use std::time::Duration as StdDuration;
+    use std::time::Instant as StdInstant;
+
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, _repo) = test_support::tempdir_repo();
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    app.set_active_tab(Tab::Git);
+    app.enter_focused_preview();
+
+    // Stale leader from "minutes ago".
+    app.space_leader_at = Some(StdInstant::now() - StdDuration::from_secs(60));
+
+    // `d` is destructive in handle_key_git (calls git_status_panel `d`
+    // → discard). It's NOT in the FocusedPreview whitelist, so with the
+    // bypass's timeout check correctly recognising the leader as stale,
+    // the whitelist swallows the keystroke as if no leader were armed.
+    let layout_before = app.diff_layout;
+    let mode_before = app.diff_mode;
+    let stage_count_before = (app.staged_files.len(), app.unstaged_files.len());
+    input::handle_key(key(KeyCode::Char('d')), &mut app);
+    assert_eq!(app.diff_layout, layout_before);
+    assert_eq!(app.diff_mode, mode_before);
+    assert_eq!(
+        (app.staged_files.len(), app.unstaged_files.len()),
+        stage_count_before,
+        "stale leader must not let `d` reach git_status_panel discard"
+    );
+}
+
+#[test]
+fn g_pending_clears_on_tab_switch() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, _repo) = test_support::tempdir_repo();
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    input::handle_key(key(KeyCode::Char('g')), &mut app);
+    assert!(app.g_pending_at.is_some());
+
+    app.set_active_tab(Tab::Git);
+    assert!(
+        app.g_pending_at.is_none(),
+        "set_active_tab must drop in-flight chord state so a stray `g` \
+         after a mouse-driven tab switch doesn't surprise-scroll the new tab"
+    );
+}

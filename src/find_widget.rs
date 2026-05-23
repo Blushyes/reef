@@ -103,6 +103,24 @@ impl FindWidgetState {
 /// No-op when the active panel has no in-panel find target (e.g. focus
 /// is on the Search tab's left list).
 pub fn begin_with_selection(app: &mut App) {
+    use crate::app::{Panel, Tab};
+    // VSCode-style "find in this file" — if focus is currently on a
+    // list panel (file tree, git status, commit graph) that has no
+    // searchable preview target, force-focus onto the content column
+    // so Space+F lands on the diff/preview the user sees, mirroring
+    // the behaviour the removed Ctrl+F binding used to give.
+    // Without this, pressing Space+F at app startup (default focus is
+    // `Panel::Files`) silently no-ops because resolve_target returns
+    // None for `(Files, Files)` / `(Git, Files)` etc.
+    //
+    // Exception: `(Tab::Search, Panel::Files)` is the search input
+    // row, not a list — pulling focus away from it would lose the
+    // user's half-typed query. Leave it alone; the user can Tab into
+    // the preview panel themselves if they want find-in-file there.
+    let on_search_input = app.active_tab == Tab::Search && app.active_panel == Panel::Files;
+    if !on_search_input && resolve_target(app).is_none() && app.active_panel != Panel::Diff {
+        app.active_panel = Panel::Diff;
+    }
     let Some(target) = resolve_target(app) else {
         return;
     };

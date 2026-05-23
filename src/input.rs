@@ -133,7 +133,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
 
     // Hosts picker (Ctrl+O) — fully owns input while active, same contract
     // as the other overlays.
-    if app.hosts_picker.active {
+    if app.hosts_picker.core.active {
         handle_key_hosts_picker(key, app);
         return;
     }
@@ -141,7 +141,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // Graph branch picker (`b` on Graph tab) — same exclusive ownership
     // as the other overlays. Sits next to `hosts_picker` because it's a
     // peer overlay (filter input + commit-on-Enter + Esc-cancel).
-    if app.graph_branch_picker.active {
+    if app.graph_branch_picker.core.active {
         handle_key_graph_branch_picker(key, app);
         return;
     }
@@ -156,14 +156,14 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     }
 
     // Global-search palette — fully owns input while active.
-    if app.global_search.active {
+    if app.global_search.core.active {
         global_search::handle_key(key, app);
         return;
     }
 
     // Quick-open palette has the next-highest priority — while active it
     // fully owns input (character append, cursor, Enter/Esc, Space-P close).
-    if app.quick_open.active {
+    if app.quick_open.core.active {
         quick_open::handle_key(key, app);
         return;
     }
@@ -304,7 +304,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         && !app.global_search.input_focused()
         && app.global_search.replace_open;
     let leader_allow_arm = if search_input_focused {
-        app.global_search.query.is_empty()
+        app.global_search.core.filter.is_empty()
     } else if commit_input_focused {
         app.git_status.commit_message.is_empty()
     } else {
@@ -325,8 +325,8 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             app.space_leader_at = None;
             // Only one palette at a time — opening either implicitly closes
             // the other. `begin()` then activates the chosen one.
-            app.quick_open.active = false;
-            app.global_search.active = false;
+            app.quick_open.core.active = false;
+            app.global_search.core.active = false;
             match key.code {
                 KeyCode::Char('p') | KeyCode::Char('P') => quick_open::begin(app),
                 // Space+F = VSCode-style find widget (selection-seeded,
@@ -379,10 +379,10 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     let gg_suppressed = in_input_mode
         || app.search.active
         || app.find_widget.active
-        || app.global_search.active
-        || app.quick_open.active
-        || app.hosts_picker.active
-        || app.graph_branch_picker.active
+        || app.global_search.core.active
+        || app.quick_open.core.active
+        || app.hosts_picker.core.active
+        || app.graph_branch_picker.core.active
         || app.tree_edit.active
         || app.db_goto_input.is_some()
         || app.is_sqlite_preview();
@@ -1104,7 +1104,7 @@ fn handle_key_search_list_mode(key: KeyEvent, app: &mut App, ctrl: bool) {
         // Space-leader is disarmed in this state (see `handle_key`);
         // bare Space toggles the current row's checkbox.
         KeyCode::Char(' ') if key.modifiers.is_empty() && app.global_search.replace_open => {
-            let idx = app.global_search.selected;
+            let idx = app.global_search.core.selected_idx;
             app.global_search.toggle_match_excluded(idx);
         }
 
@@ -1206,8 +1206,8 @@ fn handle_key_search_find_input(key: KeyEvent, app: &mut App, ctrl: bool, alt: b
     // `mark_query_edited`; cursor-only and unhandled keys are silent.
     let outcome = crate::input_edit::dispatch_key(
         &key,
-        &mut app.global_search.query,
-        &mut app.global_search.cursor,
+        &mut app.global_search.core.filter,
+        &mut app.global_search.core.cursor,
     );
     if outcome == crate::input_edit::Outcome::Edited {
         global_search::mark_query_edited(&mut app.global_search);
@@ -2058,153 +2058,99 @@ fn handle_key_tree_context_menu(key: KeyEvent, app: &mut App) {
 
 /// Keyboard handler for the Ctrl+O hosts picker overlay.
 ///
-/// Two-phase routing (same shape as `handle_key_graph_branch_picker`):
-///   1. Picker-specific keys — Esc / Ctrl+C close, Enter commits,
-///      Up/Down + Ctrl+J/K + Ctrl+N/P navigate the list, Ctrl+P
-///      enters path mode (literal `[user@]host[:path]` input).
-///   2. Anything left flows into [`input_edit::dispatch_key`] against
-///      whichever buffer is active (filter vs path_buffer), giving
-///      both the same readline / VSCode editor shortcuts as every
-///      other input in reef.
+/// Splits along the picker's input-mode:
+/// - **Filter mode**: standard `PickerCore::dispatch_key` (list nav +
+///   Esc/Enter + full editor vocabulary). One bespoke shortcut on top:
+///   Ctrl+P switches to path mode.
+/// - **Path mode**: no list, just a literal `[user@]host[:path]`
+///   buffer. Esc demotes back to filter mode (preserves picker
+///   state); Enter commits. Editor keys flow straight through
+///   `input_edit::dispatch_key` against `path_buffer` / `path_cursor`.
 fn handle_key_hosts_picker(key: KeyEvent, app: &mut App) {
     use crate::hosts_picker::InputMode;
+    use crate::picker_core::InputOutcome;
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-    // Phase 1: picker-specific shortcuts.
-    match key.code {
-        KeyCode::Esc => {
-            if app.hosts_picker.input_mode == InputMode::Path {
-                // Esc in path mode drops back to the filter view rather
-                // than closing outright — gives the user a way out of
-                // the path buffer without losing the picker state.
-                app.hosts_picker.input_mode = InputMode::Search;
-                app.hosts_picker.path_buffer.clear();
-                app.hosts_picker.path_cursor = 0;
-            } else {
-                app.close_hosts_picker();
+    match app.hosts_picker.input_mode {
+        InputMode::Search => {
+            // Picker-specific shortcut that has to precede PickerCore:
+            // Ctrl+P would otherwise be eaten as list-up.
+            if ctrl && matches!(key.code, KeyCode::Char('p')) {
+                app.hosts_picker.enter_path_mode();
+                return;
             }
-            return;
+            let visible = app.hosts_picker.visible_rows().len();
+            match app.hosts_picker.core.dispatch_key(&key, visible) {
+                InputOutcome::Cancel => {
+                    let ctrl_c = matches!(key.code, KeyCode::Char('c')) && ctrl;
+                    app.close_hosts_picker();
+                    if ctrl_c {
+                        app.should_quit = true;
+                    }
+                }
+                InputOutcome::Confirm => app.confirm_hosts_picker(),
+                _ => {}
+            }
         }
-        KeyCode::Char('c') if ctrl => {
-            app.close_hosts_picker();
-            app.should_quit = true;
-            return;
+        InputMode::Path => {
+            match key.code {
+                KeyCode::Esc => {
+                    // Drop back to filter view rather than closing
+                    // outright — gives the user a way out of the path
+                    // buffer without losing the picker state.
+                    app.hosts_picker.input_mode = InputMode::Search;
+                    app.hosts_picker.path_buffer.clear();
+                    app.hosts_picker.path_cursor = 0;
+                    return;
+                }
+                KeyCode::Char('c') if ctrl => {
+                    app.close_hosts_picker();
+                    app.should_quit = true;
+                    return;
+                }
+                KeyCode::Enter => {
+                    app.confirm_hosts_picker();
+                    return;
+                }
+                _ => {}
+            }
+            // Editor keys against the path buffer. No list = no
+            // selected_idx side effect.
+            let _ = crate::input_edit::dispatch_key(
+                &key,
+                &mut app.hosts_picker.path_buffer,
+                &mut app.hosts_picker.path_cursor,
+            );
         }
-        KeyCode::Char('p') if ctrl => {
-            app.hosts_picker.enter_path_mode();
-            return;
-        }
-        KeyCode::Enter => {
-            app.confirm_hosts_picker();
-            return;
-        }
-        KeyCode::Up => {
-            app.hosts_picker.move_selection(-1);
-            return;
-        }
-        KeyCode::Down => {
-            app.hosts_picker.move_selection(1);
-            return;
-        }
-        // Note: Ctrl+P is consumed above as the path-mode toggle
-        // (hosts_picker's bespoke shortcut), so the list-up alias here
-        // is only Ctrl+K. Ctrl+N (next) is unambiguous as down.
-        KeyCode::Char('k') if ctrl => {
-            app.hosts_picker.move_selection(-1);
-            return;
-        }
-        KeyCode::Char('j' | 'n') if ctrl => {
-            app.hosts_picker.move_selection(1);
-            return;
-        }
-        _ => {}
-    }
-
-    // Phase 2: shared text-input dispatch against the active buffer.
-    let (buf, cur) = match app.hosts_picker.input_mode {
-        InputMode::Search => (
-            &mut app.hosts_picker.filter,
-            &mut app.hosts_picker.filter_cursor,
-        ),
-        InputMode::Path => (
-            &mut app.hosts_picker.path_buffer,
-            &mut app.hosts_picker.path_cursor,
-        ),
-    };
-    let outcome = crate::input_edit::dispatch_key(&key, buf, cur);
-    if outcome == crate::input_edit::Outcome::Edited
-        && app.hosts_picker.input_mode == InputMode::Search
-    {
-        // Filter edits reset list cursor (path mode has no list).
-        app.hosts_picker.selected_idx = 0;
     }
 }
 
 /// Keyboard handler for the Graph tab's `b` branch picker.
 ///
-/// Routing is two-phase to match the convention shared with
-/// `find_widget` / `quick_open`:
-///
-///   1. Picker-specific keys first — Esc / Ctrl+C close, Enter commits,
-///      Up/Down + Ctrl+J/K + Ctrl+N/P navigate the list.
-///   2. Anything left over flows into [`input_edit::dispatch_key`], which
-///      owns the readline / VSCode text-input vocabulary: Alt/Ctrl+←/→
-///      word-jump, Home/End, Ctrl+A/E, Alt+B/F word-jump, Backspace +
-///      Ctrl+W word-delete, Alt+Backspace / Ctrl+W word-back, Alt+D /
-///      Ctrl+Delete word-forward, Ctrl+U clear, plain char insert.
-///
-/// Edits reset `selected_idx` to 0 so the filtered list always lands
-/// the cursor on the first match (matches the contract of every other
-/// fuzzy picker in reef).
+/// All standard picker keys (Esc / Ctrl+C close, Enter commit,
+/// Up/Down/Ctrl+J/K/N/P navigate, full text-editing vocabulary) are
+/// owned by [`crate::picker_core::PickerCore::dispatch_key`]; we just
+/// translate the returned `InputOutcome` into the picker-specific
+/// app methods. No bespoke shortcuts (the graph picker has no leader
+/// chord or mode-switch key), so the handler stays trivial.
 fn handle_key_graph_branch_picker(key: KeyEvent, app: &mut App) {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    // Phase 1: picker-specific shortcuts. These must run before
-    // `dispatch_key`, which would otherwise eat e.g. Ctrl+N as a no-op
-    // (it isn't in the editor vocabulary) and `n` would fall through
-    // to the printable-char insert.
-    match key.code {
-        KeyCode::Esc => {
+    use crate::picker_core::InputOutcome;
+    let visible = app.graph_branch_picker.visible_rows().len();
+    match app.graph_branch_picker.core.dispatch_key(&key, visible) {
+        InputOutcome::Cancel => {
+            // Ctrl+C also requests app quit; plain Esc just closes.
+            let ctrl_c = matches!(key.code, KeyCode::Char('c'))
+                && key.modifiers.contains(KeyModifiers::CONTROL);
             app.close_graph_branch_picker();
-            return;
+            if ctrl_c {
+                app.should_quit = true;
+            }
         }
-        KeyCode::Char('c') if ctrl => {
-            app.close_graph_branch_picker();
-            app.should_quit = true;
-            return;
-        }
-        KeyCode::Enter => {
-            app.confirm_graph_branch_picker();
-            return;
-        }
-        KeyCode::Up => {
-            app.graph_branch_picker.move_selection(-1);
-            return;
-        }
-        KeyCode::Down => {
-            app.graph_branch_picker.move_selection(1);
-            return;
-        }
-        KeyCode::Char('k' | 'p') if ctrl => {
-            app.graph_branch_picker.move_selection(-1);
-            return;
-        }
-        KeyCode::Char('j' | 'n') if ctrl => {
-            app.graph_branch_picker.move_selection(1);
-            return;
-        }
-        _ => {}
-    }
-
-    // Phase 2: shared text-input dispatch. Any `Edited` outcome resets
-    // the list cursor so the filtered view always opens at row 0 —
-    // same UX convention as quick_open / find_widget.
-    let outcome = crate::input_edit::dispatch_key(
-        &key,
-        &mut app.graph_branch_picker.filter,
-        &mut app.graph_branch_picker.cursor,
-    );
-    if outcome == crate::input_edit::Outcome::Edited {
-        app.graph_branch_picker.selected_idx = 0;
+        InputOutcome::Confirm => app.confirm_graph_branch_picker(),
+        InputOutcome::Edited
+        | InputOutcome::SelectionMoved
+        | InputOutcome::CursorMoved
+        | InputOutcome::Unhandled => {}
     }
 }
 
@@ -2425,19 +2371,19 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
     // Palettes fully own mouse input while active (global-search first,
     // then quick-open): clicks must not leak through to hidden panels,
     // and scroll wheels inside the popup should move the selection.
-    if app.hosts_picker.active {
+    if app.hosts_picker.core.active {
         handle_mouse_hosts_picker(mouse, app);
         return;
     }
-    if app.graph_branch_picker.active {
+    if app.graph_branch_picker.core.active {
         handle_mouse_graph_branch_picker(mouse, app);
         return;
     }
-    if app.global_search.active {
+    if app.global_search.core.active {
         global_search::handle_mouse(mouse, app);
         return;
     }
-    if app.quick_open.active {
+    if app.quick_open.core.active {
         quick_open::handle_mouse(mouse, app);
         return;
     }
@@ -2664,7 +2610,7 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
                 // Handled here rather than in `handle_action` because the
                 // is_double signal isn't threaded through App methods.
                 if is_double && let ui::mouse::ClickAction::GlobalSearchSelect(idx) = action {
-                    app.global_search.selected = idx;
+                    app.global_search.core.selected_idx = idx;
                     global_search::accept(app);
                     app.last_click = None;
                     return;
@@ -3775,7 +3721,7 @@ fn apply_scroll_delta(field: &mut usize, delta: i32) {
 /// select a row (and double-click commits); clicks outside dismiss the
 /// overlay, matching the quick-open / global-search click-away behaviour.
 fn handle_mouse_hosts_picker(mouse: MouseEvent, app: &mut App) {
-    let popup = match app.hosts_picker.last_popup_area {
+    let popup = match app.hosts_picker.core.last_popup_area {
         Some(r) => r,
         None => return,
     };
@@ -3802,7 +3748,7 @@ fn handle_mouse_hosts_picker(mouse: MouseEvent, app: &mut App) {
             if let Some(ui::mouse::ClickAction::HostsPickerSelect(idx)) =
                 app.hit_registry.hit_test(mouse.column, mouse.row)
             {
-                app.hosts_picker.selected_idx = idx;
+                app.hosts_picker.core.selected_idx = idx;
                 if is_double {
                     app.confirm_hosts_picker();
                     app.last_click = None;
@@ -3831,7 +3777,7 @@ fn handle_mouse_hosts_picker(mouse: MouseEvent, app: &mut App) {
 /// `handle_mouse_hosts_picker`: click inside selects (double-click
 /// commits), click outside dismisses, scroll moves the selection.
 fn handle_mouse_graph_branch_picker(mouse: MouseEvent, app: &mut App) {
-    let popup = match app.graph_branch_picker.last_popup_area {
+    let popup = match app.graph_branch_picker.core.last_popup_area {
         Some(r) => r,
         None => return,
     };
@@ -3858,7 +3804,7 @@ fn handle_mouse_graph_branch_picker(mouse: MouseEvent, app: &mut App) {
             if let Some(ui::mouse::ClickAction::GraphBranchPickerSelect(idx)) =
                 app.hit_registry.hit_test(mouse.column, mouse.row)
             {
-                app.graph_branch_picker.selected_idx = idx;
+                app.graph_branch_picker.core.selected_idx = idx;
                 if is_double {
                     app.confirm_graph_branch_picker();
                     app.last_click = None;
@@ -3939,11 +3885,11 @@ pub fn handle_paste(s: String, app: &mut App) {
         app.enter_place_mode(paths);
         return;
     }
-    if app.quick_open.active {
+    if app.quick_open.core.active {
         quick_open::handle_paste(&s, app);
     } else if app.search.active {
         search::handle_paste(&s, app);
-    } else if app.global_search.active {
+    } else if app.global_search.core.active {
         global_search::handle_paste_overlay(&s, &mut app.global_search);
     } else if app.active_tab == Tab::Search
         && app.active_panel == Panel::Files

@@ -22,6 +22,7 @@ pub mod images;
 pub mod input;
 pub mod input_edit;
 pub mod paste_conflict;
+pub mod picker_core;
 pub mod place_mode;
 pub mod prefs;
 pub mod quick_open;

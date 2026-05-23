@@ -6,8 +6,6 @@
 //! sentinel row that resets the scope to the default and a "recent"
 //! section seeded from `GitGraphState::recent_branches`.
 
-use ratatui::layout::Rect;
-
 use crate::git::{GraphScope, RefLabel};
 use std::collections::HashMap;
 
@@ -59,7 +57,11 @@ impl BranchPickerRow {
 
 #[derive(Debug, Default)]
 pub struct GraphBranchPickerState {
-    pub active: bool,
+    /// Shared overlay scaffolding (`active`, `filter`, `cursor`,
+    /// `selected_idx`, `last_popup_area`). Edits route through
+    /// [`crate::picker_core::PickerCore::dispatch_key`]; see
+    /// `input::handle_key_graph_branch_picker` for the call site.
+    pub core: crate::picker_core::PickerCore,
     /// All branches derived once from `git_graph.ref_map` when the
     /// picker opens. Stored sorted (locals first, then remotes,
     /// alphabetised within each group).
@@ -68,13 +70,6 @@ pub struct GraphBranchPickerState {
     /// `all_branches` so a deleted recent silently disappears from the
     /// rendered list.
     pub recent: Vec<String>,
-    pub filter: String,
-    /// Byte offset into `filter`. Always on a UTF-8 char boundary.
-    /// Maintained by [`crate::input_edit`] alongside `filter` so the
-    /// caret survives word-motion / word-delete chords correctly.
-    pub cursor: usize,
-    pub selected_idx: usize,
-    pub last_popup_area: Option<Rect>,
 }
 
 impl GraphBranchPickerState {
@@ -90,13 +85,12 @@ impl GraphBranchPickerState {
     ) {
         self.all_branches = collect_branches(ref_map);
         self.recent = recent;
-        self.filter.clear();
-        self.cursor = 0;
+        self.core.open();
         // Land on whatever row matches the active scope so the picker
         // is "where you are" by default — pressing Esc cancels with no
         // surprise, and Enter is a no-op rebuild rather than an
         // accidental change.
-        self.selected_idx = self
+        self.core.selected_idx = self
             .visible_rows()
             .iter()
             .position(|row| match (row, current_scope) {
@@ -106,15 +100,10 @@ impl GraphBranchPickerState {
                 _ => false,
             })
             .unwrap_or(0);
-        self.active = true;
     }
 
     pub fn close(&mut self) {
-        self.active = false;
-        self.filter.clear();
-        self.cursor = 0;
-        self.selected_idx = 0;
-        self.last_popup_area = None;
+        self.core.close();
     }
 
     /// Apply the current filter against AllRefs + recents + branches.
@@ -123,7 +112,7 @@ impl GraphBranchPickerState {
     /// the default scope.
     pub fn visible_rows(&self) -> Vec<BranchPickerRow> {
         let mut out: Vec<BranchPickerRow> = Vec::new();
-        let f = self.filter.to_ascii_lowercase();
+        let f = self.core.filter.to_ascii_lowercase();
 
         // Sentinel is shown ONLY on the empty filter. Substring /
         // prefix matching against literal labels turned out to be a
@@ -178,19 +167,18 @@ impl GraphBranchPickerState {
 
     pub fn confirm(&self) -> Option<GraphScope> {
         self.visible_rows()
-            .get(self.selected_idx)
+            .get(self.core.selected_idx)
             .map(BranchPickerRow::to_scope)
     }
 
+    /// Move the row cursor by `delta`, clamped against the current
+    /// `visible_rows()` count. Thin wrapper around the shared
+    /// [`crate::picker_core::PickerCore::move_selection`] that handles
+    /// the row-count lookup so callers (mouse wheel, etc.) don't have
+    /// to recompute `visible_rows()` themselves.
     pub fn move_selection(&mut self, delta: i32) {
-        let rows = self.visible_rows();
-        if rows.is_empty() {
-            self.selected_idx = 0;
-            return;
-        }
-        let last = rows.len() as i32 - 1;
-        let next = (self.selected_idx as i32 + delta).clamp(0, last);
-        self.selected_idx = next as usize;
+        let visible_count = self.visible_rows().len();
+        self.core.move_selection(visible_count, delta);
     }
 }
 
@@ -294,7 +282,7 @@ mod tests {
         );
         let rows = s.visible_rows();
         assert!(matches!(rows[0], BranchPickerRow::AllRefs));
-        s.filter = "mai".into();
+        s.core.filter = "mai".into();
         let rows = s.visible_rows();
         assert!(matches!(
             rows.last().unwrap(),
@@ -307,15 +295,15 @@ mod tests {
         // Make sure re-opening the picker after a previous filter
         // leaves the cursor at the start, matching the cleared filter.
         let mut s = GraphBranchPickerState::default();
-        s.cursor = 7;
-        s.filter = "stale-from-last-time".into();
+        s.core.cursor = 7;
+        s.core.filter = "stale-from-last-time".into();
         s.open(
             &ref_map(&[("a", &[RefLabel::Branch("main".into())])]),
             vec![],
             &GraphScope::AllRefs,
         );
-        assert_eq!(s.cursor, 0);
-        assert!(s.filter.is_empty());
+        assert_eq!(s.core.cursor, 0);
+        assert!(s.core.filter.is_empty());
     }
 
     #[test]
@@ -337,34 +325,34 @@ mod tests {
         for c in ['a', 'b'] {
             let outcome = crate::input_edit::dispatch_key(
                 &KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
-                &mut s.filter,
-                &mut s.cursor,
+                &mut s.core.filter,
+                &mut s.core.cursor,
             );
             assert_eq!(outcome, crate::input_edit::Outcome::Edited);
         }
-        assert_eq!(s.filter, "ab");
-        assert_eq!(s.cursor, 2);
+        assert_eq!(s.core.filter, "ab");
+        assert_eq!(s.core.cursor, 2);
 
         // Ctrl+U wipes the line via input_edit's editor vocabulary.
         let outcome = crate::input_edit::dispatch_key(
             &KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
-            &mut s.filter,
-            &mut s.cursor,
+            &mut s.core.filter,
+            &mut s.core.cursor,
         );
         assert_eq!(outcome, crate::input_edit::Outcome::Edited);
-        assert!(s.filter.is_empty());
-        assert_eq!(s.cursor, 0);
+        assert!(s.core.filter.is_empty());
+        assert_eq!(s.core.cursor, 0);
 
         // Insert a CJK codepoint, then confirm the cursor lands on a
         // valid char boundary (3-byte char advances cursor by 3).
         let outcome = crate::input_edit::dispatch_key(
             &KeyEvent::new(KeyCode::Char('你'), KeyModifiers::NONE),
-            &mut s.filter,
-            &mut s.cursor,
+            &mut s.core.filter,
+            &mut s.core.cursor,
         );
         assert_eq!(outcome, crate::input_edit::Outcome::Edited);
-        assert_eq!(s.filter, "你");
-        assert_eq!(s.cursor, 3);
+        assert_eq!(s.core.filter, "你");
+        assert_eq!(s.core.cursor, 3);
     }
 
     #[test]
@@ -390,7 +378,7 @@ mod tests {
         // Any non-empty filter, even a single letter that "happens to
         // be in 'all refs'", must drop the sentinel.
         for f in ["a", "r", "e", "f", "s", " ", "all"] {
-            s.filter = f.to_string();
+            s.core.filter = f.to_string();
             let rows = s.visible_rows();
             assert!(
                 !rows.iter().any(|r| matches!(r, BranchPickerRow::AllRefs)),
@@ -426,12 +414,12 @@ mod tests {
             &GraphScope::AllRefs,
         );
         // Row 0 is AllRefs, row 1 is "main".
-        s.selected_idx = 1;
+        s.core.selected_idx = 1;
         assert_eq!(
             s.confirm(),
             Some(GraphScope::Branch("refs/heads/main".into()))
         );
-        s.selected_idx = 0;
+        s.core.selected_idx = 0;
         assert_eq!(s.confirm(), Some(GraphScope::AllRefs));
     }
 

@@ -1,6 +1,6 @@
 //! Hosts picker overlay (bound to Ctrl+O; see `crate::hosts_picker`).
 //!
-//! Renders on top of the normal UI when `app.hosts_picker.active` is true.
+//! Renders on top of the normal UI when `app.hosts_picker.core.active` is true.
 //! Three regions inside the popup: a single-row input line (filter or
 //! literal path), the visible-row list (recent targets + parsed
 //! `~/.ssh/config` entries), and a help footer. Registers a `ClickAction`
@@ -26,7 +26,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     let y = screen.y + screen.height.saturating_sub(popup_h) / 2;
     let area = Rect::new(x, y, popup_w, popup_h);
 
-    app.hosts_picker.last_popup_area = Some(area);
+    app.hosts_picker.core.last_popup_area = Some(area);
 
     f.render_widget(Clear, area);
 
@@ -64,8 +64,8 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     // Input row.
     let (input_text, cursor_byte) = match app.hosts_picker.input_mode {
         InputMode::Search => (
-            app.hosts_picker.filter.as_str(),
-            app.hosts_picker.filter_cursor,
+            app.hosts_picker.core.filter.as_str(),
+            app.hosts_picker.core.cursor,
         ),
         InputMode::Path => (
             app.hosts_picker.path_buffer.as_str(),
@@ -104,7 +104,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
 
     for (row_idx, row) in rows.iter().enumerate().take(list_h as usize) {
         let y = list_y + row_idx as u16;
-        let is_selected = row_idx == app.hosts_picker.selected_idx;
+        let is_selected = row_idx == app.hosts_picker.core.selected_idx;
         let (left, right, is_recent) = match row {
             PickerRow::Recent(t) => (t.to_arg(), "recent".to_string(), true),
             PickerRow::Entry(h) => {

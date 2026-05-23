@@ -25,7 +25,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     let y = screen.y + screen.height.saturating_sub(popup_h) / 2;
     let area = Rect::new(x, y, popup_w, popup_h);
 
-    app.graph_branch_picker.last_popup_area = Some(area);
+    app.graph_branch_picker.core.last_popup_area = Some(area);
 
     f.render_widget(Clear, area);
 
@@ -61,7 +61,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     let input_line = Line::from(vec![
         Span::styled(prompt, Style::default().fg(th.accent)),
         Span::styled(
-            app.graph_branch_picker.filter.clone(),
+            app.graph_branch_picker.core.filter.clone(),
             Style::default().fg(th.fg_primary),
         ),
     ]);
@@ -72,9 +72,10 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     // caret past the border.
     let cursor_byte = app
         .graph_branch_picker
+        .core
         .cursor
-        .min(app.graph_branch_picker.filter.len());
-    let cursor_w = UnicodeWidthStr::width(&app.graph_branch_picker.filter[..cursor_byte]) as u16;
+        .min(app.graph_branch_picker.core.filter.len());
+    let cursor_w = UnicodeWidthStr::width(&app.graph_branch_picker.core.filter[..cursor_byte]) as u16;
     let max_caret_offset = inner.width.saturating_sub(prompt_w + 1);
     let caret_x = inner.x + prompt_w + cursor_w.min(max_caret_offset);
     f.set_cursor_position((caret_x, input_y));
@@ -88,7 +89,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
 
     for (row_idx, row) in rows.iter().enumerate().take(list_h as usize) {
         let y = list_y + row_idx as u16;
-        let is_selected = row_idx == app.graph_branch_picker.selected_idx;
+        let is_selected = row_idx == app.graph_branch_picker.core.selected_idx;
 
         let (left, right, accent) = match row {
             BranchPickerRow::AllRefs => ("[ All refs ]".to_string(), "default".to_string(), true),

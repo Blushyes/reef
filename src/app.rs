@@ -1365,7 +1365,7 @@ impl App {
         self.tasks.replace_in_files(
             generation,
             self.backend.clone(),
-            self.global_search.query.clone(),
+            self.global_search.core.filter.clone(),
             self.global_search.replace_text.clone(),
             items,
         );
@@ -1436,7 +1436,7 @@ impl App {
         // place mode in `handle_key`), the search prompt would still
         // commandeer the status bar instead of the PLACE badge, and
         // the user would need two Esc presses to fully unwind.
-        self.quick_open.active = false;
+        self.quick_open.core.active = false;
         if self.search.active {
             crate::search::exit_cancel(self);
         }
@@ -4878,7 +4878,7 @@ impl App {
             // trigger live preview.
             ClickAction::GlobalSearchSelect(idx) => {
                 if self.active_tab == Tab::Search {
-                    self.global_search.selected = idx;
+                    self.global_search.core.selected_idx = idx;
                     crate::global_search::navigate_to_selected(self);
                 }
                 // Overlay case is unreachable via this path — handled inline
@@ -4955,7 +4955,7 @@ impl App {
                 // commit. The picker's own keyboard path goes through a
                 // different method, so here we just re-use `move_selection`
                 // by computing the delta.
-                let current = self.hosts_picker.selected_idx;
+                let current = self.hosts_picker.core.selected_idx;
                 let delta = idx as i32 - current as i32;
                 self.hosts_picker.move_selection(delta);
                 // Enter path-mode immediately so user can type /path and
@@ -5350,7 +5350,7 @@ impl App {
         let Some(hit) = self
             .global_search
             .results
-            .get(self.global_search.selected)
+            .get(self.global_search.core.selected_idx)
             .cloned()
         else {
             return;
@@ -5375,7 +5375,7 @@ impl App {
         if Instant::now().duration_since(t) < crate::global_search::DEBOUNCE {
             return;
         }
-        if self.global_search.query == self.global_search.last_searched_query {
+        if self.global_search.core.filter == self.global_search.last_searched_query {
             self.global_search.last_keystroke_at = None;
             return;
         }
@@ -5391,16 +5391,16 @@ impl App {
 
         self.global_search.results.clear();
         self.global_search.truncated = false;
-        self.global_search.selected = 0;
+        self.global_search.core.selected_idx = 0;
         self.global_search.scroll = 0;
         // New query → fresh results → start from smart-view. Leaving a
         // stale h-scroll here would mean the first chunks land already
         // offset, which looks like a bug.
         self.global_search.results_h_scroll = 0;
-        self.global_search.last_searched_query = self.global_search.query.clone();
+        self.global_search.last_searched_query = self.global_search.core.filter.clone();
         self.global_search.last_keystroke_at = None;
 
-        if self.global_search.query.is_empty() {
+        if self.global_search.core.filter.is_empty() {
             // No worker to send. Still bump+complete the AsyncState so any
             // late Done from the previous (now-cancelled) worker is dropped
             // via generation mismatch, and `loading` correctly reads false.
@@ -5418,7 +5418,7 @@ impl App {
             new_gen,
             new_cancel,
             Arc::clone(&self.backend),
-            self.global_search.query.clone(),
+            self.global_search.core.filter.clone(),
         );
     }
 
@@ -5532,7 +5532,7 @@ impl App {
                     && let Some(hit) = self
                         .global_search
                         .results
-                        .get(self.global_search.selected)
+                        .get(self.global_search.core.selected_idx)
                         .cloned()
                 {
                     self.load_preview_for_path(hit.path);
@@ -5891,7 +5891,7 @@ mod tests {
         fx.app.open_graph_branch_picker();
 
         assert!(
-            !fx.app.graph_branch_picker.active,
+            !fx.app.graph_branch_picker.core.active,
             "picker must not open while ref_map is empty"
         );
         assert!(fx.app.toasts.len() > toasts_before, "must surface a hint toast");
@@ -6046,9 +6046,9 @@ mod tests {
             .ref_map
             .insert("oid".into(), vec![crate::git::RefLabel::Branch("main".into())]);
         fx.app.open_graph_branch_picker();
-        assert!(fx.app.graph_branch_picker.active);
+        assert!(fx.app.graph_branch_picker.core.active);
 
-        fx.app.graph_branch_picker.filter = "zzz".into();
+        fx.app.graph_branch_picker.core.filter = "zzz".into();
         assert!(
             fx.app.graph_branch_picker.confirm().is_none(),
             "filter 'zzz' has no rows"
@@ -6056,7 +6056,7 @@ mod tests {
 
         fx.app.confirm_graph_branch_picker();
         assert!(
-            !fx.app.graph_branch_picker.active,
+            !fx.app.graph_branch_picker.core.active,
             "picker must close even when confirm() returned None"
         );
     }

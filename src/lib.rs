@@ -21,6 +21,7 @@ pub mod i18n;
 pub mod images;
 pub mod input;
 pub mod input_edit;
+pub mod input_edit_multi;
 pub mod paste_conflict;
 pub mod picker_core;
 pub mod place_mode;

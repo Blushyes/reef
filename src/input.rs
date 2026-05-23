@@ -1464,131 +1464,46 @@ fn handle_key_graph(key: KeyEvent, app: &mut App) {
 }
 
 /// Route a key event to the commit-box buffer when the Git tab's
-/// commit input is focused. Mirrors the text-input contract used by
-/// `handle_key_search_input_mode`: typing fills the draft, standard
-/// nav / edit keys move the cursor, Esc blurs, Ctrl+Enter submits,
-/// bare Enter inserts a newline (subject + body pattern). Returns
-/// `true` when the key was consumed.
-fn handle_key_git_commit(key: KeyEvent, app: &mut App, ctrl: bool, alt: bool) -> bool {
+/// commit input is focused.
+///
+/// Two-phase routing matching every other input in reef:
+///   1. Commit-box-specific shortcuts (Esc blur, Ctrl+Enter submit).
+///   2. Everything else flows into
+///      [`input_edit_multi::dispatch_key_multi`], which extends the
+///      shared single-line vocabulary with line-aware Up/Down
+///      navigation, line-aware Home/End, and bare-Enter newline
+///      insert. Returns `true` when the key was consumed by either
+///      phase — never falls through to global Git-tab shortcuts
+///      while the commit box is focused.
+fn handle_key_git_commit(key: KeyEvent, app: &mut App, ctrl: bool, _alt: bool) -> bool {
     use crate::app::Panel;
     if app.active_panel != Panel::Files || !app.git_status.commit_editing {
         return false;
     }
+    // Phase 1: commit-box-specific shortcuts.
     match key.code {
         KeyCode::Esc => {
             app.git_status.commit_editing = false;
-            true
+            return true;
         }
         KeyCode::Enter if ctrl => {
             app.run_commit();
-            true
+            return true;
         }
-        KeyCode::Enter => {
-            crate::input_edit::insert_char(
-                &mut app.git_status.commit_message,
-                &mut app.git_status.commit_cursor,
-                '\n',
-            );
-            true
-        }
-        KeyCode::Backspace if alt || ctrl => {
-            crate::input_edit::delete_word_backward(
-                &mut app.git_status.commit_message,
-                &mut app.git_status.commit_cursor,
-            );
-            true
-        }
-        KeyCode::Backspace => {
-            crate::input_edit::backspace(
-                &mut app.git_status.commit_message,
-                &mut app.git_status.commit_cursor,
-            );
-            true
-        }
-        KeyCode::Delete if alt || ctrl => {
-            crate::input_edit::delete_word_forward(
-                &mut app.git_status.commit_message,
-                &mut app.git_status.commit_cursor,
-            );
-            true
-        }
-        KeyCode::Delete => {
-            crate::input_edit::delete_char_forward(
-                &mut app.git_status.commit_message,
-                &mut app.git_status.commit_cursor,
-            );
-            true
-        }
-        KeyCode::Left if alt || ctrl => {
-            crate::input_edit::move_cursor_word_backward(
-                &app.git_status.commit_message,
-                &mut app.git_status.commit_cursor,
-            );
-            true
-        }
-        KeyCode::Right if alt || ctrl => {
-            crate::input_edit::move_cursor_word_forward(
-                &app.git_status.commit_message,
-                &mut app.git_status.commit_cursor,
-            );
-            true
-        }
-        KeyCode::Left => {
-            crate::input_edit::move_cursor(
-                &app.git_status.commit_message,
-                &mut app.git_status.commit_cursor,
-                -1,
-            );
-            true
-        }
-        KeyCode::Right => {
-            crate::input_edit::move_cursor(
-                &app.git_status.commit_message,
-                &mut app.git_status.commit_cursor,
-                1,
-            );
-            true
-        }
-        KeyCode::Home => {
-            app.git_status.commit_cursor = 0;
-            true
-        }
-        KeyCode::End => {
-            app.git_status.commit_cursor = app.git_status.commit_message.len();
-            true
-        }
-        KeyCode::Char('u') if ctrl => {
-            crate::input_edit::clear(
-                &mut app.git_status.commit_message,
-                &mut app.git_status.commit_cursor,
-            );
-            true
-        }
-        KeyCode::Char('w') if ctrl => {
-            crate::input_edit::delete_word_backward(
-                &mut app.git_status.commit_message,
-                &mut app.git_status.commit_cursor,
-            );
-            true
-        }
-        KeyCode::Char('a') if ctrl => {
-            app.git_status.commit_cursor = 0;
-            true
-        }
-        KeyCode::Char('e') if ctrl => {
-            app.git_status.commit_cursor = app.git_status.commit_message.len();
-            true
-        }
-        KeyCode::Char(c) if !ctrl => {
-            crate::input_edit::insert_char(
-                &mut app.git_status.commit_message,
-                &mut app.git_status.commit_cursor,
-                c,
-            );
-            true
-        }
-        _ => false,
+        _ => {}
     }
+
+    // Phase 2: shared multi-line text-input dispatch.
+    let outcome = crate::input_edit_multi::dispatch_key_multi(
+        &key,
+        &mut app.git_status.commit_message,
+        &mut app.git_status.commit_cursor,
+    );
+    // Even on `Unhandled` we return `true` — the commit box owns the
+    // keyboard while focused; falling through to Git-tab letter
+    // shortcuts (s / u / d / …) mid-message would clobber the draft.
+    let _ = outcome;
+    true
 }
 
 fn handle_key_git(key: KeyEvent, app: &mut App) {

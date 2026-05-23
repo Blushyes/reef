@@ -106,6 +106,12 @@ pub fn leader_decision(
         if allow_arm && is_bare_space {
             return LeaderVerdict::Arm;
         }
+        // Stale or non-target → Consume clears the leader at the call
+        // site, so a single keystroke after timeout resets state cleanly.
+        // The destructive-key risk this used to carry in FocusedPreview
+        // (Space + idle + stray `d` → discard) is now bounded by the
+        // bypass's own timeout check at `handle_key_focused_preview`'s
+        // entry — see comment there.
         return LeaderVerdict::Consume;
     }
 
@@ -348,6 +354,63 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         LeaderVerdict::None => {}
     }
 
+    // vim `gg` / `G` — jump the active preview to top / bottom. Sits
+    // between the Space-leader chord and the global keymap so the chord
+    // works in both Main and FocusedPreview without each per-tab handler
+    // having to reimplement it. Suppressed in:
+    //
+    // - input modes (search query / commit message / db-goto-page input);
+    // - any modal overlay (find widget / global / quick / hosts pickers,
+    //   tree edit, search-tab replace mode);
+    // - SQLite preview, so bare `g` keeps its goto-page meaning down in
+    //   `handle_key_files`.
+    //
+    // `g` arms the chord; a second `g` within 500 ms fires `to_top` and
+    // anything else cancels. `G` is a single-shot `to_bottom` that also
+    // clears any pending `g` so an unrelated stutter doesn't strand state.
+    let gg_suppressed = in_input_mode
+        || app.search.active
+        || app.find_widget.active
+        || app.global_search.active
+        || app.quick_open.active
+        || app.hosts_picker.active
+        || app.tree_edit.active
+        || app.db_goto_input.is_some()
+        || app.is_sqlite_preview();
+    if !gg_suppressed {
+        // Use `contains` + a Ctrl/Alt veto rather than strict equality on
+        // `modifiers`, so terminals that surface extra modifier bits
+        // alongside Shift (kitty enhanced keyboard, some IME paths) still
+        // deliver `G` correctly. Matches the convention in the rest of
+        // this file (`if !ctrl` guards on per-tab handlers).
+        let no_ctrl_alt = !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT);
+        let is_bare_g = key.code == KeyCode::Char('g')
+            && no_ctrl_alt
+            && !key.modifiers.contains(KeyModifiers::SHIFT);
+        let is_shift_g = key.code == KeyCode::Char('G') && no_ctrl_alt;
+        if is_shift_g {
+            app.g_pending_at = None;
+            app.scroll_active_preview_to_bottom();
+            return;
+        }
+        if is_bare_g {
+            let now = Instant::now();
+            if let Some(t0) = app.g_pending_at.take() {
+                if now.duration_since(t0) < Duration::from_millis(500) {
+                    app.scroll_active_preview_to_top();
+                    return;
+                }
+            }
+            app.g_pending_at = Some(now);
+            return;
+        }
+        if app.g_pending_at.is_some() {
+            // Any other keystroke breaks the chord — back to normal dispatch.
+            app.g_pending_at = None;
+        }
+    }
+
     // Always-available global keys — even when the user is typing in a
     // search input, these need to remain usable as the escape hatch.
     // `Ctrl+C` quits, `Tab` / `BackTab` move between tabs and panels so the
@@ -383,22 +446,6 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         // message / search query isn't stolen by the chord.
         KeyCode::Char(',') if key.modifiers.contains(KeyModifiers::CONTROL) && !in_input_mode => {
             app.open_settings();
-            return;
-        }
-        // Ctrl+F: VSCode-style find-in-file. Forces focus onto the
-        // preview so `search::begin`'s `resolve_target` picks
-        // `SearchTarget::FilePreview` regardless of where focus was.
-        // Suppressed in text-input modes so it doesn't yank the user
-        // out of a half-typed commit message or global-search query.
-        KeyCode::Char('f')
-            if key.modifiers.contains(KeyModifiers::CONTROL)
-                && !in_input_mode
-                && matches!(app.active_tab, Tab::Files | Tab::Search) =>
-        {
-            if app.active_panel != Panel::Diff {
-                app.active_panel = Panel::Diff;
-            }
-            search::begin(app, false);
             return;
         }
         // Ctrl+Tab: best-effort "next tab" alias. Many legacy terminals
@@ -674,6 +721,27 @@ fn handle_key_focused_preview(key: KeyEvent, app: &mut App) -> bool {
         }
     }
 
+    // When a Space leader is armed AND still within the chord window,
+    // the *next* key must reach `leader_decision` so chord targets
+    // (Space+F = FindWidget, Space+V = exit FocusedPreview, etc.) can
+    // fire. The whitelist below would otherwise swallow most chord
+    // targets — `p`/`P` for QuickOpen aren't in it at all — and a
+    // typo'd chord would silently stay armed past the timeout.
+    //
+    // The timeout check is load-bearing: without it, a stray Space
+    // (e.g. the user tapped Space and walked away) would leave
+    // `space_leader_at = Some(stale_t)` indefinitely, and every
+    // subsequent key — including destructive `s`/`u`/`d` on Git —
+    // would bypass the whitelist and reach per-tab dispatch against
+    // the invisible status row. With the check, the bypass is bounded
+    // to LEADER_TIMEOUT (800 ms) starting from the Space press.
+    if app
+        .space_leader_at
+        .is_some_and(|t| Instant::now().duration_since(t) < LEADER_TIMEOUT)
+    {
+        return false;
+    }
+
     // Explicit handling for FocusedPreview-specific actions.
     match key.code {
         KeyCode::Esc => {
@@ -751,7 +819,9 @@ fn handle_key_focused_preview(key: KeyEvent, app: &mut App) -> bool {
                 | KeyCode::Home
                 | KeyCode::End
                 | KeyCode::Char(
-                    'j' | 'k'      // vim vertical
+                    ' '            // Space-leader arm — chord targets fire
+                                   // via the leader-armed bypass above.
+                    | 'j' | 'k'    // vim vertical
                     | 'h'          // help popup (FocusedPreview is in the
                                    // takeover list now, so the next key
                                    // reaches us, not "dismiss help")
@@ -759,7 +829,9 @@ fn handle_key_focused_preview(key: KeyEvent, app: &mut App) -> bool {
                     | 'n' | 'N'    // search step
                     | 'm' | 'f'    // diff layout / diff mode toggles
                     | '[' | ']'    // SQLite preview: prev/next table
-                    | 'g' | 'G', // SQLite preview: goto-page; vim top/bottom
+                    | 'g' | 'G', // vim top/bottom + SQLite goto-page; the
+                                 // chord runs in `handle_key`'s main body,
+                                 // SQLite goto is per-tab in handle_key_files.
                 )
         );
     // Ctrl-prefixed nav aliases that the per-tab handlers honor and
@@ -770,7 +842,6 @@ fn handle_key_focused_preview(key: KeyEvent, app: &mut App) -> bool {
             KeyCode::Char(
                 'p' | 'n'      // readline up/down
                 | 'j' | 'k'    // vim-style with ctrl
-                | 'f'          // VSCode-style find widget
                 | 'b' // sidebar toggle (no-op visually in
                       // FocusedPreview but harmless)
             )
@@ -1354,13 +1425,16 @@ fn handle_key_graph(key: KeyEvent, app: &mut App) {
             app.refresh_graph();
         }
         // m/f/t target the commit-detail panel regardless of focus.
-        KeyCode::Char('m') => {
+        // `!ctrl` guards so Ctrl+F/M/T (e.g. VSCode muscle-memory Ctrl+F
+        // for find) don't silently flip diff layout/mode — the global
+        // Ctrl+F binding was removed in favour of Space+F.
+        KeyCode::Char('m') if !ctrl => {
             commit_detail_panel::handle_key(app, "m");
         }
-        KeyCode::Char('f') => {
+        KeyCode::Char('f') if !ctrl => {
             commit_detail_panel::handle_key(app, "f");
         }
-        KeyCode::Char('t') => {
+        KeyCode::Char('t') if !ctrl => {
             commit_detail_panel::handle_key(app, "t");
         }
         _ => {}
@@ -1606,10 +1680,13 @@ fn handle_key_git(key: KeyEvent, app: &mut App) {
         KeyCode::Char('t') => {
             ui::git_status_panel::handle_key(app, "t");
         }
-        KeyCode::Char('m') => {
+        // `!ctrl` guard on `m`/`f` so Ctrl+F (VSCode muscle memory)
+        // doesn't silently flip diff layout/mode now that the global
+        // Ctrl+F binding has been removed in favour of Space+F.
+        KeyCode::Char('m') if !ctrl => {
             app.toggle_diff_layout();
         }
-        KeyCode::Char('f') => {
+        KeyCode::Char('f') if !ctrl => {
             app.toggle_diff_mode();
         }
         KeyCode::Char('e') | KeyCode::Enter => {
@@ -4230,9 +4307,14 @@ mod leader_tests {
     }
 
     #[test]
-    fn ctrl_f_does_not_fire_even_when_armed() {
-        // Keep Ctrl+F free for future panel-level search bindings; only bare
-        // `f` is the chord target.
+    fn ctrl_f_is_not_a_chord_target() {
+        // Only bare `f` / `F` is the FindWidget chord target — Ctrl+F has no
+        // global binding (Find is reached exclusively via Space+F), so when
+        // the leader is armed pressing Ctrl+F just consumes the leader.
+        // NOTE: this test only covers `leader_decision`'s view. The
+        // integration-level guarantee that "Ctrl+F doesn't toggle diff
+        // mode / layout in Git/Graph tabs" is asserted by the
+        // `ctrl_f_in_main_mode_*` tests in tests/focused_preview_scroll.rs.
         let now = Instant::now();
         let ctrl_f = ke(KeyCode::Char('f'), KeyModifiers::CONTROL);
         let v = leader_decision(&ctrl_f, true, Some(now), now, LEADER_TIMEOUT);

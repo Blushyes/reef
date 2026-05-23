@@ -18,7 +18,7 @@ use crate::app::{App, Tab};
 use crate::i18n::{Msg, t};
 use crate::ui::mouse::ClickAction;
 use crate::ui::text::truncate_to_width;
-use crate::ui::{diff_panel, file_preview_panel, hover};
+use crate::ui::{diff_panel, file_preview_panel, find_widget_panel, hover};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -80,7 +80,26 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         render_chip(f, app, body);
     }
 
-    render_hint(f, app, hint_row);
+    // FocusedPreview takes over `ui::render` and returns early before the
+    // normal `find_widget_panel::render` call, so the Space+F overlay
+    // would never appear here without this hop. Draw after the body
+    // renderers (which write `last_preview_rect` / `last_diff_rect`)
+    // so the widget can anchor itself to the visible content column.
+    // Skips itself when `find_widget.active == false`.
+    find_widget_panel::render(f, app);
+
+    // FocusedPreview replaces the normal status bar entirely, so the search
+    // prompt would never render here without this branch — `/` would silently
+    // capture keystrokes against an invisible input. Mirror the same
+    // priority order `render_status_bar` uses (active prompt → dormant
+    // counter → hint) so the bottom row stays meaningful in every state.
+    if app.search.active {
+        super::render_search_prompt(f, app, hint_row);
+    } else if !app.search.matches.is_empty() {
+        super::render_search_dormant(f, app, hint_row);
+    } else {
+        render_hint(f, app, hint_row);
+    }
 }
 
 fn render_chip(f: &mut Frame, app: &mut App, body: Rect) {

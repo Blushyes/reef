@@ -230,14 +230,13 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // Shared picker dispatch. `Edited` re-runs the fuzzy filter; the
     // other outcomes are no-ops (PickerCore already updated state).
     use crate::picker_core::InputOutcome;
+    let _ = ctrl; // Quit branch handles Ctrl+C; no other ctrl-gating here.
     let visible = app.quick_open.matches.len();
     match app.quick_open.core.dispatch_key(&key, visible) {
-        InputOutcome::Cancel => {
-            let ctrl_c = matches!(key.code, KeyCode::Char('c')) && ctrl;
+        InputOutcome::Cancel => app.quick_open.core.active = false,
+        InputOutcome::Quit => {
             app.quick_open.core.active = false;
-            if ctrl_c {
-                app.should_quit = true;
-            }
+            app.should_quit = true;
         }
         InputOutcome::Confirm => accept(app),
         InputOutcome::Edited => filter(&mut app.quick_open),

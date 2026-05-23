@@ -17,16 +17,23 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-/// Result of [`dispatch_key`]. `Edited` and `CursorOnly` both mean the
-/// key was consumed; `Unhandled` lets the caller try its own arms (for
-/// keys that aren't part of the text-input vocabulary, e.g. Esc, Tab,
-/// list navigation).
+/// Result of [`dispatch_key`]. `Edited`, `CursorOnly` and `Rejected`
+/// all mean the key was consumed; `Unhandled` lets the caller try
+/// its own arms (for keys that aren't part of the text-input
+/// vocabulary, e.g. Esc, Tab, list navigation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     /// Buffer content changed (insert, delete, clear, …).
     Edited,
     /// Recognized cursor-motion key; buffer untouched.
     CursorOnly,
+    /// A printable char was recognised but the caller's
+    /// [`dispatch_key_filtered`] predicate rejected its insertion.
+    /// The key is treated as consumed (no fall-through to global
+    /// hotkeys) but the buffer is unchanged — callers that re-run
+    /// derived work on `Edited` (e.g. `mark_query_edited`) should
+    /// NOT treat this as an edit.
+    Rejected,
     /// Not a text-input key. Caller should match it against its own
     /// per-field handlers.
     Unhandled,
@@ -140,11 +147,13 @@ pub fn dispatch_key_filtered(
                 Outcome::Edited
             } else {
                 // Recognised the keystroke as a printable character but
-                // the caller's predicate rejected it. Treat as consumed
-                // (so the key doesn't fall through to global hotkeys)
-                // but report no edit so the caller can avoid spurious
-                // re-search / re-filter.
-                Outcome::CursorOnly
+                // the caller's predicate rejected it. `Rejected` is
+                // distinct from `CursorOnly` so callers that re-run
+                // derived work on `Edited` (mark_query_edited, etc.)
+                // don't accidentally treat a filtered char as a cursor
+                // move either. Both report "consumed" — the key won't
+                // fall through to global hotkeys.
+                Outcome::Rejected
             }
         }
         _ => Outcome::Unhandled,
@@ -554,7 +563,7 @@ mod tests {
     fn dispatch_filtered_swallows_rejected_char() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         // Predicate rejects non-digit: 'a' is swallowed but treated
-        // as consumed (CursorOnly, not Unhandled) so it doesn't fall
+        // as consumed (Rejected, not Unhandled) so it doesn't fall
         // through to global hotkeys.
         let (mut t, mut c) = state("12", 2);
         let outcome = dispatch_key_filtered(
@@ -563,7 +572,7 @@ mod tests {
             &mut c,
             |c| c.is_ascii_digit(),
         );
-        assert_eq!(outcome, Outcome::CursorOnly);
+        assert_eq!(outcome, Outcome::Rejected);
         assert_eq!(t, "12", "buffer untouched");
         assert_eq!(c, 2, "cursor untouched");
     }

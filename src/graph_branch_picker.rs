@@ -70,6 +70,17 @@ pub struct GraphBranchPickerState {
     /// `all_branches` so a deleted recent silently disappears from the
     /// rendered list.
     pub recent: Vec<String>,
+    /// Memoised result of [`visible_rows`]. The cache key is the
+    /// lowercased filter string — `all_branches` / `recent` only
+    /// change at `open()` time (which calls `invalidate_cache`), so
+    /// the filter alone is enough to distinguish identical recomputes.
+    ///
+    /// `RefCell` so `visible_rows(&self)` can populate it lazily
+    /// without forcing every caller to a `&mut` receiver. The
+    /// alternative — recomputing N keystrokes/second on a 2k-branch
+    /// monorepo — would allocate ~60k Strings per second of held
+    /// autorepeat.
+    cache: std::cell::RefCell<Option<(String, Vec<BranchPickerRow>)>>,
 }
 
 impl GraphBranchPickerState {
@@ -85,6 +96,7 @@ impl GraphBranchPickerState {
     ) {
         self.all_branches = collect_branches(ref_map);
         self.recent = recent;
+        self.cache.get_mut().take(); // ref_map / recent changed — drop cache
         self.core.open();
         // Land on whatever row matches the active scope so the picker
         // is "where you are" by default — pressing Esc cancels with no
@@ -103,16 +115,28 @@ impl GraphBranchPickerState {
     }
 
     pub fn close(&mut self) {
+        self.cache.get_mut().take();
         self.core.close();
     }
 
     /// Apply the current filter against AllRefs + recents + branches.
-    /// `AllRefs` always renders when the filter is empty or matches
-    /// the literal "all" — gives the user a deterministic way back to
-    /// the default scope.
+    /// `AllRefs` always renders when the filter is empty.
+    ///
+    /// Memoised via [`Self::cache`] keyed on the lowercased filter
+    /// string — autorepeat on j/k holding 30Hz used to reallocate a
+    /// HashSet + N String::to_ascii_lowercase + up to MAX_BRANCH_ROWS
+    /// `BranchEntry` clones per tick. The cache is invalidated on
+    /// `open` / `close` (data inputs change) and inside this method
+    /// whenever the filter shifts.
     pub fn visible_rows(&self) -> Vec<BranchPickerRow> {
-        let mut out: Vec<BranchPickerRow> = Vec::new();
         let f = self.core.filter.to_ascii_lowercase();
+        // Cache hit?
+        if let Some((cached_filter, cached_rows)) = self.cache.borrow().as_ref() {
+            if cached_filter == &f {
+                return cached_rows.clone();
+            }
+        }
+        let mut out: Vec<BranchPickerRow> = Vec::new();
 
         // Sentinel is shown ONLY on the empty filter. Substring /
         // prefix matching against literal labels turned out to be a
@@ -162,6 +186,9 @@ impl GraphBranchPickerState {
             }
         }
 
+        // Populate cache. Borrow is short-lived; `Vec::clone` is a
+        // single heap-block memcpy of small enums (~24 bytes each).
+        *self.cache.borrow_mut() = Some((f, out.clone()));
         out
     }
 

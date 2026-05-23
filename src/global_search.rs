@@ -496,14 +496,13 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     }
 
     use crate::picker_core::InputOutcome;
+    let _ = ctrl; // Quit branch handles Ctrl+C; no other ctrl-gating here.
     let visible = app.global_search.results.len();
     match app.global_search.core.dispatch_key(&key, visible) {
-        InputOutcome::Cancel => {
-            let ctrl_c = matches!(key.code, KeyCode::Char('c')) && ctrl;
+        InputOutcome::Cancel => app.global_search.core.active = false,
+        InputOutcome::Quit => {
             app.global_search.core.active = false;
-            if ctrl_c {
-                app.should_quit = true;
-            }
+            app.should_quit = true;
         }
         InputOutcome::Confirm => accept(app),
         InputOutcome::Edited => mark_query_edited(&mut app.global_search),

@@ -1467,15 +1467,23 @@ fn handle_key_graph(key: KeyEvent, app: &mut App) {
 /// commit input is focused.
 ///
 /// Two-phase routing matching every other input in reef:
-///   1. Commit-box-specific shortcuts (Esc blur, Ctrl+Enter submit).
+///   1. Commit-box-specific shortcuts (Esc blur, Ctrl+Enter submit;
+///      Ctrl+Enter requires `!alt` so a stray Ctrl+Alt+Enter on
+///      Linux WMs doesn't silently commit).
 ///   2. Everything else flows into
 ///      [`input_edit_multi::dispatch_key_multi`], which extends the
 ///      shared single-line vocabulary with line-aware Up/Down
 ///      navigation, line-aware Home/End, and bare-Enter newline
-///      insert. Returns `true` when the key was consumed by either
-///      phase — never falls through to global Git-tab shortcuts
-///      while the commit box is focused.
-fn handle_key_git_commit(key: KeyEvent, app: &mut App, ctrl: bool, _alt: bool) -> bool {
+///      insert.
+///
+/// Returns `true` when the key was actually consumed (Phase 1 hit
+/// OR Phase 2 returned `Edited` / `CursorOnly`). Keys the multi-line
+/// editor doesn't recognise (PageUp / PageDown / Shift+Arrow / F-keys
+/// …) yield `Unhandled` and we return `false` so the outer Git-tab
+/// handler can do its own thing with them. Letter chords like
+/// `s` / `u` / `d` arrive here as `Char(c)` which the editor DOES
+/// handle (as a literal insert), so the draft is safe.
+fn handle_key_git_commit(key: KeyEvent, app: &mut App, ctrl: bool, alt: bool) -> bool {
     use crate::app::Panel;
     if app.active_panel != Panel::Files || !app.git_status.commit_editing {
         return false;
@@ -1486,24 +1494,23 @@ fn handle_key_git_commit(key: KeyEvent, app: &mut App, ctrl: bool, _alt: bool) -
             app.git_status.commit_editing = false;
             return true;
         }
-        KeyCode::Enter if ctrl => {
+        KeyCode::Enter if ctrl && !alt => {
             app.run_commit();
             return true;
         }
         _ => {}
     }
 
-    // Phase 2: shared multi-line text-input dispatch.
+    // Phase 2: shared multi-line text-input dispatch. Forward
+    // `Unhandled` to the caller as "not consumed" so unknown keys
+    // (PageUp / Shift+Arrow / F-keys / …) can flow up to the outer
+    // Git-tab handler instead of being silently swallowed mid-edit.
     let outcome = crate::input_edit_multi::dispatch_key_multi(
         &key,
         &mut app.git_status.commit_message,
         &mut app.git_status.commit_cursor,
     );
-    // Even on `Unhandled` we return `true` — the commit box owns the
-    // keyboard while focused; falling through to Git-tab letter
-    // shortcuts (s / u / d / …) mid-message would clobber the draft.
-    let _ = outcome;
-    true
+    !matches!(outcome, crate::input_edit::Outcome::Unhandled)
 }
 
 fn handle_key_git(key: KeyEvent, app: &mut App) {
@@ -1996,12 +2003,10 @@ fn handle_key_hosts_picker(key: KeyEvent, app: &mut App) {
             }
             let visible = app.hosts_picker.visible_rows().len();
             match app.hosts_picker.core.dispatch_key(&key, visible) {
-                InputOutcome::Cancel => {
-                    let ctrl_c = matches!(key.code, KeyCode::Char('c')) && ctrl;
+                InputOutcome::Cancel => app.close_hosts_picker(),
+                InputOutcome::Quit => {
                     app.close_hosts_picker();
-                    if ctrl_c {
-                        app.should_quit = true;
-                    }
+                    app.should_quit = true;
                 }
                 InputOutcome::Confirm => app.confirm_hosts_picker(),
                 _ => {}
@@ -2013,6 +2018,16 @@ fn handle_key_hosts_picker(key: KeyEvent, app: &mut App) {
                     // Drop back to filter view rather than closing
                     // outright — gives the user a way out of the path
                     // buffer without losing the picker state.
+                    app.hosts_picker.input_mode = InputMode::Search;
+                    app.hosts_picker.path_buffer.clear();
+                    app.hosts_picker.path_cursor = 0;
+                    return;
+                }
+                // Symmetric with the path-mode entry: Ctrl+P also
+                // exits back to filter mode. Without this, the only
+                // way out is Esc, which is a UX asymmetry every
+                // tester trips on at least once.
+                KeyCode::Char('p') if ctrl => {
                     app.hosts_picker.input_mode = InputMode::Search;
                     app.hosts_picker.path_buffer.clear();
                     app.hosts_picker.path_cursor = 0;
@@ -2052,14 +2067,10 @@ fn handle_key_graph_branch_picker(key: KeyEvent, app: &mut App) {
     use crate::picker_core::InputOutcome;
     let visible = app.graph_branch_picker.visible_rows().len();
     match app.graph_branch_picker.core.dispatch_key(&key, visible) {
-        InputOutcome::Cancel => {
-            // Ctrl+C also requests app quit; plain Esc just closes.
-            let ctrl_c = matches!(key.code, KeyCode::Char('c'))
-                && key.modifiers.contains(KeyModifiers::CONTROL);
+        InputOutcome::Cancel => app.close_graph_branch_picker(),
+        InputOutcome::Quit => {
             app.close_graph_branch_picker();
-            if ctrl_c {
-                app.should_quit = true;
-            }
+            app.should_quit = true;
         }
         InputOutcome::Confirm => app.confirm_graph_branch_picker(),
         InputOutcome::Edited

@@ -116,7 +116,7 @@ pub fn move_line_vertical(text: &str, cursor: &mut usize, delta: i32) {
         let prev_line_start = line_start_of(text, prev_line_end);
         let prev_line_len = prev_line_end - prev_line_start;
         let target = prev_line_start + column.min(prev_line_len);
-        *cursor = next_safe_boundary(text, target);
+        *cursor = prev_safe_boundary(text, target);
     } else {
         // Move to the next line.
         let line_end = line_end_of(text, clamped);
@@ -129,20 +129,26 @@ pub fn move_line_vertical(text: &str, cursor: &mut usize, delta: i32) {
         let next_line_end = line_end_of(text, next_line_start);
         let next_line_len = next_line_end - next_line_start;
         let target = next_line_start + column.min(next_line_len);
-        *cursor = next_safe_boundary(text, target);
+        *cursor = prev_safe_boundary(text, target);
     }
 }
 
-/// Snap to the nearest valid UTF-8 char boundary at or after `target`.
-/// Defends `move_line_vertical` against the case where the byte-column
-/// from the source line lands mid-codepoint on the destination line
-/// (e.g. source line had "abc" + cursor at 2, destination is "你好"
-/// — byte 2 is mid-`你`). Walks forward to the next boundary to keep
-/// the cursor invariant: always on a char boundary.
-fn next_safe_boundary(text: &str, target: usize) -> usize {
+/// Snap to the nearest valid UTF-8 char boundary at or BEFORE
+/// `target`. Defends `move_line_vertical` against the case where the
+/// byte-column from the source line lands mid-codepoint on the
+/// destination line (e.g. source "abc" cursor at col 2 → target line
+/// "你好" col 2 → byte 2 is mid-`你`).
+///
+/// The backward direction is deliberate: a byte-column of N means
+/// "after N source bytes". Walking *forward* on a CJK destination
+/// would overshoot — the cursor lands one codepoint to the right of
+/// the visual column the user expects. Walking backward keeps the
+/// caret at-or-before the intended visual column, matching how
+/// most editors (vim, emacs) handle the equivalent navigation.
+fn prev_safe_boundary(text: &str, target: usize) -> usize {
     let mut p = target.min(text.len());
-    while p < text.len() && !text.is_char_boundary(p) {
-        p += 1;
+    while p > 0 && !text.is_char_boundary(p) {
+        p -= 1;
     }
     p
 }
@@ -241,8 +247,10 @@ mod tests {
         let mut c = 2; // column 2 on line "abc"
         dispatch_key_multi(&k(KeyCode::Down, KeyModifiers::NONE), &mut t, &mut c);
         // Column 2 in "你好" would be mid-codepoint of '你' (3-byte);
-        // next_safe_boundary should snap forward to byte 3 (after '你').
-        assert_eq!(c, "abc\n你".len());
+        // prev_safe_boundary snaps BACKWARD to byte 0 (before '你')
+        // so the caret stays at-or-before the source's visual column
+        // instead of overshooting to byte 3 (after '你').
+        assert_eq!(c, "abc\n".len());
         assert!(t.is_char_boundary(c));
     }
 

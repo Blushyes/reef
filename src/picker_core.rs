@@ -49,17 +49,27 @@ pub struct PickerCore {
 /// Callers translate these into picker-specific actions:
 ///
 /// ```text
-/// Cancel         → close()         (and possibly extra state cleanup)
+/// Cancel         → close()                   (Esc — close picker only)
+/// Quit           → close() + should_quit     (Ctrl+C — close + app quit)
 /// Confirm        → look up the row at `selected_idx`, act on it
 /// Edited         → recompute the candidate list against `filter`
 /// SelectionMoved → no-op (renderer already sees the new cursor)
 /// CursorMoved    → no-op (filter buffer cursor moved inside text)
-/// Unhandled      → caller's own match arms (e.g. picker-specific
-///                  shortcuts like leader chords / mode toggles)
+/// Unhandled      → the picker fully consumed the key as a no-op; do
+///                  NOT forward it elsewhere. Overlays own keyboard
+///                  while active so unknown keys are intentionally
+///                  swallowed rather than bubbled up to global hotkeys.
 /// ```
+///
+/// `Cancel` and `Quit` are split so callers can wire `should_quit`
+/// in one place — letting them collapse to a single outcome forces
+/// every site to re-derive Ctrl+C by re-matching `key.code`, which
+/// is the kind of duplication that drifts the first time a new
+/// caller forgets to copy the branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputOutcome {
     Cancel,
+    Quit,
     Confirm,
     Edited,
     SelectionMoved,
@@ -123,7 +133,7 @@ impl PickerCore {
         // Phase 1: list nav + close + commit.
         match key.code {
             KeyCode::Esc => return InputOutcome::Cancel,
-            KeyCode::Char('c') if ctrl => return InputOutcome::Cancel,
+            KeyCode::Char('c') if ctrl => return InputOutcome::Quit,
             KeyCode::Enter => return InputOutcome::Confirm,
             KeyCode::Up => {
                 self.move_selection(visible_count, -1);
@@ -153,6 +163,11 @@ impl PickerCore {
                 InputOutcome::Edited
             }
             crate::input_edit::Outcome::CursorOnly => InputOutcome::CursorMoved,
+            // PickerCore uses the non-filtered dispatcher so Rejected
+            // can't actually appear here; map it to CursorMoved as a
+            // defensive default if a future variant of dispatch_key
+            // starts emitting Rejected against this code path.
+            crate::input_edit::Outcome::Rejected => InputOutcome::CursorMoved,
             crate::input_edit::Outcome::Unhandled => InputOutcome::Unhandled,
         }
     }
@@ -220,11 +235,11 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_ctrl_c_returns_cancel() {
+    fn dispatch_ctrl_c_returns_quit() {
         let mut c = PickerCore::default();
         assert_eq!(
             c.dispatch_key(&k(KeyCode::Char('c'), KeyModifiers::CONTROL), 5),
-            InputOutcome::Cancel
+            InputOutcome::Quit
         );
     }
 

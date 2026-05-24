@@ -94,6 +94,16 @@ impl PickerCore {
         self.filter.clear();
         self.cursor = 0;
         self.selected_idx = 0;
+        // Also clear the stale popup rect. quick_open and global_search
+        // toggle `core.active = false` directly on close (intentional —
+        // they preserve `filter` for Esc-peek-and-return UX), so they
+        // never go through `close()`. Without invalidating
+        // `last_popup_area` at open time, the first frame after a
+        // terminal resize + reopen sees a stale rect; the mouse
+        // hit-test against `last_popup_area` would misclassify the
+        // first click as outside-the-popup and dismiss the freshly-
+        // opened overlay.
+        self.last_popup_area = None;
         self.active = true;
     }
 
@@ -138,10 +148,14 @@ impl PickerCore {
     /// editor table would consume them as plain inserts.
     pub fn dispatch_key(&mut self, key: &KeyEvent, visible_count: usize) -> InputOutcome {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        // Phase 1: list nav + close + commit.
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        // Phase 1: list nav + close + commit. `Quit` requires `!shift`
+        // so terminals reporting Ctrl+Shift+C as a distinct chord
+        // (kitty / iTerm enhanced keyboard) don't accidentally quit
+        // the app when the user wanted to copy to clipboard.
         match key.code {
             KeyCode::Esc => return InputOutcome::Cancel,
-            KeyCode::Char('c') if ctrl => return InputOutcome::Quit,
+            KeyCode::Char('c') if ctrl && !shift => return InputOutcome::Quit,
             KeyCode::Enter => return InputOutcome::Confirm,
             KeyCode::Up => {
                 self.move_selection(visible_count, -1);

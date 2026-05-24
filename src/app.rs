@@ -2529,7 +2529,15 @@ impl App {
     /// we don't build the new backend here because the outer loop owns
     /// the terminal teardown/setup dance around the connect.
     pub fn confirm_hosts_picker(&mut self) {
-        let Some(target) = self.hosts_picker.confirm() else {
+        // Close first, then act on the (optional) target. Same shape as
+        // `confirm_graph_branch_picker` — without it, a `confirm()` of
+        // None (filter matched zero hosts + Enter) would early-return
+        // and leave the overlay open trapping the keyboard, same UX
+        // trap that R3 of the previous review fixed for the graph
+        // picker.
+        let target = self.hosts_picker.confirm();
+        self.hosts_picker.close();
+        let Some(target) = target else {
             return;
         };
         // Persist the chosen target to the recents list before handing
@@ -2539,7 +2547,6 @@ impl App {
         current = crate::hosts_picker::bump_recent(current, target.clone());
         crate::hosts_picker::save_recent(&current);
 
-        self.hosts_picker.close();
         self.pending_ssh_target = Some(target);
         self.should_quit_session = true;
     }
@@ -2559,6 +2566,35 @@ impl App {
             self.toasts
                 .push(Toast::info(crate::i18n::graph_picker_not_ready_toast()));
             return;
+        }
+        // If the persisted scope points at a branch that's no longer
+        // in ref_map (e.g. ref deleted between sessions; the
+        // background revalidator's stale-branch fallback hasn't run
+        // yet), fall back to AllRefs HERE so the picker doesn't open
+        // already-pointing at the AllRefs sentinel row by silent
+        // accident — pressing Enter would otherwise overwrite the
+        // persisted branch with no toast. Surface the same toast the
+        // worker fallback uses, then proceed with the user's normal
+        // picker flow against AllRefs.
+        if let GraphScope::Branch(target) = &self.git_graph.scope.clone() {
+            let still_present = self.git_graph.ref_map.values().any(|labels| {
+                labels.iter().any(|label| match label {
+                    RefLabel::Branch(name) => format!("refs/heads/{name}") == *target,
+                    RefLabel::RemoteBranch(name) => format!("refs/remotes/{name}") == *target,
+                    _ => false,
+                })
+            });
+            if !still_present {
+                let short = shorthand_for_full_ref(target).to_string();
+                self.git_graph
+                    .recent_branches
+                    .retain(|existing| existing != target);
+                self.toasts.push(Toast::info(
+                    crate::i18n::graph_scope_stale_branch_toast(&short),
+                ));
+                self.apply_scope_no_refresh(GraphScope::AllRefs);
+                self.refresh_graph();
+            }
         }
         let recent = self.git_graph.recent_branches.clone();
         let scope = self.git_graph.scope.clone();

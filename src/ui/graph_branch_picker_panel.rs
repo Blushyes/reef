@@ -87,8 +87,24 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
 
     let rows = app.graph_branch_picker.visible_rows();
 
-    for (row_idx, row) in rows.iter().enumerate().take(list_h as usize) {
-        let y = list_y + row_idx as u16;
+    // Auto-scroll so `selected_idx` stays in the visible window.
+    // Same pattern as `quick_open_panel`: only adjust scroll when the
+    // selection moves outside the window, so the user can scroll
+    // independently (mouse wheel etc.) without snapping back. Without
+    // this, monorepos with hundreds of branches push the highlight
+    // off-screen on Down-key autorepeat.
+    let sel = app.graph_branch_picker.core.selected_idx;
+    let list_h_usize = list_h as usize;
+    if sel < app.graph_branch_picker.scroll {
+        app.graph_branch_picker.scroll = sel;
+    } else if list_h_usize > 0 && sel >= app.graph_branch_picker.scroll + list_h_usize {
+        app.graph_branch_picker.scroll = sel + 1 - list_h_usize;
+    }
+    let scroll = app.graph_branch_picker.scroll.min(rows.len().saturating_sub(1));
+
+    for (visible_row, row) in rows.iter().skip(scroll).take(list_h_usize).enumerate() {
+        let row_idx = scroll + visible_row;
+        let y = list_y + visible_row as u16;
         let is_selected = row_idx == app.graph_branch_picker.core.selected_idx;
 
         let (left, right, accent) = match row {

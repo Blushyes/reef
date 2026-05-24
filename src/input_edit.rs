@@ -70,7 +70,18 @@ pub fn dispatch_key_filtered(
 ) -> Outcome {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
-    match key.code {
+    // Snapshot before the dispatch so we can downgrade a "claimed
+    // edit" that didn't actually change anything to `CursorOnly`.
+    // Examples this prevents from firing spurious recomputes:
+    // - Backspace at cursor=0
+    // - Delete at cursor=text.len()
+    // - Ctrl+U on an empty buffer
+    // - Word-delete at the relevant boundary
+    // Without the downgrade, PickerCore maps `Edited → selected_idx
+    // = 0`, so a no-op Backspace would jump the highlighted row from
+    // (say) #5 back to #0 even though the filter didn't change.
+    let pre_len = text.len();
+    let outcome = match key.code {
         // ── Cursor motion ──
         KeyCode::Left if alt || ctrl => {
             move_cursor_word_backward(text, cursor);
@@ -158,7 +169,17 @@ pub fn dispatch_key_filtered(
             }
         }
         _ => Outcome::Unhandled,
+    };
+    // Downgrade an `Edited` that didn't actually move the buffer
+    // length. (Length is a cheap proxy — every edit op that we emit
+    // changes either `text.len()` or fills a previously-empty buffer.
+    // Insert / delete / clear ALL touch length. The single false
+    // negative would be an edit that ADDS one char and REMOVES one
+    // char in the same call, which none of our ops do.)
+    if outcome == Outcome::Edited && text.len() == pre_len {
+        return Outcome::CursorOnly;
     }
+    outcome
 }
 
 pub fn insert_char(text: &mut String, cursor: &mut usize, c: char) {
@@ -576,6 +597,51 @@ mod tests {
         assert_eq!(outcome, Outcome::Rejected);
         assert_eq!(t, "12", "buffer untouched");
         assert_eq!(c, 2, "cursor untouched");
+    }
+
+    #[test]
+    fn backspace_at_cursor_zero_downgrades_to_cursor_only() {
+        // Regression: pre-fix, Backspace at cursor=0 returned
+        // Outcome::Edited even though the buffer was untouched.
+        // PickerCore wrappers map Edited → selected_idx = 0, so a
+        // no-op Backspace would jump the highlighted row from #5 to
+        // #0 with no apparent input change. Downgrade is via the
+        // pre/post length comparison in dispatch_key_filtered.
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut t, mut c) = state("abc", 0);
+        let outcome = dispatch_key(
+            &KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            &mut t,
+            &mut c,
+        );
+        assert_eq!(outcome, Outcome::CursorOnly);
+        assert_eq!(t, "abc");
+        assert_eq!(c, 0);
+    }
+
+    #[test]
+    fn delete_at_cursor_end_downgrades_to_cursor_only() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut t, mut c) = state("abc", 3);
+        let outcome = dispatch_key(
+            &KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+            &mut t,
+            &mut c,
+        );
+        assert_eq!(outcome, Outcome::CursorOnly);
+        assert_eq!(t, "abc");
+    }
+
+    #[test]
+    fn ctrl_u_on_empty_buffer_downgrades_to_cursor_only() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut t, mut c) = state("", 0);
+        let outcome = dispatch_key(
+            &KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            &mut t,
+            &mut c,
+        );
+        assert_eq!(outcome, Outcome::CursorOnly);
     }
 
     #[test]

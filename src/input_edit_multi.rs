@@ -35,35 +35,41 @@ use crate::input_edit::{self, Outcome};
 ///   word-motion, delete, Ctrl+A/E, paste, plain-char insert all
 ///   behave identically to the single-line path.
 pub fn dispatch_key_multi(key: &KeyEvent, text: &mut String, cursor: &mut usize) -> Outcome {
-    let no_mods = key.modifiers.is_empty();
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // All multi-line specifics accept `!ctrl` (Shift / Alt are OK).
+    // Without Shift-tolerance, Shift+Up / Shift+Down / Shift+Home /
+    // Shift+End fall through to the caller as Unhandled, and the
+    // outer Git handler's `Up | Char('k') if !ctrl` arm fires
+    // `navigate_files` mid-message. Shift+arrow text-selection isn't
+    // a thing in this textarea today, so accepting the modifier as
+    // equivalent to bare-key motion is the right call.
     match key.code {
-        // Enter without Ctrl → newline insert (Shift+Enter, Alt+Enter,
-        // Ctrl+Alt+Enter all count). Ctrl+Enter is left for the caller
-        // to interpret as "submit" — Shift+Enter / Alt+Enter falling
-        // through would land in the outer Git handler's
-        // `Char('e') | Enter` arm and open the selected file in
-        // $EDITOR, which is the opposite of "soft newline".
         KeyCode::Enter if !ctrl => {
             input_edit::insert_char(text, cursor, '\n');
             Outcome::Edited
         }
-        KeyCode::Up if no_mods => {
+        KeyCode::Up if !ctrl => {
             move_line_vertical(text, cursor, -1);
             Outcome::CursorOnly
         }
-        KeyCode::Down if no_mods => {
+        KeyCode::Down if !ctrl => {
             move_line_vertical(text, cursor, 1);
             Outcome::CursorOnly
         }
-        KeyCode::Home if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Home if !ctrl => {
             *cursor = line_start_of(text, *cursor);
             Outcome::CursorOnly
         }
-        KeyCode::End if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::End if !ctrl => {
             *cursor = line_end_of(text, *cursor);
             Outcome::CursorOnly
         }
+        // Defensive `\r` filter. Bracketed-paste payloads go through
+        // the paste handler which strips CR explicitly, but some
+        // terminals deliver Char('\r') as a literal key event on
+        // raw paste; without this guard the buffer ingests CR and
+        // `git commit -F -` surfaces `^M` in `git log`.
+        KeyCode::Char('\r') => Outcome::CursorOnly,
         _ => input_edit::dispatch_key(key, text, cursor),
     }
 }
@@ -234,6 +240,20 @@ mod tests {
         let mut c = 0; // start of first line
         dispatch_key_multi(&k(KeyCode::End, KeyModifiers::NONE), &mut t, &mut c);
         assert_eq!(c, 5, "cursor on the '\\n' that ends line 1");
+    }
+
+    #[test]
+    fn shift_up_moves_cursor_like_bare_up() {
+        // Regression: Shift+Up previously failed the `no_mods` gate,
+        // fell through as Unhandled, and the outer Git handler's
+        // `Up | Char('k') if !ctrl` arm navigated the files list
+        // instead of the textarea cursor. With the widened `!ctrl`
+        // gate, Shift+Up behaves identically to bare Up.
+        let mut t = "alpha\nbeta\ngamma".to_string();
+        let mut c = "alpha\nbeta\nga".len(); // column 2 on "gamma"
+        let outcome = dispatch_key_multi(&k(KeyCode::Up, KeyModifiers::SHIFT), &mut t, &mut c);
+        assert_eq!(outcome, Outcome::CursorOnly);
+        assert_eq!(c, 8, "should land at column 2 on 'beta'");
     }
 
     #[test]

@@ -154,7 +154,7 @@ fn space_does_not_arm_while_typing_in_search_query() {
     app.set_active_tab(Tab::Search);
     app.active_panel = Panel::Files;
     app.global_search.focus = reef::global_search::SearchPanelFocus::FindInput;
-    app.global_search.query = "foo".to_string();
+    app.global_search.core.filter = "foo".to_string();
 
     input::handle_key(space_key(), &mut app);
     assert!(

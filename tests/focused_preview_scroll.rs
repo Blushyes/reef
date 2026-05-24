@@ -761,8 +761,8 @@ fn quick_open_keeps_v_keystroke_after_leader() {
 
     let mut app = App::new(Theme::dark(), None);
     reef::quick_open::begin(&mut app);
-    assert!(app.quick_open.active);
-    assert!(app.quick_open.query.is_empty());
+    assert!(app.quick_open.core.active);
+    assert!(app.quick_open.core.filter.is_empty());
 
     // Space arms the leader (allowed because query is empty).
     input::handle_key(key(KeyCode::Char(' ')), &mut app);
@@ -772,12 +772,12 @@ fn quick_open_keeps_v_keystroke_after_leader() {
     // leader is cleared and `v` falls through to the char-append arm.
     input::handle_key(key(KeyCode::Char('v')), &mut app);
     assert!(
-        app.quick_open.active,
+        app.quick_open.core.active,
         "Space+V must not close quick_open — it's not the palette's own chord"
     );
     assert!(app.quick_open.space_leader_at.is_none());
     assert_eq!(
-        app.quick_open.query, "v",
+        app.quick_open.core.filter, "v",
         "the 'v' keystroke should land in the query buffer"
     );
 
@@ -788,12 +788,12 @@ fn quick_open_keeps_v_keystroke_after_leader() {
     // again, which it isn't (we typed 'v'). With 'v' in query, the
     // leader isn't armed by Space, so Space appends to query.
     // Reset for a clean P-toggle check:
-    app.quick_open.query.clear();
-    app.quick_open.cursor = 0;
+    app.quick_open.core.filter.clear();
+    app.quick_open.core.cursor = 0;
     input::handle_key(key(KeyCode::Char(' ')), &mut app);
     input::handle_key(key(KeyCode::Char('p')), &mut app);
     assert!(
-        !app.quick_open.active,
+        !app.quick_open.core.active,
         "Space+P with empty query should close quick_open"
     );
 }

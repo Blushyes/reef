@@ -70,6 +70,12 @@ pub struct GraphBranchPickerState {
     /// `all_branches` so a deleted recent silently disappears from the
     /// rendered list.
     pub recent: Vec<String>,
+    /// First visible row in the list — read by the panel renderer to
+    /// scroll the viewport when `selected_idx` leaves the window.
+    /// Without this, big monorepos (hundreds of branches > visible
+    /// list_h) leave the user's selection rendered off-screen on
+    /// Down-key autorepeat. Reset to 0 by `open()` / `close()`.
+    pub scroll: usize,
     /// Memoised result of [`visible_rows`].
     ///
     /// Cache key is `(lowercased_filter, all_branches.len(),
@@ -106,6 +112,7 @@ impl GraphBranchPickerState {
         self.all_branches = collect_branches(ref_map);
         self.recent = recent;
         self.cache.get_mut().take(); // ref_map / recent changed — drop cache
+        self.scroll = 0;
         self.core.open();
         // Land on whatever row matches the active scope so the picker
         // is "where you are" by default — pressing Esc cancels with no
@@ -125,7 +132,18 @@ impl GraphBranchPickerState {
 
     pub fn close(&mut self) {
         self.cache.get_mut().take();
+        self.scroll = 0;
         self.core.close();
+    }
+
+    /// Drop the memoised [`visible_rows`] result. Call this if any
+    /// future writer mutates `all_branches` or `recent` IN PLACE
+    /// (e.g. swapping one entry for another of the same kind, or
+    /// editing a `BranchEntry` field). Push/pop changes are already
+    /// covered by the `.len()` components of the cache key, but
+    /// content-only mutations would otherwise return stale rows.
+    pub fn mark_dirty(&mut self) {
+        self.cache.get_mut().take();
     }
 
     /// Apply the current filter against AllRefs + recents + branches.

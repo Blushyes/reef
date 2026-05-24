@@ -599,8 +599,8 @@ fn snapshot_search_tab_replace_open_with_excluded_row() {
     let mut app = App::new(Theme::dark(), None);
     wait_for_file_tree(&mut app);
     app.set_active_tab(reef::app::Tab::Search);
-    app.global_search.query = "needle".to_string();
-    app.global_search.cursor = "needle".len();
+    app.global_search.core.filter = "needle".to_string();
+    app.global_search.core.cursor = "needle".len();
     app.global_search.replace_text = "thread".to_string();
     app.global_search.replace_cursor = "thread".len();
     app.global_search.replace_open = true;

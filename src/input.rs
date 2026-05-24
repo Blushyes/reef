@@ -1203,13 +1203,18 @@ fn handle_key_search_find_input(key: KeyEvent, app: &mut App, ctrl: bool, alt: b
     }
 
     // Pass 2: text-buffer edits. Edit outcomes re-run the search via
-    // `mark_query_edited`; cursor-only and unhandled keys are silent.
+    // `mark_query_edited` AND immediately reset `selected_idx = 0`
+    // (mirroring the overlay path's PickerCore behavior) so PageUp /
+    // PageDown handled above against stale results-from-old-query
+    // don't paginate into rows that won't survive the next debounced
+    // search rerun.
     let outcome = crate::input_edit::dispatch_key(
         &key,
         &mut app.global_search.core.filter,
         &mut app.global_search.core.cursor,
     );
     if outcome == crate::input_edit::Outcome::Edited {
+        app.global_search.core.selected_idx = 0;
         global_search::mark_query_edited(&mut app.global_search);
     }
 }
@@ -1488,19 +1493,22 @@ fn handle_key_git_commit(key: KeyEvent, app: &mut App, ctrl: bool, alt: bool) ->
     if app.active_panel != Panel::Files || !app.git_status.commit_editing {
         return false;
     }
-    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-    // Phase 1: commit-box-specific shortcuts. Strict `Ctrl+Enter`
-    // (no alt, no shift) is the only commit-submit chord; the `!alt`
-    // guard defends against Linux WMs forwarding Ctrl+Alt+Enter and
-    // `!shift` defends against kitty-style enhanced keyboard
-    // protocols that report Shift+Ctrl+Enter as a distinct chord.
-    // Shift+Enter alone is left to Phase 2 (newline insert).
+    // Phase 1: commit-box-specific shortcuts. ANY Ctrl-modified
+    // Enter submits the commit — Shift/Alt extra modifier bits are
+    // accepted because terminals disagree about which subset gets
+    // forwarded (kitty enhanced-keyboard sends Shift on Enter; some
+    // Linux WMs bundle Alt). Without this, Ctrl+Shift+Enter /
+    // Ctrl+Alt+Enter would fall through Phase 2 (which only matches
+    // `Enter if !ctrl`) as Unhandled — and Enter isn't `Char`, so the
+    // Ctrl-letter swallow guard below doesn't catch it — landing on
+    // the outer Git handler's `Char('e') | Enter` arm that opens
+    // `$EDITOR` on the selected file.
     match key.code {
         KeyCode::Esc => {
             app.git_status.commit_editing = false;
             return true;
         }
-        KeyCode::Enter if ctrl && !alt && !shift => {
+        KeyCode::Enter if ctrl => {
             app.run_commit();
             return true;
         }
@@ -1949,7 +1957,14 @@ fn handle_key_tree_edit(key: KeyEvent, app: &mut App) {
         app.tree_edit.error = None;
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     // Phase 1: tree-edit-specific shortcuts (Esc/Enter/Ctrl+C).
+    // Enter is strict bare-Enter only: Shift+Enter / Alt+Enter /
+    // Ctrl+Enter would otherwise commit the rename on a stray
+    // modifier press (the commit-box right next door treats
+    // Shift+Enter as soft-newline; consistent muscle-memory says
+    // Shift+Enter is non-destructive).
     match key.code {
         KeyCode::Esc => {
             app.cancel_tree_edit();
@@ -1959,7 +1974,7 @@ fn handle_key_tree_edit(key: KeyEvent, app: &mut App) {
             app.cancel_tree_edit();
             return;
         }
-        KeyCode::Enter => {
+        KeyCode::Enter if !ctrl && !alt && !shift => {
             app.commit_tree_edit();
             return;
         }
@@ -2037,6 +2052,8 @@ fn handle_key_hosts_picker(key: KeyEvent, app: &mut App) {
             }
         }
         InputMode::Path => {
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+            let alt = key.modifiers.contains(KeyModifiers::ALT);
             match key.code {
                 KeyCode::Esc => {
                     // Drop back to filter view rather than closing
@@ -2062,7 +2079,11 @@ fn handle_key_hosts_picker(key: KeyEvent, app: &mut App) {
                     app.should_quit = true;
                     return;
                 }
-                KeyCode::Enter => {
+                // Strict bare Enter — Shift+Enter / Alt+Enter would
+                // otherwise commit a half-typed target on a stray
+                // modifier press (users muscle-memory Shift+Enter as
+                // "newline" even in single-line buffers).
+                KeyCode::Enter if !ctrl && !alt && !shift => {
                     app.confirm_hosts_picker();
                     return;
                 }
@@ -3847,6 +3868,23 @@ pub fn handle_paste(s: String, app: &mut App) {
         && app.global_search.input_focused()
     {
         global_search::handle_paste_search_tab(&s, &mut app.global_search);
+    } else if app.active_tab == Tab::Git
+        && app.active_panel == Panel::Files
+        && app.git_status.commit_editing
+    {
+        // Multi-line textarea: keep `\n` (the textarea is multi-line)
+        // but strip `\r` so CRLF clipboard payloads don't embed
+        // carriage returns into the commit message. Without this,
+        // Windows users pasting a multi-line draft on a terminal that
+        // disagrees with bracketed-paste land with `^M` characters in
+        // `git log` and tripped commit-lint hooks.
+        let filtered: String = s.chars().filter(|c| *c != '\r').collect();
+        if !filtered.is_empty() {
+            let buf = &mut app.git_status.commit_message;
+            let cur = &mut app.git_status.commit_cursor;
+            buf.insert_str(*cur, &filtered);
+            *cur += filtered.len();
+        }
     }
     // No focused input; intentionally dropped. A stray paste into the
     // global keymap has no defined meaning, and we don't want to

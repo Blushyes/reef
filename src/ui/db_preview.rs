@@ -265,8 +265,9 @@ pub(in crate::ui) fn render(
                     let cursor_byte = app.db_goto_cursor.min(buf.len());
                     let cursor_w =
                         unicode_width::UnicodeWidthStr::width(&buf[..cursor_byte]) as u16;
-                    let caret_x =
-                        prompt_rect.x + prompt_w + cursor_w.min(area.width.saturating_sub(prompt_w));
+                    let caret_x = prompt_rect.x
+                        + prompt_w
+                        + cursor_w.min(area.width.saturating_sub(prompt_w));
                     f.set_cursor_position((caret_x, body_max_y));
                 } else {
                     let footer_idx = position_in_row_bearing(info, o).unwrap_or(0);

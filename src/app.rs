@@ -2589,9 +2589,10 @@ impl App {
                 self.git_graph
                     .recent_branches
                     .retain(|existing| existing != target);
-                self.toasts.push(Toast::info(
-                    crate::i18n::graph_scope_stale_branch_toast(&short),
-                ));
+                self.toasts
+                    .push(Toast::info(crate::i18n::graph_scope_stale_branch_toast(
+                        &short,
+                    )));
                 self.apply_scope_no_refresh(GraphScope::AllRefs);
                 self.refresh_graph();
             }
@@ -3317,9 +3318,7 @@ impl App {
             self.git_graph
                 .recent_branches
                 .retain(|existing| existing != full_ref);
-            self.git_graph
-                .recent_branches
-                .insert(0, full_ref.clone());
+            self.git_graph.recent_branches.insert(0, full_ref.clone());
             if self.git_graph.recent_branches.len() > GRAPH_RECENT_BRANCHES_MAX {
                 self.git_graph
                     .recent_branches
@@ -5537,8 +5536,7 @@ impl App {
                 // arm collapses into the periodic arm: bootstrap fires
                 // on the first tick (next_graph_revalidate_at is in
                 // the past at construction) but errors back off.
-                let stale_no_error =
-                    self.graph_load.stale && self.graph_load.error.is_none();
+                let stale_no_error = self.graph_load.stale && self.graph_load.error.is_none();
                 if !self.graph_load.loading && (stale_no_error || should_poll_graph) {
                     self.refresh_graph();
                     self.next_graph_revalidate_at = now + Duration::from_secs(5);
@@ -5873,10 +5871,7 @@ mod tests {
         // don't have to babysit the worker round-trip in this test).
         fx.app.git_graph.scope = GraphScope::Branch("refs/heads/ghost".into());
         fx.app.git_graph.recent_branches = vec!["refs/heads/ghost".into()];
-        persist_graph_scope(
-            &fx.app.git_graph.scope,
-            &fx.app.git_graph.recent_branches,
-        );
+        persist_graph_scope(&fx.app.git_graph.scope, &fx.app.git_graph.recent_branches);
 
         let generation = fx.app.graph_load.begin();
         let payload = GraphPayload {
@@ -5892,7 +5887,12 @@ mod tests {
         });
 
         assert_eq!(fx.app.git_graph.scope, GraphScope::AllRefs);
-        assert!(!fx.app.git_graph.recent_branches.contains(&"refs/heads/ghost".to_string()));
+        assert!(
+            !fx.app
+                .git_graph
+                .recent_branches
+                .contains(&"refs/heads/ghost".to_string())
+        );
         assert!(fx.app.toasts.len() > toasts_before);
         assert!(
             fx.app.toasts.last().unwrap().message.contains("ghost"),
@@ -5900,10 +5900,7 @@ mod tests {
         );
 
         // Persisted state matches the fallback.
-        assert_eq!(
-            crate::prefs::get(PREF_GRAPH_SCOPE).as_deref(),
-            Some("all")
-        );
+        assert_eq!(crate::prefs::get(PREF_GRAPH_SCOPE).as_deref(), Some("all"));
         assert_eq!(
             crate::prefs::get(PREF_GRAPH_SCOPE_RECENT)
                 .as_deref()
@@ -5930,7 +5927,10 @@ mod tests {
             !fx.app.graph_branch_picker.core.active,
             "picker must not open while ref_map is empty"
         );
-        assert!(fx.app.toasts.len() > toasts_before, "must surface a hint toast");
+        assert!(
+            fx.app.toasts.len() > toasts_before,
+            "must surface a hint toast"
+        );
         // Persisted scope untouched.
         assert_eq!(
             fx.app.git_graph.scope,
@@ -5974,7 +5974,12 @@ mod tests {
             GraphScope::Branch("refs/heads/feature".into())
         );
         assert_eq!(fx.app.toasts.len(), toasts_before);
-        assert!(fx.app.git_graph.recent_branches.contains(&"refs/heads/feature".to_string()));
+        assert!(
+            fx.app
+                .git_graph
+                .recent_branches
+                .contains(&"refs/heads/feature".to_string())
+        );
     }
 
     #[test]
@@ -6077,10 +6082,10 @@ mod tests {
         let mut fx = make_scope_fixture();
         // Pretend we already have a populated ref_map so open_graph_branch_picker
         // succeeds.
-        fx.app
-            .git_graph
-            .ref_map
-            .insert("oid".into(), vec![crate::git::RefLabel::Branch("main".into())]);
+        fx.app.git_graph.ref_map.insert(
+            "oid".into(),
+            vec![crate::git::RefLabel::Branch("main".into())],
+        );
         fx.app.open_graph_branch_picker();
         assert!(fx.app.graph_branch_picker.core.active);
 

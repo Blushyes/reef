@@ -673,12 +673,9 @@ fn handle_key_db_goto(key: KeyEvent, app: &mut App) {
     // applies only to NEW insertions, not to e.g. Backspace / cursor
     // motion, hence wrapping it inside the predicate.
     let current_len = buf.len();
-    let _ = crate::input_edit::dispatch_key_filtered(
-        &key,
-        buf,
-        &mut app.db_goto_cursor,
-        |c| c.is_ascii_digit() && current_len < 18,
-    );
+    let _ = crate::input_edit::dispatch_key_filtered(&key, buf, &mut app.db_goto_cursor, |c| {
+        c.is_ascii_digit() && current_len < 18
+    });
 }
 
 /// 纯预览模式的早期闸门 —— 拦截退出语义 + 文件 picker 相关按键。

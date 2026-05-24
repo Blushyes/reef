@@ -75,7 +75,8 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
         .core
         .cursor
         .min(app.graph_branch_picker.core.filter.len());
-    let cursor_w = UnicodeWidthStr::width(&app.graph_branch_picker.core.filter[..cursor_byte]) as u16;
+    let cursor_w =
+        UnicodeWidthStr::width(&app.graph_branch_picker.core.filter[..cursor_byte]) as u16;
     let max_caret_offset = inner.width.saturating_sub(prompt_w + 1);
     let caret_x = inner.x + prompt_w + cursor_w.min(max_caret_offset);
     f.set_cursor_position((caret_x, input_y));
@@ -100,7 +101,10 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     } else if list_h_usize > 0 && sel >= app.graph_branch_picker.scroll + list_h_usize {
         app.graph_branch_picker.scroll = sel + 1 - list_h_usize;
     }
-    let scroll = app.graph_branch_picker.scroll.min(rows.len().saturating_sub(1));
+    let scroll = app
+        .graph_branch_picker
+        .scroll
+        .min(rows.len().saturating_sub(1));
 
     for (visible_row, row) in rows.iter().skip(scroll).take(list_h_usize).enumerate() {
         let row_idx = scroll + visible_row;

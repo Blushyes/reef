@@ -152,7 +152,8 @@ pub fn render_body(f: &mut Frame, app: &mut App, inner: Rect, input_focused: boo
     );
     if find_focused {
         let cursor_w =
-            UnicodeWidthStr::width(&app.global_search.core.filter[..app.global_search.core.cursor]) as u16;
+            UnicodeWidthStr::width(&app.global_search.core.filter[..app.global_search.core.cursor])
+                as u16;
         let cursor_x = inner.x + PROMPT_COL_W + cursor_w.min(inner.width.saturating_sub(3));
         f.set_cursor_position((cursor_x, find_y));
     }

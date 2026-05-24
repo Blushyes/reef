@@ -229,13 +229,12 @@ fn list_commits_returns_history() {
     commit_file(&raw, "a.txt", "v2", "second");
 
     let mut agent = Agent::spawn(tmp.path());
-    let commits: Vec<CommitInfoDto> = serde_json::from_value(ok_result(agent.request(
-        Request::ListCommits {
+    let commits: Vec<CommitInfoDto> =
+        serde_json::from_value(ok_result(agent.request(Request::ListCommits {
             limit: 10,
             scope: Default::default(),
-        },
-    )))
-    .unwrap();
+        })))
+        .unwrap();
     assert_eq!(commits.len(), 2);
     assert_eq!(commits[0].subject, "second");
     assert_eq!(commits[1].subject, "first");

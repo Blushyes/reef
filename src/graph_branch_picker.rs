@@ -318,11 +318,26 @@ mod tests {
         let branches = collect_branches(&map);
         // Locals alphabetised, then remotes. HEAD points at "main".
         assert_eq!(
-            branches.iter().map(|b| b.display.as_str()).collect::<Vec<_>>(),
+            branches
+                .iter()
+                .map(|b| b.display.as_str())
+                .collect::<Vec<_>>(),
             vec!["dev", "feature", "main", "origin/main"]
         );
-        assert!(branches.iter().find(|b| b.display == "main").unwrap().is_head);
-        assert!(!branches.iter().find(|b| b.display == "dev").unwrap().is_head);
+        assert!(
+            branches
+                .iter()
+                .find(|b| b.display == "main")
+                .unwrap()
+                .is_head
+        );
+        assert!(
+            !branches
+                .iter()
+                .find(|b| b.display == "dev")
+                .unwrap()
+                .is_head
+        );
     }
 
     #[test]

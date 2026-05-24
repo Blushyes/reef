@@ -217,11 +217,7 @@ mod tests {
         // is the textarea-submit convention (handled by the caller).
         let mut t = "msg".to_string();
         let mut c = 3;
-        let outcome = dispatch_key_multi(
-            &k(KeyCode::Enter, KeyModifiers::CONTROL),
-            &mut t,
-            &mut c,
-        );
+        let outcome = dispatch_key_multi(&k(KeyCode::Enter, KeyModifiers::CONTROL), &mut t, &mut c);
         assert_eq!(outcome, Outcome::Unhandled);
         assert_eq!(t, "msg", "buffer untouched");
     }
@@ -342,11 +338,7 @@ mod tests {
         // above — kept as a docs-style regression sentinel.
         let mut t = "msg".to_string();
         let mut c = 3;
-        let outcome = dispatch_key_multi(
-            &k(KeyCode::Enter, KeyModifiers::CONTROL),
-            &mut t,
-            &mut c,
-        );
+        let outcome = dispatch_key_multi(&k(KeyCode::Enter, KeyModifiers::CONTROL), &mut t, &mut c);
         assert_eq!(outcome, Outcome::Unhandled);
         assert_eq!(t, "msg");
         assert_eq!(c, 3);

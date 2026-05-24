@@ -87,8 +87,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     // clamped so a very long buffer doesn't park the caret past the
     // popup's right border.
     let cursor_clamped = cursor_byte.min(input_text.len());
-    let cursor_w =
-        unicode_width::UnicodeWidthStr::width(&input_text[..cursor_clamped]) as u16;
+    let cursor_w = unicode_width::UnicodeWidthStr::width(&input_text[..cursor_clamped]) as u16;
     let max_caret_offset = inner.width.saturating_sub(prompt_w + 1);
     let caret_x = inner.x + prompt_w + cursor_w.min(max_caret_offset);
     f.set_cursor_position((caret_x, input_y));

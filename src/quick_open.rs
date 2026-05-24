@@ -222,7 +222,11 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // them inline before delegating the rest to the shared core.
     if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
         let step = app.quick_open.last_view_h.max(1) as i32;
-        let signed = if matches!(key.code, KeyCode::PageUp) { -step } else { step };
+        let signed = if matches!(key.code, KeyCode::PageUp) {
+            -step
+        } else {
+            step
+        };
         move_selection(&mut app.quick_open, signed);
         return;
     }
@@ -259,7 +263,11 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
 /// Called from `input::handle_paste` after the drop-path parser has already
 /// ruled out the payload as a file drop.
 pub fn handle_paste(s: &str, app: &mut App) {
-    input_edit::paste_single_line(s, &mut app.quick_open.core.filter, &mut app.quick_open.core.cursor);
+    input_edit::paste_single_line(
+        s,
+        &mut app.quick_open.core.filter,
+        &mut app.quick_open.core.cursor,
+    );
     filter(&mut app.quick_open);
 }
 
@@ -371,7 +379,11 @@ pub fn filter(state: &mut QuickOpenState) {
         }
     } else {
         let mut matcher = Matcher::new(Config::DEFAULT);
-        let pattern = Pattern::parse(&state.core.filter, CaseMatching::Smart, Normalization::Smart);
+        let pattern = Pattern::parse(
+            &state.core.filter,
+            CaseMatching::Smart,
+            Normalization::Smart,
+        );
         for (idx, cand) in state.index.iter().enumerate() {
             let mut indices: Vec<u32> = Vec::new();
             if let Some(score) = pattern.indices(cand.utf32.slice(..), &mut matcher, &mut indices) {

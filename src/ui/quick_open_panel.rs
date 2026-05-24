@@ -101,7 +101,8 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     );
     // Blinking cursor — same trick `render_search_prompt` uses. Using
     // UnicodeWidthStr so cursor lands between CJK/wide chars correctly.
-    let cursor_w = UnicodeWidthStr::width(&app.quick_open.core.filter[..app.quick_open.core.cursor]) as u16;
+    let cursor_w =
+        UnicodeWidthStr::width(&app.quick_open.core.filter[..app.quick_open.core.cursor]) as u16;
     let cursor_x = inner.x + 2 + cursor_w.min(inner.width.saturating_sub(3));
     f.set_cursor_position((cursor_x, input_y));
 

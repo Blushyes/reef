@@ -92,8 +92,9 @@ fn remote_list_commits_matches_local() {
     let local = LocalBackend::open_at(tmp.path().to_path_buf());
     let remote = spawn_remote(tmp.path());
 
-    let l = local.list_commits(10).expect("local commits");
-    let r = remote.list_commits(10).expect("remote commits");
+    let scope = reef::git::GraphScope::AllRefs;
+    let l = local.list_commits(&scope, 10).expect("local commits");
+    let r = remote.list_commits(&scope, 10).expect("remote commits");
 
     assert_eq!(l.len(), r.len());
     for (a, b) in l.iter().zip(r.iter()) {

@@ -11,6 +11,7 @@ pub mod focused_preview_panel;
 pub mod git_graph_panel;
 pub mod git_status_panel;
 pub mod global_search_panel;
+pub mod graph_branch_picker_panel;
 pub mod highlight;
 pub mod hosts_picker_panel;
 pub mod hover;
@@ -219,14 +220,17 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // Global-search after quick-open: if both flags were somehow true the
     // later render wins on overlap, and having global-search on top matches
     // its priority in input dispatch.
-    if app.quick_open.active {
+    if app.quick_open.core.active {
         quick_open_panel::render(f, app, size);
     }
-    if app.global_search.active {
+    if app.global_search.core.active {
         global_search_panel::render(f, app, size);
     }
-    if app.hosts_picker.active {
+    if app.hosts_picker.core.active {
         hosts_picker_panel::render(f, app, size);
+    }
+    if app.graph_branch_picker.core.active {
+        graph_branch_picker_panel::render(f, app, size);
     }
     // Context menu overlay renders last so it sits above the help
     // popup and any other in-panel chrome. The menu itself is scoped

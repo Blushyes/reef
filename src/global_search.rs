@@ -14,7 +14,6 @@
 //! async preview arrives. See `app::PreviewHighlight` + the tick handler.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::layout::Rect;
 use std::collections::HashSet;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -72,11 +71,12 @@ pub struct MatchHit {
 }
 
 pub struct GlobalSearchState {
-    pub active: bool,
-    pub query: String,
-    /// Byte offset into `query`. Always on a char boundary.
-    pub cursor: usize,
-    pub selected: usize,
+    /// Shared overlay scaffolding (`active`, `query` → `core.filter`,
+    /// `cursor`, `selected` → `core.selected_idx`, `last_popup_area`).
+    /// `replace_text` / `replace_cursor` are a SECOND single-line
+    /// buffer, edited directly via `input_edit::dispatch_key` when
+    /// `focus == ReplaceInput`. PickerCore only tracks the find buffer.
+    pub core: crate::picker_core::PickerCore,
     pub scroll: usize,
     /// Results are sorted by path so same-file hits are adjacent in the list
     /// (mirrors VSCode's data-layer grouping without a full tree UI).
@@ -102,7 +102,6 @@ pub struct GlobalSearchState {
     pub last_searched_query: String,
 
     pub last_view_h: u16,
-    pub last_popup_area: Option<Rect>,
 
     /// Palette-side Space-leader slot. Re-uses `input::leader_decision` so
     /// Space-F inside the palette (when `query` is empty) closes it, same
@@ -188,10 +187,7 @@ pub struct GlobalSearchState {
 impl Default for GlobalSearchState {
     fn default() -> Self {
         Self {
-            active: false,
-            query: String::new(),
-            cursor: 0,
-            selected: 0,
+            core: crate::picker_core::PickerCore::default(),
             scroll: 0,
             results: Vec::new(),
             truncated: false,
@@ -199,7 +195,6 @@ impl Default for GlobalSearchState {
             last_keystroke_at: None,
             last_searched_query: String::new(),
             last_view_h: 0,
-            last_popup_area: None,
             space_leader_at: None,
             focus: SearchPanelFocus::List,
             replace_open: false,
@@ -309,16 +304,16 @@ pub const PREVIEW_SYNC_DEBOUNCE: std::time::Duration = std::time::Duration::from
 /// and-return doesn't lose state.
 pub fn begin(app: &mut App) {
     if let Some(seed) = current_text_selection(app)
-        && seed != app.global_search.query
+        && seed != app.global_search.core.filter
     {
         // Skip the rerun + excluded-clear when the seed equals the
         // existing query: the user might have ticked off hits in
         // replace mode and we don't want a no-op chord to wipe that.
-        app.global_search.query = seed;
+        app.global_search.core.filter = seed;
         mark_query_edited(&mut app.global_search);
     }
-    app.global_search.cursor = app.global_search.query.len();
-    app.global_search.active = true;
+    app.global_search.core.cursor = app.global_search.core.filter.len();
+    app.global_search.core.active = true;
     // Fresh leader slot — a stale timestamp from a prior session would make
     // the first Space-after-open surprisingly close the palette.
     app.global_search.space_leader_at = None;
@@ -373,7 +368,7 @@ pub(crate) fn first_nonempty_trimmed_line(s: &str) -> Option<String> {
 /// newlines and re-runs the search. Called from `input::handle_paste`
 /// after the drop-path parser has declined the payload.
 pub fn handle_paste_overlay(s: &str, state: &mut GlobalSearchState) {
-    if input_edit::paste_single_line(s, &mut state.query, &mut state.cursor) {
+    if input_edit::paste_single_line(s, &mut state.core.filter, &mut state.core.cursor) {
         mark_query_edited(state);
     }
 }
@@ -385,7 +380,7 @@ pub fn handle_paste_overlay(s: &str, state: &mut GlobalSearchState) {
 pub fn handle_paste_search_tab(s: &str, state: &mut GlobalSearchState) {
     match state.focus {
         SearchPanelFocus::FindInput => {
-            if input_edit::paste_single_line(s, &mut state.query, &mut state.cursor) {
+            if input_edit::paste_single_line(s, &mut state.core.filter, &mut state.core.cursor) {
                 mark_query_edited(state);
             }
         }
@@ -403,10 +398,10 @@ pub fn accept(app: &mut App) {
     let Some(hit) = app
         .global_search
         .results
-        .get(app.global_search.selected)
+        .get(app.global_search.core.selected_idx)
         .cloned()
     else {
-        app.global_search.active = false;
+        app.global_search.core.active = false;
         return;
     };
 
@@ -420,13 +415,13 @@ pub fn accept(app: &mut App) {
             .results
             .retain(|h| root.join(&h.path).exists());
         let len = app.global_search.results.len();
-        if app.global_search.selected >= len {
-            app.global_search.selected = len.saturating_sub(1);
+        if app.global_search.core.selected_idx >= len {
+            app.global_search.core.selected_idx = len.saturating_sub(1);
         }
         return;
     }
 
-    app.global_search.active = false;
+    app.global_search.core.active = false;
     app.set_active_tab(Tab::Files);
     app.file_tree.reveal(&hit.path);
     app.refresh_file_tree_with_target(Some(hit.path.clone()));
@@ -448,7 +443,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // empty query so a literal space in the search string is allowed.
     match crate::input::leader_decision(
         &key,
-        /* allow_arm */ app.global_search.query.is_empty(),
+        /* allow_arm */ app.global_search.core.filter.is_empty(),
         app.global_search.space_leader_at,
         Instant::now(),
         crate::input::LEADER_TIMEOUT,
@@ -465,7 +460,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             // to the input-append arm rather than silently swallow it.
             app.global_search.space_leader_at = None;
             if key.code == KeyCode::Char('F') && !ctrl && !alt {
-                app.global_search.active = false;
+                app.global_search.core.active = false;
                 return;
             }
             // Fall through — non-Shift-F chord lands in the input handler.
@@ -477,168 +472,54 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         crate::input::LeaderVerdict::None => {}
     }
 
-    match key.code {
-        KeyCode::Esc => {
-            app.global_search.active = false;
-        }
-        KeyCode::Char('c') if ctrl => {
-            app.global_search.active = false;
+    // Palette-specific shortcuts that must precede PickerCore:
+    // - Alt/Ctrl+Enter pins to Tab::Search (otherwise PickerCore would
+    //   treat it as a plain Confirm)
+    // - PageUp/PageDown depend on `last_view_h` which PickerCore
+    //   doesn't see
+    if matches!(key.code, KeyCode::Enter) && (alt || ctrl) {
+        app.global_search.core.active = false;
+        app.global_search.focus = SearchPanelFocus::FindInput;
+        app.set_active_tab(Tab::Search);
+        navigate_to_selected(app);
+        return;
+    }
+    if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+        let step = app.global_search.last_view_h.max(1) as i32;
+        let signed = if matches!(key.code, KeyCode::PageUp) {
+            -step
+        } else {
+            step
+        };
+        move_selection(&mut app.global_search, signed);
+        return;
+    }
+
+    use crate::picker_core::InputOutcome;
+    let _ = ctrl; // Quit branch handles Ctrl+C; no other ctrl-gating here.
+    let visible = app.global_search.results.len();
+    match app.global_search.core.dispatch_key(&key, visible) {
+        InputOutcome::Cancel => app.global_search.core.active = false,
+        InputOutcome::Quit => {
+            app.global_search.core.active = false;
             app.should_quit = true;
         }
-        // Pin to Tab::Search — close the overlay, switch to the persistent
-        // search view. Query/results are preserved on `app.global_search`.
-        // Alt and Ctrl both bound because terminal emulators disagree on
-        // which modifier they forward for Shift/Ctrl+Enter: Alt+Enter is
-        // the most portable. VSCode's analogue is "Open Results in Editor"
-        // (workbench.action.search.openInEditor) which is also a two-handed
-        // hand-off of the same state.
-        KeyCode::Enter if alt || ctrl => {
-            app.global_search.active = false;
-            // Land in input mode — the user was typing inside the overlay,
-            // so keeping the input focused is the no-surprise hand-off.
-            // From the other entry paths (digit key, Tab cycle) the tab
-            // starts in list mode; see `handle_key_search`.
-            app.global_search.focus = SearchPanelFocus::FindInput;
-            app.set_active_tab(Tab::Search);
-            // Sync preview_highlight to the current selection so the tab's
-            // right panel lights up without waiting for another keystroke.
-            navigate_to_selected(app);
-        }
-        KeyCode::Enter => accept(app),
-
-        // ── Deletion ─────────────────────────────────────────────
-        KeyCode::Backspace if alt || ctrl => {
-            input_edit::delete_word_backward(
-                &mut app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-            mark_query_edited(&mut app.global_search);
-        }
-        KeyCode::Char('w') if ctrl => {
-            input_edit::delete_word_backward(
-                &mut app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-            mark_query_edited(&mut app.global_search);
-        }
-        KeyCode::Char('u') if ctrl => {
-            input_edit::clear(&mut app.global_search.query, &mut app.global_search.cursor);
-            mark_query_edited(&mut app.global_search);
-        }
-        KeyCode::Backspace => {
-            input_edit::backspace(&mut app.global_search.query, &mut app.global_search.cursor);
-            mark_query_edited(&mut app.global_search);
-        }
-
-        // ── List navigation ──────────────────────────────────────
-        KeyCode::Up => move_selection(&mut app.global_search, -1),
-        KeyCode::Char('p') if ctrl => move_selection(&mut app.global_search, -1),
-        KeyCode::Char('k') if ctrl => move_selection(&mut app.global_search, -1),
-        KeyCode::Down => move_selection(&mut app.global_search, 1),
-        KeyCode::Char('n') if ctrl => move_selection(&mut app.global_search, 1),
-        KeyCode::Char('j') if ctrl => move_selection(&mut app.global_search, 1),
-        KeyCode::PageUp => {
-            let step = app.global_search.last_view_h.max(1) as i32;
-            move_selection(&mut app.global_search, -step);
-        }
-        KeyCode::PageDown => {
-            let step = app.global_search.last_view_h.max(1) as i32;
-            move_selection(&mut app.global_search, step);
-        }
-
-        // ── Cursor movement inside the query ────────────────────
-        // Alt/Ctrl + arrow = jump by word, matching readline (Meta+B/F),
-        // macOS Option+Arrow, and Windows/Linux Ctrl+Arrow conventions.
-        // Must come before the bare-arrow arms so modifier combos win.
-        KeyCode::Left if alt || ctrl => {
-            input_edit::move_cursor_word_backward(
-                &app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-        }
-        KeyCode::Right if alt || ctrl => {
-            input_edit::move_cursor_word_forward(
-                &app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-        }
-        KeyCode::Left => {
-            input_edit::move_cursor(&app.global_search.query, &mut app.global_search.cursor, -1);
-        }
-        KeyCode::Right => {
-            input_edit::move_cursor(&app.global_search.query, &mut app.global_search.cursor, 1);
-        }
-        KeyCode::Home => {
-            app.global_search.cursor = 0;
-        }
-        KeyCode::End => {
-            app.global_search.cursor = app.global_search.query.len();
-        }
-
-        // ── Forward-delete ──────────────────────────────────────
-        // Symmetric with Backspace: plain Delete kills one char, Alt/Ctrl
-        // +Delete kills a word. Both re-run the search via mark_query_edited.
-        KeyCode::Delete if alt || ctrl => {
-            input_edit::delete_word_forward(
-                &mut app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-            mark_query_edited(&mut app.global_search);
-        }
-        KeyCode::Delete => {
-            input_edit::delete_char_forward(
-                &mut app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-            mark_query_edited(&mut app.global_search);
-        }
-
-        // ── Readline aliases ────────────────────────────────────
-        // Reliable fallback for terminals that don't pass Alt/Ctrl+Arrow
-        // through cleanly (the kitty kbd protocol in main.rs helps, but
-        // isn't universally supported). `Alt+b/f/d` and `Ctrl+A/E` are
-        // what bash-readline users type anyway.
-        KeyCode::Char('b') if alt => {
-            input_edit::move_cursor_word_backward(
-                &app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-        }
-        KeyCode::Char('f') if alt => {
-            input_edit::move_cursor_word_forward(
-                &app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-        }
-        KeyCode::Char('d') if alt => {
-            input_edit::delete_word_forward(
-                &mut app.global_search.query,
-                &mut app.global_search.cursor,
-            );
-            mark_query_edited(&mut app.global_search);
-        }
-        KeyCode::Char('a') if ctrl => {
-            app.global_search.cursor = 0;
-        }
-        KeyCode::Char('e') if ctrl => {
-            app.global_search.cursor = app.global_search.query.len();
-        }
-
-        KeyCode::Char(c) if !ctrl => {
-            input_edit::insert_char(
-                &mut app.global_search.query,
-                &mut app.global_search.cursor,
-                c,
-            );
-            mark_query_edited(&mut app.global_search);
-        }
-        _ => {}
+        InputOutcome::Confirm => accept(app),
+        InputOutcome::Edited => mark_query_edited(&mut app.global_search),
+        // Rejected only fires once PickerCore is wired to a filtered
+        // dispatcher (today unreachable). When that lands, decide
+        // whether a rejected char should also re-run the search;
+        // currently the buffer didn't change so the answer is no.
+        InputOutcome::Rejected
+        | InputOutcome::SelectionMoved
+        | InputOutcome::CursorMoved
+        | InputOutcome::Unhandled => {}
     }
 }
 
 /// Dispatch one mouse event while the palette is active.
 pub fn handle_mouse(mouse: MouseEvent, app: &mut App) {
-    let popup = match app.global_search.last_popup_area {
+    let popup = match app.global_search.core.last_popup_area {
         Some(r) => r,
         None => return,
     };
@@ -650,7 +531,7 @@ pub fn handle_mouse(mouse: MouseEvent, app: &mut App) {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if !inside {
-                app.global_search.active = false;
+                app.global_search.core.active = false;
                 app.last_click = None;
                 return;
             }
@@ -667,7 +548,7 @@ pub fn handle_mouse(mouse: MouseEvent, app: &mut App) {
             if let Some(ClickAction::GlobalSearchSelect(idx)) =
                 app.hit_registry.hit_test(mouse.column, mouse.row)
             {
-                app.global_search.selected = idx;
+                app.global_search.core.selected_idx = idx;
                 if is_double {
                     accept(app);
                     app.last_click = None;
@@ -708,13 +589,13 @@ pub(crate) fn mark_query_edited(state: &mut GlobalSearchState) {
 
 fn move_selection(state: &mut GlobalSearchState, delta: i32) {
     if state.results.is_empty() {
-        state.selected = 0;
+        state.core.selected_idx = 0;
         return;
     }
     let last = state.results.len() - 1;
-    let cur = state.selected as i32;
+    let cur = state.core.selected_idx as i32;
     let next = (cur + delta).clamp(0, last as i32) as usize;
-    state.selected = next;
+    state.core.selected_idx = next;
 }
 
 /// Public wrapper around `move_selection` for call sites outside the
@@ -743,7 +624,7 @@ pub fn schedule_preview_sync(app: &mut App) {
 /// debounce gate fires. Does nothing when the query is empty (there's
 /// nothing to reload).
 pub fn reload(app: &mut App) {
-    if app.global_search.query.is_empty() {
+    if app.global_search.core.filter.is_empty() {
         return;
     }
     app.global_search.last_searched_query.clear();
@@ -764,7 +645,7 @@ pub fn navigate_to_selected(app: &mut App) {
     let Some(hit) = app
         .global_search
         .results
-        .get(app.global_search.selected)
+        .get(app.global_search.core.selected_idx)
         .cloned()
     else {
         return;
@@ -865,9 +746,9 @@ mod tests {
             ..GlobalSearchState::default()
         };
         move_selection(&mut s, 10);
-        assert_eq!(s.selected, 2);
+        assert_eq!(s.core.selected_idx, 2);
         move_selection(&mut s, -99);
-        assert_eq!(s.selected, 0);
+        assert_eq!(s.core.selected_idx, 0);
     }
 
     #[test]
@@ -963,11 +844,14 @@ mod tests {
         // want move_selection to snap it back to 0 when there's nothing in
         // the list.
         let mut s = GlobalSearchState {
-            selected: 5,
+            core: crate::picker_core::PickerCore {
+                selected_idx: 5,
+                ..crate::picker_core::PickerCore::default()
+            },
             ..GlobalSearchState::default()
         };
         move_selection(&mut s, 1);
-        assert_eq!(s.selected, 0);
+        assert_eq!(s.core.selected_idx, 0);
     }
 
     fn dummy_hit(name: &str) -> MatchHit {
@@ -1014,8 +898,8 @@ mod tests {
         let mut state = GlobalSearchState::default();
         assert!(state.last_keystroke_at.is_none());
         handle_paste_overlay("hello", &mut state);
-        assert_eq!(state.query, "hello");
-        assert_eq!(state.cursor, 5);
+        assert_eq!(state.core.filter, "hello");
+        assert_eq!(state.core.cursor, 5);
         assert!(
             state.last_keystroke_at.is_some(),
             "non-empty paste must arm the search-rerun debounce",
@@ -1026,7 +910,7 @@ mod tests {
     fn handle_paste_overlay_pure_newlines_do_not_trigger_rerun() {
         let mut state = GlobalSearchState::default();
         handle_paste_overlay("\n\r\n", &mut state);
-        assert_eq!(state.query, "");
+        assert_eq!(state.core.filter, "");
         assert!(
             state.last_keystroke_at.is_none(),
             "all-newline paste inserts nothing → search rerun must NOT fire",
@@ -1040,13 +924,16 @@ mod tests {
         // must survive untouched.
         let mut state = GlobalSearchState {
             results: vec![dummy_hit("a"), dummy_hit("b"), dummy_hit("c")],
-            selected: 2,
+            core: crate::picker_core::PickerCore {
+                selected_idx: 2,
+                ..crate::picker_core::PickerCore::default()
+            },
             replace_text: "kept".to_string(),
             replace_cursor: 4,
             ..GlobalSearchState::default()
         };
         handle_paste_overlay("foo", &mut state);
-        assert_eq!(state.selected, 2);
+        assert_eq!(state.core.selected_idx, 2);
         assert_eq!(state.replace_text, "kept");
         assert_eq!(state.replace_cursor, 4);
     }
@@ -1060,8 +947,8 @@ mod tests {
             ..GlobalSearchState::default()
         };
         handle_paste_search_tab("abc", &mut state);
-        assert_eq!(state.query, "abc");
-        assert_eq!(state.cursor, 3);
+        assert_eq!(state.core.filter, "abc");
+        assert_eq!(state.core.cursor, 3);
         assert!(state.last_keystroke_at.is_some());
         assert_eq!(state.replace_text, "");
     }
@@ -1076,7 +963,7 @@ mod tests {
         handle_paste_search_tab("xyz", &mut state);
         assert_eq!(state.replace_text, "xyz");
         assert_eq!(state.replace_cursor, 3);
-        assert_eq!(state.query, "");
+        assert_eq!(state.core.filter, "");
         assert!(
             state.last_keystroke_at.is_none(),
             "replace-input edits never re-run the search",
@@ -1089,14 +976,17 @@ mod tests {
         // nowhere to land. Must not silently leak into either field.
         let mut state = GlobalSearchState {
             focus: SearchPanelFocus::List,
-            query: "kept-query".to_string(),
-            cursor: 10,
+            core: crate::picker_core::PickerCore {
+                filter: "kept-query".to_string(),
+                cursor: 10,
+                ..crate::picker_core::PickerCore::default()
+            },
             replace_text: "kept-replace".to_string(),
             replace_cursor: 12,
             ..GlobalSearchState::default()
         };
         handle_paste_search_tab("LEAK", &mut state);
-        assert_eq!(state.query, "kept-query");
+        assert_eq!(state.core.filter, "kept-query");
         assert_eq!(state.replace_text, "kept-replace");
         assert!(state.last_keystroke_at.is_none());
     }

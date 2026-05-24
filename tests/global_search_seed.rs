@@ -47,14 +47,14 @@ fn select_byte_range(app: &mut App, start: (usize, usize), end: (usize, usize)) 
 fn begin_without_selection_preserves_existing_query() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp, _g) = fresh_app();
-    app.global_search.query = "previous".to_string();
-    app.global_search.cursor = "previous".len();
+    app.global_search.core.filter = "previous".to_string();
+    app.global_search.core.cursor = "previous".len();
 
     global_search::begin(&mut app);
 
-    assert!(app.global_search.active);
-    assert_eq!(app.global_search.query, "previous");
-    assert_eq!(app.global_search.cursor, "previous".len());
+    assert!(app.global_search.core.active);
+    assert_eq!(app.global_search.core.filter, "previous");
+    assert_eq!(app.global_search.core.cursor, "previous".len());
 }
 
 #[test]
@@ -67,9 +67,9 @@ fn begin_seeds_query_from_preview_selection() {
 
     global_search::begin(&mut app);
 
-    assert_eq!(app.global_search.query, "bar();");
-    assert_eq!(app.global_search.cursor, "bar();".len());
-    assert!(app.global_search.active);
+    assert_eq!(app.global_search.core.filter, "bar();");
+    assert_eq!(app.global_search.core.cursor, "bar();".len());
+    assert!(app.global_search.core.active);
 }
 
 #[test]
@@ -83,7 +83,7 @@ fn begin_seeds_first_nonempty_line_when_selection_spans_multiple_rows() {
     global_search::begin(&mut app);
 
     assert_eq!(
-        app.global_search.query, "hello",
+        app.global_search.core.filter, "hello",
         "leading blank row must be skipped, indent must be trimmed",
     );
 }
@@ -96,7 +96,7 @@ fn begin_with_seed_equal_to_existing_query_keeps_excluded_set() {
     // Guard: `begin()` skips `mark_query_edited` when the seed matches.
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp, _g) = fresh_app();
-    app.global_search.query = "bar".to_string();
+    app.global_search.core.filter = "bar".to_string();
     app.global_search
         .excluded
         .insert((PathBuf::from("a.rs"), 1));
@@ -105,7 +105,7 @@ fn begin_with_seed_equal_to_existing_query_keeps_excluded_set() {
 
     global_search::begin(&mut app);
 
-    assert_eq!(app.global_search.query, "bar");
+    assert_eq!(app.global_search.core.filter, "bar");
     assert!(
         !app.global_search.excluded.is_empty(),
         "no-op seed must not wipe per-match opt-outs",
@@ -119,11 +119,11 @@ fn begin_with_empty_selection_keeps_existing_query() {
     // seed with, so the existing query stays.
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp, _g) = fresh_app();
-    app.global_search.query = "kept".to_string();
+    app.global_search.core.filter = "kept".to_string();
     install_text_preview(&mut app, &["foo bar"]);
     select_byte_range(&mut app, (0, 2), (0, 2));
 
     global_search::begin(&mut app);
 
-    assert_eq!(app.global_search.query, "kept");
+    assert_eq!(app.global_search.core.filter, "kept");
 }

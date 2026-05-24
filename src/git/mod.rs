@@ -163,6 +163,21 @@ pub enum RefLabel {
     Tag(String),
 }
 
+/// What slice of the commit history the graph should walk. `AllRefs`
+/// matches the historical behaviour (every local head + remote-tracking
+/// branch + tag + HEAD); `Branch` restricts the walk to a single
+/// fully-qualified ref so multi-branch repos don't crowd out the lane
+/// the user actually wants to see.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub enum GraphScope {
+    #[default]
+    AllRefs,
+    /// Fully-qualified ref name, e.g. `refs/heads/main` or
+    /// `refs/remotes/origin/feature`. Stored fully-qualified to avoid
+    /// the local-vs-remote shorthand collision (`main` vs `origin/main`).
+    Branch(String),
+}
+
 pub struct GitRepo {
     repo: Repository,
 }
@@ -791,20 +806,33 @@ impl GitRepo {
             .map(|c| c.id().to_string())
     }
 
-    /// Walk up to `limit` commits reachable from all branches/tags/HEAD, in
-    /// topological + time order (child before parent, newest first).
-    pub fn list_commits(&self, limit: usize) -> Vec<CommitInfo> {
+    /// Walk up to `limit` commits in topological + time order (child before
+    /// parent, newest first). `scope` controls which refs seed the walk:
+    /// `AllRefs` keeps the historical behaviour (every head + remote +
+    /// tag + HEAD); `Branch(full_ref)` walks only commits reachable from
+    /// that one ref. A missing ref yields an empty `Vec` — callers
+    /// detect this and fall back to `AllRefs`.
+    pub fn list_commits(&self, scope: &GraphScope, limit: usize) -> Vec<CommitInfo> {
         let Ok(mut walk) = self.repo.revwalk() else {
             return Vec::new();
         };
         let _ = walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME);
 
-        // Seed from local branches, remote branches, tags (peeled), and HEAD.
-        // push_glob dereferences annotated tags; non-commit targets are skipped.
-        let _ = walk.push_glob("refs/heads/*");
-        let _ = walk.push_glob("refs/remotes/*");
-        let _ = walk.push_glob("refs/tags/*");
-        let _ = walk.push_head();
+        match scope {
+            GraphScope::AllRefs => {
+                // Seed from local branches, remote branches, tags (peeled), and HEAD.
+                // push_glob dereferences annotated tags; non-commit targets are skipped.
+                let _ = walk.push_glob("refs/heads/*");
+                let _ = walk.push_glob("refs/remotes/*");
+                let _ = walk.push_glob("refs/tags/*");
+                let _ = walk.push_head();
+            }
+            GraphScope::Branch(full_ref) => {
+                if walk.push_ref(full_ref).is_err() {
+                    return Vec::new();
+                }
+            }
+        }
 
         let mut out = Vec::with_capacity(limit.min(256));
         for oid in walk.flatten().take(limit) {

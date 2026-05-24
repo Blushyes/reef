@@ -1,6 +1,6 @@
 //! Hosts picker overlay (bound to Ctrl+O; see `crate::hosts_picker`).
 //!
-//! Renders on top of the normal UI when `app.hosts_picker.active` is true.
+//! Renders on top of the normal UI when `app.hosts_picker.core.active` is true.
 //! Three regions inside the popup: a single-row input line (filter or
 //! literal path), the visible-row list (recent targets + parsed
 //! `~/.ssh/config` entries), and a help footer. Registers a `ClickAction`
@@ -26,7 +26,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     let y = screen.y + screen.height.saturating_sub(popup_h) / 2;
     let area = Rect::new(x, y, popup_w, popup_h);
 
-    app.hosts_picker.last_popup_area = Some(area);
+    app.hosts_picker.core.last_popup_area = Some(area);
 
     f.render_widget(Clear, area);
 
@@ -62,20 +62,35 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     };
 
     // Input row.
-    let input_text = match app.hosts_picker.input_mode {
-        InputMode::Search => app.hosts_picker.filter.clone(),
-        InputMode::Path => app.hosts_picker.path_buffer.clone(),
+    let (input_text, cursor_byte) = match app.hosts_picker.input_mode {
+        InputMode::Search => (
+            app.hosts_picker.core.filter.as_str(),
+            app.hosts_picker.core.cursor,
+        ),
+        InputMode::Path => (
+            app.hosts_picker.path_buffer.as_str(),
+            app.hosts_picker.path_cursor,
+        ),
     };
     let prompt = match app.hosts_picker.input_mode {
         InputMode::Search => "› ",
         InputMode::Path => "➜ ",
     };
+    let prompt_w = unicode_width::UnicodeWidthStr::width(prompt) as u16;
     let input_line = Line::from(vec![
         Span::styled(prompt, Style::default().fg(th.accent)),
-        Span::styled(input_text, Style::default().fg(th.fg_primary)),
+        Span::styled(input_text.to_string(), Style::default().fg(th.fg_primary)),
     ]);
     let input_rect = Rect::new(inner.x, input_y, inner.width, 1);
     f.render_widget(input_line, input_rect);
+    // Visible caret. Width-aware so multi-byte chars don't desync,
+    // clamped so a very long buffer doesn't park the caret past the
+    // popup's right border.
+    let cursor_clamped = cursor_byte.min(input_text.len());
+    let cursor_w = unicode_width::UnicodeWidthStr::width(&input_text[..cursor_clamped]) as u16;
+    let max_caret_offset = inner.width.saturating_sub(prompt_w + 1);
+    let caret_x = inner.x + prompt_w + cursor_w.min(max_caret_offset);
+    f.set_cursor_position((caret_x, input_y));
 
     // Separator line between input and list.
     let sep = "─".repeat(inner.width as usize);
@@ -88,7 +103,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
 
     for (row_idx, row) in rows.iter().enumerate().take(list_h as usize) {
         let y = list_y + row_idx as u16;
-        let is_selected = row_idx == app.hosts_picker.selected_idx;
+        let is_selected = row_idx == app.hosts_picker.core.selected_idx;
         let (left, right, is_recent) = match row {
             PickerRow::Recent(t) => (t.to_arg(), "recent".to_string(), true),
             PickerRow::Entry(h) => {

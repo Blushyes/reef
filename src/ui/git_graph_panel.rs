@@ -1,9 +1,9 @@
 //! Graph tab's left sidebar — DAG of commits with lane rendering and
 //! ref-label chips.
 
-use crate::app::App;
-use crate::git::RefLabel;
+use crate::app::{App, shorthand_for_full_ref};
 use crate::git::graph::{GraphRow, LaneCell};
+use crate::git::{GraphScope, RefLabel};
 use crate::i18n::{Msg, t};
 use crate::search::SearchTarget;
 use crate::ui::mouse::ClickAction;
@@ -17,6 +17,8 @@ use std::ops::Range;
 use unicode_width::UnicodeWidthStr;
 
 pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
+    let area = draw_scope_header_if_any(f, app, area);
+
     if app.git_graph.rows.is_empty() {
         let line = Line::from(Span::styled(
             t(Msg::NoCommits),
@@ -32,7 +34,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
         .git_graph
         .cache_key
         .as_ref()
-        .map(|(head, _)| head.as_str());
+        .map(|(head, _, _)| head.as_str());
 
     // Clamp scroll to a valid range. Auto-scroll into view only when the
     // selection actually moved since the last render — running this every
@@ -97,6 +99,35 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
             },
         );
     }
+}
+
+/// When `git_graph.scope` is restricted to a branch, draw a one-row
+/// "Branch <name>  (press b)" header at the top of the sidebar and
+/// return the remaining `Rect` for the commit rows. With AllRefs (or
+/// a too-short panel) the input rect is returned unchanged so the
+/// rows panel sits flush against the top.
+fn draw_scope_header_if_any(f: &mut Frame, app: &App, area: Rect) -> Rect {
+    let label = match &app.git_graph.scope {
+        GraphScope::AllRefs => return area,
+        GraphScope::Branch(full_ref) => shorthand_for_full_ref(full_ref),
+    };
+    if area.height < 2 {
+        return area;
+    }
+    let header_area = Rect::new(area.x, area.y, area.width, 1);
+    let muted = Style::default().fg(app.theme.chrome_muted_fg);
+    let line = Line::from(vec![
+        Span::styled("Branch ", muted),
+        Span::styled(
+            label.to_string(),
+            Style::default()
+                .fg(app.theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  (press b)", muted),
+    ]);
+    f.render_widget(line, header_area);
+    Rect::new(area.x, area.y + 1, area.width, area.height - 1)
 }
 
 pub fn handle_key(app: &mut App, key: &str) -> bool {

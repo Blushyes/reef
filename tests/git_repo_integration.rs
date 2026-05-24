@@ -184,10 +184,68 @@ fn list_commits_returns_topological_order() {
     commit_file(&raw, "a.txt", "v3", "third");
 
     let (_g, repo) = open_in(tmp.path());
-    let commits = repo.list_commits(10);
+    let commits = repo.list_commits(&reef::git::GraphScope::AllRefs, 10);
     assert_eq!(commits.len(), 3);
     assert_eq!(commits[0].subject, "third");
     assert_eq!(commits[2].subject, "first");
+}
+
+#[test]
+fn list_commits_branch_scope_only_walks_named_ref() {
+    // Build two divergent branches off of the initial commit. The default
+    // branch (`main`/`master`) holds A→B; a feature branch points at A→C.
+    // Scoping to the feature branch must surface C but never B; scoping
+    // to the default must surface B but never C.
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "a.txt", "v1", "A: shared root");
+    let after_a = raw.head().unwrap().target().unwrap();
+    let head_name = raw.head().unwrap().shorthand().map(String::from).unwrap();
+
+    // Create + check out a feature branch off A, commit C.
+    raw.branch("feature", &raw.find_commit(after_a).unwrap(), false)
+        .unwrap();
+    raw.set_head("refs/heads/feature").unwrap();
+    raw.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+    commit_file(&raw, "feature.txt", "vC", "C: on feature");
+
+    // Back to the default branch and commit B.
+    raw.set_head(&format!("refs/heads/{head_name}")).unwrap();
+    raw.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+    commit_file(&raw, "b.txt", "vB", "B: on default");
+
+    let (_g, repo) = open_in(tmp.path());
+    let default_ref = format!("refs/heads/{head_name}");
+    let default_commits =
+        repo.list_commits(&reef::git::GraphScope::Branch(default_ref.clone()), 50);
+    let default_subjects: Vec<&str> = default_commits.iter().map(|c| c.subject.as_str()).collect();
+    assert!(default_subjects.contains(&"A: shared root"));
+    assert!(default_subjects.contains(&"B: on default"));
+    assert!(!default_subjects.contains(&"C: on feature"));
+
+    let feature_commits = repo.list_commits(
+        &reef::git::GraphScope::Branch("refs/heads/feature".into()),
+        50,
+    );
+    let feature_subjects: Vec<&str> = feature_commits.iter().map(|c| c.subject.as_str()).collect();
+    assert!(feature_subjects.contains(&"A: shared root"));
+    assert!(feature_subjects.contains(&"C: on feature"));
+    assert!(!feature_subjects.contains(&"B: on default"));
+
+    // Missing ref → empty Vec, no panic.
+    let none = repo.list_commits(
+        &reef::git::GraphScope::Branch("refs/heads/does-not-exist".into()),
+        50,
+    );
+    assert!(none.is_empty());
+
+    // AllRefs still surfaces both branches' tips.
+    let all = repo.list_commits(&reef::git::GraphScope::AllRefs, 50);
+    let all_subjects: Vec<&str> = all.iter().map(|c| c.subject.as_str()).collect();
+    assert!(all_subjects.contains(&"B: on default"));
+    assert!(all_subjects.contains(&"C: on feature"));
 }
 
 #[test]
@@ -270,7 +328,7 @@ fn get_range_files_multi_commit_is_union() {
 
     let (_g, repo) = open_in(tmp.path());
     // list_commits is newest-first, so oldest = first commit, newest = third.
-    let commits = repo.list_commits(10);
+    let commits = repo.list_commits(&reef::git::GraphScope::AllRefs, 10);
     let oldest = &commits[2].oid;
     let newest = &commits[0].oid;
     let files = repo.get_range_files(oldest, newest);
@@ -290,7 +348,7 @@ fn get_range_file_diff_collapses_multiple_edits() {
     let _c3 = commit_file(&raw, "a.txt", "v3\n", "third");
 
     let (_g, repo) = open_in(tmp.path());
-    let commits = repo.list_commits(10);
+    let commits = repo.list_commits(&reef::git::GraphScope::AllRefs, 10);
     let oldest = &commits[2].oid;
     let newest = &commits[0].oid;
     let diff = repo

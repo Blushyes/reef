@@ -375,9 +375,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // the full-screen Settings page own every key unconditionally —
                         // 'any key' must not dismiss help while one of them is up — so
                         // route to handle_key first and let it delegate to the page.
-                        if app.quick_open.active
-                            || app.global_search.active
-                            || app.hosts_picker.active
+                        if app.quick_open.core.active
+                            || app.global_search.core.active
+                            || app.hosts_picker.core.active
                             || app.view_mode == ViewMode::Settings
                             || app.view_mode == ViewMode::FocusedPreview
                         {

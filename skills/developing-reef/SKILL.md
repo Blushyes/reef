@@ -1,6 +1,6 @@
 ---
 name: developing-reef
-description: Architecture and coding conventions for changing Reef itself. Use before modifying Reef runtime architecture, `App` state, tabs/panels, rendering code, input dispatch, background work, git/file-tree/diff/graph loading, performance-sensitive paths, or when the user asks about "how Reef is structured", "render blocking", "heavy tasks", "new tab", "new feature architecture", or "project conventions". Pair with `testing-reef` whenever adding or changing tests.
+description: REQUIRED before any non-test code change in Reef. Load this skill before modifying Reef runtime architecture, `App` state, tabs/panels, rendering code, input dispatch (`src/input.rs`, any picker overlay, the commit textarea, any new text-input field), background work, git/file-tree/diff/graph loading, performance-sensitive paths, or when the user asks about "how Reef is structured", "render blocking", "heavy tasks", "new tab", "new feature architecture", "input handling", "text input", "picker", "PickerCore", "input_edit", or "project conventions". Do NOT start editing Reef source without loading this skill first — the architecture has non-obvious invariants (render-pure, async generation tokens, three-layer text-input stack) whose violation has been re-introduced and re-fixed across multiple PRs. Pair with `testing-reef` whenever adding or changing tests.
 ---
 
 # Developing Reef
@@ -32,8 +32,27 @@ Read `references/runtime-architecture.md` before changing `src/app.rs`, `src/tas
 - `src/tasks.rs` owns background worker definitions and should stay free of UI concerns.
 - `src/ui/**` owns rendering and local panel command dispatch; keep it pure except transient hit-test registration.
 - `src/input.rs` owns key/mouse routing; use `App::set_active_tab` instead of assigning `active_tab` directly.
+- `src/input_edit{,_multi}.rs` and `src/picker_core.rs` own the shared text-input vocabulary. Don't hand-roll a key table; embed one of the three layers (see "Text Input Stack" below).
 - `src/file_tree.rs` owns tree structure and preview data types; updating Git decorations must not rebuild the tree unless structure changed.
 - `src/git/**` owns direct git2 operations and pure graph algorithms. Open repositories inside workers with `GitRepo::open_at`.
+
+## Text Input Stack
+
+Every text input in Reef routes through one of three layers — L0
+`input_edit` (single-line readline/VSCode vocabulary), L1
+`input_edit_multi` (textarea: Enter→\n, line-aware Up/Down/Home/End),
+or L2 `picker_core::PickerCore` (overlay scaffold: filter + cursor +
+selected_idx + dispatch). 12+ input sites are already migrated; net
+~700 lines of duplicated key dispatch was removed.
+
+**Do NOT add a new text input without reading
+`references/text-input-stack.md` first.** It documents the canonical
+example for each layer plus seven mandatory invariants whose
+violation has been re-introduced and re-fixed across multiple
+review rounds (strict-bare-Enter, Ctrl+letter swallow in textareas,
+close-on-confirm-None, edit-derived work on `Edited`-only, UTF-8
+cursor boundary, exhaustive `InputOutcome` match, protocol bump
+discipline).
 
 ## Adding or Changing Features
 

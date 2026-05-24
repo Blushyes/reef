@@ -22,7 +22,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32String};
-use ratatui::layout::Rect;
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -57,11 +56,10 @@ pub struct MatchEntry {
 }
 
 pub struct QuickOpenState {
-    pub active: bool,
-    pub query: String,
-    /// Byte offset into `query`. Always on a char boundary.
-    pub cursor: usize,
-    pub selected: usize,
+    /// Shared overlay scaffolding (`active`, `query` → `core.filter`,
+    /// `cursor`, `selected` → `core.selected_idx`, `last_popup_area`).
+    /// Edits route through `PickerCore::dispatch_key`.
+    pub core: crate::picker_core::PickerCore,
     pub scroll: usize,
     pub index: Vec<Candidate>,
     /// fs-watcher flips this on; `begin()` rebuilds and clears it. Avoids
@@ -72,17 +70,10 @@ pub struct QuickOpenState {
     /// Last-rendered list viewport height in rows; used by PageUp/PageDown
     /// to pick a step size. Mirrors `last_preview_view_h` etc. in `App`.
     pub last_view_h: u16,
-    /// Last-rendered popup bounds. Read by the mouse dispatcher to decide
-    /// whether a click landed inside the palette (stays in palette mode) or
-    /// outside (dismisses). `None` means the popup hasn't been rendered yet —
-    /// any click in that window is treated as "inside" so the first click
-    /// after opening never accidentally dismisses.
-    pub last_popup_area: Option<Rect>,
-
     /// Timestamp of the most recent bare-Space keystroke inside the palette.
     /// Drives the in-palette half of the Space-P chord so the user can
     /// toggle the palette closed without reaching for Esc. Only armed when
-    /// `query.is_empty()` so that Space becomes a literal char once the
+    /// `core.filter.is_empty()` so Space becomes a literal char once the
     /// user is actually searching for something with a space in it.
     pub space_leader_at: Option<Instant>,
 }
@@ -90,17 +81,13 @@ pub struct QuickOpenState {
 impl Default for QuickOpenState {
     fn default() -> Self {
         Self {
-            active: false,
-            query: String::new(),
-            cursor: 0,
-            selected: 0,
+            core: crate::picker_core::PickerCore::default(),
             scroll: 0,
             index: Vec::new(),
             index_stale: true,
             matches: Vec::new(),
             mru: VecDeque::new(),
             last_view_h: 0,
-            last_popup_area: None,
             space_leader_at: None,
         }
     }
@@ -128,12 +115,12 @@ pub fn begin(app: &mut App) {
         app.quick_open.index = rebuild_index_via_backend(app.backend.as_ref());
         app.quick_open.index_stale = false;
     }
-    app.quick_open.active = true;
-    app.quick_open.selected = 0;
+    app.quick_open.core.active = true;
+    app.quick_open.core.selected_idx = 0;
     app.quick_open.scroll = 0;
     // Position cursor at end so the first keystroke continues (not splits)
     // the existing query.
-    app.quick_open.cursor = app.quick_open.query.len();
+    app.quick_open.core.cursor = app.quick_open.core.filter.len();
     // Start with a clean leader slot — a stale timestamp from a previous
     // session would make the first Space-after-open surprisingly close the
     // palette.
@@ -144,12 +131,12 @@ pub fn begin(app: &mut App) {
 /// Commit the current selection: update MRU, close the palette, and jump
 /// the Files tab to the chosen file with a fresh preview loaded.
 pub fn accept(app: &mut App) {
-    let Some(m) = app.quick_open.matches.get(app.quick_open.selected) else {
-        app.quick_open.active = false;
+    let Some(m) = app.quick_open.matches.get(app.quick_open.core.selected_idx) else {
+        app.quick_open.core.active = false;
         return;
     };
     let Some(cand) = app.quick_open.index.get(m.idx) else {
-        app.quick_open.active = false;
+        app.quick_open.core.active = false;
         return;
     };
     let rel = cand.rel_path.clone();
@@ -162,7 +149,7 @@ pub fn accept(app: &mut App) {
     }
     save_mru_to_prefs(&app.quick_open.mru);
 
-    app.quick_open.active = false;
+    app.quick_open.core.active = false;
     app.set_active_tab(Tab::Files);
     app.file_tree.reveal(&rel);
     app.refresh_file_tree_with_target(Some(rel.clone()));
@@ -191,7 +178,6 @@ pub fn accept(app: &mut App) {
 /// keyboard close.
 pub fn handle_key(key: KeyEvent, app: &mut App) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     // Space-leader close: mirrors the global open chord. Only armed while
     // `query.is_empty()` so once the user starts typing a path that might
@@ -199,7 +185,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // characters go straight into the query.
     match crate::input::leader_decision(
         &key,
-        /* allow_arm */ app.quick_open.query.is_empty(),
+        /* allow_arm */ app.quick_open.core.filter.is_empty(),
         app.quick_open.space_leader_at,
         Instant::now(),
         crate::input::LEADER_TIMEOUT,
@@ -219,7 +205,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             // query below.
             app.quick_open.space_leader_at = None;
             if matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P')) {
-                app.quick_open.active = false;
+                app.quick_open.core.active = false;
                 return;
             }
             // Fall through — non-P chord lands in the char-append arm.
@@ -231,76 +217,40 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         crate::input::LeaderVerdict::None => {}
     }
 
-    match key.code {
-        KeyCode::Esc => {
-            app.quick_open.active = false;
-        }
-        KeyCode::Char('c') if ctrl => {
-            app.quick_open.active = false;
+    // PageUp/PageDown depend on the rendered viewport height
+    // (`last_view_h`), which PickerCore doesn't know about — handle
+    // them inline before delegating the rest to the shared core.
+    if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+        let step = app.quick_open.last_view_h.max(1) as i32;
+        let signed = if matches!(key.code, KeyCode::PageUp) {
+            -step
+        } else {
+            step
+        };
+        move_selection(&mut app.quick_open, signed);
+        return;
+    }
+
+    // Shared picker dispatch. `Edited` re-runs the fuzzy filter; the
+    // other outcomes are no-ops (PickerCore already updated state).
+    use crate::picker_core::InputOutcome;
+    let _ = ctrl; // Quit branch handles Ctrl+C; no other ctrl-gating here.
+    let visible = app.quick_open.matches.len();
+    match app.quick_open.core.dispatch_key(&key, visible) {
+        InputOutcome::Cancel => app.quick_open.core.active = false,
+        InputOutcome::Quit => {
+            app.quick_open.core.active = false;
             app.should_quit = true;
         }
-        KeyCode::Enter => accept(app),
-
-        // ── Deletion ─────────────────────────────────────────────
-        // Alt+Backspace (macOS Option+Backspace) and Ctrl+Backspace
-        // (Windows/Linux) both ask for "delete previous word". Crossterm
-        // only surfaces these modifiers when the terminal uses a kitty /
-        // fixterms-style protocol; older terminals collapse Alt+Backspace
-        // onto plain Backspace, so Ctrl+W stays as the reliable fallback.
-        KeyCode::Backspace if alt || ctrl => {
-            input_edit::delete_word_backward(&mut app.quick_open.query, &mut app.quick_open.cursor);
-            filter(&mut app.quick_open);
-        }
-        KeyCode::Char('w') if ctrl => {
-            input_edit::delete_word_backward(&mut app.quick_open.query, &mut app.quick_open.cursor);
-            filter(&mut app.quick_open);
-        }
-        KeyCode::Char('u') if ctrl => {
-            input_edit::clear(&mut app.quick_open.query, &mut app.quick_open.cursor);
-            filter(&mut app.quick_open);
-        }
-        KeyCode::Backspace => {
-            input_edit::backspace(&mut app.quick_open.query, &mut app.quick_open.cursor);
-            filter(&mut app.quick_open);
-        }
-
-        // ── List navigation ──────────────────────────────────────
-        KeyCode::Up => move_selection(&mut app.quick_open, -1),
-        KeyCode::Char('p') if ctrl => move_selection(&mut app.quick_open, -1),
-        KeyCode::Char('k') if ctrl => move_selection(&mut app.quick_open, -1),
-        KeyCode::Down => move_selection(&mut app.quick_open, 1),
-        KeyCode::Char('n') if ctrl => move_selection(&mut app.quick_open, 1),
-        KeyCode::Char('j') if ctrl => move_selection(&mut app.quick_open, 1),
-        KeyCode::PageUp => {
-            let step = app.quick_open.last_view_h.max(1) as i32;
-            move_selection(&mut app.quick_open, -step);
-        }
-        KeyCode::PageDown => {
-            let step = app.quick_open.last_view_h.max(1) as i32;
-            move_selection(&mut app.quick_open, step);
-        }
-
-        // ── Edit-cursor movement ─────────────────────────────────
-        KeyCode::Left => {
-            input_edit::move_cursor(&app.quick_open.query, &mut app.quick_open.cursor, -1);
-        }
-        KeyCode::Right => {
-            input_edit::move_cursor(&app.quick_open.query, &mut app.quick_open.cursor, 1);
-        }
-        KeyCode::Home => {
-            app.quick_open.cursor = 0;
-        }
-        KeyCode::End => {
-            app.quick_open.cursor = app.quick_open.query.len();
-        }
-
-        // Any other Ctrl-combo is a no-op; we don't want Ctrl+A etc.
-        // landing as a literal 'a' in the query.
-        KeyCode::Char(c) if !ctrl => {
-            input_edit::insert_char(&mut app.quick_open.query, &mut app.quick_open.cursor, c);
-            filter(&mut app.quick_open);
-        }
-        _ => {}
+        InputOutcome::Confirm => accept(app),
+        InputOutcome::Edited => filter(&mut app.quick_open),
+        // Rejected unreachable today (PickerCore uses non-filtered
+        // dispatch_key); the arm is here so a future swap forces
+        // an explicit choice.
+        InputOutcome::Rejected
+        | InputOutcome::SelectionMoved
+        | InputOutcome::CursorMoved
+        | InputOutcome::Unhandled => {}
     }
 }
 
@@ -313,7 +263,11 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
 /// Called from `input::handle_paste` after the drop-path parser has already
 /// ruled out the payload as a file drop.
 pub fn handle_paste(s: &str, app: &mut App) {
-    input_edit::paste_single_line(s, &mut app.quick_open.query, &mut app.quick_open.cursor);
+    input_edit::paste_single_line(
+        s,
+        &mut app.quick_open.core.filter,
+        &mut app.quick_open.core.cursor,
+    );
     filter(&mut app.quick_open);
 }
 
@@ -328,7 +282,7 @@ pub fn handle_paste(s: &str, app: &mut App) {
 /// - Scroll wheel inside popup → move selection (3 rows per tick)
 /// - Everything else (drag, right-click, move) → ignored
 pub fn handle_mouse(mouse: MouseEvent, app: &mut App) {
-    let popup = match app.quick_open.last_popup_area {
+    let popup = match app.quick_open.core.last_popup_area {
         Some(r) => r,
         // No popup rendered yet — swallow the event without side-effects so
         // a spurious click during the first tick can't dismiss the palette.
@@ -345,7 +299,7 @@ pub fn handle_mouse(mouse: MouseEvent, app: &mut App) {
                 // Click-away dismisses the palette, just like clicking
                 // outside a dropdown in a GUI. Keeps the pre-palette state
                 // intact (filter doesn't touch scroll/selection elsewhere).
-                app.quick_open.active = false;
+                app.quick_open.core.active = false;
                 app.last_click = None;
                 return;
             }
@@ -367,7 +321,7 @@ pub fn handle_mouse(mouse: MouseEvent, app: &mut App) {
             if let Some(ClickAction::QuickOpenSelect(idx)) =
                 app.hit_registry.hit_test(mouse.column, mouse.row)
             {
-                app.quick_open.selected = idx;
+                app.quick_open.core.selected_idx = idx;
                 if is_double {
                     accept(app);
                     app.last_click = None;
@@ -402,7 +356,7 @@ pub fn handle_mouse(mouse: MouseEvent, app: &mut App) {
 pub fn filter(state: &mut QuickOpenState) {
     state.matches.clear();
 
-    if state.query.is_empty() {
+    if state.core.filter.is_empty() {
         let mut seen: HashSet<usize> = HashSet::new();
         for path in &state.mru {
             if let Some(idx) = state.index.iter().position(|c| &c.rel_path == path) {
@@ -425,7 +379,11 @@ pub fn filter(state: &mut QuickOpenState) {
         }
     } else {
         let mut matcher = Matcher::new(Config::DEFAULT);
-        let pattern = Pattern::parse(&state.query, CaseMatching::Smart, Normalization::Smart);
+        let pattern = Pattern::parse(
+            &state.core.filter,
+            CaseMatching::Smart,
+            Normalization::Smart,
+        );
         for (idx, cand) in state.index.iter().enumerate() {
             let mut indices: Vec<u32> = Vec::new();
             if let Some(score) = pattern.indices(cand.utf32.slice(..), &mut matcher, &mut indices) {
@@ -450,7 +408,7 @@ pub fn filter(state: &mut QuickOpenState) {
     }
 
     // Query change resets the viewport so the top match is visible.
-    state.selected = 0;
+    state.core.selected_idx = 0;
     state.scroll = 0;
 }
 
@@ -558,13 +516,13 @@ fn save_mru_to_prefs(mru: &VecDeque<PathBuf>) {
 
 fn move_selection(state: &mut QuickOpenState, delta: i32) {
     if state.matches.is_empty() {
-        state.selected = 0;
+        state.core.selected_idx = 0;
         return;
     }
     let last = state.matches.len() - 1;
-    let cur = state.selected as i32;
+    let cur = state.core.selected_idx as i32;
     let next = (cur + delta).clamp(0, last as i32) as usize;
-    state.selected = next;
+    state.core.selected_idx = next;
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -616,8 +574,8 @@ mod tests {
     #[test]
     fn subsequence_match_hits_camelcase() {
         let mut s = mk_state(&["src/ui/file_tree_panel.rs", "src/app.rs", "README.md"]);
-        s.query = "uiftp".to_string();
-        s.cursor = s.query.len();
+        s.core.filter = "uiftp".to_string();
+        s.core.cursor = s.core.filter.len();
         filter(&mut s);
         assert!(!s.matches.is_empty());
         // The file_tree_panel path must rank first — it's the only one
@@ -631,8 +589,8 @@ mod tests {
     #[test]
     fn shorter_path_wins_on_score_tie() {
         let mut s = mk_state(&["deep/nested/foo.rs", "foo.rs"]);
-        s.query = "foo".to_string();
-        s.cursor = s.query.len();
+        s.core.filter = "foo".to_string();
+        s.core.cursor = s.core.filter.len();
         filter(&mut s);
         assert_eq!(s.index[s.matches[0].idx].display, "foo.rs");
     }
@@ -640,8 +598,8 @@ mod tests {
     #[test]
     fn non_match_is_excluded_when_query_nonempty() {
         let mut s = mk_state(&["alpha.rs", "beta.rs"]);
-        s.query = "zzz".to_string();
-        s.cursor = s.query.len();
+        s.core.filter = "zzz".to_string();
+        s.core.cursor = s.core.filter.len();
         filter(&mut s);
         assert!(s.matches.is_empty());
     }
@@ -651,9 +609,9 @@ mod tests {
         let mut s = mk_state(&["a.rs", "b.rs", "c.rs"]);
         filter(&mut s);
         move_selection(&mut s, 10);
-        assert_eq!(s.selected, 2);
+        assert_eq!(s.core.selected_idx, 2);
         move_selection(&mut s, -99);
-        assert_eq!(s.selected, 0);
+        assert_eq!(s.core.selected_idx, 0);
     }
 
     #[test]

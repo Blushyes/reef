@@ -47,7 +47,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     let y = screen.y + screen.height.saturating_sub(popup_h) / 2;
     let area = Rect::new(x, y, popup_w, popup_h);
 
-    app.global_search.last_popup_area = Some(area);
+    app.global_search.core.last_popup_area = Some(area);
 
     f.render_widget(Clear, area);
 
@@ -95,7 +95,7 @@ pub fn render_body(f: &mut Frame, app: &mut App, inner: Rect, input_focused: boo
     // so its prompt is just a prompt; Tab::Search makes the prompt
     // clickable.
     let replace_open = app.global_search.replace_open;
-    let toggle_in_use = !app.global_search.active; // overlay sets `active=true`
+    let toggle_in_use = !app.global_search.core.active; // overlay sets `active=true`
     let header_rows: u16 = if replace_open { 2 } else { 1 };
 
     let find_y = inner.y;
@@ -146,13 +146,14 @@ pub fn render_body(f: &mut Frame, app: &mut App, inner: Rect, input_focused: boo
     f.render_widget(
         Line::from(vec![
             Span::styled(prompt_glyph.to_string(), prompt_style),
-            Span::styled(app.global_search.query.clone(), query_style),
+            Span::styled(app.global_search.core.filter.clone(), query_style),
         ]),
         Rect::new(inner.x, find_y, inner.width, 1),
     );
     if find_focused {
         let cursor_w =
-            UnicodeWidthStr::width(&app.global_search.query[..app.global_search.cursor]) as u16;
+            UnicodeWidthStr::width(&app.global_search.core.filter[..app.global_search.core.cursor])
+                as u16;
         let cursor_x = inner.x + PROMPT_COL_W + cursor_w.min(inner.width.saturating_sub(3));
         f.set_cursor_position((cursor_x, find_y));
     }
@@ -231,7 +232,7 @@ pub fn render_body(f: &mut Frame, app: &mut App, inner: Rect, input_focused: boo
     // ── List ───────────────────────────────────────────────────────────
     let loading = app.global_search_load.loading;
     if app.global_search.results.is_empty() {
-        let msg = if app.global_search.query.is_empty() {
+        let msg = if app.global_search.core.filter.is_empty() {
             if input_focused {
                 "Type to search file contents…"
             } else {
@@ -252,7 +253,7 @@ pub fn render_body(f: &mut Frame, app: &mut App, inner: Rect, input_focused: boo
             Rect::new(inner.x, list_y, inner.width, 1),
         );
     } else {
-        let sel = app.global_search.selected;
+        let sel = app.global_search.core.selected_idx;
         if sel < app.global_search.scroll {
             app.global_search.scroll = sel;
         } else if list_h > 0 && sel >= app.global_search.scroll + list_h as usize {
@@ -396,7 +397,7 @@ fn render_footer_text(state: &crate::global_search::GlobalSearchState, loading: 
     let cur = if state.results.is_empty() {
         0
     } else {
-        state.selected + 1
+        state.core.selected_idx + 1
     };
     let total = state.results.len();
     let mut s = format!("{cur} / {total}");

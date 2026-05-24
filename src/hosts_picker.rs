@@ -6,8 +6,6 @@
 //! build a fresh `RemoteBackend` and swap the running `App` for a new
 //! one via the outer `'session:` loop.
 
-use ratatui::layout::Rect;
-
 use crate::hosts::HostEntry;
 
 /// Maximum number of recent hosts we persist in prefs. Anything beyond
@@ -72,31 +70,34 @@ impl SshTarget {
 }
 
 pub struct HostsPickerState {
-    pub active: bool,
+    /// Shared overlay scaffolding: `active`, `filter`, `cursor` (into
+    /// the filter buffer), `selected_idx`, `last_popup_area`. Hosts
+    /// picker has TWO single-line buffers (filter + path); only the
+    /// filter is part of PickerCore — `path_buffer` / `path_cursor`
+    /// stand alongside and are driven directly via
+    /// [`crate::input_edit::dispatch_key`] when `input_mode == Path`.
+    pub core: crate::picker_core::PickerCore,
     pub all_hosts: Vec<HostEntry>,
     /// Recent targets as declared by the user in prior sessions, in
     /// most-recent-first order. Duplicates against `all_hosts` are
     /// rendered in the "recent" section and omitted from the main list.
     pub recent: Vec<SshTarget>,
-    pub filter: String,
-    pub selected_idx: usize,
     pub input_mode: InputMode,
     /// Raw buffer for the path input mode (typed `[user@]host[:path]`).
     pub path_buffer: String,
-    pub last_popup_area: Option<Rect>,
+    /// Byte offset into `path_buffer`.
+    pub path_cursor: usize,
 }
 
 impl Default for HostsPickerState {
     fn default() -> Self {
         Self {
-            active: false,
+            core: crate::picker_core::PickerCore::default(),
             all_hosts: Vec::new(),
             recent: Vec::new(),
-            filter: String::new(),
-            selected_idx: 0,
             input_mode: InputMode::Search,
             path_buffer: String::new(),
-            last_popup_area: None,
+            path_cursor: 0,
         }
     }
 }
@@ -117,19 +118,17 @@ impl HostsPickerState {
     pub fn open(&mut self, all_hosts: Vec<HostEntry>, recent: Vec<SshTarget>) {
         self.all_hosts = all_hosts;
         self.recent = recent;
-        self.filter.clear();
         self.path_buffer.clear();
-        self.selected_idx = 0;
+        self.path_cursor = 0;
         self.input_mode = InputMode::Search;
-        self.active = true;
+        self.core.open();
     }
 
     pub fn close(&mut self) {
-        self.active = false;
-        self.filter.clear();
         self.path_buffer.clear();
+        self.path_cursor = 0;
         self.input_mode = InputMode::Search;
-        self.selected_idx = 0;
+        self.core.close();
     }
 
     pub fn enter_path_mode(&mut self) {
@@ -138,7 +137,8 @@ impl HostsPickerState {
         // typed so they don't lose it. Filter-as-prefix covers the
         // common "oh this alias isn't here, let me type it" path.
         if self.path_buffer.is_empty() {
-            self.path_buffer = self.filter.clone();
+            self.path_buffer = self.core.filter.clone();
+            self.path_cursor = self.path_buffer.len();
         }
     }
 
@@ -149,7 +149,7 @@ impl HostsPickerState {
     /// rendering.
     pub fn visible_rows(&self) -> Vec<PickerRow> {
         let mut out: Vec<PickerRow> = Vec::new();
-        let f = self.filter.to_ascii_lowercase();
+        let f = self.core.filter.to_ascii_lowercase();
 
         let recent_aliases: std::collections::HashSet<String> = self
             .recent
@@ -192,7 +192,7 @@ impl HostsPickerState {
             }
             InputMode::Search => {
                 let rows = self.visible_rows();
-                rows.get(self.selected_idx).map(|row| match row {
+                rows.get(self.core.selected_idx).map(|row| match row {
                     PickerRow::Recent(t) => t.clone(),
                     PickerRow::Entry(h) => SshTarget {
                         host: h.alias.clone(),
@@ -206,14 +206,8 @@ impl HostsPickerState {
     /// Bump the selection, clamped to the current row count. `delta` is
     /// signed so callers can use `+1` / `-1` without a separate method.
     pub fn move_selection(&mut self, delta: i32) {
-        let rows = self.visible_rows();
-        if rows.is_empty() {
-            self.selected_idx = 0;
-            return;
-        }
-        let last = rows.len() as i32 - 1;
-        let next = (self.selected_idx as i32 + delta).clamp(0, last);
-        self.selected_idx = next as usize;
+        let visible_count = self.visible_rows().len();
+        self.core.move_selection(visible_count, delta);
     }
 }
 
@@ -306,7 +300,7 @@ mod tests {
     fn filter_is_case_insensitive_substring() {
         let mut s = HostsPickerState::default();
         s.open(vec![h("ProdDb"), h("staging"), h("dev-a")], vec![]);
-        s.filter = "db".into();
+        s.core.filter = "db".into();
         let rows = s.visible_rows();
         assert_eq!(rows.len(), 1);
         assert!(matches!(rows[0], PickerRow::Entry(ref e) if e.alias == "ProdDb"));
@@ -348,7 +342,7 @@ mod tests {
     fn confirm_in_search_mode_returns_selected_entry() {
         let mut s = HostsPickerState::default();
         s.open(vec![h("one"), h("two")], vec![]);
-        s.selected_idx = 1;
+        s.core.selected_idx = 1;
         let t = s.confirm().unwrap();
         assert_eq!(t.host, "two");
         assert_eq!(t.path, ".");
@@ -359,9 +353,9 @@ mod tests {
         let mut s = HostsPickerState::default();
         s.open(vec![h("a"), h("b"), h("c")], vec![]);
         s.move_selection(10);
-        assert_eq!(s.selected_idx, 2);
+        assert_eq!(s.core.selected_idx, 2);
         s.move_selection(-99);
-        assert_eq!(s.selected_idx, 0);
+        assert_eq!(s.core.selected_idx, 0);
     }
 
     #[test]

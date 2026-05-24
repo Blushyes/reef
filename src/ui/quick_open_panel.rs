@@ -1,6 +1,6 @@
 //! Quick-open palette overlay (bound to Space-P; see `crate::quick_open`).
 //!
-//! Rendered on top of the normal UI when `app.quick_open.active` is true.
+//! Rendered on top of the normal UI when `app.quick_open.core.active` is true.
 //! Three regions inside the popup: a single-row input line, a list of
 //! matches, and a right-aligned counter footer. The only state this panel
 //! writes back to `App` is `quick_open.last_view_h` (used by PageUp/PageDown
@@ -39,11 +39,11 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     // Stash bounds so `quick_open::handle_mouse` can decide "inside popup
     // vs. click-away dismiss". Overwritten every frame so it stays in sync
     // with terminal resizes.
-    app.quick_open.last_popup_area = Some(area);
+    app.quick_open.core.last_popup_area = Some(area);
 
     f.render_widget(Clear, area);
 
-    let recent = app.quick_open.query.is_empty() && !app.quick_open.mru.is_empty();
+    let recent = app.quick_open.core.filter.is_empty() && !app.quick_open.mru.is_empty();
     let title = if recent {
         " Quick Open · recent "
     } else {
@@ -91,7 +91,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            app.quick_open.query.clone(),
+            app.quick_open.core.filter.clone(),
             Style::default().fg(th.fg_primary),
         ),
     ];
@@ -101,7 +101,8 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     );
     // Blinking cursor — same trick `render_search_prompt` uses. Using
     // UnicodeWidthStr so cursor lands between CJK/wide chars correctly.
-    let cursor_w = UnicodeWidthStr::width(&app.quick_open.query[..app.quick_open.cursor]) as u16;
+    let cursor_w =
+        UnicodeWidthStr::width(&app.quick_open.core.filter[..app.quick_open.core.cursor]) as u16;
     let cursor_x = inner.x + 2 + cursor_w.min(inner.width.saturating_sub(3));
     f.set_cursor_position((cursor_x, input_y));
 
@@ -116,7 +117,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
 
     // ── List ───────────────────────────────────────────────────────────
     if app.quick_open.matches.is_empty() {
-        let msg = if app.quick_open.query.is_empty() {
+        let msg = if app.quick_open.core.filter.is_empty() {
             "Type to search files…"
         } else {
             "No matching files"
@@ -134,7 +135,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
         // Keep the selection in view. Same pattern as file_tree_panel — only
         // adjust scroll when selection moved outside the window, so the user
         // can scroll independently (Future: wire mouse wheel on popup).
-        let sel = app.quick_open.selected;
+        let sel = app.quick_open.core.selected_idx;
         if sel < app.quick_open.scroll {
             app.quick_open.scroll = sel;
         } else if list_h > 0 && sel >= app.quick_open.scroll + list_h as usize {
@@ -171,7 +172,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
         let cur = if app.quick_open.matches.is_empty() {
             0
         } else {
-            app.quick_open.selected + 1
+            app.quick_open.core.selected_idx + 1
         };
         let text = format!("{} / {}", cur, app.quick_open.matches.len());
         let w = UnicodeWidthStr::width(text.as_str()) as u16;

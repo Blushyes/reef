@@ -133,8 +133,16 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
 
     // Hosts picker (Ctrl+O) — fully owns input while active, same contract
     // as the other overlays.
-    if app.hosts_picker.active {
+    if app.hosts_picker.core.active {
         handle_key_hosts_picker(key, app);
+        return;
+    }
+
+    // Graph branch picker (`b` on Graph tab) — same exclusive ownership
+    // as the other overlays. Sits next to `hosts_picker` because it's a
+    // peer overlay (filter input + commit-on-Enter + Esc-cancel).
+    if app.graph_branch_picker.core.active {
+        handle_key_graph_branch_picker(key, app);
         return;
     }
 
@@ -148,14 +156,14 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     }
 
     // Global-search palette — fully owns input while active.
-    if app.global_search.active {
+    if app.global_search.core.active {
         global_search::handle_key(key, app);
         return;
     }
 
     // Quick-open palette has the next-highest priority — while active it
     // fully owns input (character append, cursor, Enter/Esc, Space-P close).
-    if app.quick_open.active {
+    if app.quick_open.core.active {
         quick_open::handle_key(key, app);
         return;
     }
@@ -296,7 +304,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         && !app.global_search.input_focused()
         && app.global_search.replace_open;
     let leader_allow_arm = if search_input_focused {
-        app.global_search.query.is_empty()
+        app.global_search.core.filter.is_empty()
     } else if commit_input_focused {
         app.git_status.commit_message.is_empty()
     } else {
@@ -317,8 +325,8 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             app.space_leader_at = None;
             // Only one palette at a time — opening either implicitly closes
             // the other. `begin()` then activates the chosen one.
-            app.quick_open.active = false;
-            app.global_search.active = false;
+            app.quick_open.core.active = false;
+            app.global_search.core.active = false;
             match key.code {
                 KeyCode::Char('p') | KeyCode::Char('P') => quick_open::begin(app),
                 // Space+F = VSCode-style find widget (selection-seeded,
@@ -371,9 +379,10 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     let gg_suppressed = in_input_mode
         || app.search.active
         || app.find_widget.active
-        || app.global_search.active
-        || app.quick_open.active
-        || app.hosts_picker.active
+        || app.global_search.core.active
+        || app.quick_open.core.active
+        || app.hosts_picker.core.active
+        || app.graph_branch_picker.core.active
         || app.tree_edit.active
         || app.db_goto_input.is_some()
         || app.is_sqlite_preview();
@@ -621,31 +630,21 @@ fn next_panel(current: Panel, three_col: bool, reverse: bool) -> Panel {
 }
 
 /// SQLite preview page-jump input. While `app.db_goto_input` is
-/// `Some(_)`, this handler fully owns the keyboard. Digits append,
-/// Backspace pops, Enter parses and jumps via
-/// [`App::db_navigate_to_page`], Esc cancels. Anything else is
-/// silently ignored so a stray modifier doesn't accidentally commit
-/// a partial number.
+/// `Some(_)`, this handler fully owns the keyboard.
+///
+/// Two-phase routing matching every other input in reef:
+///   1. Enter parses-and-jumps; Esc cancels.
+///   2. Everything else flows into [`input_edit::dispatch_key_filtered`]
+///      with a digit-only predicate, so the user gets word-motion,
+///      Home/End, Ctrl+U clear, etc. for free while non-digit chars
+///      are silently swallowed.
 fn handle_key_db_goto(key: KeyEvent, app: &mut App) {
     let buf = match app.db_goto_input.as_mut() {
         Some(b) => b,
         None => return,
     };
     match key.code {
-        crossterm::event::KeyCode::Char(c) if c.is_ascii_digit() => {
-            // Cap input length at 18 chars — that's beyond u64::MAX
-            // digit count, so anything longer is the user fat-
-            // fingering rather than a real page number. Silently
-            // dropping the extra keystroke is friendlier than
-            // rejecting the whole buffer.
-            if buf.len() < 18 {
-                buf.push(c);
-            }
-        }
-        crossterm::event::KeyCode::Backspace => {
-            buf.pop();
-        }
-        crossterm::event::KeyCode::Enter => {
+        KeyCode::Enter => {
             // Empty input on Enter → treat as Esc (cancel) rather
             // than parsing "" → 0 → page 0. Keeps the contract
             // friendlier when the user opens the prompt by accident.
@@ -655,17 +654,28 @@ fn handle_key_db_goto(key: KeyEvent, app: &mut App) {
                 buf.parse::<u64>().ok()
             };
             app.db_goto_input = None;
+            app.db_goto_cursor = 0;
             if let Some(page) = parsed {
                 if page > 0 {
                     app.db_navigate_to_page(page);
                 }
             }
+            return;
         }
-        crossterm::event::KeyCode::Esc => {
+        KeyCode::Esc => {
             app.db_goto_input = None;
+            app.db_goto_cursor = 0;
+            return;
         }
         _ => {}
     }
+    // Digit-only + 18-char cap (beyond u64::MAX digit count). The cap
+    // applies only to NEW insertions, not to e.g. Backspace / cursor
+    // motion, hence wrapping it inside the predicate.
+    let current_len = buf.len();
+    let _ = crate::input_edit::dispatch_key_filtered(&key, buf, &mut app.db_goto_cursor, |c| {
+        c.is_ascii_digit() && current_len < 18
+    });
 }
 
 /// 纯预览模式的早期闸门 —— 拦截退出语义 + 文件 picker 相关按键。
@@ -1091,7 +1101,7 @@ fn handle_key_search_list_mode(key: KeyEvent, app: &mut App, ctrl: bool) {
         // Space-leader is disarmed in this state (see `handle_key`);
         // bare Space toggles the current row's checkbox.
         KeyCode::Char(' ') if key.modifiers.is_empty() && app.global_search.replace_open => {
-            let idx = app.global_search.selected;
+            let idx = app.global_search.core.selected_idx;
             app.global_search.toggle_match_excluded(idx);
         }
 
@@ -1190,13 +1200,18 @@ fn handle_key_search_find_input(key: KeyEvent, app: &mut App, ctrl: bool, alt: b
     }
 
     // Pass 2: text-buffer edits. Edit outcomes re-run the search via
-    // `mark_query_edited`; cursor-only and unhandled keys are silent.
+    // `mark_query_edited` AND immediately reset `selected_idx = 0`
+    // (mirroring the overlay path's PickerCore behavior) so PageUp /
+    // PageDown handled above against stale results-from-old-query
+    // don't paginate into rows that won't survive the next debounced
+    // search rerun.
     let outcome = crate::input_edit::dispatch_key(
         &key,
-        &mut app.global_search.query,
-        &mut app.global_search.cursor,
+        &mut app.global_search.core.filter,
+        &mut app.global_search.core.cursor,
     );
     if outcome == crate::input_edit::Outcome::Edited {
+        app.global_search.core.selected_idx = 0;
         global_search::mark_query_edited(&mut app.global_search);
     }
 }
@@ -1424,6 +1439,15 @@ fn handle_key_graph(key: KeyEvent, app: &mut App) {
             app.git_graph.cache_key = None;
             app.refresh_graph();
         }
+        // `b` opens the branch picker overlay (see `graph_branch_picker`).
+        // Available from every panel on the Graph tab — the picker is a
+        // tab-level navigation, not a sidebar-local action, so the user
+        // can switch branches while focus is on the commit pane or the
+        // diff column too. (`V`/visual-mode stays gated on Panel::Files
+        // because it's specifically a sidebar-row range selection.)
+        KeyCode::Char('b') if !ctrl => {
+            app.open_graph_branch_picker();
+        }
         // m/f/t target the commit-detail panel regardless of focus.
         // `!ctrl` guards so Ctrl+F/M/T (e.g. VSCode muscle-memory Ctrl+F
         // for find) don't silently flip diff layout/mode — the global
@@ -1442,131 +1466,80 @@ fn handle_key_graph(key: KeyEvent, app: &mut App) {
 }
 
 /// Route a key event to the commit-box buffer when the Git tab's
-/// commit input is focused. Mirrors the text-input contract used by
-/// `handle_key_search_input_mode`: typing fills the draft, standard
-/// nav / edit keys move the cursor, Esc blurs, Ctrl+Enter submits,
-/// bare Enter inserts a newline (subject + body pattern). Returns
-/// `true` when the key was consumed.
+/// commit input is focused.
+///
+/// Two-phase routing matching every other input in reef:
+///   1. Commit-box-specific shortcuts (Esc blur, Ctrl+Enter submit;
+///      Ctrl+Enter requires `!alt` so a stray Ctrl+Alt+Enter on
+///      Linux WMs doesn't silently commit).
+///   2. Everything else flows into
+///      [`input_edit_multi::dispatch_key_multi`], which extends the
+///      shared single-line vocabulary with line-aware Up/Down
+///      navigation, line-aware Home/End, and bare-Enter newline
+///      insert.
+///
+/// Returns `true` when the key was actually consumed (Phase 1 hit
+/// OR Phase 2 returned `Edited` / `CursorOnly`). Keys the multi-line
+/// editor doesn't recognise (PageUp / PageDown / Shift+Arrow / F-keys
+/// …) yield `Unhandled` and we return `false` so the outer Git-tab
+/// handler can do its own thing with them. Letter chords like
+/// `s` / `u` / `d` arrive here as `Char(c)` which the editor DOES
+/// handle (as a literal insert), so the draft is safe.
 fn handle_key_git_commit(key: KeyEvent, app: &mut App, ctrl: bool, alt: bool) -> bool {
     use crate::app::Panel;
     if app.active_panel != Panel::Files || !app.git_status.commit_editing {
         return false;
     }
+    // Phase 1: commit-box-specific shortcuts. ANY Ctrl-modified
+    // Enter submits the commit — Shift/Alt extra modifier bits are
+    // accepted because terminals disagree about which subset gets
+    // forwarded (kitty enhanced-keyboard sends Shift on Enter; some
+    // Linux WMs bundle Alt). Without this, Ctrl+Shift+Enter /
+    // Ctrl+Alt+Enter would fall through Phase 2 (which only matches
+    // `Enter if !ctrl`) as Unhandled — and Enter isn't `Char`, so the
+    // Ctrl-letter swallow guard below doesn't catch it — landing on
+    // the outer Git handler's `Char('e') | Enter` arm that opens
+    // `$EDITOR` on the selected file.
     match key.code {
         KeyCode::Esc => {
             app.git_status.commit_editing = false;
-            true
+            return true;
         }
         KeyCode::Enter if ctrl => {
             app.run_commit();
-            true
+            return true;
         }
-        KeyCode::Enter => {
-            crate::input_edit::insert_char(
-                &mut app.git_status.commit_message,
-                &mut app.git_status.commit_cursor,
-                '\n',
-            );
-            true
-        }
-        KeyCode::Backspace if alt || ctrl => {
-            crate::input_edit::delete_word_backward(
-                &mut app.git_status.commit_message,
-                &mut app.git_status.commit_cursor,
-            );
-            true
-        }
-        KeyCode::Backspace => {
-            crate::input_edit::backspace(
-                &mut app.git_status.commit_message,
-                &mut app.git_status.commit_cursor,
-            );
-            true
-        }
-        KeyCode::Delete if alt || ctrl => {
-            crate::input_edit::delete_word_forward(
-                &mut app.git_status.commit_message,
-                &mut app.git_status.commit_cursor,
-            );
-            true
-        }
-        KeyCode::Delete => {
-            crate::input_edit::delete_char_forward(
-                &mut app.git_status.commit_message,
-                &mut app.git_status.commit_cursor,
-            );
-            true
-        }
-        KeyCode::Left if alt || ctrl => {
-            crate::input_edit::move_cursor_word_backward(
-                &app.git_status.commit_message,
-                &mut app.git_status.commit_cursor,
-            );
-            true
-        }
-        KeyCode::Right if alt || ctrl => {
-            crate::input_edit::move_cursor_word_forward(
-                &app.git_status.commit_message,
-                &mut app.git_status.commit_cursor,
-            );
-            true
-        }
-        KeyCode::Left => {
-            crate::input_edit::move_cursor(
-                &app.git_status.commit_message,
-                &mut app.git_status.commit_cursor,
-                -1,
-            );
-            true
-        }
-        KeyCode::Right => {
-            crate::input_edit::move_cursor(
-                &app.git_status.commit_message,
-                &mut app.git_status.commit_cursor,
-                1,
-            );
-            true
-        }
-        KeyCode::Home => {
-            app.git_status.commit_cursor = 0;
-            true
-        }
-        KeyCode::End => {
-            app.git_status.commit_cursor = app.git_status.commit_message.len();
-            true
-        }
-        KeyCode::Char('u') if ctrl => {
-            crate::input_edit::clear(
-                &mut app.git_status.commit_message,
-                &mut app.git_status.commit_cursor,
-            );
-            true
-        }
-        KeyCode::Char('w') if ctrl => {
-            crate::input_edit::delete_word_backward(
-                &mut app.git_status.commit_message,
-                &mut app.git_status.commit_cursor,
-            );
-            true
-        }
-        KeyCode::Char('a') if ctrl => {
-            app.git_status.commit_cursor = 0;
-            true
-        }
-        KeyCode::Char('e') if ctrl => {
-            app.git_status.commit_cursor = app.git_status.commit_message.len();
-            true
-        }
-        KeyCode::Char(c) if !ctrl => {
-            crate::input_edit::insert_char(
-                &mut app.git_status.commit_message,
-                &mut app.git_status.commit_cursor,
-                c,
-            );
-            true
-        }
-        _ => false,
+        _ => {}
     }
+
+    // Phase 2: shared multi-line text-input dispatch. Forward
+    // `Unhandled` to the caller as "not consumed" so unknown
+    // navigation keys (PageUp / Shift+Arrow / F-keys / …) can flow
+    // up to the outer Git-tab handler instead of being silently
+    // swallowed mid-edit.
+    //
+    // EXCEPT: Ctrl+letter and Alt+letter chords are deliberately
+    // swallowed even on Unhandled, because the outer Git handler's
+    // letter arms (`Char('s')` → stage, `Char('r')` → refresh,
+    // `Char('e') | Enter` → open in $EDITOR, etc. at lines ~1603-1645)
+    // are NOT modifier-gated and would mis-fire from VSCode muscle
+    // memory like Ctrl+S mid-message. The commit box's invariant —
+    // documented at the top of `handle_key_git` as "letter chords
+    // don't fire mid-message" — depends on this guard.
+    let outcome = crate::input_edit_multi::dispatch_key_multi(
+        &key,
+        &mut app.git_status.commit_message,
+        &mut app.git_status.commit_cursor,
+    );
+    if matches!(outcome, crate::input_edit::Outcome::Unhandled)
+        && matches!(key.code, KeyCode::Char(_))
+        && (ctrl || alt)
+    {
+        // Swallow any ctrl/alt-modified char chord the editor didn't
+        // recognise. Returning true keeps focus on the commit box.
+        return true;
+    }
+    !matches!(outcome, crate::input_edit::Outcome::Unhandled)
 }
 
 fn handle_key_git(key: KeyEvent, app: &mut App) {
@@ -1840,6 +1813,7 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                     .is_some_and(|p| p.is_database()) =>
         {
             app.db_goto_input = Some(String::new());
+            app.db_goto_cursor = 0;
         }
         KeyCode::Left if app.active_panel == Panel::Diff => {
             let step = if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -1980,47 +1954,44 @@ fn handle_key_tree_edit(key: KeyEvent, app: &mut App) {
         app.tree_edit.error = None;
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    // Phase 1: tree-edit-specific shortcuts (Esc/Enter/Ctrl+C).
+    // Enter is strict bare-Enter only: Shift+Enter / Alt+Enter /
+    // Ctrl+Enter would otherwise commit the rename on a stray
+    // modifier press (the commit-box right next door treats
+    // Shift+Enter as soft-newline; consistent muscle-memory says
+    // Shift+Enter is non-destructive).
     match key.code {
-        KeyCode::Esc => app.cancel_tree_edit(),
-        KeyCode::Char('c') if ctrl => app.cancel_tree_edit(),
-        KeyCode::Enter => app.commit_tree_edit(),
-        KeyCode::Backspace => {
-            if ctrl || key.modifiers.contains(KeyModifiers::ALT) {
-                crate::input_edit::delete_word_backward(
-                    &mut app.tree_edit.buffer,
-                    &mut app.tree_edit.cursor,
-                );
-            } else {
-                crate::input_edit::backspace(&mut app.tree_edit.buffer, &mut app.tree_edit.cursor);
-            }
+        KeyCode::Esc => {
+            app.cancel_tree_edit();
+            return;
         }
-        KeyCode::Char('w') if ctrl => {
-            crate::input_edit::delete_word_backward(
-                &mut app.tree_edit.buffer,
-                &mut app.tree_edit.cursor,
-            );
+        KeyCode::Char('c') if ctrl => {
+            app.cancel_tree_edit();
+            return;
         }
-        KeyCode::Char('u') if ctrl => {
-            app.tree_edit.buffer.clear();
-            app.tree_edit.cursor = 0;
-        }
-        KeyCode::Left => {
-            crate::input_edit::move_cursor(&app.tree_edit.buffer, &mut app.tree_edit.cursor, -1);
-        }
-        KeyCode::Right => {
-            crate::input_edit::move_cursor(&app.tree_edit.buffer, &mut app.tree_edit.cursor, 1);
-        }
-        KeyCode::Home => {
-            app.tree_edit.cursor = 0;
-        }
-        KeyCode::End => {
-            app.tree_edit.cursor = app.tree_edit.buffer.len();
-        }
-        KeyCode::Char(c) if !ctrl => {
-            crate::input_edit::insert_char(&mut app.tree_edit.buffer, &mut app.tree_edit.cursor, c);
+        KeyCode::Enter if !ctrl && !alt && !shift => {
+            app.commit_tree_edit();
+            return;
         }
         _ => {}
     }
+
+    // Phase 2: shared text-input dispatch with inline char filter.
+    // We reject path separators, NUL, and control characters at the
+    // point of insertion — `validate_basename` already rejects them
+    // at commit, but swallowing here gives the user an immediate
+    // signal (no character appears) and keeps the buffer in a
+    // perpetually-valid state. Empty / "." / ".." stay as commit-
+    // time validations since they depend on the full buffer, not a
+    // single char.
+    let _ = crate::input_edit::dispatch_key_filtered(
+        &key,
+        &mut app.tree_edit.buffer,
+        &mut app.tree_edit.cursor,
+        |c| c != '/' && c != '\\' && c != '\0' && !c.is_control(),
+    );
 }
 
 /// Keyboard navigation for the right-click context menu popup.
@@ -2043,57 +2014,112 @@ fn handle_key_tree_context_menu(key: KeyEvent, app: &mut App) {
     }
 }
 
-/// Keyboard handler for the Ctrl+O hosts picker overlay. Mirrors the
-/// quick-open contract: Esc / Ctrl+C close, Enter commits, arrows
-/// navigate, printable chars append to the active input (filter or
-/// path). Ctrl+P toggles between the two input modes so the user can
-/// swap from "filter my config" to "type a target literally".
+/// Keyboard handler for the Ctrl+O hosts picker overlay.
+///
+/// Splits along the picker's input-mode:
+/// - **Filter mode**: standard `PickerCore::dispatch_key` (list nav +
+///   Esc/Enter + full editor vocabulary). One bespoke shortcut on top:
+///   Ctrl+P switches to path mode.
+/// - **Path mode**: no list, just a literal `[user@]host[:path]`
+///   buffer. Esc demotes back to filter mode (preserves picker
+///   state); Enter commits. Editor keys flow straight through
+///   `input_edit::dispatch_key` against `path_buffer` / `path_cursor`.
 fn handle_key_hosts_picker(key: KeyEvent, app: &mut App) {
     use crate::hosts_picker::InputMode;
+    use crate::picker_core::InputOutcome;
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    match key.code {
-        KeyCode::Esc => {
-            if app.hosts_picker.input_mode == InputMode::Path {
-                // Esc in path mode drops back to the filter view rather
-                // than closing outright — gives the user a way out of
-                // the path buffer without losing the picker state.
-                app.hosts_picker.input_mode = InputMode::Search;
-                app.hosts_picker.path_buffer.clear();
-            } else {
-                app.close_hosts_picker();
+
+    match app.hosts_picker.input_mode {
+        InputMode::Search => {
+            // Picker-specific shortcut that has to precede PickerCore:
+            // Ctrl+P would otherwise be eaten as list-up.
+            if ctrl && matches!(key.code, KeyCode::Char('p')) {
+                app.hosts_picker.enter_path_mode();
+                return;
+            }
+            let visible = app.hosts_picker.visible_rows().len();
+            match app.hosts_picker.core.dispatch_key(&key, visible) {
+                InputOutcome::Cancel => app.close_hosts_picker(),
+                InputOutcome::Quit => {
+                    app.close_hosts_picker();
+                    app.should_quit = true;
+                }
+                InputOutcome::Confirm => app.confirm_hosts_picker(),
+                _ => {}
             }
         }
-        KeyCode::Char('c') if ctrl => {
-            app.close_hosts_picker();
+        InputMode::Path => {
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+            let alt = key.modifiers.contains(KeyModifiers::ALT);
+            match key.code {
+                KeyCode::Esc => {
+                    // Drop back to filter view rather than closing
+                    // outright — gives the user a way out of the path
+                    // buffer without losing the picker state.
+                    app.hosts_picker.input_mode = InputMode::Search;
+                    app.hosts_picker.path_buffer.clear();
+                    app.hosts_picker.path_cursor = 0;
+                    return;
+                }
+                // Symmetric with the path-mode entry: Ctrl+P also
+                // exits back to filter mode. Without this, the only
+                // way out is Esc, which is a UX asymmetry every
+                // tester trips on at least once.
+                KeyCode::Char('p') if ctrl => {
+                    app.hosts_picker.input_mode = InputMode::Search;
+                    app.hosts_picker.path_buffer.clear();
+                    app.hosts_picker.path_cursor = 0;
+                    return;
+                }
+                KeyCode::Char('c') if ctrl => {
+                    app.close_hosts_picker();
+                    app.should_quit = true;
+                    return;
+                }
+                // Strict bare Enter — Shift+Enter / Alt+Enter would
+                // otherwise commit a half-typed target on a stray
+                // modifier press (users muscle-memory Shift+Enter as
+                // "newline" even in single-line buffers).
+                KeyCode::Enter if !ctrl && !alt && !shift => {
+                    app.confirm_hosts_picker();
+                    return;
+                }
+                _ => {}
+            }
+            // Editor keys against the path buffer. No list = no
+            // selected_idx side effect.
+            let _ = crate::input_edit::dispatch_key(
+                &key,
+                &mut app.hosts_picker.path_buffer,
+                &mut app.hosts_picker.path_cursor,
+            );
+        }
+    }
+}
+
+/// Keyboard handler for the Graph tab's `b` branch picker.
+///
+/// All standard picker keys (Esc / Ctrl+C close, Enter commit,
+/// Up/Down/Ctrl+J/K/N/P navigate, full text-editing vocabulary) are
+/// owned by [`crate::picker_core::PickerCore::dispatch_key`]; we just
+/// translate the returned `InputOutcome` into the picker-specific
+/// app methods. No bespoke shortcuts (the graph picker has no leader
+/// chord or mode-switch key), so the handler stays trivial.
+fn handle_key_graph_branch_picker(key: KeyEvent, app: &mut App) {
+    use crate::picker_core::InputOutcome;
+    let visible = app.graph_branch_picker.visible_rows().len();
+    match app.graph_branch_picker.core.dispatch_key(&key, visible) {
+        InputOutcome::Cancel => app.close_graph_branch_picker(),
+        InputOutcome::Quit => {
+            app.close_graph_branch_picker();
             app.should_quit = true;
         }
-        KeyCode::Char('p') if ctrl => {
-            app.hosts_picker.enter_path_mode();
-        }
-        KeyCode::Enter => app.confirm_hosts_picker(),
-        KeyCode::Up => app.hosts_picker.move_selection(-1),
-        KeyCode::Down => app.hosts_picker.move_selection(1),
-        KeyCode::Char('k') if ctrl => app.hosts_picker.move_selection(-1),
-        KeyCode::Char('j') if ctrl => app.hosts_picker.move_selection(1),
-        KeyCode::Backspace => match app.hosts_picker.input_mode {
-            InputMode::Search => {
-                app.hosts_picker.filter.pop();
-                app.hosts_picker.selected_idx = 0;
-            }
-            InputMode::Path => {
-                app.hosts_picker.path_buffer.pop();
-            }
-        },
-        KeyCode::Char(c) if !ctrl => match app.hosts_picker.input_mode {
-            InputMode::Search => {
-                app.hosts_picker.filter.push(c);
-                app.hosts_picker.selected_idx = 0;
-            }
-            InputMode::Path => {
-                app.hosts_picker.path_buffer.push(c);
-            }
-        },
-        _ => {}
+        InputOutcome::Confirm => app.confirm_graph_branch_picker(),
+        InputOutcome::Edited
+        | InputOutcome::Rejected
+        | InputOutcome::SelectionMoved
+        | InputOutcome::CursorMoved
+        | InputOutcome::Unhandled => {}
     }
 }
 
@@ -2307,21 +2333,26 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
         )
     {
         app.db_goto_input = None;
+        app.db_goto_cursor = 0;
         return;
     }
 
     // Palettes fully own mouse input while active (global-search first,
     // then quick-open): clicks must not leak through to hidden panels,
     // and scroll wheels inside the popup should move the selection.
-    if app.hosts_picker.active {
+    if app.hosts_picker.core.active {
         handle_mouse_hosts_picker(mouse, app);
         return;
     }
-    if app.global_search.active {
+    if app.graph_branch_picker.core.active {
+        handle_mouse_graph_branch_picker(mouse, app);
+        return;
+    }
+    if app.global_search.core.active {
         global_search::handle_mouse(mouse, app);
         return;
     }
-    if app.quick_open.active {
+    if app.quick_open.core.active {
         quick_open::handle_mouse(mouse, app);
         return;
     }
@@ -2548,7 +2579,7 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
                 // Handled here rather than in `handle_action` because the
                 // is_double signal isn't threaded through App methods.
                 if is_double && let ui::mouse::ClickAction::GlobalSearchSelect(idx) = action {
-                    app.global_search.selected = idx;
+                    app.global_search.core.selected_idx = idx;
                     global_search::accept(app);
                     app.last_click = None;
                     return;
@@ -3659,7 +3690,7 @@ fn apply_scroll_delta(field: &mut usize, delta: i32) {
 /// select a row (and double-click commits); clicks outside dismiss the
 /// overlay, matching the quick-open / global-search click-away behaviour.
 fn handle_mouse_hosts_picker(mouse: MouseEvent, app: &mut App) {
-    let popup = match app.hosts_picker.last_popup_area {
+    let popup = match app.hosts_picker.core.last_popup_area {
         Some(r) => r,
         None => return,
     };
@@ -3686,7 +3717,7 @@ fn handle_mouse_hosts_picker(mouse: MouseEvent, app: &mut App) {
             if let Some(ui::mouse::ClickAction::HostsPickerSelect(idx)) =
                 app.hit_registry.hit_test(mouse.column, mouse.row)
             {
-                app.hosts_picker.selected_idx = idx;
+                app.hosts_picker.core.selected_idx = idx;
                 if is_double {
                     app.confirm_hosts_picker();
                     app.last_click = None;
@@ -3706,6 +3737,62 @@ fn handle_mouse_hosts_picker(mouse: MouseEvent, app: &mut App) {
         MouseEventKind::ScrollDown if inside => {
             let step = app.vertical_scroll_pacer.step() as i32;
             app.hosts_picker.move_selection(step);
+        }
+        _ => {}
+    }
+}
+
+/// Mouse dispatch for the Graph tab branch picker. Same shape as
+/// `handle_mouse_hosts_picker`: click inside selects (double-click
+/// commits), click outside dismisses, scroll moves the selection.
+fn handle_mouse_graph_branch_picker(mouse: MouseEvent, app: &mut App) {
+    let popup = match app.graph_branch_picker.core.last_popup_area {
+        Some(r) => r,
+        None => return,
+    };
+    let inside = mouse.column >= popup.x
+        && mouse.column < popup.x + popup.width
+        && mouse.row >= popup.y
+        && mouse.row < popup.y + popup.height;
+
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if !inside {
+                app.close_graph_branch_picker();
+                app.last_click = None;
+                return;
+            }
+            let now = Instant::now();
+            let is_double = matches!(
+                app.last_click,
+                Some((t, c, r))
+                    if c == mouse.column
+                        && r == mouse.row
+                        && now.duration_since(t) < DOUBLE_CLICK_WINDOW
+            );
+            if let Some(ui::mouse::ClickAction::GraphBranchPickerSelect(idx)) =
+                app.hit_registry.hit_test(mouse.column, mouse.row)
+            {
+                app.graph_branch_picker.core.selected_idx = idx;
+                if is_double {
+                    app.confirm_graph_branch_picker();
+                    app.last_click = None;
+                    return;
+                }
+            }
+            app.last_click = if is_double {
+                None
+            } else {
+                Some((now, mouse.column, mouse.row))
+            };
+        }
+        MouseEventKind::ScrollUp if inside => {
+            let step = app.vertical_scroll_pacer.step() as i32;
+            app.graph_branch_picker.move_selection(-step);
+        }
+        MouseEventKind::ScrollDown if inside => {
+            let step = app.vertical_scroll_pacer.step() as i32;
+            app.graph_branch_picker.move_selection(step);
         }
         _ => {}
     }
@@ -3767,17 +3854,34 @@ pub fn handle_paste(s: String, app: &mut App) {
         app.enter_place_mode(paths);
         return;
     }
-    if app.quick_open.active {
+    if app.quick_open.core.active {
         quick_open::handle_paste(&s, app);
     } else if app.search.active {
         search::handle_paste(&s, app);
-    } else if app.global_search.active {
+    } else if app.global_search.core.active {
         global_search::handle_paste_overlay(&s, &mut app.global_search);
     } else if app.active_tab == Tab::Search
         && app.active_panel == Panel::Files
         && app.global_search.input_focused()
     {
         global_search::handle_paste_search_tab(&s, &mut app.global_search);
+    } else if app.active_tab == Tab::Git
+        && app.active_panel == Panel::Files
+        && app.git_status.commit_editing
+    {
+        // Multi-line textarea: keep `\n` (the textarea is multi-line)
+        // but strip `\r` so CRLF clipboard payloads don't embed
+        // carriage returns into the commit message. Without this,
+        // Windows users pasting a multi-line draft on a terminal that
+        // disagrees with bracketed-paste land with `^M` characters in
+        // `git log` and tripped commit-lint hooks.
+        let filtered: String = s.chars().filter(|c| *c != '\r').collect();
+        if !filtered.is_empty() {
+            let buf = &mut app.git_status.commit_message;
+            let cur = &mut app.git_status.commit_cursor;
+            buf.insert_str(*cur, &filtered);
+            *cur += filtered.len();
+        }
     }
     // No focused input; intentionally dropped. A stray paste into the
     // global keymap has no defined meaning, and we don't want to

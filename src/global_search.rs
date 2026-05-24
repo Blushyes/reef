@@ -506,7 +506,12 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         }
         InputOutcome::Confirm => accept(app),
         InputOutcome::Edited => mark_query_edited(&mut app.global_search),
-        InputOutcome::SelectionMoved
+        // Rejected only fires once PickerCore is wired to a filtered
+        // dispatcher (today unreachable). When that lands, decide
+        // whether a rejected char should also re-run the search;
+        // currently the buffer didn't change so the answer is no.
+        InputOutcome::Rejected
+        | InputOutcome::SelectionMoved
         | InputOutcome::CursorMoved
         | InputOutcome::Unhandled => {}
     }

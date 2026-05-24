@@ -1488,13 +1488,19 @@ fn handle_key_git_commit(key: KeyEvent, app: &mut App, ctrl: bool, alt: bool) ->
     if app.active_panel != Panel::Files || !app.git_status.commit_editing {
         return false;
     }
-    // Phase 1: commit-box-specific shortcuts.
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    // Phase 1: commit-box-specific shortcuts. Strict `Ctrl+Enter`
+    // (no alt, no shift) is the only commit-submit chord; the `!alt`
+    // guard defends against Linux WMs forwarding Ctrl+Alt+Enter and
+    // `!shift` defends against kitty-style enhanced keyboard
+    // protocols that report Shift+Ctrl+Enter as a distinct chord.
+    // Shift+Enter alone is left to Phase 2 (newline insert).
     match key.code {
         KeyCode::Esc => {
             app.git_status.commit_editing = false;
             return true;
         }
-        KeyCode::Enter if ctrl && !alt => {
+        KeyCode::Enter if ctrl && !alt && !shift => {
             app.run_commit();
             return true;
         }
@@ -1502,14 +1508,32 @@ fn handle_key_git_commit(key: KeyEvent, app: &mut App, ctrl: bool, alt: bool) ->
     }
 
     // Phase 2: shared multi-line text-input dispatch. Forward
-    // `Unhandled` to the caller as "not consumed" so unknown keys
-    // (PageUp / Shift+Arrow / F-keys / …) can flow up to the outer
-    // Git-tab handler instead of being silently swallowed mid-edit.
+    // `Unhandled` to the caller as "not consumed" so unknown
+    // navigation keys (PageUp / Shift+Arrow / F-keys / …) can flow
+    // up to the outer Git-tab handler instead of being silently
+    // swallowed mid-edit.
+    //
+    // EXCEPT: Ctrl+letter and Alt+letter chords are deliberately
+    // swallowed even on Unhandled, because the outer Git handler's
+    // letter arms (`Char('s')` → stage, `Char('r')` → refresh,
+    // `Char('e') | Enter` → open in $EDITOR, etc. at lines ~1603-1645)
+    // are NOT modifier-gated and would mis-fire from VSCode muscle
+    // memory like Ctrl+S mid-message. The commit box's invariant —
+    // documented at the top of `handle_key_git` as "letter chords
+    // don't fire mid-message" — depends on this guard.
     let outcome = crate::input_edit_multi::dispatch_key_multi(
         &key,
         &mut app.git_status.commit_message,
         &mut app.git_status.commit_cursor,
     );
+    if matches!(outcome, crate::input_edit::Outcome::Unhandled)
+        && matches!(key.code, KeyCode::Char(_))
+        && (ctrl || alt)
+    {
+        // Swallow any ctrl/alt-modified char chord the editor didn't
+        // recognise. Returning true keeps focus on the commit box.
+        return true;
+    }
     !matches!(outcome, crate::input_edit::Outcome::Unhandled)
 }
 
@@ -2074,6 +2098,7 @@ fn handle_key_graph_branch_picker(key: KeyEvent, app: &mut App) {
         }
         InputOutcome::Confirm => app.confirm_graph_branch_picker(),
         InputOutcome::Edited
+        | InputOutcome::Rejected
         | InputOutcome::SelectionMoved
         | InputOutcome::CursorMoved
         | InputOutcome::Unhandled => {}

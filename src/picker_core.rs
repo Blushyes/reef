@@ -53,6 +53,13 @@ pub struct PickerCore {
 /// Quit           → close() + should_quit     (Ctrl+C — close + app quit)
 /// Confirm        → look up the row at `selected_idx`, act on it
 /// Edited         → recompute the candidate list against `filter`
+/// Rejected       → a printable char was recognised but a future
+///                  filtered dispatcher refused to insert it. Today
+///                  PickerCore uses the non-filtered backend so this
+///                  is unreachable, but the variant is reserved so
+///                  swapping in `dispatch_key_filtered` later forces
+///                  every caller to update its match (compile-time
+///                  safety net).
 /// SelectionMoved → no-op (renderer already sees the new cursor)
 /// CursorMoved    → no-op (filter buffer cursor moved inside text)
 /// Unhandled      → the picker fully consumed the key as a no-op; do
@@ -72,6 +79,7 @@ pub enum InputOutcome {
     Quit,
     Confirm,
     Edited,
+    Rejected,
     SelectionMoved,
     CursorMoved,
     Unhandled,
@@ -164,10 +172,12 @@ impl PickerCore {
             }
             crate::input_edit::Outcome::CursorOnly => InputOutcome::CursorMoved,
             // PickerCore uses the non-filtered dispatcher so Rejected
-            // can't actually appear here; map it to CursorMoved as a
-            // defensive default if a future variant of dispatch_key
-            // starts emitting Rejected against this code path.
-            crate::input_edit::Outcome::Rejected => InputOutcome::CursorMoved,
+            // can't fire today. Surface it as a distinct outcome
+            // anyway so a future swap to `dispatch_key_filtered`
+            // forces every caller (each currently has a `Rejected =>`
+            // arm) to make an explicit choice instead of folding
+            // rejection into CursorMoved.
+            crate::input_edit::Outcome::Rejected => InputOutcome::Rejected,
             crate::input_edit::Outcome::Unhandled => InputOutcome::Unhandled,
         }
     }

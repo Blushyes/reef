@@ -70,18 +70,27 @@ pub struct GraphBranchPickerState {
     /// `all_branches` so a deleted recent silently disappears from the
     /// rendered list.
     pub recent: Vec<String>,
-    /// Memoised result of [`visible_rows`]. The cache key is the
-    /// lowercased filter string — `all_branches` / `recent` only
-    /// change at `open()` time (which calls `invalidate_cache`), so
-    /// the filter alone is enough to distinguish identical recomputes.
+    /// Memoised result of [`visible_rows`].
+    ///
+    /// Cache key is `(lowercased_filter, all_branches.len(),
+    /// recent.len())`. The two length fields guard against the case
+    /// where a future caller mutates `all_branches` or `recent` in
+    /// place without going through `open()` / `close()` — any
+    /// push/pop changes the length and forces a recompute. Identical
+    /// length but different content (e.g. swap one entry for another
+    /// of the same kind) would still hit a stale cache, but that
+    /// scenario has no current writer in the codebase.
     ///
     /// `RefCell` so `visible_rows(&self)` can populate it lazily
     /// without forcing every caller to a `&mut` receiver. The
     /// alternative — recomputing N keystrokes/second on a 2k-branch
     /// monorepo — would allocate ~60k Strings per second of held
     /// autorepeat.
-    cache: std::cell::RefCell<Option<(String, Vec<BranchPickerRow>)>>,
+    cache: std::cell::RefCell<Option<(CacheKey, Vec<BranchPickerRow>)>>,
 }
+
+/// Composite key for [`GraphBranchPickerState::cache`].
+type CacheKey = (String, usize, usize);
 
 impl GraphBranchPickerState {
     /// Prep state from the cached `ref_map` and recents and activate
@@ -130,12 +139,14 @@ impl GraphBranchPickerState {
     /// whenever the filter shifts.
     pub fn visible_rows(&self) -> Vec<BranchPickerRow> {
         let f = self.core.filter.to_ascii_lowercase();
+        let key: CacheKey = (f, self.all_branches.len(), self.recent.len());
         // Cache hit?
-        if let Some((cached_filter, cached_rows)) = self.cache.borrow().as_ref() {
-            if cached_filter == &f {
+        if let Some((cached_key, cached_rows)) = self.cache.borrow().as_ref() {
+            if cached_key == &key {
                 return cached_rows.clone();
             }
         }
+        let f: &str = key.0.as_str();
         let mut out: Vec<BranchPickerRow> = Vec::new();
 
         // Sentinel is shown ONLY on the empty filter. Substring /
@@ -166,7 +177,7 @@ impl GraphBranchPickerState {
             else {
                 continue;
             };
-            if f.is_empty() || entry.display.to_ascii_lowercase().contains(&f) {
+            if f.is_empty() || entry.display.to_ascii_lowercase().contains(f) {
                 out.push(BranchPickerRow::Recent(entry));
             }
         }
@@ -176,7 +187,7 @@ impl GraphBranchPickerState {
             if recent_set.contains(entry.full_ref.as_str()) {
                 continue;
             }
-            if !(f.is_empty() || entry.display.to_ascii_lowercase().contains(&f)) {
+            if !(f.is_empty() || entry.display.to_ascii_lowercase().contains(f)) {
                 continue;
             }
             out.push(BranchPickerRow::Branch(entry.clone()));
@@ -188,7 +199,7 @@ impl GraphBranchPickerState {
 
         // Populate cache. Borrow is short-lived; `Vec::clone` is a
         // single heap-block memcpy of small enums (~24 bytes each).
-        *self.cache.borrow_mut() = Some((f, out.clone()));
+        *self.cache.borrow_mut() = Some((key, out.clone()));
         out
     }
 

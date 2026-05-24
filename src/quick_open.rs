@@ -240,7 +240,11 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         }
         InputOutcome::Confirm => accept(app),
         InputOutcome::Edited => filter(&mut app.quick_open),
-        InputOutcome::SelectionMoved
+        // Rejected unreachable today (PickerCore uses non-filtered
+        // dispatch_key); the arm is here so a future swap forces
+        // an explicit choice.
+        InputOutcome::Rejected
+        | InputOutcome::SelectionMoved
         | InputOutcome::CursorMoved
         | InputOutcome::Unhandled => {}
     }

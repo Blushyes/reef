@@ -52,9 +52,10 @@ pub fn dispatch_key(key: &KeyEvent, text: &mut String, cursor: &mut usize) -> Ou
 /// Filtered variant of [`dispatch_key`]: every other op (cursor
 /// motion, word-delete, paste, …) is unchanged, but plain-char
 /// insertion is gated by `accept_char`. Rejected chars are swallowed
-/// (Outcome::Unhandled-like effect: returns
-/// [`Outcome::CursorOnly`] so the caller still recognises the key as
-/// consumed but knows the buffer is untouched).
+/// and reported as [`Outcome::Rejected`] so callers can distinguish
+/// "predicate filtered out a char" from "cursor moved without edit"
+/// — important if any derived work (e.g. `mark_query_edited`) only
+/// fires on `Outcome::Edited`.
 ///
 /// Use this for inputs where the buffer has a content predicate the
 /// caller wants enforced inline: db_goto's digit-only page number,

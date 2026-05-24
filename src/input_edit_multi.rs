@@ -36,8 +36,15 @@ use crate::input_edit::{self, Outcome};
 ///   behave identically to the single-line path.
 pub fn dispatch_key_multi(key: &KeyEvent, text: &mut String, cursor: &mut usize) -> Outcome {
     let no_mods = key.modifiers.is_empty();
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
-        KeyCode::Enter if no_mods => {
+        // Enter without Ctrl → newline insert (Shift+Enter, Alt+Enter,
+        // Ctrl+Alt+Enter all count). Ctrl+Enter is left for the caller
+        // to interpret as "submit" — Shift+Enter / Alt+Enter falling
+        // through would land in the outer Git handler's
+        // `Char('e') | Enter` arm and open the selected file in
+        // $EDITOR, which is the opposite of "soft newline".
+        KeyCode::Enter if !ctrl => {
             input_edit::insert_char(text, cursor, '\n');
             Outcome::Edited
         }
@@ -173,6 +180,47 @@ mod tests {
     }
 
     #[test]
+    fn shift_enter_inserts_newline() {
+        // Regression: Shift+Enter is the universal "soft newline"
+        // convention in IM / VSCode / GitHub. Before the gate was
+        // widened from `no_mods` to `!ctrl`, this returned Unhandled
+        // and the outer Git handler interpreted Enter as "open file
+        // in $EDITOR" — a destructive surprise mid-typing.
+        let mut t = "ab".to_string();
+        let mut c = 1;
+        let outcome = dispatch_key_multi(&k(KeyCode::Enter, KeyModifiers::SHIFT), &mut t, &mut c);
+        assert_eq!(outcome, Outcome::Edited);
+        assert_eq!(t, "a\nb");
+        assert_eq!(c, 2);
+    }
+
+    #[test]
+    fn alt_enter_inserts_newline() {
+        // Same regression class as Shift+Enter: Alt+Enter pre-fix
+        // fell through to the outer Git handler.
+        let mut t = "ab".to_string();
+        let mut c = 1;
+        let outcome = dispatch_key_multi(&k(KeyCode::Enter, KeyModifiers::ALT), &mut t, &mut c);
+        assert_eq!(outcome, Outcome::Edited);
+        assert_eq!(t, "a\nb");
+    }
+
+    #[test]
+    fn ctrl_enter_unhandled_so_caller_can_submit() {
+        // The one Enter variant we deliberately don't insert: Ctrl+Enter
+        // is the textarea-submit convention (handled by the caller).
+        let mut t = "msg".to_string();
+        let mut c = 3;
+        let outcome = dispatch_key_multi(
+            &k(KeyCode::Enter, KeyModifiers::CONTROL),
+            &mut t,
+            &mut c,
+        );
+        assert_eq!(outcome, Outcome::Unhandled);
+        assert_eq!(t, "msg", "buffer untouched");
+    }
+
+    #[test]
     fn home_snaps_to_line_start_not_buffer_start() {
         let mut t = "first\nsecond".to_string();
         let mut c = "first\nsecond".len(); // end of second line
@@ -270,9 +318,8 @@ mod tests {
 
     #[test]
     fn ctrl_enter_falls_through_for_caller_to_handle() {
-        // Bare Enter inserts newline; Ctrl+Enter should NOT (caller
-        // intercepts it for "submit"). Verify by checking that
-        // dispatch_key_multi with Ctrl+Enter doesn't mutate the buffer.
+        // Superseded by `ctrl_enter_unhandled_so_caller_can_submit`
+        // above — kept as a docs-style regression sentinel.
         let mut t = "msg".to_string();
         let mut c = 3;
         let outcome = dispatch_key_multi(
@@ -280,9 +327,6 @@ mod tests {
             &mut t,
             &mut c,
         );
-        // Single-line dispatch doesn't know Enter either, so returns
-        // Unhandled. That's what we want — caller layer handles
-        // Ctrl+Enter explicitly before calling us.
         assert_eq!(outcome, Outcome::Unhandled);
         assert_eq!(t, "msg");
         assert_eq!(c, 3);

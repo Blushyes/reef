@@ -300,7 +300,8 @@ fn build_row_line(
     if search_ranges.is_empty() {
         spans.push(Span::styled(subject, subject_style));
     } else {
-        let sub_tokens = vec![(subject_style, subject)];
+        let sub_tokens: Vec<(Style, std::borrow::Cow<'_, str>)> =
+            vec![(subject_style, std::borrow::Cow::Owned(subject))];
         let overlaid = overlay_match_highlight(
             sub_tokens,
             search_ranges,

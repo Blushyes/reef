@@ -13,6 +13,7 @@
 use crate::app::{App, Panel, SelectedFile, Tab};
 use crate::input_edit;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::collections::HashMap;
 use std::ops::Range;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,9 +25,10 @@ pub enum SearchTarget {
     Diff,
     CommitDetail,
     /// Graph tab 三列布局下右侧 diff 栏的 `/` 搜索目标。行索引对齐
-    /// `unified_display_rows(&file_diff.diff)`——和 Git tab 的
-    /// `SearchTarget::Diff` 同款 —— 这样渲染层的 `ranges_on_row` 直接拿
-    /// 到匹配区间,跟 `diff_panel::render_diff` 的行号系统无缝对接。
+    /// `commit_detail.file_diff.display.unified_row_texts`——和 Git tab 的
+    /// `SearchTarget::Diff` 同款(共享同一份 worker-built `DiffDisplay` 缓存)
+    /// —— 这样渲染层的 `ranges_on_row` 直接拿到匹配区间,跟
+    /// `diff_panel::render_diff` 的行号系统无缝对接。
     GraphDiff,
 }
 
@@ -71,10 +73,27 @@ pub struct SearchState {
     /// Byte offset into `query`. Always on a char boundary.
     pub cursor: usize,
     pub target: Option<SearchTarget>,
+    /// Match locations. **Invariant**: must agree with `row_index` —
+    /// mutate ONLY through `set_matches` / `clear_matches`. Direct
+    /// `matches.push(...)` or `matches = vec![...]` leaves `row_index`
+    /// stale and `ranges_on_row` will silently return empty results
+    /// for the desynced rows.
     pub matches: Vec<MatchLoc>,
     pub current: Option<usize>,
     pub snapshot: Option<Snapshot>,
     pub wrap_msg: Option<WrapMsg>,
+    /// `row → indices into `matches`` index. Rebuilt whenever `matches`
+    /// changes via [`set_matches`] / [`clear_matches`]. Lets per-row
+    /// renderers look up overlays in O(1+k) (k = matches on that row)
+    /// instead of scanning all matches every frame — at 10k+ hits the
+    /// linear scan was the dominant render cost for global-search
+    /// previews.
+    ///
+    /// **Invariant:** kept in sync via `set_matches` / `clear_matches`.
+    /// External code (tests etc.) using the struct-literal form should
+    /// pass `Default::default()` here; mutating after construction is
+    /// not supported.
+    pub row_index: HashMap<usize, Vec<usize>>,
 }
 
 impl SearchState {
@@ -84,8 +103,39 @@ impl SearchState {
         !self.active && !self.matches.is_empty() && self.target.is_some()
     }
 
+    /// Replace `matches` and rebuild the per-row lookup. Also resets
+    /// `current` to `None` — callers picking a fresh "current" must
+    /// assign it right after this call. (Pre-fix, leaving the stale
+    /// `current` index hanging past the new `matches.len()` made
+    /// `step` / `jump_to_current` silently no-op; the asymmetry with
+    /// `clear_matches` (which always wiped `current`) was a footgun.)
+    ///
+    /// Panic-safe: `self.matches` is assigned BEFORE we build the
+    /// `row_index` over it. If a HashMap rehash inside the loop panics
+    /// (OOM), we leave `row_index` partial — but the indices it holds
+    /// still point into `self.matches`, so `ranges_on_row` returns a
+    /// truncated but consistent view rather than reading past
+    /// stale-vec bounds.
+    pub fn set_matches(&mut self, matches: Vec<MatchLoc>) {
+        self.matches = matches;
+        self.current = None;
+        self.row_index.clear();
+        for (i, m) in self.matches.iter().enumerate() {
+            self.row_index.entry(m.row).or_default().push(i);
+        }
+    }
+
+    /// Empty `matches` + clear the index. Cheaper than building a fresh
+    /// `SearchState` when only matches need to drop.
+    pub fn clear_matches(&mut self) {
+        self.matches.clear();
+        self.row_index.clear();
+        self.current = None;
+    }
+
     /// Ranges of matches falling on a given row, plus the current-match
     /// range if it lives on this row. Consumed by the overlay renderer.
+    /// O(1+k) where k = match count on `row` — backed by `row_index`.
     pub fn ranges_on_row(
         &self,
         target: SearchTarget,
@@ -94,12 +144,13 @@ impl SearchState {
         if self.target != Some(target) || self.matches.is_empty() {
             return (Vec::new(), None);
         }
-        let mut all = Vec::new();
+        let Some(idxs) = self.row_index.get(&row) else {
+            return (Vec::new(), None);
+        };
+        let mut all = Vec::with_capacity(idxs.len());
         let mut cur = None;
-        for (i, m) in self.matches.iter().enumerate() {
-            if m.row != row {
-                continue;
-            }
+        for &i in idxs {
+            let m = &self.matches[i];
             if Some(i) == self.current {
                 cur = Some(m.byte_range.clone());
             }
@@ -133,6 +184,7 @@ pub fn begin(app: &mut App, backwards: bool) {
         current: None,
         snapshot: Some(snap),
         wrap_msg: None,
+        row_index: HashMap::new(),
     };
 }
 
@@ -275,24 +327,30 @@ pub(crate) fn resolve_target(app: &App) -> Option<SearchTarget> {
 
 /// Build the searchable row list for a target. Row indices returned in match
 /// locations are into this vec.
-fn collect_rows(app: &App, target: SearchTarget) -> Vec<String> {
+/// Returns a row vec where each entry is borrowed from `app` when possible
+/// (`Cow::Borrowed(&str)`) and only allocates for the synthesized empty
+/// separator rows in diffs. Saves the per-keystroke `to_string()` storm
+/// over Arc<str>-backed diff lines.
+fn collect_rows(app: &App, target: SearchTarget) -> Vec<std::borrow::Cow<'_, str>> {
+    use std::borrow::Cow;
     match target {
         SearchTarget::FileTree => app
             .file_tree
             .entries
             .iter()
-            .map(|e| e.name.clone())
+            .map(|e| Cow::Borrowed(e.name.as_str()))
             .collect(),
         SearchTarget::GitStatus => {
             // Unified staged-then-unstaged path list — matches the order of
             // selectable rows in the panel. Search in git_status is file-only
             // (banners and section headers are skipped).
-            let mut rows = Vec::with_capacity(app.staged_files.len() + app.unstaged_files.len());
+            let mut rows: Vec<Cow<'_, str>> =
+                Vec::with_capacity(app.staged_files.len() + app.unstaged_files.len());
             for f in &app.staged_files {
-                rows.push(f.path.clone());
+                rows.push(Cow::Borrowed(f.path.as_str()));
             }
             for f in &app.unstaged_files {
-                rows.push(f.path.clone());
+                rows.push(Cow::Borrowed(f.path.as_str()));
             }
             rows
         }
@@ -300,28 +358,30 @@ fn collect_rows(app: &App, target: SearchTarget) -> Vec<String> {
             .git_graph
             .rows
             .iter()
-            .map(|r| r.commit.subject.clone())
+            .map(|r| Cow::Borrowed(r.commit.subject.as_str()))
             .collect(),
         SearchTarget::FilePreview => match &app.preview_content {
             Some(p) => match &p.body {
-                crate::file_tree::PreviewBody::Text { lines, .. } => lines.clone(),
+                crate::file_tree::PreviewBody::Text { lines, .. } => {
+                    lines.iter().map(|l| Cow::Borrowed(l.as_str())).collect()
+                }
                 _ => Vec::new(),
             },
             _ => Vec::new(),
         },
         SearchTarget::Diff => match &app.diff_content {
-            // Row layout matches the Unified diff panel's `all_lines`:
-            // separator rows between hunks, then hunk header + per-line rows.
-            // `diff_scroll` is an offset into that vec, so our row index is
-            // directly usable as a scroll target.
-            Some(d) => unified_display_rows(&d.diff),
+            // Read directly from the pre-built `display.unified_row_texts`
+            // (Arc<Vec<DiffRowText>> built once at diff load) instead of
+            // re-flattening the diff on every keystroke. Each row borrows
+            // from the Arc<str> inside the DiffRowText — zero per-row alloc.
+            Some(d) => row_texts_to_cows(&d.display.unified_row_texts),
             None => Vec::new(),
         },
         SearchTarget::GraphDiff => match &app.commit_detail.file_diff {
             // Graph tab 3-col diff column — same row layout as the Git tab's
             // diff panel, just sourced from `commit_detail.file_diff` instead
             // of `app.diff_content`.
-            Some(d) => unified_display_rows(&d.diff),
+            Some(d) => row_texts_to_cows(&d.display.unified_row_texts),
             None => Vec::new(),
         },
         SearchTarget::CommitDetail => {
@@ -332,21 +392,45 @@ fn collect_rows(app: &App, target: SearchTarget) -> Vec<String> {
             // inline diff rows in 3-col mode so match coordinates stay
             // aligned with what's actually rendered under Panel::Commit.
             crate::ui::commit_detail_panel::searchable_rows(app)
+                .into_iter()
+                .map(Cow::Owned)
+                .collect()
         }
     }
 }
 
+/// Project a slice of `DiffRowText` into the `Cow<&str>` shape `collect_rows`
+/// returns. Each row borrows directly from the underlying `Arc<str>` —
+/// zero per-row allocation, mirroring the find_widget SBS path.
+fn row_texts_to_cows(rows: &[crate::ui::selection::DiffRowText]) -> Vec<std::borrow::Cow<'_, str>> {
+    use crate::ui::selection::DiffRowText;
+    use std::borrow::Cow;
+    rows.iter()
+        .map(|r| match r {
+            DiffRowText::Separator => Cow::Borrowed(""),
+            DiffRowText::Header(s) => Cow::Borrowed(s.as_ref()),
+            DiffRowText::Unified(s) => Cow::Borrowed(s.as_ref()),
+            // Sbs variants don't appear in `unified_row_texts`; defensive.
+            DiffRowText::Sbs { .. } => Cow::Borrowed(""),
+        })
+        .collect()
+}
+
 /// Flatten a diff into searchable rows that line up with the Unified diff
 /// panel's `all_lines` layout (separator between hunks → header → body).
-pub(crate) fn unified_display_rows(diff: &crate::git::DiffContent) -> Vec<String> {
-    let mut rows = Vec::new();
+/// Returns `Vec<Arc<str>>` (refcount bumps, no heap copies) since the
+/// underlying `DiffLine.content` / `DiffHunk.header` are already `Arc<str>`
+/// — the matcher only reads `&str` via deref coercion.
+pub fn unified_display_rows(diff: &crate::git::DiffContent) -> Vec<std::sync::Arc<str>> {
+    let empty = crate::ui::text::empty_arc_str();
+    let mut rows: Vec<std::sync::Arc<str>> = Vec::new();
     for (i, hunk) in diff.hunks.iter().enumerate() {
         if i > 0 {
-            rows.push(String::new()); // Separator row — never matches.
+            rows.push(std::sync::Arc::clone(&empty)); // Separator row — never matches.
         }
-        rows.push(hunk.header.clone());
+        rows.push(std::sync::Arc::clone(&hunk.header));
         for line in &hunk.lines {
-            rows.push(line.content.clone());
+            rows.push(std::sync::Arc::clone(&line.content));
         }
     }
     rows
@@ -360,7 +444,7 @@ pub(crate) fn smart_case(query: &str) -> bool {
 
 /// All byte-range matches of `needle` in `haystack`, non-overlapping, with
 /// smart-case folding. Needle must be non-empty.
-pub(crate) fn find_all(haystack: &str, needle: &str, case_insensitive: bool) -> Vec<Range<usize>> {
+pub fn find_all(haystack: &str, needle: &str, case_insensitive: bool) -> Vec<Range<usize>> {
     if needle.is_empty() {
         return Vec::new();
     }
@@ -395,8 +479,7 @@ fn recompute_and_jump(app: &mut App, from_step: bool) {
     let query = app.search.query.clone();
 
     if query.is_empty() {
-        app.search.matches.clear();
-        app.search.current = None;
+        app.search.clear_matches();
         // Re-apply the snapshot so the view shows the starting position while
         // the user is still editing.
         if let Some(snap) = app.search.snapshot.clone() {
@@ -417,7 +500,7 @@ fn recompute_and_jump(app: &mut App, from_step: bool) {
         }
     }
 
-    app.search.matches = matches;
+    app.search.set_matches(matches);
     app.search.current = pick_current(app, target, from_step);
     jump_to_current(app);
 }
@@ -667,25 +750,27 @@ mod tests {
 
     #[test]
     fn ranges_on_row_filters_correctly() {
-        let s = SearchState {
+        let mut s = SearchState {
             target: Some(SearchTarget::FilePreview),
-            matches: vec![
-                MatchLoc {
-                    row: 1,
-                    byte_range: 0..3,
-                },
-                MatchLoc {
-                    row: 1,
-                    byte_range: 5..8,
-                },
-                MatchLoc {
-                    row: 2,
-                    byte_range: 0..3,
-                },
-            ],
-            current: Some(1),
             ..SearchState::default()
         };
+        s.set_matches(vec![
+            MatchLoc {
+                row: 1,
+                byte_range: 0..3,
+            },
+            MatchLoc {
+                row: 1,
+                byte_range: 5..8,
+            },
+            MatchLoc {
+                row: 2,
+                byte_range: 0..3,
+            },
+        ]);
+        // `set_matches` resets `current` — assign it after so the test still
+        // exercises the `Some(idx)` branch of `ranges_on_row`.
+        s.current = Some(1);
         let (all, cur) = s.ranges_on_row(SearchTarget::FilePreview, 1);
         assert_eq!(all, vec![0..3, 5..8]);
         assert_eq!(cur, Some(5..8));
@@ -695,14 +780,14 @@ mod tests {
 
     #[test]
     fn ranges_on_row_target_mismatch_returns_empty() {
-        let s = SearchState {
+        let mut s = SearchState {
             target: Some(SearchTarget::FilePreview),
-            matches: vec![MatchLoc {
-                row: 0,
-                byte_range: 0..1,
-            }],
             ..SearchState::default()
         };
+        s.set_matches(vec![MatchLoc {
+            row: 0,
+            byte_range: 0..1,
+        }]);
         let (all, _) = s.ranges_on_row(SearchTarget::Diff, 0);
         assert!(all.is_empty());
     }

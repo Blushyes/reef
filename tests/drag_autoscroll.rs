@@ -260,9 +260,11 @@ fn unified_hit(rows: usize, scroll: usize) -> DiffHit {
         h_scroll: 0,
         sbs_left_h_scroll: 0,
         sbs_right_h_scroll: 0,
-        rows: (0..rows)
-            .map(|i| DiffRowText::Unified(format!("row {}", i)))
-            .collect(),
+        rows: std::sync::Arc::new(
+            (0..rows)
+                .map(|i| DiffRowText::Unified(format!("row {}", i).into()))
+                .collect(),
+        ),
     }
 }
 

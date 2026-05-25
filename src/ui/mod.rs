@@ -351,7 +351,23 @@ fn render_graph_diff_column(f: &mut Frame, app: &mut App, area: Rect) {
     // one of them renders Diff at a time.
     app.last_diff_rect = Some(inner);
 
-    let Some(d) = app.commit_detail.file_diff.take() else {
+    // RAII guard around take/restore — mirrors `diff_panel::render`'s
+    // pattern so a panic inside `render_diff` doesn't strand the loaded
+    // commit-file diff in `None` (would render the loading banner
+    // forever even after the load is long since complete).
+    struct FileDiffGuard<'a> {
+        slot: &'a mut Option<crate::app::CommitFileDiff>,
+        held: Option<crate::app::CommitFileDiff>,
+    }
+    impl<'a> Drop for FileDiffGuard<'a> {
+        fn drop(&mut self) {
+            if let Some(d) = self.held.take() {
+                *self.slot = Some(d);
+            }
+        }
+    }
+
+    let Some(taken) = app.commit_detail.file_diff.take() else {
         // In 3-col mode this only fires when `commit_file_diff_load.loading`
         // is still true. Show a quiet "loading…" banner so the column is
         // never blank between the click and the async result landing.
@@ -365,12 +381,17 @@ fn render_graph_diff_column(f: &mut Frame, app: &mut App, area: Rect) {
         }
         return;
     };
+    let guard = FileDiffGuard {
+        slot: &mut app.commit_detail.file_diff,
+        held: Some(taken),
+    };
+    let d = guard.held.as_ref().expect("just took it");
     let selection = app.diff_selection;
     diff_panel::render_diff(
         f,
         inner,
         &d.diff,
-        d.highlighted.as_ref(),
+        &d.display,
         app.commit_detail.diff_layout,
         app.commit_detail.diff_mode,
         app.theme,
@@ -388,7 +409,7 @@ fn render_graph_diff_column(f: &mut Frame, app: &mut App, area: Rect) {
         },
         &mut app.last_diff_hit,
     );
-    app.commit_detail.file_diff = Some(d);
+    drop(guard);
 }
 
 fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {

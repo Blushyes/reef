@@ -3,10 +3,10 @@ use crate::find_widget::{FindTarget, FindWidgetState};
 use crate::git::{DiffContent, DiffHunk, LineTag};
 use crate::i18n::{Msg, t};
 use crate::search::{SearchState, SearchTarget};
-use crate::ui::highlight::StyledToken;
 use crate::ui::selection::{DiffHit, DiffRowText, DiffSelection, DiffSide};
 use crate::ui::text::{
-    clip_spans, overlay_match_highlight, overlay_selection_highlight, truncate_to_width,
+    clip_spans, empty_arc_str, overlay_match_highlight, overlay_selection_highlight, spaces,
+    truncate_to_width,
 };
 use crate::ui::theme::Theme;
 use ratatui::Frame;
@@ -14,7 +14,9 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding};
+use std::borrow::Cow;
 use std::ops::Range;
+use std::sync::Arc;
 use unicode_width::UnicodeWidthStr;
 
 /// Scroll + viewport state held by whichever layer owns a diff panel
@@ -44,16 +46,40 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     // both since at most one tab renders Diff at a time.
     app.last_diff_rect = Some(inner);
 
-    let Some(d) = app.diff_content.take() else {
+    // RAII guard around the `take()`+restore pattern: the diff is moved
+    // out for the duration of `render_diff` (to break the aliasing with
+    // `&mut app.diff_scroll` etc), and put back from `Drop` so a panic
+    // inside `render_diff` doesn't permanently strand the loaded diff.
+    // Pre-fix, an unwind skipped the restore and the panel rendered
+    // empty until the user re-triggered a load.
+    struct DiffSlotGuard<'a> {
+        slot: &'a mut Option<crate::app::HighlightedDiff>,
+        held: Option<crate::app::HighlightedDiff>,
+    }
+    impl<'a> Drop for DiffSlotGuard<'a> {
+        fn drop(&mut self) {
+            if let Some(d) = self.held.take() {
+                *self.slot = Some(d);
+            }
+        }
+    }
+
+    let Some(taken) = app.diff_content.take() else {
         render_empty(f, inner, &app.theme);
         return;
     };
+    let guard = DiffSlotGuard {
+        slot: &mut app.diff_content,
+        held: Some(taken),
+    };
+    let d = guard.held.as_ref().expect("just took it");
+
     let selection = app.diff_selection;
     render_diff(
         f,
         inner,
         &d.diff,
-        d.highlighted.as_ref(),
+        &d.display,
         app.diff_layout,
         app.diff_mode,
         app.theme,
@@ -71,7 +97,10 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         },
         &mut app.last_diff_hit,
     );
-    app.diff_content = Some(d);
+    // Drop fires here on the happy path; on unwind it fires implicitly
+    // from the panic propagation — either way `app.diff_content` is
+    // restored. Explicit drop for clarity.
+    drop(guard);
 }
 
 /// Pure diff renderer — no `App` dependency. Callers own the scroll state
@@ -86,7 +115,7 @@ pub fn render_diff(
     f: &mut Frame,
     area: Rect,
     diff: &DiffContent,
-    highlighted: Option<&DiffHighlighted>,
+    display: &DiffDisplay,
     layout: DiffLayout,
     mode: DiffMode,
     theme: Theme,
@@ -103,7 +132,7 @@ pub fn render_diff(
             f,
             area,
             diff,
-            highlighted,
+            display,
             mode,
             theme,
             search,
@@ -118,7 +147,7 @@ pub fn render_diff(
             f,
             area,
             diff,
-            highlighted,
+            display,
             mode,
             theme,
             search,
@@ -184,7 +213,7 @@ fn render_unified(
     f: &mut Frame,
     area: Rect,
     diff: &DiffContent,
-    highlighted: Option<&DiffHighlighted>,
+    display: &DiffDisplay,
     mode: DiffMode,
     theme: Theme,
     search: &SearchState,
@@ -209,26 +238,9 @@ fn render_unified(
         max_y,
     );
 
-    // Build all display lines. Content rows pick up per-line syntect tokens
-    // when available so the render path can emit syntax-colored spans
-    // instead of a single plain-fg span.
-    let mut all_lines: Vec<UnifiedLine> = Vec::new();
-    for (hi, hunk) in diff.hunks.iter().enumerate() {
-        if hi > 0 {
-            all_lines.push(UnifiedLine::Separator);
-        }
-        all_lines.push(UnifiedLine::HunkHeader(hunk.header.clone()));
-        let hunk_tokens = highlighted.and_then(|h| h.get(hi));
-        for (li, line) in hunk.lines.iter().enumerate() {
-            all_lines.push(UnifiedLine::Content {
-                tag: line.tag,
-                old_lineno: line.old_lineno,
-                new_lineno: line.new_lineno,
-                text: line.content.clone(),
-                tokens: hunk_tokens.and_then(|t| t.get(li)).cloned(),
-            });
-        }
-    }
+    // Display rows + tokens are pre-built in the worker on diff load — no
+    // per-frame hunk walk. See `DiffDisplay::build`.
+    let all_lines: &[UnifiedLine] = &display.unified_lines;
 
     // ` XXXXX  XXXXX ` (14 cols line-number gutter) + `+ ` (2 cols prefix)
     // = 16 cols before body. Constants here match the span math in
@@ -254,7 +266,7 @@ fn render_unified(
         .skip(*view.scroll)
         .take(visible_rows)
         .filter_map(|dl| match dl {
-            UnifiedLine::Content { text, .. } => Some(UnicodeWidthStr::width(text.as_str())),
+            UnifiedLine::Content { text, .. } => Some(UnicodeWidthStr::width(text.as_ref())),
             _ => None,
         })
         .max()
@@ -264,17 +276,9 @@ fn render_unified(
     let h = *view.h_scroll;
     let content_y = y;
 
-    // Snapshot rows + geometry so the mouse-selection handler can translate
-    // a terminal `(col, row)` hit into `(side, row_idx, byte_offset)` without
-    // touching the diff data structure. Rebuilt every frame.
-    let diff_rows: Vec<DiffRowText> = all_lines
-        .iter()
-        .map(|dl| match dl {
-            UnifiedLine::Separator => DiffRowText::Separator,
-            UnifiedLine::HunkHeader(h) => DiffRowText::Header(h.clone()),
-            UnifiedLine::Content { text, .. } => DiffRowText::Unified(text.clone()),
-        })
-        .collect();
+    // Geometry snapshot for the mouse-selection handler. `rows` shares
+    // the same `Arc<Vec<DiffRowText>>` built in `DiffDisplay::build` —
+    // per-frame work here is one refcount bump, not a clone of the vec.
     *hit_slot = Some(DiffHit {
         layout: DiffLayout::Unified,
         content_y,
@@ -286,7 +290,7 @@ fn render_unified(
         h_scroll: h,
         sbs_left_h_scroll: 0,
         sbs_right_h_scroll: 0,
-        rows: diff_rows,
+        rows: Arc::clone(&display.unified_row_texts),
     });
 
     let scroll = *view.scroll;
@@ -308,10 +312,10 @@ fn render_unified(
         let sel_range = selection
             .filter(|s| s.side == DiffSide::Unified)
             .and_then(|s| {
-                let txt = match dl {
+                let txt: &str = match dl {
                     UnifiedLine::Separator => "",
-                    UnifiedLine::HunkHeader(h) => h.as_str(),
-                    UnifiedLine::Content { text, .. } => text.as_str(),
+                    UnifiedLine::HunkHeader(h) => h.as_ref(),
+                    UnifiedLine::Content { text, .. } => text.as_ref(),
                 };
                 s.sel.line_byte_range(row_idx, txt)
             });
@@ -348,7 +352,8 @@ fn render_unified_line(
                 .fg(theme.accent)
                 .add_modifier(Modifier::DIM);
             let prefix = Span::styled(" ", base_style);
-            let header_tokens = vec![(base_style, header.clone())];
+            let header_tokens: Vec<(Style, Cow<'_, str>)> =
+                vec![(base_style, Cow::Borrowed(header.as_ref()))];
             let tokens = if match_ranges.is_empty() {
                 header_tokens
             } else {
@@ -389,11 +394,12 @@ fn render_unified_line(
             // onto unshifted text. `clip_spans` then handles h_scroll without
             // caring that the token stream was split.
             let body_style = Style::default().fg(fg).bg(bg);
-            let base_tokens: Vec<StyledToken> = match syntax_tokens {
-                Some(toks) if !toks.is_empty() => {
-                    toks.iter().map(|(s, t)| (s.bg(bg), t.clone())).collect()
-                }
-                _ => vec![(body_style, text.clone())],
+            let base_tokens: Vec<(Style, Cow<'_, str>)> = match syntax_tokens {
+                Some(toks) if !toks.is_empty() => toks
+                    .iter()
+                    .map(|(s, t)| (s.bg(bg), Cow::Borrowed(t.as_str())))
+                    .collect(),
+                _ => vec![(body_style, Cow::Borrowed(text.as_ref()))],
             };
             let tokens = if match_ranges.is_empty() {
                 base_tokens
@@ -429,7 +435,7 @@ fn render_unified_line(
             ];
             spans.extend(body_spans);
             spans.push(Span::styled(
-                " ".repeat(pad.min(area.width as usize)),
+                spaces(pad.min(area.width as usize)),
                 Style::default().bg(bg),
             ));
             let line = Line::from(spans);
@@ -438,14 +444,15 @@ fn render_unified_line(
     }
 }
 
-enum UnifiedLine {
+#[derive(Debug)]
+pub enum UnifiedLine {
     Separator,
-    HunkHeader(String),
+    HunkHeader(Arc<str>),
     Content {
         tag: LineTag,
         old_lineno: Option<u32>,
         new_lineno: Option<u32>,
-        text: String,
+        text: Arc<str>,
         /// Syntect-colored tokens for this line (when a syntax resolved).
         /// Concatenating token texts yields `text`; render path overlays
         /// the row's bg on each token. `Arc` so per-hunk `tokens_for` pass
@@ -456,72 +463,129 @@ enum UnifiedLine {
 
 // ─── Side-by-side view ───────────────────────────────────────────────────────
 
-struct SbsRow {
-    left_tag: LineTag,
-    left_no: Option<u32>,
-    left_text: String,
+#[derive(Debug)]
+pub struct SbsRow {
+    pub left_tag: LineTag,
+    pub left_no: Option<u32>,
+    pub left_text: Arc<str>,
     /// Syntect tokens for `left_text` (when a syntax resolved); concatenating
     /// token texts yields `left_text`. `None` falls back to a single plain-fg
     /// span at render time. `Arc` so pairing / render clones are O(1).
-    left_tokens: Option<LineTokens>,
-    right_tag: LineTag,
-    right_no: Option<u32>,
-    right_text: String,
-    right_tokens: Option<LineTokens>,
+    pub left_tokens: Option<LineTokens>,
+    pub right_tag: LineTag,
+    pub right_no: Option<u32>,
+    pub right_text: Arc<str>,
+    pub right_tokens: Option<LineTokens>,
 }
 
-enum SbsDisplayLine {
+#[derive(Debug)]
+pub enum SbsDisplayLine {
     Separator,
-    HunkHeader(String),
+    HunkHeader(Arc<str>),
     Row(SbsRow),
 }
 
-/// Flatten an entire diff into the SBS row layout used by `render_side_by_side`.
-/// Row indices in the returned vec line up 1:1 with `diff_scroll` in SBS mode,
-/// so match positions found by `find_widget` can be jump-targeted by setting
-/// `diff_scroll` directly.
+/// Pre-built display rows + per-row text snapshots for both layouts of a
+/// single diff. Built once per diff load (in the worker), then read by
+/// every frame — render no longer walks the hunks itself, and the mouse
+/// hit-test snapshot reuses the same row_texts Arcs (no per-frame copy).
 ///
-/// Returns text-only `DiffRowText` entries (no tokens / line numbers); the
-/// find widget only needs the per-side string per row to run its matcher.
-pub(crate) fn build_sbs_row_texts(diff: &DiffContent) -> Vec<DiffRowText> {
-    let mut out: Vec<DiffRowText> = Vec::new();
-    for (hi, hunk) in diff.hunks.iter().enumerate() {
-        if hi > 0 {
-            out.push(DiffRowText::Separator);
-        }
-        for line in build_sbs_lines(hunk, None) {
-            match line {
-                SbsDisplayLine::Separator => out.push(DiffRowText::Separator),
-                SbsDisplayLine::HunkHeader(h) => out.push(DiffRowText::Header(h)),
-                SbsDisplayLine::Row(row) => out.push(DiffRowText::Sbs {
-                    left: row.left_text,
-                    right: row.right_text,
-                }),
+/// Both layouts are built up-front because layout is a render-time toggle
+/// (`u`) — rebuilding on toggle would re-introduce the cost we're paying
+/// here once at load time.
+#[derive(Debug)]
+pub struct DiffDisplay {
+    pub unified_lines: Vec<UnifiedLine>,
+    pub sbs_lines: Vec<SbsDisplayLine>,
+    pub unified_row_texts: Arc<Vec<DiffRowText>>,
+    pub sbs_row_texts: Arc<Vec<DiffRowText>>,
+}
+
+impl DiffDisplay {
+    /// Build both unified + SBS display vectors in a single pass over
+    /// `diff.hunks`. Each hunk pushes its Separator + HunkHeader into both
+    /// vecs once and the highlight lookup `highlighted.and_then(|h| h.get(hi))`
+    /// happens once per hunk instead of twice. Per-line tokens are still
+    /// Arc-cloned into the unified layout; SBS's pairing state machine
+    /// continues to live inside `build_sbs_lines` since its output isn't
+    /// directly derivable from the unified order.
+    pub fn build(diff: &DiffContent, highlighted: Option<&DiffHighlighted>) -> Self {
+        let mut unified_lines: Vec<UnifiedLine> = Vec::new();
+        let mut sbs_lines: Vec<SbsDisplayLine> = Vec::new();
+        for (hi, hunk) in diff.hunks.iter().enumerate() {
+            if hi > 0 {
+                unified_lines.push(UnifiedLine::Separator);
+                sbs_lines.push(SbsDisplayLine::Separator);
             }
+            unified_lines.push(UnifiedLine::HunkHeader(Arc::clone(&hunk.header)));
+            let hunk_tokens = highlighted.and_then(|h| h.get(hi));
+            for (li, line) in hunk.lines.iter().enumerate() {
+                unified_lines.push(UnifiedLine::Content {
+                    tag: line.tag,
+                    old_lineno: line.old_lineno,
+                    new_lineno: line.new_lineno,
+                    text: Arc::clone(&line.content),
+                    tokens: hunk_tokens.and_then(|t| t.get(li)).cloned(),
+                });
+            }
+            sbs_lines.extend(build_sbs_lines(hunk, hunk_tokens));
+        }
+        let unified_row_texts = Arc::new(unified_row_texts_from(&unified_lines));
+        let sbs_row_texts = Arc::new(sbs_row_texts_from(&sbs_lines));
+        DiffDisplay {
+            unified_lines,
+            sbs_lines,
+            unified_row_texts,
+            sbs_row_texts,
         }
     }
-    out
+}
+
+fn unified_row_texts_from(lines: &[UnifiedLine]) -> Vec<DiffRowText> {
+    lines
+        .iter()
+        .map(|dl| match dl {
+            UnifiedLine::Separator => DiffRowText::Separator,
+            UnifiedLine::HunkHeader(h) => DiffRowText::Header(Arc::clone(h)),
+            UnifiedLine::Content { text, .. } => DiffRowText::Unified(Arc::clone(text)),
+        })
+        .collect()
+}
+
+fn sbs_row_texts_from(lines: &[SbsDisplayLine]) -> Vec<DiffRowText> {
+    lines
+        .iter()
+        .map(|dl| match dl {
+            SbsDisplayLine::Separator => DiffRowText::Separator,
+            SbsDisplayLine::HunkHeader(h) => DiffRowText::Header(Arc::clone(h)),
+            SbsDisplayLine::Row(r) => DiffRowText::Sbs {
+                left: Arc::clone(&r.left_text),
+                right: Arc::clone(&r.right_text),
+            },
+        })
+        .collect()
 }
 
 fn build_sbs_lines(hunk: &DiffHunk, hunk_tokens: Option<&Vec<LineTokens>>) -> Vec<SbsDisplayLine> {
     let mut rows: Vec<SbsDisplayLine> = Vec::new();
     // Carry tokens alongside each pending removal so a later Added pairing
     // keeps the left half's syntax highlighting.
-    let mut pending_removed: Vec<(Option<u32>, String, Option<LineTokens>)> = Vec::new();
+    let mut pending_removed: Vec<(Option<u32>, Arc<str>, Option<LineTokens>)> = Vec::new();
     let tokens_for =
         |li: usize| -> Option<LineTokens> { hunk_tokens.and_then(|t| t.get(li)).cloned() };
+    let empty: Arc<str> = empty_arc_str();
 
-    rows.push(SbsDisplayLine::HunkHeader(hunk.header.clone()));
+    rows.push(SbsDisplayLine::HunkHeader(Arc::clone(&hunk.header)));
 
     for (li, line) in hunk.lines.iter().enumerate() {
         match line.tag {
             LineTag::Removed => {
-                pending_removed.push((line.old_lineno, line.content.clone(), tokens_for(li)));
+                pending_removed.push((line.old_lineno, Arc::clone(&line.content), tokens_for(li)));
             }
             LineTag::Added => {
                 let added_tokens = tokens_for(li);
-                if let Some((old_no, old_text, old_tokens)) = pending_removed.first().cloned() {
-                    pending_removed.remove(0);
+                if !pending_removed.is_empty() {
+                    let (old_no, old_text, old_tokens) = pending_removed.remove(0);
                     rows.push(SbsDisplayLine::Row(SbsRow {
                         left_tag: LineTag::Removed,
                         left_no: old_no,
@@ -529,7 +593,7 @@ fn build_sbs_lines(hunk: &DiffHunk, hunk_tokens: Option<&Vec<LineTokens>>) -> Ve
                         left_tokens: old_tokens,
                         right_tag: LineTag::Added,
                         right_no: line.new_lineno,
-                        right_text: line.content.clone(),
+                        right_text: Arc::clone(&line.content),
                         right_tokens: added_tokens,
                     }));
                 } else {
@@ -537,11 +601,11 @@ fn build_sbs_lines(hunk: &DiffHunk, hunk_tokens: Option<&Vec<LineTokens>>) -> Ve
                     rows.push(SbsDisplayLine::Row(SbsRow {
                         left_tag: LineTag::Context,
                         left_no: None,
-                        left_text: String::new(),
+                        left_text: Arc::clone(&empty),
                         left_tokens: None,
                         right_tag: LineTag::Added,
                         right_no: line.new_lineno,
-                        right_text: line.content.clone(),
+                        right_text: Arc::clone(&line.content),
                         right_tokens: added_tokens,
                     }));
                 }
@@ -556,7 +620,7 @@ fn build_sbs_lines(hunk: &DiffHunk, hunk_tokens: Option<&Vec<LineTokens>>) -> Ve
                         left_tokens: old_tokens,
                         right_tag: LineTag::Context,
                         right_no: None,
-                        right_text: String::new(),
+                        right_text: Arc::clone(&empty),
                         right_tokens: None,
                     }));
                 }
@@ -565,11 +629,11 @@ fn build_sbs_lines(hunk: &DiffHunk, hunk_tokens: Option<&Vec<LineTokens>>) -> Ve
                 rows.push(SbsDisplayLine::Row(SbsRow {
                     left_tag: LineTag::Context,
                     left_no: line.old_lineno,
-                    left_text: line.content.clone(),
+                    left_text: Arc::clone(&line.content),
                     left_tokens: ctx_tokens.clone(),
                     right_tag: LineTag::Context,
                     right_no: line.new_lineno,
-                    right_text: line.content.clone(),
+                    right_text: Arc::clone(&line.content),
                     right_tokens: ctx_tokens,
                 }));
             }
@@ -585,7 +649,7 @@ fn build_sbs_lines(hunk: &DiffHunk, hunk_tokens: Option<&Vec<LineTokens>>) -> Ve
             left_tokens: old_tokens,
             right_tag: LineTag::Context,
             right_no: None,
-            right_text: String::new(),
+            right_text: Arc::clone(&empty),
             right_tokens: None,
         }));
     }
@@ -598,7 +662,7 @@ fn render_side_by_side(
     f: &mut Frame,
     area: Rect,
     diff: &DiffContent,
-    highlighted: Option<&DiffHighlighted>,
+    display: &DiffDisplay,
     mode: DiffMode,
     theme: Theme,
     search: &SearchState,
@@ -633,15 +697,8 @@ fn render_side_by_side(
     let _ = search;
     let (widget_left_target, widget_right_target) = sbs_side_targets(widget_unified_target);
 
-    // Build all display lines
-    let mut all_lines: Vec<SbsDisplayLine> = Vec::new();
-    for (hi, hunk) in diff.hunks.iter().enumerate() {
-        if hi > 0 {
-            all_lines.push(SbsDisplayLine::Separator);
-        }
-        let hunk_tokens = highlighted.and_then(|h| h.get(hi));
-        all_lines.extend(build_sbs_lines(hunk, hunk_tokens));
-    }
+    // Display rows + tokens pre-built in the worker — see `DiffDisplay::build`.
+    let all_lines: &[SbsDisplayLine] = &display.sbs_lines;
 
     // Half width: leave 1 col for center divider
     let half_w = (area.width.saturating_sub(1)) / 2;
@@ -670,8 +727,8 @@ fn render_side_by_side(
         .take(visible_rows)
         .fold((0, 0), |(ml, mr), dl| match dl {
             SbsDisplayLine::Row(row) => (
-                ml.max(UnicodeWidthStr::width(row.left_text.as_str())),
-                mr.max(UnicodeWidthStr::width(row.right_text.as_str())),
+                ml.max(UnicodeWidthStr::width(row.left_text.as_ref())),
+                mr.max(UnicodeWidthStr::width(row.right_text.as_ref())),
             ),
             _ => (ml, mr),
         });
@@ -683,21 +740,10 @@ fn render_side_by_side(
     let h_right = *view.sbs_right_h_scroll;
     let content_y = y;
 
-    // Snapshot rows + geometry for the selection handler. Each SBS row
-    // carries both halves so `DiffRowText::text_for(side)` can pick the
-    // right one at copy time. Separator + HunkHeader rows don't have a
-    // per-side split — the mouse handler treats them as neutral.
-    let diff_rows: Vec<DiffRowText> = all_lines
-        .iter()
-        .map(|dl| match dl {
-            SbsDisplayLine::Separator => DiffRowText::Separator,
-            SbsDisplayLine::HunkHeader(h) => DiffRowText::Header(h.clone()),
-            SbsDisplayLine::Row(r) => DiffRowText::Sbs {
-                left: r.left_text.clone(),
-                right: r.right_text.clone(),
-            },
-        })
-        .collect();
+    // Geometry snapshot for the selection handler. `rows` shares the
+    // worker-built `Arc<Vec<DiffRowText>>` — each row already carries both
+    // halves so `DiffRowText::text_for(side)` can pick the right one at
+    // copy time.
     let gutter = 7u16;
     *hit_slot = Some(DiffHit {
         layout: DiffLayout::SideBySide,
@@ -713,7 +759,7 @@ fn render_side_by_side(
         h_scroll: 0,
         sbs_left_h_scroll: h_left,
         sbs_right_h_scroll: h_right,
-        rows: diff_rows,
+        rows: Arc::clone(&display.sbs_row_texts),
     });
 
     let scroll = *view.scroll;
@@ -728,7 +774,7 @@ fn render_side_by_side(
             Some(s) => match s.side {
                 DiffSide::SbsLeft => {
                     if let SbsDisplayLine::Row(row) = dl {
-                        (s.sel.line_byte_range(row_idx, row.left_text.as_str()), None)
+                        (s.sel.line_byte_range(row_idx, row.left_text.as_ref()), None)
                     } else {
                         (None, None)
                     }
@@ -737,7 +783,7 @@ fn render_side_by_side(
                     if let SbsDisplayLine::Row(row) = dl {
                         (
                             None,
-                            s.sel.line_byte_range(row_idx, row.right_text.as_str()),
+                            s.sel.line_byte_range(row_idx, row.right_text.as_ref()),
                         )
                     } else {
                         (None, None)
@@ -755,14 +801,14 @@ fn render_side_by_side(
             find_widget.ranges_on_row(widget_right_target, row_idx);
         match dl {
             SbsDisplayLine::Separator => {
-                let line = Line::from(Span::styled(
-                    format!(
-                        " {:>5}  ⋯{}",
-                        "",
-                        " ".repeat(area.width.saturating_sub(10) as usize)
+                let pad = area.width.saturating_sub(10) as usize;
+                let line = Line::from(vec![
+                    Span::styled(
+                        format!(" {:>5}  ⋯", ""),
+                        Style::default().fg(theme.fg_secondary),
                     ),
-                    Style::default().fg(theme.fg_secondary),
-                ));
+                    Span::styled(spaces(pad), Style::default().fg(theme.fg_secondary)),
+                ]);
                 f.render_widget(line, Rect::new(area.x, y, area.width, 1));
             }
             SbsDisplayLine::HunkHeader(header) => {
@@ -779,11 +825,13 @@ fn render_side_by_side(
                 let base = Style::default()
                     .fg(theme.accent)
                     .add_modifier(Modifier::DIM);
+                let header_tokens: Vec<(Style, Cow<'_, str>)> =
+                    vec![(base, Cow::Borrowed(header.as_ref()))];
                 let tokens = if combined.is_empty() {
-                    vec![(base, header.clone())]
+                    header_tokens
                 } else {
                     overlay_match_highlight(
-                        vec![(base, header.clone())],
+                        header_tokens,
                         &combined,
                         combined_cur,
                         theme.search_match,
@@ -886,10 +934,7 @@ fn render_sbs_row(
         Style::default().fg(theme.fg_secondary).bg(left_bg),
     )];
     left_line_spans.extend(left_spans);
-    left_line_spans.push(Span::styled(
-        " ".repeat(left_pad),
-        Style::default().bg(left_bg),
-    ));
+    left_line_spans.push(Span::styled(spaces(left_pad), Style::default().bg(left_bg)));
     f.render_widget(Line::from(left_line_spans), Rect::new(area.x, y, half_w, 1));
 
     // ── Divider ──
@@ -935,7 +980,7 @@ fn render_sbs_row(
     )];
     right_line_spans.extend(right_spans);
     right_line_spans.push(Span::styled(
-        " ".repeat(right_pad),
+        spaces(right_pad),
         Style::default().bg(right_bg),
     ));
     f.render_widget(
@@ -945,17 +990,22 @@ fn render_sbs_row(
 }
 
 /// Pick the token stream for one SBS body: syntect tokens (bg overlaid per-token)
-/// when available, else a single plain-fg span with bg. `Arc` lets the caller
-/// pass a per-line handle it got cheaply from the hunk token table.
-fn build_sbs_body_tokens(
-    text: &str,
-    tokens: Option<&LineTokens>,
+/// when available, else a single plain-fg span with bg. Tokens are borrowed
+/// (`Cow::Borrowed`) so the overlay → clip pipeline doesn't allocate when
+/// the row has no search match. Lifetime `'a` ties the output to whichever
+/// of `text` / `tokens` it ends up referencing.
+fn build_sbs_body_tokens<'a>(
+    text: &'a str,
+    tokens: Option<&'a LineTokens>,
     fg: Color,
     bg: Color,
-) -> Vec<StyledToken> {
+) -> Vec<(Style, Cow<'a, str>)> {
     match tokens {
-        Some(toks) if !toks.is_empty() => toks.iter().map(|(s, t)| (s.bg(bg), t.clone())).collect(),
-        _ => vec![(Style::default().fg(fg).bg(bg), text.to_string())],
+        Some(toks) if !toks.is_empty() => toks
+            .iter()
+            .map(|(s, t)| (s.bg(bg), Cow::Borrowed(t.as_str())))
+            .collect(),
+        _ => vec![(Style::default().fg(fg).bg(bg), Cow::Borrowed(text))],
     }
 }
 
@@ -1041,7 +1091,7 @@ mod tests {
     ) -> DiffLine {
         DiffLine {
             tag,
-            content: content.to_string(),
+            content: Arc::from(content),
             old_lineno: old_no,
             new_lineno: new_no,
         }
@@ -1049,7 +1099,7 @@ mod tests {
 
     fn make_hunk(header: &str, lines: Vec<DiffLine>) -> DiffHunk {
         DiffHunk {
-            header: header.to_string(),
+            header: Arc::from(header),
             lines,
         }
     }
@@ -1135,8 +1185,8 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].left_tag, LineTag::Context);
         assert_eq!(rows[0].right_tag, LineTag::Context);
-        assert_eq!(rows[0].left_text, "same");
-        assert_eq!(rows[0].right_text, "same");
+        assert_eq!(rows[0].left_text.as_ref(), "same");
+        assert_eq!(rows[0].right_text.as_ref(), "same");
     }
 
     #[test]
@@ -1151,7 +1201,7 @@ mod tests {
         assert_eq!(rows[0].left_tag, LineTag::Context);
         assert!(rows[0].left_text.is_empty());
         assert_eq!(rows[0].right_tag, LineTag::Added);
-        assert_eq!(rows[0].right_text, "new line");
+        assert_eq!(rows[0].right_text.as_ref(), "new line");
     }
 
     #[test]
@@ -1164,7 +1214,7 @@ mod tests {
         let rows = get_rows(&lines);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].left_tag, LineTag::Removed);
-        assert_eq!(rows[0].left_text, "old line");
+        assert_eq!(rows[0].left_text.as_ref(), "old line");
         assert_eq!(rows[0].right_tag, LineTag::Context);
         assert!(rows[0].right_text.is_empty());
     }
@@ -1181,8 +1231,8 @@ mod tests {
         let lines = build_sbs_lines(&hunk, None);
         let rows = get_rows(&lines);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].left_text, "old");
-        assert_eq!(rows[0].right_text, "new");
+        assert_eq!(rows[0].left_text.as_ref(), "old");
+        assert_eq!(rows[0].right_text.as_ref(), "new");
     }
 
     #[test]

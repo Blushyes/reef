@@ -1,7 +1,37 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
+use std::borrow::Cow;
 use std::ops::Range;
+use std::sync::{Arc, LazyLock};
 use unicode_width::UnicodeWidthChar;
+
+/// Shared empty `Arc<str>` — handed out by `empty_arc_str()` so the
+/// many "no content for this half" SBS pairings, etc., don't each
+/// allocate a fresh empty Arc. `Arc::clone(&EMPTY)` is a refcount bump;
+/// `Arc::from("")` was a full allocation per call.
+static EMPTY_ARC_STR: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from(""));
+
+/// Cheap shared `Arc<str>` for the empty-string case.
+pub fn empty_arc_str() -> Arc<str> {
+    Arc::clone(&EMPTY_ARC_STR)
+}
+
+/// 256-cell ASCII space buffer. Most padding / clip-spans filler is well
+/// under this; render frame allocations were dominated by `" ".repeat(N)`
+/// because every visible diff/preview row added 1-3 of them.
+const SPACES_BUF: &str = "                                                                                                                                                                                                                                                                ";
+
+/// Borrow `n` spaces from the static buffer. Falls back to a fresh
+/// allocation only when `n` exceeds 256 cells (very wide terminals); the
+/// common case (≤256) is zero-alloc. Returns `Cow<'static, str>` so it
+/// flows directly into `Span::styled` without further conversion.
+pub fn spaces(n: usize) -> Cow<'static, str> {
+    if n <= SPACES_BUF.len() {
+        Cow::Borrowed(&SPACES_BUF[..n])
+    } else {
+        Cow::Owned(" ".repeat(n))
+    }
+}
 
 /// 从字符串头部按显示列截取，直到累计宽度超过 `max_width` 为止。返回
 /// 的切片以显示列为单位，保证不会切在宽字符中间。
@@ -22,8 +52,14 @@ pub fn truncate_to_width(s: &str, max_width: usize) -> &str {
 /// 等量的 filler 空格，确保多行同一 `skip_cols` 下的输出保持竖向对齐
 /// —— 不补 filler 会让后续内容向左漂移 1 列，多行混合 CJK 时整列错位。
 /// 右端超出 `max_width` 的宽字符直接整体丢弃（不强行半切）。
+///
+/// Tokens are `(Style, Cow<'_, str>)` so the overlay → clip pipeline can
+/// thread borrowed slices end-to-end. Callers that already hold owned
+/// `String` (e.g. test paths) wrap via `Cow::Owned`; render paths that
+/// borrow into `Arc<str>` use `Cow::Borrowed` and avoid the per-row
+/// `.to_string()` storm.
 pub fn clip_spans<'a>(
-    tokens: &'a [(Style, String)],
+    tokens: &'a [(Style, Cow<'a, str>)],
     skip_cols: usize,
     max_width: usize,
 ) -> Vec<Span<'a>> {
@@ -56,7 +92,7 @@ pub fn clip_spans<'a>(
                     let filler_w = skipped + cw - skip_cols;
                     let render = filler_w.min(max_width.saturating_sub(kept_cols));
                     if render > 0 {
-                        out.push(Span::styled(" ".repeat(render), *style));
+                        out.push(Span::styled(spaces(render), *style));
                         kept_cols += render;
                         if kept_cols >= max_width {
                             break 'outer;
@@ -105,17 +141,17 @@ pub fn clip_spans<'a>(
 /// Returns a new token vec with (potentially) more tokens because each match
 /// range that straddles a token boundary forces a split. Rows with no matches
 /// round-trip unchanged.
-pub fn overlay_match_highlight(
-    tokens: Vec<(Style, String)>,
+pub fn overlay_match_highlight<'a>(
+    tokens: Vec<(Style, Cow<'a, str>)>,
     ranges: &[Range<usize>],
     current_range: Option<Range<usize>>,
     match_bg: Color,
     current_bg: Color,
-) -> Vec<(Style, String)> {
+) -> Vec<(Style, Cow<'a, str>)> {
     if ranges.is_empty() {
         return tokens;
     }
-    let mut out: Vec<(Style, String)> = Vec::with_capacity(tokens.len());
+    let mut out: Vec<(Style, Cow<'a, str>)> = Vec::with_capacity(tokens.len());
     let mut abs = 0usize;
     for (style, text) in tokens {
         if text.is_empty() {
@@ -136,28 +172,48 @@ pub fn overlay_match_highlight(
             }
             let next_kind = kind_at(base_abs + i, ranges, current_range.as_ref());
             if next_kind != run_kind {
-                out.push(styled_segment(
-                    style,
-                    &text[seg_start..i],
-                    run_kind,
-                    match_bg,
-                    current_bg,
-                ));
+                push_match_segment(
+                    &mut out, style, &text, seg_start, i, run_kind, match_bg, current_bg,
+                );
                 seg_start = i;
                 run_kind = next_kind;
             }
         }
         if seg_start < len {
-            out.push(styled_segment(
-                style,
-                &text[seg_start..len],
-                run_kind,
-                match_bg,
-                current_bg,
-            ));
+            push_match_segment(
+                &mut out, style, &text, seg_start, len, run_kind, match_bg, current_bg,
+            );
         }
     }
     out
+}
+
+/// Slice `parent[start..end]` into `out` with the kind's style applied.
+/// Borrows when `parent` is `Cow::Borrowed`; allocates a fresh String when
+/// `parent` is `Cow::Owned` (the slice doesn't outlive the input Vec).
+/// Clippy's `ptr_arg` lint flags `&Cow<…>` but we genuinely need to
+/// discriminate the variants to pick borrow-vs-clone — silence it here.
+#[allow(clippy::ptr_arg, clippy::too_many_arguments)]
+fn push_match_segment<'a>(
+    out: &mut Vec<(Style, Cow<'a, str>)>,
+    base: Style,
+    parent: &Cow<'a, str>,
+    start: usize,
+    end: usize,
+    kind: MatchKind,
+    match_bg: Color,
+    current_bg: Color,
+) {
+    let style = match kind {
+        MatchKind::None => base,
+        MatchKind::Match => apply_search_bg(base, match_bg, /*is_current=*/ false),
+        MatchKind::Current => apply_search_bg(base, current_bg, /*is_current=*/ true),
+    };
+    let seg: Cow<'a, str> = match parent {
+        Cow::Borrowed(s) => Cow::Borrowed(&s[start..end]),
+        Cow::Owned(s) => Cow::Owned(s[start..end].to_string()),
+    };
+    out.push((style, seg));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,21 +235,6 @@ fn kind_at(abs: usize, ranges: &[Range<usize>], current: Option<&Range<usize>>) 
         }
     }
     MatchKind::None
-}
-
-fn styled_segment(
-    base: Style,
-    text: &str,
-    kind: MatchKind,
-    match_bg: Color,
-    current_bg: Color,
-) -> (Style, String) {
-    let style = match kind {
-        MatchKind::None => base,
-        MatchKind::Match => apply_search_bg(base, match_bg, /*is_current=*/ false),
-        MatchKind::Current => apply_search_bg(base, current_bg, /*is_current=*/ true),
-    };
-    (style, text.to_string())
 }
 
 fn apply_search_bg(base: Style, bg: Color, is_current: bool) -> Style {
@@ -226,14 +267,14 @@ fn apply_search_bg(base: Style, bg: Color, is_current: bool) -> Style {
 ///
 /// Empty ranges round-trip the tokens unchanged. Mirrors the split-at-boundary
 /// pattern in [`overlay_match_highlight`].
-pub fn overlay_selection_highlight(
-    tokens: Vec<(Style, String)>,
+pub fn overlay_selection_highlight<'a>(
+    tokens: Vec<(Style, Cow<'a, str>)>,
     range: Range<usize>,
-) -> Vec<(Style, String)> {
+) -> Vec<(Style, Cow<'a, str>)> {
     if range.start >= range.end {
         return tokens;
     }
-    let mut out: Vec<(Style, String)> = Vec::with_capacity(tokens.len());
+    let mut out: Vec<(Style, Cow<'a, str>)> = Vec::with_capacity(tokens.len());
     let mut abs = 0usize;
     for (style, text) in tokens {
         if text.is_empty() {
@@ -252,21 +293,13 @@ pub fn overlay_selection_highlight(
             }
             let next_selected = byte_in_range(base_abs + i, &range);
             if next_selected != run_selected {
-                out.push(styled_selection_segment(
-                    style,
-                    &text[seg_start..i],
-                    run_selected,
-                ));
+                push_selection_segment(&mut out, style, &text, seg_start, i, run_selected);
                 seg_start = i;
                 run_selected = next_selected;
             }
         }
         if seg_start < len {
-            out.push(styled_selection_segment(
-                style,
-                &text[seg_start..len],
-                run_selected,
-            ));
+            push_selection_segment(&mut out, style, &text, seg_start, len, run_selected);
         }
     }
     out
@@ -276,13 +309,25 @@ fn byte_in_range(abs: usize, range: &Range<usize>) -> bool {
     abs >= range.start && abs < range.end
 }
 
-fn styled_selection_segment(base: Style, text: &str, selected: bool) -> (Style, String) {
+#[allow(clippy::ptr_arg)]
+fn push_selection_segment<'a>(
+    out: &mut Vec<(Style, Cow<'a, str>)>,
+    base: Style,
+    parent: &Cow<'a, str>,
+    start: usize,
+    end: usize,
+    selected: bool,
+) {
     let style = if selected {
         base.add_modifier(Modifier::REVERSED)
     } else {
         base
     };
-    (style, text.to_string())
+    let seg: Cow<'a, str> = match parent {
+        Cow::Borrowed(s) => Cow::Borrowed(&s[start..end]),
+        Cow::Owned(s) => Cow::Owned(s[start..end].to_string()),
+    };
+    out.push((style, seg));
 }
 
 #[cfg(test)]
@@ -326,7 +371,7 @@ mod tests {
 
     #[test]
     fn clip_spans_skip_zero_equivalent_to_truncate() {
-        let tokens = vec![(sty(), "hello ".to_string()), (sty(), "world".to_string())];
+        let tokens = vec![(sty(), "hello ".into()), (sty(), "world".into())];
         let out = clip_spans(&tokens, 0, 8);
         let joined: String = out.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(joined, "hello wo");
@@ -334,7 +379,7 @@ mod tests {
 
     #[test]
     fn clip_spans_skip_past_first_token() {
-        let tokens = vec![(sty(), "hello ".to_string()), (sty(), "world".to_string())];
+        let tokens = vec![(sty(), "hello ".into()), (sty(), "world".into())];
         let out = clip_spans(&tokens, 6, 5);
         let joined: String = out.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(joined, "world");
@@ -343,7 +388,7 @@ mod tests {
 
     #[test]
     fn clip_spans_skip_splits_first_token() {
-        let tokens = vec![(sty(), "abcdef".to_string())];
+        let tokens = vec![(sty(), "abcdef".into())];
         let out = clip_spans(&tokens, 2, 10);
         let joined: String = out.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(joined, "cdef");
@@ -351,7 +396,7 @@ mod tests {
 
     #[test]
     fn clip_spans_max_width_zero_returns_empty() {
-        let tokens = vec![(sty(), "abc".to_string())];
+        let tokens = vec![(sty(), "abc".into())];
         assert!(clip_spans(&tokens, 0, 0).is_empty());
     }
 
@@ -363,7 +408,7 @@ mod tests {
         // clipped at the same `skip_cols` aligned vertically. Joined
         // output is " 好" (1 cell filler + 2 cells from '好'),
         // visible width 3.
-        let tokens = vec![(sty(), "你好".to_string())];
+        let tokens = vec![(sty(), "你好".into())];
         let out = clip_spans(&tokens, 1, 10);
         let joined: String = out.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(joined, " 好");
@@ -377,8 +422,8 @@ mod tests {
         // outputs of identical visible width. Without filler in
         // the straddle case, row B was 1 cell shorter and every
         // following column visually shifted left.
-        let row_a = vec![(sty(), "abcdef".to_string())]; // skip=1 cuts after 'a'
-        let row_b = vec![(sty(), "你好啊".to_string())]; // skip=1 splits '你'
+        let row_a = vec![(sty(), "abcdef".into())]; // skip=1 cuts after 'a'
+        let row_b = vec![(sty(), "你好啊".into())]; // skip=1 splits '你'
 
         let out_a = clip_spans(&row_a, 1, 5);
         let out_b = clip_spans(&row_b, 1, 5);
@@ -395,7 +440,7 @@ mod tests {
 
     #[test]
     fn clip_spans_skip_beyond_total_width() {
-        let tokens = vec![(sty(), "hi".to_string())];
+        let tokens = vec![(sty(), "hi".into())];
         assert!(clip_spans(&tokens, 10, 10).is_empty());
     }
 
@@ -403,7 +448,7 @@ mod tests {
     fn clip_spans_preserves_distinct_styles_across_tokens() {
         let a = Style::default();
         let b = Style::default().fg(ratatui::style::Color::Red);
-        let tokens = vec![(a, "hello".to_string()), (b, " world".to_string())];
+        let tokens = vec![(a, "hello".into()), (b, " world".into())];
         let out = clip_spans(&tokens, 0, 20);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].content.as_ref(), "hello");
@@ -414,7 +459,7 @@ mod tests {
 
     #[test]
     fn clip_spans_truncates_across_token_boundary() {
-        let tokens = vec![(sty(), "abc".to_string()), (sty(), "defgh".to_string())];
+        let tokens = vec![(sty(), "abc".into()), (sty(), "defgh".into())];
         let out = clip_spans(&tokens, 0, 5);
         let joined: String = out.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(joined, "abcde");
@@ -423,9 +468,9 @@ mod tests {
     #[test]
     fn clip_spans_empty_token_tolerated() {
         let tokens = vec![
-            (sty(), "".to_string()),
-            (sty(), "abc".to_string()),
-            (sty(), "".to_string()),
+            (sty(), "".into()),
+            (sty(), "abc".into()),
+            (sty(), "".into()),
         ];
         let out = clip_spans(&tokens, 1, 10);
         let joined: String = out.iter().map(|s| s.content.as_ref()).collect();
@@ -434,13 +479,13 @@ mod tests {
 
     // ── overlay_match_highlight ──────────────────────────────────────────────
 
-    fn collect_text(v: &[(Style, String)]) -> String {
-        v.iter().map(|(_, s)| s.as_str()).collect()
+    fn collect_text(v: &[(Style, Cow<'_, str>)]) -> String {
+        v.iter().map(|(_, s)| s.as_ref()).collect()
     }
 
     #[test]
     fn overlay_no_ranges_is_identity() {
-        let tokens = vec![(Style::default(), "hello".to_string())];
+        let tokens = vec![(Style::default(), "hello".into())];
         let out = overlay_match_highlight(
             tokens.clone(),
             &[],
@@ -453,7 +498,7 @@ mod tests {
 
     #[test]
     fn overlay_single_match_splits_and_colors() {
-        let tokens = vec![(Style::default(), "abcdef".to_string())];
+        let tokens = vec![(Style::default(), "abcdef".into())];
         let r = 2..4;
         let out = overlay_match_highlight(
             tokens,
@@ -474,10 +519,10 @@ mod tests {
     #[test]
     fn overlay_match_spans_token_boundary() {
         let tokens = vec![
-            (Style::default(), "abc".to_string()),
+            (Style::default(), "abc".into()),
             (
                 Style::default().fg(ratatui::style::Color::Red),
-                "def".to_string(),
+                "def".into(),
             ),
         ];
         // Range "bcde" — crosses boundary.
@@ -504,7 +549,7 @@ mod tests {
 
     #[test]
     fn overlay_current_overrides_match() {
-        let tokens = vec![(Style::default(), "foofoo".to_string())];
+        let tokens = vec![(Style::default(), "foofoo".into())];
         let out = overlay_match_highlight(
             tokens,
             &[0..3, 3..6],
@@ -522,7 +567,7 @@ mod tests {
         // Non-current match on a diff (bg-bearing) row uses REVERSED so
         // the diff add/remove color stays visible under the highlight.
         let base = Style::default().bg(ratatui::style::Color::Green);
-        let tokens = vec![(base, "abcdef".to_string())];
+        let tokens = vec![(base, "abcdef".into())];
         let r = 2..4;
         let out = overlay_match_highlight(
             tokens,
@@ -542,7 +587,7 @@ mod tests {
         // the active match unreadable on the amber highlight.
         let tokens = vec![(
             Style::default().fg(ratatui::style::Color::Magenta),
-            "foobar".to_string(),
+            "foobar".into(),
         )];
         let r = 0..3;
         let out = overlay_match_highlight(
@@ -566,7 +611,7 @@ mod tests {
         let base = Style::default()
             .bg(ratatui::style::Color::Green)
             .fg(ratatui::style::Color::Magenta);
-        let tokens = vec![(base, "abcdef".to_string())];
+        let tokens = vec![(base, "abcdef".into())];
         let r = 2..4;
         let out = overlay_match_highlight(
             tokens,
@@ -583,7 +628,7 @@ mod tests {
 
     #[test]
     fn overlay_preserves_text_across_segments() {
-        let tokens = vec![(Style::default(), "hello world".to_string())];
+        let tokens = vec![(Style::default(), "hello world".into())];
         let out = overlay_match_highlight(
             tokens,
             &[0..5, 6..11],
@@ -598,14 +643,14 @@ mod tests {
 
     #[test]
     fn selection_overlay_empty_range_is_identity() {
-        let tokens = vec![(Style::default(), "hello".to_string())];
+        let tokens = vec![(Style::default(), "hello".into())];
         let out = overlay_selection_highlight(tokens.clone(), 3..3);
         assert_eq!(out, tokens);
     }
 
     #[test]
     fn selection_overlay_reverses_range() {
-        let tokens = vec![(Style::default(), "abcdef".to_string())];
+        let tokens = vec![(Style::default(), "abcdef".into())];
         let out = overlay_selection_highlight(tokens, 2..4);
         assert_eq!(collect_text(&out), "abcdef");
         assert_eq!(out.len(), 3);
@@ -618,10 +663,10 @@ mod tests {
     #[test]
     fn selection_overlay_spans_token_boundary() {
         let tokens = vec![
-            (Style::default(), "abc".to_string()),
+            (Style::default(), "abc".into()),
             (
                 Style::default().fg(ratatui::style::Color::Red),
-                "def".to_string(),
+                "def".into(),
             ),
         ];
         let out = overlay_selection_highlight(tokens, 1..5);
@@ -640,7 +685,7 @@ mod tests {
 
     #[test]
     fn selection_overlay_full_token_range() {
-        let tokens = vec![(Style::default(), "abc".to_string())];
+        let tokens = vec![(Style::default(), "abc".into())];
         let out = overlay_selection_highlight(tokens, 0..3);
         assert_eq!(out.len(), 1);
         assert!(out[0].0.add_modifier.contains(Modifier::REVERSED));

@@ -1194,7 +1194,7 @@ impl From<reef_proto::DiffContentDto> for DiffContent {
 impl From<reef_proto::DiffHunkDto> for crate::git::DiffHunk {
     fn from(v: reef_proto::DiffHunkDto) -> Self {
         crate::git::DiffHunk {
-            header: v.header,
+            header: std::sync::Arc::from(v.header),
             lines: v.lines.into_iter().map(Into::into).collect(),
         }
     }
@@ -1204,7 +1204,7 @@ impl From<reef_proto::DiffLineDto> for crate::git::DiffLine {
     fn from(v: reef_proto::DiffLineDto) -> Self {
         crate::git::DiffLine {
             tag: v.tag.into(),
-            content: v.content,
+            content: std::sync::Arc::from(v.content),
             old_lineno: v.old_lineno,
             new_lineno: v.new_lineno,
         }

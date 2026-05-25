@@ -12,9 +12,7 @@
 use crate::app::App;
 use crate::input;
 use crate::input_edit;
-use crate::search::{
-    self, MatchLoc, Snapshot, center_scroll, find_all, restore_snapshot, take_snapshot,
-};
+use crate::search::{MatchLoc, Snapshot, center_scroll, find_all, restore_snapshot, take_snapshot};
 use crate::ui::selection::{DiffRowText, DiffSide};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::ops::Range;
@@ -36,9 +34,24 @@ pub struct FindWidgetState {
     pub regex: bool,
 
     pub target: Option<FindTarget>,
+    /// Match locations. **Invariant**: must agree with `row_index` —
+    /// mutate ONLY through `set_matches` / `clear_matches`. Direct
+    /// `matches.push(...)` or `matches = vec![...]` leaves `row_index`
+    /// stale and `ranges_on_row` will silently return empty results
+    /// for the desynced rows.
     pub matches: Vec<MatchLoc>,
     pub current: Option<usize>,
     pub snapshot: Option<Snapshot>,
+
+    /// `row → indices into matches`. Rebuilt by `set_matches` /
+    /// `clear_matches`. Mirrors `SearchState::row_index` so per-row
+    /// overlay lookup stays O(1+k) instead of O(matches.len()).
+    ///
+    /// **Invariant:** kept in sync via `set_matches` / `clear_matches`.
+    /// External code (tests etc.) using the struct-literal form should
+    /// pass `Default::default()` here; mutating after construction is
+    /// not supported.
+    pub row_index: std::collections::HashMap<usize, Vec<usize>>,
 
     /// Cached widget rect for mouse hit-testing.
     pub last_widget_rect: Option<ratatui::layout::Rect>,
@@ -63,9 +76,37 @@ pub enum FindTarget {
 }
 
 impl FindWidgetState {
+    /// Replace `matches` and rebuild the per-row lookup. Also resets
+    /// `current` to `None` — callers picking a fresh "current" must
+    /// assign it right after this call. Mirrors `SearchState::set_matches`'s
+    /// invariant so a future caller can't accidentally carry a stale
+    /// `current >= matches.len()` past the swap.
+    ///
+    /// Panic-safe: see `SearchState::set_matches` for the rationale on
+    /// the assign-before-index ordering.
+    pub fn set_matches(&mut self, matches: Vec<MatchLoc>) {
+        self.matches = matches;
+        self.current = None;
+        self.row_index.clear();
+        for (i, m) in self.matches.iter().enumerate() {
+            self.row_index.entry(m.row).or_default().push(i);
+        }
+    }
+
+    /// Empty `matches` + reset associated fields (index, current,
+    /// regex_error). Also clears `regex_error` so a panel-blur / Esc /
+    /// mode-swap path doesn't leak a stale error string into the
+    /// prompt render.
+    pub fn clear_matches(&mut self) {
+        self.matches.clear();
+        self.row_index.clear();
+        self.current = None;
+        self.regex_error = None;
+    }
+
     /// Ranges of matches on `row` for `target` plus the current-match
     /// range if it lives on this row. Render-time helper, mirrors
-    /// `SearchState::ranges_on_row`.
+    /// `SearchState::ranges_on_row` — O(1+k) via `row_index`.
     pub fn ranges_on_row(
         &self,
         target: FindTarget,
@@ -74,12 +115,13 @@ impl FindWidgetState {
         if self.target != Some(target) || self.matches.is_empty() {
             return (Vec::new(), None);
         }
-        let mut all = Vec::new();
+        let Some(idxs) = self.row_index.get(&row) else {
+            return (Vec::new(), None);
+        };
+        let mut all = Vec::with_capacity(idxs.len());
         let mut cur = None;
-        for (i, m) in self.matches.iter().enumerate() {
-            if m.row != row {
-                continue;
-            }
+        for &i in idxs {
+            let m = &self.matches[i];
             if Some(i) == self.current {
                 cur = Some(m.byte_range.clone());
             }
@@ -343,53 +385,74 @@ fn diff_target_from_layout(
     }
 }
 
-fn collect_rows(app: &App, target: FindTarget) -> Vec<String> {
+/// Returns a row vec where each entry borrows from `app` (`Cow::Borrowed(&str)`)
+/// when possible — the diff paths read directly from the precomputed
+/// `display.unified_row_texts` / `display.sbs_row_texts` rather than
+/// re-flattening the diff on every keystroke.
+fn collect_rows(app: &App, target: FindTarget) -> Vec<std::borrow::Cow<'_, str>> {
+    use std::borrow::Cow;
     match target {
         FindTarget::FilePreview => match app.preview_content.as_ref().map(|p| &p.body) {
-            Some(crate::file_tree::PreviewBody::Text { lines, .. }) => lines.clone(),
+            Some(crate::file_tree::PreviewBody::Text { lines, .. }) => {
+                lines.iter().map(|l| Cow::Borrowed(l.as_str())).collect()
+            }
             _ => Vec::new(),
         },
         FindTarget::DiffUnified => match &app.diff_content {
-            Some(d) => search::unified_display_rows(&d.diff),
+            Some(d) => row_texts_to_cows(&d.display.unified_row_texts),
             None => Vec::new(),
         },
         FindTarget::GraphDiffUnified => match &app.commit_detail.file_diff {
-            Some(d) => search::unified_display_rows(&d.diff),
+            Some(d) => row_texts_to_cows(&d.display.unified_row_texts),
             None => Vec::new(),
         },
         FindTarget::DiffSbsLeft => match &app.diff_content {
-            Some(d) => sbs_side_rows(&d.diff, DiffSide::SbsLeft),
+            Some(d) => sbs_side_cows(&d.display.sbs_row_texts, DiffSide::SbsLeft),
             None => Vec::new(),
         },
         FindTarget::DiffSbsRight => match &app.diff_content {
-            Some(d) => sbs_side_rows(&d.diff, DiffSide::SbsRight),
+            Some(d) => sbs_side_cows(&d.display.sbs_row_texts, DiffSide::SbsRight),
             None => Vec::new(),
         },
         FindTarget::GraphDiffSbsLeft => match &app.commit_detail.file_diff {
-            Some(d) => sbs_side_rows(&d.diff, DiffSide::SbsLeft),
+            Some(d) => sbs_side_cows(&d.display.sbs_row_texts, DiffSide::SbsLeft),
             None => Vec::new(),
         },
         FindTarget::GraphDiffSbsRight => match &app.commit_detail.file_diff {
-            Some(d) => sbs_side_rows(&d.diff, DiffSide::SbsRight),
+            Some(d) => sbs_side_cows(&d.display.sbs_row_texts, DiffSide::SbsRight),
             None => Vec::new(),
         },
     }
 }
 
-fn sbs_side_rows(diff: &crate::git::DiffContent, side: DiffSide) -> Vec<String> {
-    crate::ui::diff_panel::build_sbs_row_texts(diff)
-        .into_iter()
+fn row_texts_to_cows(rows: &[DiffRowText]) -> Vec<std::borrow::Cow<'_, str>> {
+    use std::borrow::Cow;
+    rows.iter()
         .map(|r| match r {
-            DiffRowText::Separator => String::new(),
-            DiffRowText::Header(h) => h,
-            // `build_sbs_row_texts` only ever emits Separator / Header /
-            // Sbs (paired rows), never `Unified` — exhaustive match keeps
-            // the compiler honest if the row enum grows new variants.
-            DiffRowText::Unified(s) => s,
+            DiffRowText::Separator => Cow::Borrowed(""),
+            DiffRowText::Header(s) => Cow::Borrowed(s.as_ref()),
+            DiffRowText::Unified(s) => Cow::Borrowed(s.as_ref()),
+            DiffRowText::Sbs { .. } => Cow::Borrowed(""),
+        })
+        .collect()
+}
+
+/// Project the precomputed `Arc<Vec<DiffRowText>>` from `DiffDisplay::build`
+/// onto the requested SBS side. Previously this re-ran the SBS pairing state
+/// machine on every keystroke; now it's an O(N) walk over already-shared
+/// `Arc<str>` rows, with zero per-row allocation (each output `Cow::Borrowed`
+/// points into the cached Arc).
+fn sbs_side_cows(rows: &[DiffRowText], side: DiffSide) -> Vec<std::borrow::Cow<'_, str>> {
+    use std::borrow::Cow;
+    rows.iter()
+        .map(|r| match r {
+            DiffRowText::Separator => Cow::Borrowed(""),
+            DiffRowText::Header(h) => Cow::Borrowed(h.as_ref()),
+            DiffRowText::Unified(s) => Cow::Borrowed(s.as_ref()),
             DiffRowText::Sbs { left, right } => match side {
-                DiffSide::SbsLeft => left,
-                DiffSide::SbsRight => right,
-                DiffSide::Unified => String::new(),
+                DiffSide::SbsLeft => Cow::Borrowed(left.as_ref()),
+                DiffSide::SbsRight => Cow::Borrowed(right.as_ref()),
+                DiffSide::Unified => Cow::Borrowed(""),
             },
         })
         .collect()
@@ -448,9 +511,8 @@ pub fn recompute(app: &mut App) {
     let query = app.find_widget.query.clone();
 
     if query.is_empty() {
-        app.find_widget.matches.clear();
-        app.find_widget.current = None;
-        app.find_widget.regex_error = None;
+        // `clear_matches` already nulls `regex_error` — see its doc.
+        app.find_widget.clear_matches();
         // Re-apply snapshot scroll so the view rests at the starting
         // position while the user is mid-edit. Matches the legacy
         // `/`-prompt feel where deleting back to empty undoes the jump.
@@ -489,7 +551,7 @@ pub fn recompute(app: &mut App) {
         }
     }
 
-    app.find_widget.matches = matches;
+    app.find_widget.set_matches(matches);
     app.find_widget.regex_error = regex_error;
     app.find_widget.current = pick_current(app, target);
     jump_to_current(app);

@@ -420,10 +420,47 @@ pub type DiffHighlighted = Vec<Vec<LineTokens>>;
 /// A diff plus its optional syntax-highlighted tokens. Used for the Git-tab
 /// working/staged diff (no path needed — the selected file is tracked
 /// elsewhere) where `CommitFileDiff` would be overkill.
+///
+/// `display` is the worker-built render cache (per-frame display rows +
+/// mouse-hit row_texts for both unified and SBS layouts). Wrapped in `Arc` so
+/// cloning the struct doesn't clone the cache, and so the renderer's
+/// `hit_slot` can share the same Vec without per-frame copy.
+///
+/// **Invariant**: `display` must be built from `diff` + `highlighted` via
+/// `HighlightedDiff::new`. Mutating `diff` or `highlighted` in place (both
+/// fields are pub for ergonomics) without rebuilding `display` desyncs
+/// the render-time row vectors from the underlying data — render shows
+/// stale text while `ranges_on_row` indexes into the new content. Always
+/// reassign the whole struct via `::new(...)` for content-changing
+/// updates.
 #[derive(Debug, Clone)]
 pub struct HighlightedDiff {
     pub diff: DiffContent,
-    pub highlighted: Option<DiffHighlighted>,
+    /// Syntax-highlighted tokens, shared as `Arc<DiffHighlighted>` so the
+    /// process-wide highlight cache can hand the same allocation to every
+    /// caller without cloning the deep `Vec<Vec<Arc<...>>>` structure.
+    /// `None` means the file's extension didn't resolve a syntax (or we
+    /// skipped highlighting due to size guards).
+    pub highlighted: Option<Arc<DiffHighlighted>>,
+    pub display: Arc<crate::ui::diff_panel::DiffDisplay>,
+}
+
+impl HighlightedDiff {
+    /// Build a `HighlightedDiff` and its render-cache (`DiffDisplay`) in one
+    /// step. Worker callers use this so tests don't have to know about the
+    /// cache wiring; pass the highlight result (or `None` if no syntax
+    /// resolved / highlighting was skipped).
+    pub fn new(diff: DiffContent, highlighted: Option<Arc<DiffHighlighted>>) -> Self {
+        let display = Arc::new(crate::ui::diff_panel::DiffDisplay::build(
+            &diff,
+            highlighted.as_deref(),
+        ));
+        Self {
+            diff,
+            highlighted,
+            display,
+        }
+    }
 }
 
 /// A loaded commit-file diff plus its optional syntax-highlighted tokens.
@@ -433,7 +470,23 @@ pub struct HighlightedDiff {
 pub struct CommitFileDiff {
     pub path: String,
     pub diff: DiffContent,
-    pub highlighted: Option<DiffHighlighted>,
+    pub highlighted: Option<Arc<DiffHighlighted>>,
+    pub display: Arc<crate::ui::diff_panel::DiffDisplay>,
+}
+
+impl CommitFileDiff {
+    pub fn new(path: String, diff: DiffContent, highlighted: Option<Arc<DiffHighlighted>>) -> Self {
+        let display = Arc::new(crate::ui::diff_panel::DiffDisplay::build(
+            &diff,
+            highlighted.as_deref(),
+        ));
+        Self {
+            path,
+            diff,
+            highlighted,
+            display,
+        }
+    }
 }
 
 /// Range-mode summary for the Graph tab's right panel. Shown instead of
@@ -6024,17 +6077,19 @@ mod tests {
         // without resetting search would leave `n`/`N` jumping to
         // rows that no longer correspond to anything visible.
         let mut fx = make_scope_fixture();
-        // Synthesize an active CommitGraph search.
+        // Synthesize an active CommitGraph search via `set_matches` so the
+        // `row_index` invariant holds (set_matches resets `current`, so
+        // assign it on the next line).
         fx.app.search = crate::search::SearchState {
             target: Some(crate::search::SearchTarget::CommitGraph),
-            matches: vec![crate::search::MatchLoc {
-                row: 0,
-                byte_range: 0..3,
-            }],
-            current: Some(0),
             query: "foo".into(),
             ..crate::search::SearchState::default()
         };
+        fx.app.search.set_matches(vec![crate::search::MatchLoc {
+            row: 0,
+            byte_range: 0..3,
+        }]);
+        fx.app.search.current = Some(0);
 
         fx.app
             .set_graph_scope(GraphScope::Branch("refs/heads/main".into()));
@@ -6053,14 +6108,14 @@ mod tests {
         let mut fx = make_scope_fixture();
         fx.app.search = crate::search::SearchState {
             target: Some(crate::search::SearchTarget::FilePreview),
-            matches: vec![crate::search::MatchLoc {
-                row: 5,
-                byte_range: 0..3,
-            }],
-            current: Some(0),
             query: "foo".into(),
             ..crate::search::SearchState::default()
         };
+        fx.app.search.set_matches(vec![crate::search::MatchLoc {
+            row: 5,
+            byte_range: 0..3,
+        }]);
+        fx.app.search.current = Some(0);
 
         fx.app
             .set_graph_scope(GraphScope::Branch("refs/heads/main".into()));

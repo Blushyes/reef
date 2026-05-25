@@ -1427,7 +1427,8 @@ fn build_spans_with_path_overlay(
     for (i, s) in row.spans.iter().enumerate() {
         if i == 1 {
             // Filename span — overlay here.
-            let tokens = vec![(s.style, s.text.clone())];
+            let tokens: Vec<(Style, std::borrow::Cow<'static, str>)> =
+                vec![(s.style, std::borrow::Cow::Owned(s.text.clone()))];
             let overlaid =
                 overlay_match_highlight(tokens, ranges, current.clone(), match_bg, current_bg);
             for (style, text) in overlaid {

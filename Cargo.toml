@@ -77,6 +77,10 @@ harness = false
 name = "graph"
 harness = false
 
+[[bench]]
+name = "diff_perf"
+harness = false
+
 # ─── Workspace ─────────────────────────────────────────────────────────────
 # Root is the `reef` crate itself; `crates/test-support` is a dev-only helper
 # lib used by this crate's integration tests. `fuzz/` is excluded and runs as

@@ -362,20 +362,18 @@ mod tests {
 
     #[test]
     fn counter_with_matches() {
-        let s = FindWidgetState {
-            matches: vec![
-                crate::search::MatchLoc {
-                    row: 0,
-                    byte_range: 0..1,
-                },
-                crate::search::MatchLoc {
-                    row: 0,
-                    byte_range: 2..3,
-                },
-            ],
-            current: Some(0),
-            ..FindWidgetState::default()
-        };
+        let mut s = FindWidgetState::default();
+        s.set_matches(vec![
+            crate::search::MatchLoc {
+                row: 0,
+                byte_range: 0..1,
+            },
+            crate::search::MatchLoc {
+                row: 0,
+                byte_range: 2..3,
+            },
+        ]);
+        s.current = Some(0);
         assert_eq!(format_counter(&s), "1/2");
     }
 

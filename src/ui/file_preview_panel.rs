@@ -58,7 +58,15 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         Some(preview) => preview,
     };
 
-    match &preview.body {
+    // `render_text` / `render_image` take `&mut App` (image protocol lives
+    // on App), which rules out the RAII-slot-guard pattern used in
+    // `diff_panel::render` — that pattern needs concurrent disjoint
+    // `&mut app.preview_content` and `&mut App`, which Rust forbids when
+    // the render fn re-borrows the whole `app`. Use `catch_unwind` instead
+    // so a panic inside the body renderers still restores
+    // `app.preview_content`, then re-raises. Pre-fix, the unwind skipped
+    // the restore and the panel render-emptied until re-selection.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &preview.body {
         PreviewBody::Text { .. } => render_text(f, app, inner, &preview, focused),
         PreviewBody::Image(img) => render_image(f, app, inner, &preview.file_path, img, focused),
         PreviewBody::Binary(info) => {
@@ -67,9 +75,13 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         PreviewBody::Database(info) => {
             crate::ui::db_preview::render(f, app, inner, &preview.file_path, info, focused)
         }
-    }
+    }));
 
     app.preview_content = Some(preview);
+
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
 }
 
 /// Transitional card shown while a preview request is in flight against a
@@ -391,10 +403,20 @@ fn render_text(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewConten
         // fallback: build a token vec, overlay any search matches for this row,
         // then clip horizontally. Keeps horizontal-scroll and search highlight
         // independent of whether syntax tokens were produced.
-        let base_tokens: Vec<(Style, String)> =
+        //
+        // Borrowed (`Cow::Borrowed`) all the way through so the per-row hot
+        // path doesn't allocate when there's no match — the previous code
+        // cloned every syntect token's String every frame.
+        let base_tokens: Vec<(Style, std::borrow::Cow<'_, str>)> =
             match highlighted.as_ref().and_then(|hh| hh.get(real_idx)) {
-                Some(tokens) => tokens.clone(),
-                None => vec![(Style::default().fg(th.fg_primary), line.clone())],
+                Some(tokens) => tokens
+                    .iter()
+                    .map(|(s, t)| (*s, std::borrow::Cow::Borrowed(t.as_str())))
+                    .collect(),
+                None => vec![(
+                    Style::default().fg(th.fg_primary),
+                    std::borrow::Cow::Borrowed(line.as_str()),
+                )],
             };
         // Find widget owns highlights when it targets the preview; the
         // legacy `/` search is mutually exclusive (either side clears

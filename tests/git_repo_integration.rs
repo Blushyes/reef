@@ -137,7 +137,7 @@ fn get_diff_unstaged_shows_additions() {
         .iter()
         .flat_map(|h| h.lines.iter())
         .filter(|l| l.tag == LineTag::Added)
-        .map(|l| l.content.as_str())
+        .map(|l| l.content.as_ref())
         .collect();
     assert!(added.iter().any(|c| c.contains("line2")));
 }
@@ -361,7 +361,7 @@ fn get_range_file_diff_collapses_multiple_edits() {
         .iter()
         .flat_map(|h| h.lines.iter())
         .filter(|l| matches!(l.tag, LineTag::Added))
-        .map(|l| l.content.as_str())
+        .map(|l| l.content.as_ref())
         .collect::<Vec<_>>()
         .join("\n");
     assert!(all_content.contains("v3"));

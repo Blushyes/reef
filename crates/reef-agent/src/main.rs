@@ -716,7 +716,7 @@ fn diff_to_dto(d: reef::git::DiffContent) -> DiffContentDto {
 
 fn diff_hunk_to_dto(h: reef::git::DiffHunk) -> DiffHunkDto {
     DiffHunkDto {
-        header: h.header,
+        header: h.header.to_string(),
         lines: h.lines.into_iter().map(diff_line_to_dto).collect(),
     }
 }
@@ -724,7 +724,7 @@ fn diff_hunk_to_dto(h: reef::git::DiffHunk) -> DiffHunkDto {
 fn diff_line_to_dto(l: reef::git::DiffLine) -> DiffLineDto {
     DiffLineDto {
         tag: line_tag_to_dto(l.tag),
-        content: l.content,
+        content: l.content.to_string(),
         old_lineno: l.old_lineno,
         new_lineno: l.new_lineno,
     }

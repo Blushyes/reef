@@ -400,7 +400,10 @@ fn render_entry_row(
     if ranges.is_empty() {
         spans.push(Span::styled(entry.name.clone(), name_base_style));
     } else {
-        let name_tokens = vec![(name_base_style, entry.name.clone())];
+        let name_tokens: Vec<(Style, std::borrow::Cow<'_, str>)> = vec![(
+            name_base_style,
+            std::borrow::Cow::Borrowed(entry.name.as_str()),
+        )];
         let overlaid = overlay_match_highlight(
             name_tokens,
             &ranges,

@@ -1696,27 +1696,436 @@ fn spawn_graph_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Gra
     tx
 }
 
+/// Skip highlighting when a diff exceeds this many content lines. Mirrors
+/// the preview path's `lines.len() <= 5_000` cap (see `file_tree::load_preview`)
+/// but lets diffs go further because the typical diff has way fewer lines than
+/// the file it came from. Past this point syntect's per-line cost stops being
+/// negligible (50k+ lines of generated code can stall the worker for
+/// seconds — bad even off the render path).
+const HIGHLIGHT_DIFF_LINE_CAP: usize = 10_000;
+
+/// Skip highlighting when the diff's total content byte size exceeds this.
+/// Matches `file_tree::load_preview`'s `raw.len() <= 512 * 1024` byte gate,
+/// scaled up since diffs are usually a subset of the file. A 2 MB diff is
+/// already in "regenerated file" territory and not interesting to colorize.
+const HIGHLIGHT_DIFF_BYTE_CAP: usize = 2 * 1024 * 1024;
+
+/// Max entries in the shared highlight cache. Each entry is one
+/// `Arc<DiffHighlighted>` (deep structure of `Vec<Vec<Arc<...>>>`); 32
+/// covers the typical "flip between 5-10 files in a working tree"
+/// pattern without unbounded growth. Eviction is true LRU (oldest entry
+/// pops when full) so a 33rd insert doesn't nuke the warm working set.
+const HIGHLIGHT_CACHE_MAX: usize = 32;
+
+/// Cell state with named variants (vs. the original `Option<Option<Arc<…>>>`
+/// where the outer Option was "Pending vs Done" and the inner was
+/// "highlight succeeded vs no syntax"). The double-Option encoding was
+/// reader-hostile and brittle to refactors — a future flatten would
+/// silently break the `while pending` loop in `wait`.
+enum CellState {
+    Pending,
+    Done(Option<Arc<DiffHighlighted>>),
+}
+
+/// Filled-once cell that lets late callers wait on an in-flight syntect
+/// computation instead of starting their own. First miss installs the
+/// cell into the LRU; concurrent misses for the same key grab the same
+/// `Arc<InFlightCell>` and `wait` on the Condvar until the first caller
+/// stores the result and `notify_all`s.
+struct InFlightCell {
+    state: std::sync::Mutex<CellState>,
+    cv: std::sync::Condvar,
+}
+
+impl InFlightCell {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(CellState::Pending),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Publish the result and wake all waiters. Idempotent — late
+    /// `PublishGuard::drop` calls after the worker already published
+    /// are silent no-ops (the second `Done` write would just overwrite
+    /// itself with the same value).
+    fn publish(&self, result: Option<Arc<DiffHighlighted>>) {
+        let mut g = self.state.lock().unwrap_or_else(|p| {
+            self.state.clear_poison();
+            p.into_inner()
+        });
+        // Skip if already published — protects against the Drop guard
+        // running after the explicit publish (cell.publish(result) then
+        // PublishGuard::drop tries to publish(None)).
+        if matches!(*g, CellState::Done(_)) {
+            return;
+        }
+        *g = CellState::Done(result);
+        self.cv.notify_all();
+    }
+
+    /// Block until `publish` runs. Poison-tolerant.
+    ///
+    /// The `v.clone()` happens while still holding the state mutex —
+    /// `Arc::clone` on the `Option<Arc<DiffHighlighted>>` is a single
+    /// atomic refcount bump so there's no real win in trying to hoist
+    /// it out (and structurally we can't — the borrow is anchored to
+    /// the guard). The explicit `drop(g)` makes the lock-release point
+    /// obvious and ensures subsequent woken waiters serialize only on
+    /// the cheap clone, not on whatever the caller does with `value`.
+    fn wait(&self) -> Option<Arc<DiffHighlighted>> {
+        let mut g = self.state.lock().unwrap_or_else(|p| {
+            self.state.clear_poison();
+            p.into_inner()
+        });
+        while matches!(*g, CellState::Pending) {
+            g = self.cv.wait(g).unwrap_or_else(|p| {
+                self.state.clear_poison();
+                p.into_inner()
+            });
+        }
+        let value = match &*g {
+            CellState::Done(v) => v.clone(),
+            CellState::Pending => unreachable!("loop only exits on Done"),
+        };
+        drop(g);
+        value
+    }
+}
+
+/// RAII guard that ensures `publish` runs on every exit from the
+/// syntect-compute window, including panic unwind. Without this, a
+/// panic between `Slot::InFlight(cell)` insertion and the explicit
+/// `cell.publish(result)` would strand every future caller for the
+/// same cache key on the Condvar forever — the cell would stay
+/// `Pending` and `wait()` would block indefinitely.
+struct PublishGuard {
+    cell: Arc<InFlightCell>,
+    key: u64,
+    armed: bool,
+}
+
+impl PublishGuard {
+    fn new(cell: Arc<InFlightCell>, key: u64) -> Self {
+        Self {
+            cell,
+            key,
+            armed: true,
+        }
+    }
+
+    /// Disarm the guard — call this after the explicit `cell.publish(result)`
+    /// so the subsequent `Drop` is a cheap no-op (it still runs, but the
+    /// early-`return` on `!self.armed` skips the `publish`/`lock_cache`
+    /// work). Use `std::mem::forget(self)` if you want to skip `Drop`
+    /// entirely; we deliberately don't, because Drop's branch is one
+    /// load + jump and panicking through `defuse` would still need the
+    /// safety net.
+    fn defuse(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PublishGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Panic path: publish None so waiters return cleanly (render falls
+        // back to plain colors). Then evict the InFlight slot from the
+        // cache so the next caller re-misses instead of re-waiting on a
+        // dead cell.
+        self.cell.publish(None);
+        let mut cache = lock_cache();
+        // Only drop the slot if it's still our cell — a concurrent
+        // worker may have already replaced it.
+        if let Some(Slot::InFlight(c)) = cache.map.get(&self.key) {
+            if Arc::ptr_eq(c, &self.cell) {
+                cache.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// LRU slot. `Ready` is a finished entry (highlight result or `None` for
+/// "we decided not to highlight"); `InFlight` is a syntect job currently
+/// running on some worker — late callers grab the Arc and `wait()`.
+enum Slot {
+    Ready(Option<Arc<DiffHighlighted>>),
+    InFlight(Arc<InFlightCell>),
+}
+
+/// Tiny hand-rolled LRU. 32 entries → linear scan is faster than a
+/// proper linked-list LRU's allocator overhead, and avoids a 3rd-party
+/// dep. `order` lists keys oldest→newest; on access, we move the touched
+/// key to the back.
+struct HighlightLru {
+    map: std::collections::HashMap<u64, Slot>,
+    order: std::collections::VecDeque<u64>,
+}
+
+impl HighlightLru {
+    fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::with_capacity(HIGHLIGHT_CACHE_MAX),
+            order: std::collections::VecDeque::with_capacity(HIGHLIGHT_CACHE_MAX),
+        }
+    }
+
+    /// Cheap structural-invariant guard. The map and order deque must
+    /// agree on which keys are live; both insert/touch/promote/remove
+    /// maintain this. Centralising the assert here surfaces any future
+    /// helper that drifts.
+    ///
+    /// The whole body is gated behind `cfg(debug_assertions)`:
+    ///   * release builds get a true no-op (no TLS read, no len calls),
+    ///   * debug builds run the panic-skip + `debug_assert_eq`. The
+    ///     skip is necessary because `PublishGuard::drop` calls into
+    ///     this method during unwind — a debug-only mismatch there
+    ///     would otherwise trigger Rust's panic-while-panicking abort.
+    #[cfg_attr(debug_assertions, inline)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn assert_invariant(&self) {
+        #[cfg(debug_assertions)]
+        {
+            if std::thread::panicking() {
+                return;
+            }
+            debug_assert_eq!(
+                self.map.len(),
+                self.order.len(),
+                "HighlightLru: map.len() must equal order.len()"
+            );
+        }
+    }
+
+    /// Peek the slot for `key` *without* taking ownership. Updates LRU
+    /// access order on hit. The two Slot variants return different shapes
+    /// so the caller (`highlight_diff`) can branch:
+    ///   * `Ready(v)` → clone the inner Option<Arc> and return immediately
+    ///   * `InFlight(cell)` → Arc::clone the cell, drop the cache lock,
+    ///     wait on the cell
+    fn touch(&mut self, key: &u64) -> Option<SlotView> {
+        self.assert_invariant();
+        let slot = self.map.get(key)?;
+        let view = match slot {
+            Slot::Ready(v) => SlotView::Ready(v.clone()),
+            Slot::InFlight(c) => SlotView::InFlight(Arc::clone(c)),
+        };
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+            self.order.push_back(*key);
+        }
+        Some(view)
+    }
+
+    fn insert(&mut self, key: u64, slot: Slot) {
+        self.assert_invariant();
+        if self.map.contains_key(&key) {
+            if let Some(pos) = self.order.iter().position(|k| k == &key) {
+                self.order.remove(pos);
+            }
+        } else if self.order.len() >= HIGHLIGHT_CACHE_MAX {
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            }
+        }
+        // Map insert first, order push second. Panic-safety analysis:
+        //   * New-key, non-full: neither pre-branch fires; on `map.insert`
+        //     rehash-panic both halves stay at old len → invariant holds.
+        //   * New-key, full: eviction popped front of order AND removed
+        //     from map (both decremented in lockstep above); on rehash
+        //     panic both stay at old-1 → invariant holds.
+        //   * Existing-key: `order.remove(pos)` ran above (order = old-1);
+        //     `map.insert` here is a *replace* which never rehashes,
+        //     so no panic window. If it did panic, order would be
+        //     old-1 vs map old → DESYNC. Currently unreachable because
+        //     all call sites guarantee key absence via `touch()`+None,
+        //     but a future caller adding `insert(existing_key, _)`
+        //     would re-open the bug — keep the eviction symmetry and
+        //     existing-key replace semantics in mind when extending.
+        self.map.insert(key, slot);
+        self.order.push_back(key);
+    }
+
+    /// Remove `key` from both halves of the LRU. Used by `PublishGuard`
+    /// to evict a dead InFlight slot on the panic-unwind path.
+    fn remove(&mut self, key: &u64) {
+        self.assert_invariant();
+        if self.map.remove(key).is_some() {
+            if let Some(pos) = self.order.iter().position(|k| k == key) {
+                self.order.remove(pos);
+            }
+        }
+    }
+
+    /// Promote an `InFlight(our_cell)` slot to `Ready(value)`, but ONLY
+    /// if the slot still holds `our_cell` — a concurrent worker may
+    /// have evicted us and installed its own InFlight, and overwriting
+    /// that slot would corrupt the second worker's cache view. Also
+    /// rotates the key to the back of the LRU order so a freshly-
+    /// computed result isn't immediately evictable just because the
+    /// InFlight slot sat near the front during the syntect window.
+    fn promote_if_owner(
+        &mut self,
+        key: u64,
+        our_cell: &Arc<InFlightCell>,
+        value: Option<Arc<DiffHighlighted>>,
+    ) {
+        self.assert_invariant();
+        match self.map.get(&key) {
+            Some(Slot::InFlight(c)) if Arc::ptr_eq(c, our_cell) => {
+                self.map.insert(key, Slot::Ready(value));
+                if let Some(pos) = self.order.iter().position(|k| k == &key) {
+                    self.order.remove(pos);
+                    self.order.push_back(key);
+                }
+            }
+            _ => {
+                // Either evicted (None) or replaced by a concurrent
+                // worker's InFlight (Slot::InFlight with a different
+                // cell pointer). Either way, don't touch the slot —
+                // the other worker's promote will handle it.
+            }
+        }
+    }
+
+    /// Clear the entire cache. Test/bench-only helper exposed via the
+    /// public reset hook so a unit test calling `highlight_diff` directly
+    /// can flush process-global state between tests.
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+}
+
+enum SlotView {
+    Ready(Option<Arc<DiffHighlighted>>),
+    InFlight(Arc<InFlightCell>),
+}
+
+type HighlightCache = std::sync::Mutex<HighlightLru>;
+
+fn highlight_cache() -> &'static HighlightCache {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<HighlightCache> = OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HighlightLru::new()))
+}
+
+/// Poison-tolerant lock: if a previous holder panicked, recover the
+/// inner state (it's just a cache — discarding the panic-time write is
+/// fine) and clear the poison flag so subsequent callers see a clean
+/// Mutex. Without this, one panic anywhere in any worker silently
+/// deadlocks the cache for the rest of the process lifetime.
+fn lock_cache() -> std::sync::MutexGuard<'static, HighlightLru> {
+    let m = highlight_cache();
+    match m.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            m.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
+/// Compute the per-diff cache key. Hashed inputs:
+///   - `dark` flag (1 byte) so theme toggle is its own lookup
+///   - path length prefix + path bytes (so `foo.rs`+`bar` and `foo`+`.rsbar`
+///     don't collide — without the length-prefix their byte streams match)
+///   - per-hunk: hunk_lens, header length + bytes (so two diffs with
+///     identical flat content but different hunk groupings produce
+///     different keys — without this the cached `Vec<Vec<...>>` shape
+///     can mismatch the requesting diff and silently mis-render)
+///   - per-line: length prefix + bytes
+fn highlight_cache_key(path: &str, diff: &DiffContent, dark: bool) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write_u8(u8::from(dark));
+    h.write_usize(path.len());
+    h.write(path.as_bytes());
+    h.write_usize(diff.hunks.len());
+    for hunk in &diff.hunks {
+        h.write_usize(hunk.header.len());
+        h.write(hunk.header.as_bytes());
+        h.write_usize(hunk.lines.len());
+        for line in &hunk.lines {
+            h.write_usize(line.content.len());
+            h.write(line.content.as_bytes());
+        }
+    }
+    h.finish()
+}
+
 /// Run syntect over the diff's content lines once per file and split the
 /// flat result into per-hunk slices so the renderer can index by
 /// `(hunk, line)`. Runs in worker threads — keeps the UI smooth on large
-/// diffs (a 10k-line diff takes ~50ms). Lines are fed through a single
-/// `HighlightLines` instance so state (e.g. open block comments) persists
-/// across hunks; this matches delta/bat's pragmatic approach of treating
-/// the hunk stream as a pseudo-file when the full file isn't available.
-/// Added/removed/context lines are mixed together — accepted imprecision
-/// for the 90% case. Returns `None` when no syntax resolves (unknown
-/// extension, binary, etc.), letting the renderer fall back to plain
-/// per-tag colors.
-fn highlight_diff(path: &str, diff: &DiffContent, dark: bool) -> Option<DiffHighlighted> {
-    let mut flat: Vec<String> = Vec::new();
+/// diffs (a 10k-line diff takes ~50ms).
+///
+/// Returns an `Arc<DiffHighlighted>` so cache hits and downstream sharing
+/// are O(1) refcount bumps instead of a deep clone of `Vec<Vec<Arc<...>>>`.
+/// `None` means we deliberately didn't highlight (no syntax resolves,
+/// or exceeds the size guards) — render falls back to plain per-tag colors.
+pub fn highlight_diff(path: &str, diff: &DiffContent, dark: bool) -> Option<Arc<DiffHighlighted>> {
+    let key = highlight_cache_key(path, diff, dark);
+
+    // First lookup: hit → return immediately; in-flight → wait on the cell;
+    // miss → install an `InFlight` cell and commit to running syntect ourselves.
+    let cell = {
+        let mut cache = lock_cache();
+        match cache.touch(&key) {
+            Some(SlotView::Ready(v)) => return v,
+            Some(SlotView::InFlight(c)) => {
+                drop(cache);
+                return c.wait();
+            }
+            None => {
+                // Size guards run on the FIRST caller's path only — concurrent
+                // callers with the same (path, diff, dark) key see Slot::InFlight
+                // and `wait()` on the cell, inheriting whatever decision this
+                // worker makes. That's safe today because the guards depend
+                // only on `diff` (which is part of the cache key, so equal-
+                // keyed callers see equal guards); if the guards ever grow a
+                // caller-dependent dimension (theme-conditional thresholds,
+                // viewport-dependent caps) this dedup needs to re-evaluate
+                // on each path.
+                let total_lines: usize = diff.hunks.iter().map(|h| h.lines.len()).sum();
+                if total_lines > HIGHLIGHT_DIFF_LINE_CAP {
+                    cache.insert(key, Slot::Ready(None));
+                    return None;
+                }
+                let total_bytes: usize = diff
+                    .hunks
+                    .iter()
+                    .flat_map(|h| h.lines.iter().map(|l| l.content.len()))
+                    .sum();
+                if total_bytes > HIGHLIGHT_DIFF_BYTE_CAP {
+                    cache.insert(key, Slot::Ready(None));
+                    return None;
+                }
+                // Claim — concurrent callers from here on `wait()` on this cell.
+                let cell = Arc::new(InFlightCell::new());
+                cache.insert(key, Slot::InFlight(Arc::clone(&cell)));
+                cell
+            }
+        }
+    };
+
+    // RAII guard: on panic between here and `defuse()` below, the Drop
+    // impl publishes `None` so any waiters return cleanly (no permanent
+    // deadlock) and evicts the dead InFlight slot from the LRU.
+    let guard = PublishGuard::new(Arc::clone(&cell), key);
+
+    // Hold no lock during syntect.
+    let total_lines: usize = diff.hunks.iter().map(|h| h.lines.len()).sum();
+    let mut flat: Vec<String> = Vec::with_capacity(total_lines);
     let mut hunk_lens: Vec<usize> = Vec::with_capacity(diff.hunks.len());
     for hunk in &diff.hunks {
         hunk_lens.push(hunk.lines.len());
         for line in &hunk.lines {
-            flat.push(line.content.clone());
+            flat.push(line.content.to_string());
         }
     }
-    highlight::highlight_file(path, &flat, dark).map(|flat_tokens| {
+    let result = highlight::highlight_file(path, &flat, dark).map(|flat_tokens| {
         // Wrap each line's tokens in `Arc` so downstream `tokens_for(li)`
         // clones are O(1). The iterator-based split hands each Arc to its
         // owning hunk without re-bumping refcounts.
@@ -1734,21 +2143,61 @@ fn highlight_diff(path: &str, diff: &DiffContent, dark: bool) -> Option<DiffHigh
             out.push(hunk);
         }
         out
-    })
+    });
+    let result = result.map(Arc::new);
+
+    // Publish to waiters first (releases anyone blocked on the cell).
+    cell.publish(result.clone());
+
+    // Promote the cache slot from `InFlight` to `Ready` — but only if we
+    // still own the slot. A concurrent worker may have evicted us and
+    // installed its own InFlight cell; overwriting that would orphan
+    // the other worker's waiters from the cache (they still get woken
+    // via their own cell's publish, but new callers would see Ready
+    // instead of InFlight and miss the deduplication). Also rotates
+    // the key to the back of the LRU order so a long syntect job's
+    // result isn't immediately evictable.
+    {
+        let mut cache = lock_cache();
+        cache.promote_if_owner(key, &cell, result.clone());
+    }
+
+    // Success path — disarm the guard so its Drop doesn't fire a
+    // redundant `publish(None)` (idempotent thanks to the early-return
+    // in `publish`, but still cheaper to skip the lock).
+    guard.defuse();
+
+    result
+}
+
+/// Drop every entry from the process-global highlight cache. Exposed
+/// for tests / benches that call `highlight_diff` directly — without
+/// this the cache state leaks across tests within the same binary,
+/// making "is this a hit or miss?" assertions non-deterministic.
+///
+/// **Caller responsibility**: only call when no worker thread is mid-
+/// `highlight_diff` for any key you care about. Clearing the LRU drops
+/// any live `Slot::InFlight(cell)` entries without notifying the cell;
+/// the worker's later `cell.publish` still wakes any waiters it had
+/// (they got the cell Arc before the clear), but new callers post-clear
+/// will miss and may run syntect again concurrently for the same key.
+/// Functionally correct (no deadlock, deterministic syntect output),
+/// but means the next two calls for that key duplicate the syntect run.
+///
+/// Marked `#[doc(hidden)]` since it's not part of the supported API.
+#[doc(hidden)]
+pub fn _reset_highlight_cache() {
+    lock_cache().clear();
 }
 
 fn build_commit_file_diff(path: String, diff: DiffContent, dark: bool) -> CommitFileDiff {
     let highlighted = highlight_diff(&path, &diff, dark);
-    CommitFileDiff {
-        path,
-        diff,
-        highlighted,
-    }
+    CommitFileDiff::new(path, diff, highlighted)
 }
 
 fn build_highlighted_diff(path: &str, diff: DiffContent, dark: bool) -> HighlightedDiff {
     let highlighted = highlight_diff(path, &diff, dark);
-    HighlightedDiff { diff, highlighted }
+    HighlightedDiff::new(diff, highlighted)
 }
 
 fn build_file_tree_payload(

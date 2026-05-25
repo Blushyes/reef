@@ -181,26 +181,31 @@ pub enum DiffRowText {
     /// copied text so drag-selections span seamlessly across it.
     Separator,
     /// `@@ -1,5 +2,7 @@` hunk header. Copy includes the full header text.
-    Header(String),
+    Header(std::sync::Arc<str>),
     /// Unified content row — left/right don't apply.
-    Unified(String),
+    Unified(std::sync::Arc<str>),
     /// SBS paired content row. Each half is its own selectable string,
-    /// picked by the selection's `side`.
-    Sbs { left: String, right: String },
+    /// picked by the selection's `side`. Arcs are shared with the
+    /// underlying `DiffLine.content` / `DiffHunk.header` so building this
+    /// snapshot from a diff is O(N) refcount bumps, not O(N×len) copies.
+    Sbs {
+        left: std::sync::Arc<str>,
+        right: std::sync::Arc<str>,
+    },
 }
 
 impl DiffRowText {
     pub fn text_for(&self, side: DiffSide) -> &str {
         match self {
             DiffRowText::Separator => "",
-            DiffRowText::Header(h) => h.as_str(),
-            DiffRowText::Unified(s) => s.as_str(),
+            DiffRowText::Header(h) => h.as_ref(),
+            DiffRowText::Unified(s) => s.as_ref(),
             DiffRowText::Sbs { left, right } => match side {
-                DiffSide::SbsLeft => left.as_str(),
+                DiffSide::SbsLeft => left.as_ref(),
                 // SBS content row requested through the unified side (rare —
                 // would mean a stale selection from a layout change): fall
                 // through to right like a context row.
-                DiffSide::SbsRight | DiffSide::Unified => right.as_str(),
+                DiffSide::SbsRight | DiffSide::Unified => right.as_ref(),
             },
         }
     }
@@ -237,7 +242,10 @@ pub struct DiffHit {
 
     /// Flattened display rows in the same order `render_*` produces them.
     /// Index into this vec is what `PreviewSelection.anchor.0` points at.
-    pub rows: Vec<DiffRowText>,
+    /// Wrapped in `Arc` so the per-frame `*hit_slot = Some(DiffHit { rows, .. })`
+    /// just bumps a refcount instead of cloning the whole vec — the rows
+    /// themselves are pre-built in `DiffDisplay` at load time.
+    pub rows: std::sync::Arc<Vec<DiffRowText>>,
 }
 
 impl DiffHit {
@@ -582,7 +590,7 @@ mod tests {
             h_scroll: 0,
             sbs_left_h_scroll: 0,
             sbs_right_h_scroll: 0,
-            rows,
+            rows: std::sync::Arc::new(rows),
         }
     }
 
@@ -599,7 +607,7 @@ mod tests {
             h_scroll: 0,
             sbs_left_h_scroll: 0,
             sbs_right_h_scroll: 0,
-            rows,
+            rows: std::sync::Arc::new(rows),
         }
     }
 

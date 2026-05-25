@@ -1167,17 +1167,18 @@ fn render_data_pane(
     // blue for INT, etc.). Bold to keep the name as the primary
     // emphasis; the chip below uses the same hue but unbolded so the
     // hierarchy reads as "name (bold) / type (lighter)".
-    let mut name_tokens: Vec<(Style, String)> = Vec::with_capacity(columns.len() * 2);
+    let mut name_tokens: Vec<(Style, std::borrow::Cow<'_, str>)> =
+        Vec::with_capacity(columns.len() * 2);
     for (i, col) in columns.iter().enumerate() {
         if i > 0 {
-            name_tokens.push((sep_bg_default, COL_SEP.to_string()));
+            name_tokens.push((sep_bg_default, std::borrow::Cow::Borrowed(COL_SEP)));
         }
         let w = col_widths.get(i).copied().unwrap_or(0);
         let aff = affinity_of(&col.decl_type);
         let style = Style::default()
             .fg(affinity_header_color(aff, theme))
             .add_modifier(Modifier::BOLD);
-        name_tokens.push((style, pad_to_width(&col.name, w)));
+        name_tokens.push((style, std::borrow::Cow::Owned(pad_to_width(&col.name, w))));
     }
     let name_spans = clip_spans(&name_tokens, h_scroll, area.width as usize);
     f.render_widget(
@@ -1190,15 +1191,19 @@ fn render_data_pane(
     // annotation. Empty for Affinity::None columns (rendered as
     // spaces) since there's no useful tag to show.
     if area.height >= 2 {
-        let mut type_tokens: Vec<(Style, String)> = Vec::with_capacity(columns.len() * 2);
+        let mut type_tokens: Vec<(Style, std::borrow::Cow<'_, str>)> =
+            Vec::with_capacity(columns.len() * 2);
         for (i, col) in columns.iter().enumerate() {
             if i > 0 {
-                type_tokens.push((sep_bg_default, COL_SEP.to_string()));
+                type_tokens.push((sep_bg_default, std::borrow::Cow::Borrowed(COL_SEP)));
             }
             let w = col_widths.get(i).copied().unwrap_or(0);
             let aff = affinity_of(&col.decl_type);
             let style = Style::default().fg(affinity_color(aff, theme));
-            type_tokens.push((style, pad_to_width(affinity_short(aff), w)));
+            type_tokens.push((
+                style,
+                std::borrow::Cow::Owned(pad_to_width(affinity_short(aff), w)),
+            ));
         }
         let type_spans = clip_spans(&type_tokens, h_scroll, area.width as usize);
         f.render_widget(
@@ -1256,10 +1261,10 @@ fn render_data_pane(
             );
         }
 
-        let mut tokens: Vec<(Style, String)> = Vec::with_capacity(row.len() * 2);
+        let mut tokens: Vec<(Style, std::borrow::Cow<'_, str>)> = Vec::with_capacity(row.len() * 2);
         for (c_idx, value) in row.iter().enumerate() {
             if c_idx > 0 {
-                tokens.push((bg_style, COL_SEP.to_string()));
+                tokens.push((bg_style, std::borrow::Cow::Borrowed(COL_SEP)));
             }
             let w = col_widths.get(c_idx).copied().unwrap_or(0);
             let mut cell_style_v = cell_style(value, theme);
@@ -1273,7 +1278,7 @@ fn render_data_pane(
             } else {
                 pad_to_width(&value.to_string(), w)
             };
-            tokens.push((cell_style_v, padded));
+            tokens.push((cell_style_v, std::borrow::Cow::Owned(padded)));
         }
         let spans = clip_spans(&tokens, h_scroll, area.width as usize);
         f.render_widget(

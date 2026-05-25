@@ -4,6 +4,7 @@ pub mod tree;
 use git2::{DiffOptions, Repository, Sort, StatusOptions};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
@@ -114,16 +115,27 @@ pub struct DiffContent {
     pub hunks: Vec<DiffHunk>,
 }
 
+/// One hunk of a diff. `header` is the `@@ -.. +.. @@` line plus optional
+/// section context (e.g. `@@ -1,5 +1,5 @@ fn foo`). Stored as `Arc<str>`
+/// so cloning a hunk for the SBS pairing / display cache is a refcount
+/// bump rather than a String allocation — the rendered display vector
+/// hands the same Arc through to the spans on every frame.
 #[derive(Debug, Clone)]
 pub struct DiffHunk {
-    pub header: String,
+    pub header: Arc<str>,
     pub lines: Vec<DiffLine>,
 }
 
+/// One line within a hunk. `content` is the raw text without the leading
+/// `+`/`-`/` ` marker (the marker is reconstructed from `tag` at render
+/// time). `Arc<str>` so `.clone()` is a refcount bump — the per-frame
+/// `pair_hunk_lines` and `DiffDisplay::build` paths rely on this being
+/// O(1); a `String` field would re-introduce per-line heap copies
+/// across every render.
 #[derive(Debug, Clone)]
 pub struct DiffLine {
     pub tag: LineTag,
-    pub content: String,
+    pub content: Arc<str>,
     pub old_lineno: Option<u32>,
     pub new_lineno: Option<u32>,
 }
@@ -433,7 +445,7 @@ impl GitRepo {
             .enumerate()
             .map(|(i, line)| DiffLine {
                 tag: LineTag::Added,
-                content: line.to_string(),
+                content: Arc::from(line),
                 old_lineno: None,
                 new_lineno: Some(i as u32 + 1),
             })
@@ -442,7 +454,7 @@ impl GitRepo {
         Some(DiffContent {
             file_path: path.to_string(),
             hunks: vec![DiffHunk {
-                header: format!("@@ -0,0 +1,{} @@ (new file)", lines.len()),
+                header: Arc::from(format!("@@ -0,0 +1,{} @@ (new file)", lines.len())),
                 lines,
             }],
         })
@@ -470,9 +482,12 @@ impl GitRepo {
                         '-' => LineTag::Removed,
                         _ => LineTag::Context,
                     };
-                    let content = String::from_utf8_lossy(line.content()).to_string();
-                    // Trim trailing newline
-                    let content = content.trim_end_matches('\n').to_string();
+                    // `from_utf8_lossy` returns `Cow::Borrowed` for ASCII (the common
+                    // case) — going straight from that slice into `Arc::from` is one
+                    // allocation; the earlier `.to_string().trim_end_matches(..)`
+                    // path paid two (the lossy String AND the Arc<str> buffer).
+                    let cow = String::from_utf8_lossy(line.content());
+                    let content: Arc<str> = Arc::from(cow.trim_end_matches('\n'));
 
                     let diff_line = DiffLine {
                         tag,
@@ -487,10 +502,11 @@ impl GitRepo {
                     }
                 }
                 'H' => {
-                    // Hunk header
-                    let header = String::from_utf8_lossy(line.content()).trim().to_string();
+                    // Hunk header. Same one-alloc pattern as the content branch
+                    // above — `from_utf8_lossy` → trim → `Arc::from(&str)`.
+                    let cow = String::from_utf8_lossy(line.content());
                     hunks.push(DiffHunk {
-                        header,
+                        header: Arc::from(cow.trim()),
                         lines: Vec::new(),
                     });
                 }

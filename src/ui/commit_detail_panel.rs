@@ -7,9 +7,8 @@ use crate::git::{DiffContent, FileEntry, FileStatus, LineTag};
 use crate::i18n::{Msg, t};
 use crate::search::SearchTarget;
 use crate::ui::git_graph_panel;
-use crate::ui::highlight::StyledToken;
 use crate::ui::mouse::ClickAction;
-use crate::ui::text::{clip_spans, overlay_match_highlight};
+use crate::ui::text::{clip_spans, empty_arc_str, overlay_match_highlight, spaces};
 use crate::ui::theme::Theme;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -71,8 +70,8 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
                 .filter_map(|r| r.sbs.as_ref())
                 .fold((0usize, 0usize), |(l, r), p| {
                     (
-                        l.max(UnicodeWidthStr::width(p.left_text.as_str())),
-                        r.max(UnicodeWidthStr::width(p.right_text.as_str())),
+                        l.max(UnicodeWidthStr::width(p.left_text.as_ref())),
+                        r.max(UnicodeWidthStr::width(p.right_text.as_ref())),
                     )
                 });
         let max_left_h = max_left_tw.saturating_sub(left_body_w);
@@ -133,17 +132,17 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
             .search
             .ranges_on_row(SearchTarget::CommitDetail, row_idx);
 
-        let base: Vec<(Style, String)> = row
+        let base: Vec<(Style, std::borrow::Cow<'_, str>)> = row
             .spans
             .iter()
-            .map(|s| (s.style, s.text.clone()))
+            .map(|s| (s.style, std::borrow::Cow::Borrowed(s.text.as_str())))
             .collect();
         let overlaid = if ranges.is_empty() {
             base
         } else {
             overlay_match_highlight(base, &ranges, cur, theme.search_match, theme.search_current)
         };
-        let final_tokens: Vec<(Style, String)> = overlaid
+        let final_tokens: Vec<(Style, std::borrow::Cow<'_, str>)> = overlaid
             .into_iter()
             .map(|(style, text)| {
                 (
@@ -268,12 +267,20 @@ fn render_sbs_row_live(
     // When syntax tokens exist, use them with the row's bg overlaid per-token
     // so added/removed shading still fills the half. Falls back to a single
     // plain-fg span otherwise. Arc-wrapped tokens deref transparently here.
-    let left_base_tokens: Vec<(Style, String)> = match &sbs.left_tokens {
+    let left_base_tokens: Vec<(Style, std::borrow::Cow<'_, str>)> = match &sbs.left_tokens {
         Some(toks) if !toks.is_empty() => toks
             .iter()
-            .map(|(s, t)| (style_with_bg(*s, left_bg), t.clone()))
+            .map(|(s, t)| {
+                (
+                    style_with_bg(*s, left_bg),
+                    std::borrow::Cow::Borrowed(t.as_str()),
+                )
+            })
             .collect(),
-        _ => vec![(l_body_base, sbs.left_text.clone())],
+        _ => vec![(
+            l_body_base,
+            std::borrow::Cow::Borrowed(sbs.left_text.as_ref()),
+        )],
     };
     let left_overlaid = if left_ranges.is_empty() {
         left_base_tokens
@@ -286,7 +293,7 @@ fn render_sbs_row_live(
             theme.search_current,
         )
     };
-    let left_hovered: Vec<(Style, String)> = left_overlaid
+    let left_hovered: Vec<(Style, std::borrow::Cow<'_, str>)> = left_overlaid
         .into_iter()
         .map(|(s, t)| (apply_hover(s), t))
         .collect();
@@ -298,12 +305,20 @@ fn render_sbs_row_live(
     let left_pad_w = left_body_w.saturating_sub(left_clipped_w);
 
     // Right body: mirror of left.
-    let right_base_tokens: Vec<(Style, String)> = match &sbs.right_tokens {
+    let right_base_tokens: Vec<(Style, std::borrow::Cow<'_, str>)> = match &sbs.right_tokens {
         Some(toks) if !toks.is_empty() => toks
             .iter()
-            .map(|(s, t)| (style_with_bg(*s, right_bg), t.clone()))
+            .map(|(s, t)| {
+                (
+                    style_with_bg(*s, right_bg),
+                    std::borrow::Cow::Borrowed(t.as_str()),
+                )
+            })
             .collect(),
-        _ => vec![(r_body_base, sbs.right_text.clone())],
+        _ => vec![(
+            r_body_base,
+            std::borrow::Cow::Borrowed(sbs.right_text.as_ref()),
+        )],
     };
     let right_overlaid = if right_ranges.is_empty() {
         right_base_tokens
@@ -316,7 +331,7 @@ fn render_sbs_row_live(
             theme.search_current,
         )
     };
-    let right_hovered: Vec<(Style, String)> = right_overlaid
+    let right_hovered: Vec<(Style, std::borrow::Cow<'_, str>)> = right_overlaid
         .into_iter()
         .map(|(s, t)| (apply_hover(s), t))
         .collect();
@@ -333,14 +348,14 @@ fn render_sbs_row_live(
         l_gutter_style,
     ));
     out.extend(left_clipped);
-    out.push(Span::styled(" ".repeat(left_pad_w), l_pad_style));
+    out.push(Span::styled(spaces(left_pad_w), l_pad_style));
     out.push(Span::styled("│".to_string(), sep_style));
     out.push(Span::styled(
         format!(" {} ", fmt_diff_lineno(sbs.right_no)),
         r_gutter_style,
     ));
     out.extend(right_clipped);
-    out.push(Span::styled(" ".repeat(right_pad_w), r_pad_style));
+    out.push(Span::styled(spaces(right_pad_w), r_pad_style));
 
     f.render_widget(Line::from(out), Rect::new(area.x, y, area.width, 1));
 }
@@ -476,11 +491,68 @@ pub fn scroll(app: &mut App, delta: i32) {
 
 // ─── Row model ────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Default)]
+/// Lazy/tagged span text. The original `String` field forced every
+/// `format!(…)` callsite to a single allocation but cost an extra heap
+/// copy on `Arc<str>` SBS body text; the intermediate `Arc<str>` field
+/// flipped that — SBS got zero-copy, but `format!()`-built gutter and
+/// header spans paid a redundant Arc reallocation per row per frame.
+/// This enum keeps every caller at exactly one allocation:
+///   * `&'static str` literals → no allocation, no refcount.
+///   * `format!()` / owned `String` → one alloc, moved into the variant.
+///   * `Arc<str>` from SBS body text → refcount bump only.
+#[derive(Debug, Clone)]
+enum SpanText {
+    Static(&'static str),
+    Owned(String),
+    Shared(std::sync::Arc<str>),
+}
+
+impl SpanText {
+    fn as_str(&self) -> &str {
+        match self {
+            SpanText::Static(s) => s,
+            SpanText::Owned(s) => s.as_str(),
+            SpanText::Shared(a) => a.as_ref(),
+        }
+    }
+    fn len(&self) -> usize {
+        self.as_str().len()
+    }
+}
+
+impl From<&'static str> for SpanText {
+    fn from(s: &'static str) -> Self {
+        SpanText::Static(s)
+    }
+}
+
+impl From<String> for SpanText {
+    fn from(s: String) -> Self {
+        SpanText::Owned(s)
+    }
+}
+
+impl From<std::sync::Arc<str>> for SpanText {
+    fn from(a: std::sync::Arc<str>) -> Self {
+        SpanText::Shared(a)
+    }
+}
+
+#[derive(Debug, Clone)]
 struct RowSpan {
-    text: String,
+    text: SpanText,
     style: Style,
     click: Option<(String, Value)>,
+}
+
+impl Default for RowSpan {
+    fn default() -> Self {
+        Self {
+            text: SpanText::Static(""),
+            style: Style::default(),
+            click: None,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -504,7 +576,12 @@ struct Row {
 struct SbsParts {
     left_tag: LineTag,
     left_no: Option<u32>,
-    left_text: String,
+    /// Per-half text — `Arc<str>` shared with the underlying `DiffLine.content`
+    /// so the per-frame `pair_hunk_lines` rebuild costs one refcount bump per
+    /// line, not a `String::clone` heap copy. (Pre-fix, the 2-col commit-detail
+    /// path was still doing `line.content.to_string()` per line per frame even
+    /// though `DiffLine.content` is now `Arc<str>`.)
+    left_text: std::sync::Arc<str>,
     /// Syntect-colored tokens for `left_text` — populated when syntax
     /// highlighting is available for the file. Concatenating token texts
     /// must yield exactly `left_text` (search byte offsets rely on this).
@@ -513,19 +590,19 @@ struct SbsParts {
     left_tokens: Option<LineTokens>,
     right_tag: LineTag,
     right_no: Option<u32>,
-    right_text: String,
+    right_text: std::sync::Arc<str>,
     right_tokens: Option<LineTokens>,
 }
 
 impl RowSpan {
-    fn plain(text: impl Into<String>) -> Self {
+    fn plain(text: impl Into<SpanText>) -> Self {
         Self {
             text: text.into(),
             style: Style::default(),
             click: None,
         }
     }
-    fn styled(text: impl Into<String>, style: Style) -> Self {
+    fn styled(text: impl Into<SpanText>, style: Style) -> Self {
         Self {
             text: text.into(),
             style,
@@ -569,8 +646,16 @@ impl Row {
 }
 
 fn from_ratatui_span(span: Span<'static>) -> RowSpan {
+    // Match on the Cow variant directly so a Borrowed `&'static str` stays
+    // Static (zero allocation), and an Owned `String` moves into Owned
+    // (no rebox into an Arc<str> like the previous `into_owned()` +
+    // `Arc::from` chain).
+    let text = match span.content {
+        std::borrow::Cow::Borrowed(s) => SpanText::Static(s),
+        std::borrow::Cow::Owned(s) => SpanText::Owned(s),
+    };
     RowSpan {
-        text: span.content.into_owned(),
+        text,
         style: span.style,
         click: None,
     }
@@ -666,7 +751,7 @@ fn build_rows(app: &App, width: u16, display_w: u16, theme: &Theme) -> Vec<Row> 
         append_diff_rows(
             &mut rows,
             &file_diff.diff,
-            file_diff.highlighted.as_ref(),
+            file_diff.highlighted.as_deref(),
             cd.diff_layout,
             width,
             display_w,
@@ -1055,7 +1140,7 @@ fn append_unified_diff(
             // and contributed to right-edge misalignment.
             let line_content_w = DIFF_GUTTER_WIDTH
                 .saturating_add(2)
-                .saturating_add(UnicodeWidthStr::width(line.content.as_str()));
+                .saturating_add(UnicodeWidthStr::width(line.content.as_ref()));
 
             let mut spans: Vec<RowSpan> = Vec::with_capacity(2 + clipped.len() + 1);
             spans.push(RowSpan::styled(format!(" {}  {}  ", old_no, new_no), g));
@@ -1076,20 +1161,20 @@ fn append_unified_diff(
 /// Otherwise falls back to a single plain-fg token. Takes the line's tokens
 /// directly (not the nested `DiffHighlighted`) so callers can hoist the
 /// per-hunk lookup out of the inner loop.
-fn content_tokens_for_line(
-    content: &str,
-    line_tokens: Option<&LineTokens>,
+fn content_tokens_for_line<'a>(
+    content: &'a str,
+    line_tokens: Option<&'a LineTokens>,
     fallback_fg: Color,
     bg: Option<Color>,
-) -> Vec<StyledToken> {
+) -> Vec<(Style, std::borrow::Cow<'a, str>)> {
     match line_tokens {
         Some(toks) if !toks.is_empty() => toks
             .iter()
-            .map(|(s, t)| (apply_bg(*s, bg), t.clone()))
+            .map(|(s, t)| (apply_bg(*s, bg), std::borrow::Cow::Borrowed(t.as_str())))
             .collect(),
         _ => {
             let style = apply_bg(Style::default().fg(fallback_fg), bg);
-            vec![(style, content.to_string())]
+            vec![(style, std::borrow::Cow::Borrowed(content))]
         }
     }
 }
@@ -1139,18 +1224,22 @@ fn build_sbs_row(parts: SbsParts, theme: &Theme) -> Row {
     let right_gutter_style = style_with_bg(Style::default().fg(theme.fg_secondary), right_bg);
     let right_body_style = style_with_bg(Style::default().fg(right_fg), right_bg);
 
+    // SBS row content. The left/right body spans pass `Arc::clone(&parts.{l,r}_text)`
+    // straight into `RowSpan` — zero heap copy on the per-frame render path.
+    // The gutter / divider spans still allocate (formatted strings / "│") but
+    // those are O(1) per row, not O(text-length).
     let spans = vec![
         RowSpan::styled(
             format!(" {} ", fmt_diff_lineno(parts.left_no)),
             left_gutter_style,
         ),
-        RowSpan::styled(parts.left_text.clone(), left_body_style),
-        RowSpan::styled("│".to_string(), Style::default().fg(theme.fg_secondary)),
+        RowSpan::styled(std::sync::Arc::clone(&parts.left_text), left_body_style),
+        RowSpan::styled("│", Style::default().fg(theme.fg_secondary)),
         RowSpan::styled(
             format!(" {} ", fmt_diff_lineno(parts.right_no)),
             right_gutter_style,
         ),
-        RowSpan::styled(parts.right_text.clone(), right_body_style),
+        RowSpan::styled(std::sync::Arc::clone(&parts.right_text), right_body_style),
     ];
     Row::new(spans).with_sbs(parts)
 }
@@ -1174,17 +1263,19 @@ fn pair_hunk_lines(
     hunk: &crate::git::DiffHunk,
     hunk_tokens: Option<&Vec<LineTokens>>,
 ) -> Vec<SbsParts> {
+    use std::sync::Arc;
     let mut rows = Vec::new();
     // Pending removed entries carry their per-line tokens so the left half
     // keeps its syntax highlighting when paired with a later Added line.
-    let mut pending_removed: Vec<(Option<u32>, String, Option<LineTokens>)> = Vec::new();
+    let mut pending_removed: Vec<(Option<u32>, Arc<str>, Option<LineTokens>)> = Vec::new();
     let tokens_for =
         |li: usize| -> Option<LineTokens> { hunk_tokens.and_then(|t| t.get(li)).cloned() };
+    let empty = empty_arc_str();
 
     for (li, line) in hunk.lines.iter().enumerate() {
         match line.tag {
             LineTag::Removed => {
-                pending_removed.push((line.old_lineno, line.content.clone(), tokens_for(li)));
+                pending_removed.push((line.old_lineno, Arc::clone(&line.content), tokens_for(li)));
             }
             LineTag::Added => {
                 let added_tokens = tokens_for(li);
@@ -1198,18 +1289,18 @@ fn pair_hunk_lines(
                         left_tokens: old_tokens,
                         right_tag: LineTag::Added,
                         right_no: line.new_lineno,
-                        right_text: line.content.clone(),
+                        right_text: Arc::clone(&line.content),
                         right_tokens: added_tokens,
                     });
                 } else {
                     rows.push(SbsParts {
                         left_tag: LineTag::Context,
                         left_no: None,
-                        left_text: String::new(),
+                        left_text: Arc::clone(&empty),
                         left_tokens: None,
                         right_tag: LineTag::Added,
                         right_no: line.new_lineno,
-                        right_text: line.content.clone(),
+                        right_text: Arc::clone(&line.content),
                         right_tokens: added_tokens,
                     });
                 }
@@ -1223,7 +1314,7 @@ fn pair_hunk_lines(
                         left_tokens: old_tokens,
                         right_tag: LineTag::Context,
                         right_no: None,
-                        right_text: String::new(),
+                        right_text: Arc::clone(&empty),
                         right_tokens: None,
                     });
                 }
@@ -1231,11 +1322,11 @@ fn pair_hunk_lines(
                 rows.push(SbsParts {
                     left_tag: LineTag::Context,
                     left_no: line.old_lineno,
-                    left_text: line.content.clone(),
+                    left_text: Arc::clone(&line.content),
                     left_tokens: ctx_tokens.clone(),
                     right_tag: LineTag::Context,
                     right_no: line.new_lineno,
-                    right_text: line.content.clone(),
+                    right_text: Arc::clone(&line.content),
                     right_tokens: ctx_tokens,
                 });
             }
@@ -1250,7 +1341,7 @@ fn pair_hunk_lines(
             left_tokens: old_tokens,
             right_tag: LineTag::Context,
             right_no: None,
-            right_text: String::new(),
+            right_text: Arc::clone(&empty),
             right_tokens: None,
         });
     }
@@ -1318,11 +1409,16 @@ pub fn searchable_rows(app: &App) -> Vec<String> {
     let rows = build_rows(app, u16::MAX, u16::MAX, &app.theme);
     rows.into_iter()
         .map(|r| {
-            r.spans
-                .into_iter()
-                .map(|s| s.text)
-                .collect::<Vec<_>>()
-                .join("")
+            // `RowSpan.text` is `SpanText` (Static / Owned / Shared) —
+            // push each span's bytes into one owned String per row.
+            // Matches the old `Vec<String>.join("")` behavior without
+            // going through an intermediate `Vec<&str>` allocation.
+            let total: usize = r.spans.iter().map(|s| s.text.len()).sum();
+            let mut out = String::with_capacity(total);
+            for s in &r.spans {
+                out.push_str(s.text.as_str());
+            }
+            out
         })
         .collect()
 }
@@ -1386,17 +1482,17 @@ mod tests {
     fn pair_hunk_lines_threads_tokens_through_pairing() {
         use crate::git::{DiffHunk, DiffLine};
         let hunk = DiffHunk {
-            header: "@@ -1,1 +1,1 @@".to_string(),
+            header: "@@ -1,1 +1,1 @@".into(),
             lines: vec![
                 DiffLine {
                     tag: LineTag::Removed,
-                    content: "old".to_string(),
+                    content: "old".into(),
                     old_lineno: Some(1),
                     new_lineno: None,
                 },
                 DiffLine {
                     tag: LineTag::Added,
-                    content: "new".to_string(),
+                    content: "new".into(),
                     old_lineno: None,
                     new_lineno: Some(1),
                 },
@@ -1420,10 +1516,10 @@ mod tests {
     fn pair_hunk_lines_end_of_hunk_flush_preserves_tokens() {
         use crate::git::{DiffHunk, DiffLine};
         let hunk = DiffHunk {
-            header: "@@ -1,1 +1,0 @@".to_string(),
+            header: "@@ -1,1 +1,0 @@".into(),
             lines: vec![DiffLine {
                 tag: LineTag::Removed,
-                content: "gone".to_string(),
+                content: "gone".into(),
                 old_lineno: Some(1),
                 new_lineno: None,
             }],
@@ -1497,17 +1593,17 @@ mod tests {
         let parts = SbsParts {
             left_tag: LineTag::Context,
             left_no: Some(1),
-            left_text: "old".to_string(),
+            left_text: "old".into(),
             left_tokens: None,
             right_tag: LineTag::Context,
             right_no: Some(2),
-            right_text: "new".to_string(),
+            right_text: "new".into(),
             right_tokens: None,
         };
         let row = build_sbs_row(parts.clone(), &theme);
         let marker = row.sbs.as_ref().expect("SBS row must carry sbs marker");
-        assert_eq!(marker.left_text, "old");
-        assert_eq!(marker.right_text, "new");
+        assert_eq!(marker.left_text.as_ref(), "old");
+        assert_eq!(marker.right_text.as_ref(), "new");
     }
 
     /// SBS search highlight regression test: ranges in a flat row string
@@ -1570,29 +1666,29 @@ mod tests {
             SbsParts {
                 left_tag: LineTag::Context,
                 left_no: Some(1),
-                left_text: "x".repeat(100), // long left
+                left_text: "x".repeat(100).into(), // long left
                 left_tokens: None,
                 right_tag: LineTag::Context,
                 right_no: Some(1),
-                right_text: "y".repeat(50), // shorter right
+                right_text: "y".repeat(50).into(), // shorter right
                 right_tokens: None,
             },
             SbsParts {
                 left_tag: LineTag::Context,
                 left_no: Some(2),
-                left_text: "z".repeat(10), // short left
+                left_text: "z".repeat(10).into(), // short left
                 left_tokens: None,
                 right_tag: LineTag::Context,
                 right_no: Some(2),
-                right_text: "w".repeat(200), // very long right
+                right_text: "w".repeat(200).into(), // very long right
                 right_tokens: None,
             },
         ];
 
         let (max_left_tw, max_right_tw) = parts.iter().fold((0usize, 0usize), |(l, r), p| {
             (
-                l.max(UnicodeWidthStr::width(p.left_text.as_str())),
-                r.max(UnicodeWidthStr::width(p.right_text.as_str())),
+                l.max(UnicodeWidthStr::width(p.left_text.as_ref())),
+                r.max(UnicodeWidthStr::width(p.right_text.as_ref())),
             )
         });
         let max_left_h = max_left_tw.saturating_sub(left_body_w);

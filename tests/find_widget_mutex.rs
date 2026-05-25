@@ -39,20 +39,22 @@ fn opening_widget_clears_legacy_search() {
 
     // Park the legacy `/` in a dormant-but-non-empty state — the
     // "user committed a search, then went back to navigating" shape.
+    // Go through `set_matches` so the `row_index` invariant holds.
     app.search = SearchState {
         active: false,
         backwards: false,
         query: "foo".to_string(),
         cursor: 3,
         target: Some(SearchTarget::FilePreview),
-        matches: vec![MatchLoc {
-            row: 0,
-            byte_range: 0..3,
-        }],
-        current: Some(0),
         snapshot: None,
         wrap_msg: None,
+        ..SearchState::default()
     };
+    app.search.set_matches(vec![MatchLoc {
+        row: 0,
+        byte_range: 0..3,
+    }]);
+    app.search.current = Some(0);
     assert_eq!(app.search.target, Some(SearchTarget::FilePreview));
 
     // Opening the widget must wipe `app.search` so its highlights stop

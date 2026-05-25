@@ -30,41 +30,41 @@ fn fresh_app() -> (App, TempDir, CwdGuard) {
 /// left-vs-right targeted search can distinguish them.
 fn install_paired_diff(app: &mut App) {
     let hunk = DiffHunk {
-        header: "@@ -1,3 +1,3 @@".to_string(),
+        header: "@@ -1,3 +1,3 @@".into(),
         lines: vec![
             DiffLine {
                 tag: LineTag::Context,
-                content: "ctx 1".to_string(),
+                content: "ctx 1".into(),
                 old_lineno: Some(1),
                 new_lineno: Some(1),
             },
             DiffLine {
                 tag: LineTag::Removed,
-                content: "old needle here".to_string(),
+                content: "old needle here".into(),
                 old_lineno: Some(2),
                 new_lineno: None,
             },
             DiffLine {
                 tag: LineTag::Added,
-                content: "new needle there".to_string(),
+                content: "new needle there".into(),
                 old_lineno: None,
                 new_lineno: Some(2),
             },
             DiffLine {
                 tag: LineTag::Context,
-                content: "ctx 3".to_string(),
+                content: "ctx 3".into(),
                 old_lineno: Some(3),
                 new_lineno: Some(3),
             },
         ],
     };
-    app.diff_content = Some(HighlightedDiff {
-        diff: DiffContent {
+    app.diff_content = Some(HighlightedDiff::new(
+        DiffContent {
             file_path: "scratch.rs".to_string(),
             hunks: vec![hunk],
         },
-        highlighted: None,
-    });
+        None,
+    ));
 }
 
 fn diff_selection(side: DiffSide) -> DiffSelection {

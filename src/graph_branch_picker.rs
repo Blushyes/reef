@@ -136,6 +136,25 @@ impl GraphBranchPickerState {
         self.core.close();
     }
 
+    /// Bracketed-paste arrival while the picker is active. Folds the
+    /// payload into `core.filter` (CR/LF dropped — branch refs are
+    /// single-line) and snaps selection back to the top, mirroring the
+    /// `InputOutcome::Edited` path in `handle_key_graph_branch_picker`.
+    ///
+    /// Does NOT touch `self.scroll` — the keystroke `Edited` arm
+    /// leaves scroll alone and relies on the renderer to pull
+    /// `selected_idx` back into view. Resetting it here would diverge
+    /// from the typing path that this function is meant to mirror.
+    ///
+    /// The memoised [`visible_rows`] cache keys on the lowercased filter
+    /// string, so the paste automatically invalidates it; no
+    /// `mark_dirty` call is needed.
+    pub fn handle_paste(&mut self, s: &str) {
+        if crate::input_edit::paste_single_line(s, &mut self.core.filter, &mut self.core.cursor) {
+            self.core.selected_idx = 0;
+        }
+    }
+
     /// Drop the memoised [`visible_rows`] result. Call this if any
     /// future writer mutates `all_branches` or `recent` IN PLACE
     /// (e.g. swapping one entry for another of the same kind, or
@@ -424,6 +443,46 @@ mod tests {
         assert_eq!(outcome, crate::input_edit::Outcome::Edited);
         assert_eq!(s.core.filter, "你");
         assert_eq!(s.core.cursor, 3);
+    }
+
+    #[test]
+    fn handle_paste_inserts_into_filter_and_resets_selection() {
+        let mut s = GraphBranchPickerState::default();
+        s.open(
+            &ref_map(&[
+                ("aaaa", &[RefLabel::Branch("main".into())]),
+                ("bbbb", &[RefLabel::Branch("feature/x".into())]),
+                ("cccc", &[RefLabel::Branch("release/v1".into())]),
+            ]),
+            vec![],
+            &GraphScope::AllRefs,
+        );
+        s.core.selected_idx = 2;
+        s.scroll = 5;
+        s.handle_paste("feat");
+        assert_eq!(s.core.filter, "feat");
+        assert_eq!(s.core.cursor, 4);
+        // Edited path snaps selection back to the top so the user
+        // sees the row matching the just-pasted filter.
+        assert_eq!(s.core.selected_idx, 0);
+        // Scroll is NOT reset — keystroke path doesn't touch it
+        // either; the renderer pulls selected_idx back into view.
+        assert_eq!(s.scroll, 5);
+        // Cache key includes the filter, so the next visible_rows()
+        // call must reflect the paste rather than returning a stale
+        // pre-paste row set.
+        let rows = s.visible_rows();
+        assert!(
+            rows.iter()
+                .any(|r| matches!(r, BranchPickerRow::Branch(b) if b.display == "feature/x")),
+            "post-paste rows must include the filtered branch"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|r| matches!(r, BranchPickerRow::Branch(b) if b.display == "main")),
+            "post-paste rows must drop branches that don't match the filter"
+        );
     }
 
     #[test]

@@ -207,6 +207,32 @@ pub fn paste_single_line(s: &str, text: &mut String, cursor: &mut usize) -> bool
     true
 }
 
+/// Filtered variant of [`paste_single_line`] for buffers with a content
+/// predicate (e.g. digits only, file-name chars only). CR/LF are dropped
+/// unconditionally, then every remaining char must satisfy `accept(c)`
+/// to land in `text`. Rejected chars are silently swallowed, mirroring
+/// the per-char behaviour of [`dispatch_key_filtered`] so the buffer
+/// stays in a perpetually-valid state across both typing and pasting.
+///
+/// Returns `true` when at least one char actually landed.
+pub fn paste_single_line_filtered<F: Fn(char) -> bool>(
+    s: &str,
+    text: &mut String,
+    cursor: &mut usize,
+    accept: F,
+) -> bool {
+    let filtered: String = s
+        .chars()
+        .filter(|c| *c != '\n' && *c != '\r' && accept(*c))
+        .collect();
+    if filtered.is_empty() {
+        return false;
+    }
+    text.insert_str(*cursor, &filtered);
+    *cursor += filtered.len();
+    true
+}
+
 pub fn backspace(text: &mut String, cursor: &mut usize) {
     if *cursor == 0 {
         return;
@@ -564,6 +590,41 @@ mod tests {
         assert!(!paste_single_line("\n\r\n", &mut t, &mut c));
         assert_eq!(t, "keep");
         assert_eq!(c, 4);
+    }
+
+    #[test]
+    fn paste_single_line_filtered_keeps_only_accepted_chars() {
+        // Digit-only predicate models the SQLite goto-page input.
+        // Letters between digits are swallowed silently — the buffer
+        // stays in a perpetually-valid state across paste, mirroring
+        // dispatch_key_filtered's per-char behaviour.
+        let (mut t, mut c) = state("", 0);
+        assert!(paste_single_line_filtered("1a2b3", &mut t, &mut c, |c| c.is_ascii_digit(),));
+        assert_eq!(t, "123");
+        assert_eq!(c, 3);
+    }
+
+    #[test]
+    fn paste_single_line_filtered_returns_false_when_predicate_rejects_everything() {
+        let (mut t, mut c) = state("keep", 4);
+        assert!(!paste_single_line_filtered("abc", &mut t, &mut c, |c| c.is_ascii_digit(),));
+        assert_eq!(t, "keep");
+        assert_eq!(c, 4);
+    }
+
+    #[test]
+    fn paste_single_line_filtered_drops_crlf_alongside_predicate() {
+        // CR/LF stripping must precede the predicate so a "1\n2"
+        // payload doesn't trip a predicate that only accepts digits.
+        let (mut t, mut c) = state("", 0);
+        assert!(paste_single_line_filtered(
+            "1\r\n2\n3",
+            &mut t,
+            &mut c,
+            |c| c.is_ascii_digit(),
+        ));
+        assert_eq!(t, "123");
+        assert_eq!(c, 3);
     }
 
     #[test]

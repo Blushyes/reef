@@ -142,6 +142,38 @@ impl HostsPickerState {
         }
     }
 
+    /// Bracketed-paste arrival while the picker is active. Routes the
+    /// payload to whichever single-line buffer is currently in focus:
+    /// `core.filter` in Search mode, `path_buffer` in Path mode. CR/LF
+    /// are dropped — both buffers are single-line.
+    ///
+    /// Mirrors `quick_open::handle_paste` for the filter side and the
+    /// hand-rolled editor wiring at the bottom of
+    /// `input::handle_key_hosts_picker` for the path side.
+    pub fn handle_paste(&mut self, s: &str) {
+        match self.input_mode {
+            InputMode::Search => {
+                if crate::input_edit::paste_single_line(
+                    s,
+                    &mut self.core.filter,
+                    &mut self.core.cursor,
+                ) {
+                    // Filter changed — reset list cursor to the top,
+                    // matching the `InputOutcome::Edited` arm in
+                    // PickerCore consumers (quick_open / global_search).
+                    self.core.selected_idx = 0;
+                }
+            }
+            InputMode::Path => {
+                let _ = crate::input_edit::paste_single_line(
+                    s,
+                    &mut self.path_buffer,
+                    &mut self.path_cursor,
+                );
+            }
+        }
+    }
+
     /// Apply the current filter against the cached parsed hosts. Recent
     /// targets always appear first; subsequent entries are anything
     /// whose alias / hostname contains the filter (case-insensitive).
@@ -365,6 +397,45 @@ mod tests {
         let recent = vec![one.clone(), two.clone()];
         let pushed = bump_recent(recent, one.clone());
         assert_eq!(pushed, vec![one, two]);
+    }
+
+    #[test]
+    fn handle_paste_routes_to_filter_in_search_mode() {
+        let mut s = HostsPickerState::default();
+        s.open(vec![h("prod")], vec![]);
+        s.core.selected_idx = 7;
+        s.handle_paste("staging");
+        assert_eq!(s.core.filter, "staging");
+        assert_eq!(s.core.cursor, 7);
+        // Filter changed → selection must snap to top, mirroring the
+        // `InputOutcome::Edited` arm in PickerCore consumers.
+        assert_eq!(s.core.selected_idx, 0);
+        // Path buffer untouched.
+        assert!(s.path_buffer.is_empty());
+    }
+
+    #[test]
+    fn handle_paste_routes_to_path_buffer_in_path_mode() {
+        let mut s = HostsPickerState::default();
+        s.open(vec![], vec![]);
+        s.input_mode = InputMode::Path;
+        s.handle_paste("user@host:/srv");
+        assert_eq!(s.path_buffer, "user@host:/srv");
+        assert_eq!(s.path_cursor, "user@host:/srv".len());
+        // Filter side stays clean — path mode and search mode are
+        // mutually exclusive buffers.
+        assert!(s.core.filter.is_empty());
+    }
+
+    #[test]
+    fn handle_paste_strips_crlf_in_both_modes() {
+        let mut s = HostsPickerState::default();
+        s.open(vec![], vec![]);
+        s.handle_paste("ab\r\ncd");
+        assert_eq!(s.core.filter, "abcd");
+        s.input_mode = InputMode::Path;
+        s.handle_paste("xy\nzw");
+        assert_eq!(s.path_buffer, "xyzw");
     }
 
     #[test]

@@ -3840,26 +3840,92 @@ fn handle_mouse_place_mode(mouse: MouseEvent, app: &mut App) {
 
 // ─── Bracketed paste dispatch ────────────────────────────────────────────────
 
-/// Entry point for `Event::Paste(s)` from the main loop. Priorities:
+/// Entry point for `Event::Paste(s)` from the main loop.
 ///
-/// 1. If the payload parses as one or more existing absolute paths, enter
-///    drag-and-drop place mode with those sources.
-/// 2. Otherwise, if an input field has focus (quick-open palette, search
-///    prompt), forward the payload as typed text.
-/// 3. Otherwise drop silently — a paste landing on plain tab navigation
-///    has no sensible target.
+/// Routing priority mirrors the gate stack in [`handle_key`]: paste
+/// targets the same buffer that a keystroke at this moment would type
+/// into. The unification was driven by Space+F find widget pastes
+/// silently dropping; once one overlay needed paste support, lining
+/// the rest of the gate stack up was free.
+///
+/// 1. **Drop targets first.** If the payload parses as one or more
+///    existing absolute paths, enter place mode — Finder drops land
+///    here regardless of which overlay happens to be focused.
+/// 2. **Otherwise route to whichever input owns the keyboard right
+///    now.** Each branch mirrors its `handle_key_*` counterpart's
+///    gate, in the same order, so paste behaviour and typing behaviour
+///    can't drift apart.
+/// 3. **Fallthrough drops silently.** A paste landing on plain tab
+///    navigation has no sensible target.
 pub fn handle_paste(s: String, app: &mut App) {
     let paths = parse_dropped_paths(&s);
     if !paths.is_empty() {
         app.enter_place_mode(paths);
         return;
     }
-    if app.quick_open.core.active {
+
+    // Modal gates that own the keyboard but have NO text input of
+    // their own (tree_context_menu / confirm_modal / paste_conflict /
+    // place_mode / tree_drag). `handle_key` early-returns under each;
+    // mirror that by swallowing the paste, otherwise it would fall
+    // through to the sticky trailing branches (Tab::Git commit
+    // textarea, Tab::Search input) and silently mutate a buffer the
+    // user can't see behind the modal.
+    if app.tree_context_menu.active
+        || app.confirm_modal.is_some()
+        || app.paste_conflict.is_some()
+        || app.place_mode.active
+        || app.tree_drag.active
+    {
+        return;
+    }
+
+    // Mirror `handle_key`'s gate stack so paste lands wherever a
+    // keystroke at this moment would type. Order matters — db_goto
+    // sits above every overlay because it's an inline prompt that
+    // owns input even while another overlay is technically open.
+    if app.db_goto_input.is_some() {
+        if let Some(buf) = app.db_goto_input.as_mut() {
+            paste_db_goto_digits(&s, buf, &mut app.db_goto_cursor);
+        }
+    } else if app.hosts_picker.core.active {
+        app.hosts_picker.handle_paste(&s);
+    } else if app.graph_branch_picker.core.active {
+        app.graph_branch_picker.handle_paste(&s);
+    } else if app.find_widget.active {
+        find_widget::handle_paste(&s, app);
+    } else if app.global_search.core.active {
+        global_search::handle_paste_overlay(&s, &mut app.global_search);
+    } else if app.quick_open.core.active {
         quick_open::handle_paste(&s, app);
     } else if app.search.active {
         search::handle_paste(&s, app);
-    } else if app.global_search.core.active {
-        global_search::handle_paste_overlay(&s, &mut app.global_search);
+    } else if app.tree_edit.active {
+        // Per-char predicate: reject path separators, NUL, control
+        // chars. Mirrors `handle_key_tree_edit`'s phase-2 filter so
+        // the buffer stays perpetually-valid across both typing and
+        // pasting. The error banner only clears when at least one
+        // char actually landed — a fully-rejected paste (e.g. all
+        // `/`s) must not silently wipe a validation message the
+        // user hasn't addressed.
+        if crate::input_edit::paste_single_line_filtered(
+            &s,
+            &mut app.tree_edit.buffer,
+            &mut app.tree_edit.cursor,
+            |c| c != '/' && c != '\\' && c != '\0' && !c.is_control(),
+        ) {
+            app.tree_edit.error = None;
+        }
+    } else if app.view_mode == ViewMode::Settings {
+        // Settings owns every key when open. `editor_edit` is the
+        // only text input inside; everything else (nav, toggles)
+        // has no paste target. Unconditional early-return mirrors
+        // `handle_key_settings` so a paste while the menu is up
+        // can't fall through to the commit-textarea / search-input
+        // trailing branches.
+        if let Some(edit) = app.settings.editor_edit.as_mut() {
+            let _ = crate::input_edit::paste_single_line(&s, &mut edit.buffer, &mut edit.cursor);
+        }
     } else if app.active_tab == Tab::Search
         && app.active_panel == Panel::Files
         && app.global_search.input_focused()
@@ -3886,6 +3952,37 @@ pub fn handle_paste(s: String, app: &mut App) {
     // No focused input; intentionally dropped. A stray paste into the
     // global keymap has no defined meaning, and we don't want to
     // accidentally trigger an action.
+}
+
+/// Paste a digit-only payload into the SQLite goto-page buffer with an
+/// 18-digit cap (one less than `u64::MAX`'s digit count, so a parse is
+/// always safe). CR/LF + non-digit chars are silently swallowed,
+/// matching `dispatch_key_filtered`'s per-char behaviour.
+///
+/// Extracted from `handle_paste` because the natural reach for
+/// `paste_single_line_filtered` here doesn't work — its predicate is
+/// stateless, and a closure that captures the *initial* `buf.len()`
+/// happily lets a single paste blow past the cap. This loop re-derives
+/// the remaining capacity per char, then does one `insert_str`.
+fn paste_db_goto_digits(s: &str, buf: &mut String, cursor: &mut usize) {
+    const MAX_DIGITS: usize = 18;
+    let remaining = MAX_DIGITS.saturating_sub(buf.len());
+    if remaining == 0 {
+        return;
+    }
+    let mut to_insert = String::with_capacity(remaining.min(s.len()));
+    for c in s.chars() {
+        if to_insert.len() >= remaining {
+            break;
+        }
+        if c.is_ascii_digit() {
+            to_insert.push(c);
+        }
+    }
+    if !to_insert.is_empty() {
+        buf.insert_str(*cursor, &to_insert);
+        *cursor += to_insert.len();
+    }
 }
 
 /// Extract filesystem paths from a bracketed-paste payload.
@@ -4475,6 +4572,63 @@ mod leader_tests {
         let shift_space = ke(KeyCode::Char(' '), KeyModifiers::SHIFT);
         let v = leader_decision(&shift_space, true, None, now, LEADER_TIMEOUT);
         assert_eq!(v, LeaderVerdict::None);
+    }
+}
+
+#[cfg(test)]
+mod paste_db_goto_tests {
+    use super::paste_db_goto_digits;
+
+    #[test]
+    fn paste_caps_at_18_digits_even_from_empty_buffer() {
+        // Regression: previously the cap was enforced via a closure
+        // that captured `buf.len()` once at paste start, so a single
+        // paste of N >> 18 digits into an empty buffer landed all N
+        // digits. The fix re-derives remaining capacity per char.
+        let mut buf = String::new();
+        let mut cursor = 0;
+        paste_db_goto_digits("12345678901234567890123456789012345", &mut buf, &mut cursor);
+        assert_eq!(buf.len(), 18);
+        assert_eq!(cursor, 18);
+        assert_eq!(buf, "123456789012345678");
+    }
+
+    #[test]
+    fn paste_respects_existing_buffer_length() {
+        let mut buf = String::from("12345");
+        let mut cursor = 5;
+        paste_db_goto_digits("9876543210987654321098", &mut buf, &mut cursor);
+        // Buffer started at 5, cap is 18 → only 13 chars land.
+        assert_eq!(buf.len(), 18);
+        assert_eq!(buf, "123459876543210987");
+        assert_eq!(cursor, 18);
+    }
+
+    #[test]
+    fn paste_when_buffer_already_at_cap_is_noop() {
+        let mut buf = String::from("123456789012345678");
+        let mut cursor = 18;
+        paste_db_goto_digits("9", &mut buf, &mut cursor);
+        assert_eq!(buf, "123456789012345678");
+        assert_eq!(cursor, 18);
+    }
+
+    #[test]
+    fn paste_swallows_non_digits_and_crlf() {
+        let mut buf = String::new();
+        let mut cursor = 0;
+        paste_db_goto_digits("1a2\r\n3b4", &mut buf, &mut cursor);
+        assert_eq!(buf, "1234");
+        assert_eq!(cursor, 4);
+    }
+
+    #[test]
+    fn paste_at_mid_cursor_inserts_in_place() {
+        let mut buf = String::from("19");
+        let mut cursor = 1;
+        paste_db_goto_digits("23", &mut buf, &mut cursor);
+        assert_eq!(buf, "1239");
+        assert_eq!(cursor, 3);
     }
 }
 

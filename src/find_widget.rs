@@ -320,6 +320,18 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     }
 }
 
+/// Bracketed-paste arrival while the find widget is active. Same shape
+/// as `search::handle_paste` / `quick_open::handle_paste`: fold the
+/// payload in as typed chars (dropping CR/LF — the widget query is
+/// single-line) and re-derive matches when at least one char actually
+/// landed. Called from `input::handle_paste` after the drop-path parser
+/// has declined the payload.
+pub fn handle_paste(s: &str, app: &mut App) {
+    if input_edit::paste_single_line(s, &mut app.find_widget.query, &mut app.find_widget.cursor) {
+        recompute(app);
+    }
+}
+
 // ─── Internals ───────────────────────────────────────────────────────────────
 
 fn resolve_target(app: &App) -> Option<FindTarget> {

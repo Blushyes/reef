@@ -146,26 +146,6 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // sidebar slot is absent so the editor slides left by one.
     let editor_idx = if has_sidebar { 1 } else { 0 };
 
-    // Drag zone on the sidebar | right split border — only meaningful when
-    // the sidebar actually occupies a column.
-    if has_sidebar {
-        let split_x = body_layout[0].x + body_layout[0].width.saturating_sub(1);
-        app.hit_registry.register(
-            Rect::new(split_x, body_layout[0].y, 2, body_layout[0].height),
-            ClickAction::StartDragSplit,
-        );
-    }
-    // Second drag zone for the commit | diff boundary in 3-col mode. The
-    // commit column sits right after the (optional) sidebar.
-    if three_col {
-        let commit_rect = body_layout[editor_idx];
-        let mid_split_x = commit_rect.x + commit_rect.width.saturating_sub(1);
-        app.hit_registry.register(
-            Rect::new(mid_split_x, commit_rect.y, 2, commit_rect.height),
-            ClickAction::StartDragGraphDiffSplit,
-        );
-    }
-
     match app.active_tab {
         Tab::Git => {
             if !app.backend.has_repo() {
@@ -201,6 +181,36 @@ pub fn render(f: &mut Frame, app: &mut App) {
             let focused = matches!(app.active_panel, crate::app::Panel::Diff);
             file_preview_panel::render(f, app, body_layout[editor_idx], focused);
         }
+    }
+
+    // Divider drag zones, registered AFTER the panels so they shadow any
+    // panel-registered row hit zones near the boundary. Without this the
+    // sidebar's last column lives under a tree/status/graph row click and
+    // grabbing the divider requires landing on the single column to its
+    // right — clicking a few cells too far left turns a divider drag into
+    // a sidebar item drag. The widened span gives a multi-cell safety
+    // margin on each side of the boundary so the divider is comfortable
+    // to grab without being precise.
+    const DIVIDER_SAFE_LEFT: u16 = 3;
+    const DIVIDER_SAFE_RIGHT: u16 = 2;
+    if has_sidebar {
+        let split_x = body_layout[0].x + body_layout[0].width.saturating_sub(1);
+        let zone_x = split_x.saturating_sub(DIVIDER_SAFE_LEFT);
+        let zone_w = (split_x + DIVIDER_SAFE_RIGHT + 1).saturating_sub(zone_x);
+        app.hit_registry.register(
+            Rect::new(zone_x, body_layout[0].y, zone_w, body_layout[0].height),
+            ClickAction::StartDragSplit,
+        );
+    }
+    if three_col {
+        let commit_rect = body_layout[editor_idx];
+        let mid_split_x = commit_rect.x + commit_rect.width.saturating_sub(1);
+        let zone_x = mid_split_x.saturating_sub(DIVIDER_SAFE_LEFT);
+        let zone_w = (mid_split_x + DIVIDER_SAFE_RIGHT + 1).saturating_sub(zone_x);
+        app.hit_registry.register(
+            Rect::new(zone_x, commit_rect.y, zone_w, commit_rect.height),
+            ClickAction::StartDragGraphDiffSplit,
+        );
     }
 
     render_status_bar(f, app, main_layout[3]);

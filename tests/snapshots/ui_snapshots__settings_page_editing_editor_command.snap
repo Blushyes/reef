@@ -1,6 +1,6 @@
 ---
 source: tests/ui_snapshots.rs
-assertion_line: 680
+assertion_line: 679
 expression: output
 ---
 ┌ ⚙ Settings ──────────────────────────────────────────────────────────────────┐
@@ -21,9 +21,9 @@ expression: output
 │     Commit diff mode                         [compact]                       │
 │     Commit files — tree view                 [off]                           │
 │                                                                              │
-│                                                                              │
-│                                                                              │
-│                                                                              │
+│  CODE NAVIGATION                                                             │
+│     Rust                                     [RA]  Not installed             │
+│     TypeScript                               [TS]  Not installed             │
 │    › nvim --clean                                                            │
 │    Enter save · Esc cancel                                                   │
 └──────────────────────────────────────────────────────────────────────────────┘

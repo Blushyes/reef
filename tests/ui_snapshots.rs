@@ -644,6 +644,7 @@ fn snapshot_settings_page_default() {
     let mut app = App::new(Theme::dark(), None);
     wait_for_file_tree(&mut app);
     app.open_settings();
+    app.lsp_installed.clear();
     let output = render_app(&mut app, 80, 24);
     with_filters(&[], || {
         insta::assert_snapshot!("settings_page_default", output)
@@ -662,6 +663,7 @@ fn snapshot_settings_page_editing_editor_command() {
     let mut app = App::new(Theme::dark(), None);
     wait_for_file_tree(&mut app);
     app.open_settings();
+    app.lsp_installed.clear();
     let editor_idx = reef::settings::SettingItem::ALL
         .iter()
         .position(|i| matches!(i, reef::settings::SettingItem::EditorCommand))

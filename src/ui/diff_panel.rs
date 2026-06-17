@@ -3,10 +3,10 @@ use crate::find_widget::{FindTarget, FindWidgetState};
 use crate::git::{DiffContent, DiffHunk, LineTag};
 use crate::i18n::{Msg, t};
 use crate::search::{SearchState, SearchTarget};
-use crate::ui::selection::{DiffHit, DiffRowText, DiffSelection, DiffSide};
+use crate::ui::selection::{DiffHit, DiffHover, DiffRowText, DiffSelection, DiffSide};
 use crate::ui::text::{
-    clip_spans, empty_arc_str, overlay_match_highlight, overlay_selection_highlight, spaces,
-    truncate_to_width,
+    clip_spans, empty_arc_str, overlay_ctrl_hover_underline, overlay_match_highlight,
+    overlay_selection_highlight, spaces, truncate_to_width,
 };
 use crate::ui::theme::Theme;
 use ratatui::Frame;
@@ -75,6 +75,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     let d = guard.held.as_ref().expect("just took it");
 
     let selection = app.diff_selection;
+    let ctrl_hover = app.diff_ctrl_hover.clone();
     render_diff(
         f,
         inner,
@@ -88,6 +89,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         &app.find_widget,
         FindTarget::DiffUnified,
         selection.as_ref(),
+        ctrl_hover.as_ref(),
         &mut DiffView {
             scroll: &mut app.diff_scroll,
             h_scroll: &mut app.diff_h_scroll,
@@ -124,6 +126,7 @@ pub fn render_diff(
     find_widget: &FindWidgetState,
     widget_unified_target: FindTarget,
     selection: Option<&DiffSelection>,
+    ctrl_hover: Option<&DiffHover>,
     view: &mut DiffView<'_>,
     hit_slot: &mut Option<DiffHit>,
 ) {
@@ -140,6 +143,7 @@ pub fn render_diff(
             find_widget,
             widget_unified_target,
             selection,
+            ctrl_hover,
             view,
             hit_slot,
         ),
@@ -155,6 +159,7 @@ pub fn render_diff(
             find_widget,
             widget_unified_target,
             selection,
+            ctrl_hover,
             view,
             hit_slot,
         ),
@@ -221,6 +226,7 @@ fn render_unified(
     find_widget: &FindWidgetState,
     widget_unified_target: FindTarget,
     selection: Option<&DiffSelection>,
+    ctrl_hover: Option<&DiffHover>,
     view: &mut DiffView<'_>,
     hit_slot: &mut Option<DiffHit>,
 ) {
@@ -319,7 +325,21 @@ fn render_unified(
                 };
                 s.sel.line_byte_range(row_idx, txt)
             });
-        render_unified_line(f, area, y, dl, h, &theme, &ranges, cur, sel_range);
+        let hover_range = ctrl_hover
+            .filter(|h| h.side == DiffSide::Unified && h.row == row_idx)
+            .map(|h| h.range.clone());
+        render_unified_line(
+            f,
+            area,
+            y,
+            dl,
+            h,
+            &theme,
+            &ranges,
+            cur,
+            sel_range,
+            hover_range,
+        );
         y += 1;
     }
 }
@@ -335,6 +355,7 @@ fn render_unified_line(
     match_ranges: &[Range<usize>],
     current_range: Option<Range<usize>>,
     selection_range: Option<Range<usize>>,
+    hover_range: Option<Range<usize>>,
 ) {
     match dl {
         UnifiedLine::Separator => {
@@ -417,6 +438,10 @@ fn render_unified_line(
             // compose cleanly with the per-tag background.
             let tokens = match selection_range {
                 Some(r) if r.start < r.end => overlay_selection_highlight(tokens, r),
+                _ => tokens,
+            };
+            let tokens = match hover_range {
+                Some(r) if r.start < r.end => overlay_ctrl_hover_underline(tokens, r, theme.accent),
                 _ => tokens,
             };
             let body_spans = clip_spans(&tokens, h_scroll, max_text);
@@ -509,6 +534,41 @@ impl DiffDisplay {
     /// Arc-cloned into the unified layout; SBS's pairing state machine
     /// continues to live inside `build_sbs_lines` since its output isn't
     /// directly derivable from the unified order.
+    /// File line number (1-based, as git reports) for a display row, used
+    /// by diff code-navigation to map a clicked row back to a file line.
+    /// Prefers the NEW-side (post-image) number — that's the version on
+    /// disk / in the workspace index — and falls back to the OLD-side
+    /// number for a removed row that only exists pre-image. `side` picks
+    /// the SBS half (left = old, right = new); ignored in Unified. Returns
+    /// `None` for separator / hunk-header rows or an out-of-range index.
+    /// `row_idx` indexes the row list of `layout` (the same list the
+    /// `DiffHit` hit-test walks), so the two stay aligned.
+    pub fn nav_line_at(
+        &self,
+        layout: DiffLayout,
+        row_idx: usize,
+        side: crate::ui::selection::DiffSide,
+    ) -> Option<u32> {
+        use crate::ui::selection::DiffSide;
+        match layout {
+            DiffLayout::Unified => match self.unified_lines.get(row_idx)? {
+                UnifiedLine::Content {
+                    new_lineno,
+                    old_lineno,
+                    ..
+                } => new_lineno.or(*old_lineno),
+                _ => None,
+            },
+            DiffLayout::SideBySide => match self.sbs_lines.get(row_idx)? {
+                SbsDisplayLine::Row(r) => match side {
+                    DiffSide::SbsLeft => r.left_no.or(r.right_no),
+                    DiffSide::SbsRight | DiffSide::Unified => r.right_no.or(r.left_no),
+                },
+                _ => None,
+            },
+        }
+    }
+
     pub fn build(diff: &DiffContent, highlighted: Option<&DiffHighlighted>) -> Self {
         let mut unified_lines: Vec<UnifiedLine> = Vec::new();
         let mut sbs_lines: Vec<SbsDisplayLine> = Vec::new();
@@ -670,6 +730,7 @@ fn render_side_by_side(
     find_widget: &FindWidgetState,
     widget_unified_target: FindTarget,
     selection: Option<&DiffSelection>,
+    ctrl_hover: Option<&DiffHover>,
     view: &mut DiffView<'_>,
     hit_slot: &mut Option<DiffHit>,
 ) {
@@ -793,6 +854,15 @@ fn render_side_by_side(
             },
             None => (None, None),
         };
+        // Per-half Ctrl+hover underline range — only the hovered side.
+        let (hover_left, hover_right) = match ctrl_hover.filter(|h| h.row == row_idx) {
+            Some(h) => match h.side {
+                DiffSide::SbsLeft => (Some(h.range.clone()), None),
+                DiffSide::SbsRight => (None, Some(h.range.clone())),
+                DiffSide::Unified => (None, None),
+            },
+            None => (None, None),
+        };
         // Per-side widget-match ranges. `ranges_on_row` filters by
         // `widget.target`, so at most one side returns a non-empty vec
         // — they can't double-paint.
@@ -860,11 +930,13 @@ fn render_side_by_side(
                         selection: sel_left,
                         match_ranges: &match_left,
                         match_current: match_left_cur.clone(),
+                        hover: hover_left,
                     },
                     SideOverlays {
                         selection: sel_right,
                         match_ranges: &match_right,
                         match_current: match_right_cur.clone(),
+                        hover: hover_right,
                     },
                 );
             }
@@ -880,6 +952,8 @@ pub(crate) struct SideOverlays<'a> {
     pub selection: Option<Range<usize>>,
     pub match_ranges: &'a [Range<usize>],
     pub match_current: Option<Range<usize>>,
+    /// Ctrl+hover identifier underline range for this half, if any.
+    pub hover: Option<Range<usize>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -920,6 +994,10 @@ fn render_sbs_row(
     };
     let left_body = match left.selection {
         Some(r) if r.start < r.end => overlay_selection_highlight(left_body, r),
+        _ => left_body,
+    };
+    let left_body = match left.hover {
+        Some(r) if r.start < r.end => overlay_ctrl_hover_underline(left_body, r, theme.accent),
         _ => left_body,
     };
     let left_spans = clip_spans(&left_body, h_scroll_left, left_content_w);
@@ -965,6 +1043,10 @@ fn render_sbs_row(
     };
     let right_body = match right.selection {
         Some(r) if r.start < r.end => overlay_selection_highlight(right_body, r),
+        _ => right_body,
+    };
+    let right_body = match right.hover {
+        Some(r) if r.start < r.end => overlay_ctrl_hover_underline(right_body, r, theme.accent),
         _ => right_body,
     };
     let right_spans = clip_spans(&right_body, h_scroll_right, right_content_w);
@@ -1120,6 +1202,50 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    // ── nav_line_at (diff code-navigation row → file line) ────────────────────
+
+    #[test]
+    fn nav_line_at_maps_rows_to_file_lines() {
+        use crate::git::DiffContent;
+        use crate::ui::selection::DiffSide;
+        let diff = DiffContent {
+            file_path: "src/a.rs".to_string(),
+            hunks: vec![make_hunk(
+                "@@ -1,2 +1,2 @@",
+                vec![
+                    make_line(LineTag::Context, "ctx", Some(1), Some(1)),
+                    make_line(LineTag::Added, "added", None, Some(2)),
+                    make_line(LineTag::Removed, "gone", Some(2), None),
+                ],
+            )],
+        };
+        let d = DiffDisplay::build(&diff, None);
+        // Unified row order: [HunkHeader, ctx, added, removed].
+        assert_eq!(
+            d.nav_line_at(DiffLayout::Unified, 0, DiffSide::Unified),
+            None
+        );
+        // Context + added rows resolve to their NEW-side line.
+        assert_eq!(
+            d.nav_line_at(DiffLayout::Unified, 1, DiffSide::Unified),
+            Some(1)
+        );
+        assert_eq!(
+            d.nav_line_at(DiffLayout::Unified, 2, DiffSide::Unified),
+            Some(2)
+        );
+        // Removed row has no new line → falls back to the old-side number.
+        assert_eq!(
+            d.nav_line_at(DiffLayout::Unified, 3, DiffSide::Unified),
+            Some(2)
+        );
+        // Out-of-range index → None, never panics.
+        assert_eq!(
+            d.nav_line_at(DiffLayout::Unified, 99, DiffSide::Unified),
+            None
+        );
     }
 
     // ── line_style ───────────────────────────────────────────────────────────

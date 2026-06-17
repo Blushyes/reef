@@ -340,7 +340,9 @@ fn binary_reason_text(info: &BinaryInfo) -> String {
 
 fn render_text(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewContent, focused: bool) {
     let (lines, highlighted) = match &preview.body {
-        PreviewBody::Text { lines, highlighted } => (lines, highlighted),
+        PreviewBody::Text {
+            lines, highlighted, ..
+        } => (lines, highlighted),
         _ => return,
     };
     let th = app.theme;
@@ -433,8 +435,16 @@ fn render_text(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewConten
         // Applied alongside the `/` search ranges using the same overlay
         // helper — the existing "current match" slot is natural, since there
         // is only ever one global-search highlight per preview.
+        // Skip an empty band (start == end): an unresolved cross-file LSP
+        // jump or an out-of-range row leaves `byte_range` empty, which
+        // would highlight nothing anyway — pushing it just risks a
+        // zero-width artifact. Matches the `start < end` guard the
+        // selection / ctrl-hover overlays below use.
         if let Some(hl) = app.preview_highlight.as_ref() {
-            if preview.file_path == hl.path.to_string_lossy() && hl.row == real_idx {
+            if preview.file_path == hl.path.to_string_lossy()
+                && hl.row == real_idx
+                && hl.byte_range.start < hl.byte_range.end
+            {
                 ranges.push(hl.byte_range.clone());
                 if cur.is_none() {
                     cur = Some(hl.byte_range.clone());
@@ -459,6 +469,16 @@ fn render_text(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewConten
             .and_then(|s| s.line_byte_range(real_idx, line))
         {
             Some(r) if r.start < r.end => overlay_selection_highlight(tokens, r),
+            _ => tokens,
+        };
+        // Ctrl+hover affordance: when the user is holding Ctrl over a
+        // clickable identifier, paint underline + accent fg over the
+        // identifier's bytes. Matches editor convention so the user
+        // sees what would jump under a click.
+        let tokens = match app.ctrl_hover_target.as_ref() {
+            Some((row, range)) if *row == real_idx && range.start < range.end => {
+                crate::ui::text::overlay_ctrl_hover_underline(tokens, range.clone(), th.accent)
+            }
             _ => tokens,
         };
 

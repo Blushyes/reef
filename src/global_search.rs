@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-use crate::app::{App, PreviewHighlight, Tab};
+use crate::app::{App, Tab};
 use crate::input::DOUBLE_CLICK_WINDOW;
 use crate::input_edit;
 use crate::ui::mouse::ClickAction;
@@ -425,11 +425,7 @@ pub fn accept(app: &mut App) {
     app.set_active_tab(Tab::Files);
     app.file_tree.reveal(&hit.path);
     app.refresh_file_tree_with_target(Some(hit.path.clone()));
-    app.preview_highlight = Some(PreviewHighlight {
-        path: hit.path.clone(),
-        row: hit.line,
-        byte_range: hit.byte_range.clone(),
-    });
+    app.set_preview_highlight_persistent(hit.path.clone(), hit.line, hit.byte_range.clone());
     app.load_preview_for_path(hit.path);
 }
 
@@ -650,11 +646,7 @@ pub fn navigate_to_selected(app: &mut App) {
     else {
         return;
     };
-    app.preview_highlight = Some(PreviewHighlight {
-        path: hit.path.clone(),
-        row: hit.line,
-        byte_range: hit.byte_range.clone(),
-    });
+    app.set_preview_highlight_persistent(hit.path.clone(), hit.line, hit.byte_range.clone());
     app.load_preview_for_path(hit.path);
 }
 

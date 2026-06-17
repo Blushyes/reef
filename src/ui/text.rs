@@ -309,6 +309,73 @@ fn byte_in_range(abs: usize, range: &Range<usize>) -> bool {
     abs >= range.start && abs < range.end
 }
 
+/// Apply Ctrl+hover affordance — UNDERLINE + accent fg over the byte
+/// range. Modeled on `overlay_selection_highlight` (same byte-walking
+/// pattern) but applies an additive style instead of REVERSED so the
+/// underlying syntect colour shows through, just underlined and
+/// recoloured. Used by `file_preview_panel` to advertise that
+/// Ctrl+click would jump.
+pub fn overlay_ctrl_hover_underline<'a>(
+    tokens: Vec<(Style, Cow<'a, str>)>,
+    range: Range<usize>,
+    accent_fg: Color,
+) -> Vec<(Style, Cow<'a, str>)> {
+    if range.start >= range.end {
+        return tokens;
+    }
+    let mut out: Vec<(Style, Cow<'a, str>)> = Vec::with_capacity(tokens.len());
+    let mut abs = 0usize;
+    for (style, text) in tokens {
+        if text.is_empty() {
+            out.push((style, text));
+            continue;
+        }
+        let base_abs = abs;
+        let len = text.len();
+        abs += len;
+
+        let mut seg_start = 0usize;
+        let mut run_hover = byte_in_range(base_abs, &range);
+        for (i, _) in text.char_indices() {
+            if i == 0 {
+                continue;
+            }
+            let next_hover = byte_in_range(base_abs + i, &range);
+            if next_hover != run_hover {
+                push_hover_segment(&mut out, style, &text, seg_start, i, run_hover, accent_fg);
+                seg_start = i;
+                run_hover = next_hover;
+            }
+        }
+        if seg_start < len {
+            push_hover_segment(&mut out, style, &text, seg_start, len, run_hover, accent_fg);
+        }
+    }
+    out
+}
+
+#[allow(clippy::ptr_arg)]
+fn push_hover_segment<'a>(
+    out: &mut Vec<(Style, Cow<'a, str>)>,
+    base: Style,
+    parent: &Cow<'a, str>,
+    start: usize,
+    end: usize,
+    hover: bool,
+    accent_fg: Color,
+) {
+    let style = if hover {
+        base.fg(accent_fg).add_modifier(Modifier::UNDERLINED)
+    } else {
+        base
+    };
+    let seg: Cow<'a, str> = match parent {
+        Cow::Borrowed(s) => Cow::Borrowed(&s[start..end]),
+        Cow::Owned(s) => Cow::Owned(s[start..end].to_string()),
+    };
+    out.push((style, seg));
+}
+
 #[allow(clippy::ptr_arg)]
 fn push_selection_segment<'a>(
     out: &mut Vec<(Style, Cow<'a, str>)>,

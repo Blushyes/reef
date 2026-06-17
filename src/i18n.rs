@@ -272,6 +272,18 @@ pub enum Msg {
     /// runs at startup before raw mode, so the live theme keeps its
     /// current preset until next launch.
     SettingsAutoThemeOnNextLaunch,
+    /// Code navigation section header in Settings, hosting LSP rows.
+    SettingsSectionNav,
+    /// Generic label for an `Lsp(NavLang)` row — overridden at render
+    /// time with the actual language name.
+    SettingsItemLsp,
+    /// Generic description shown under any selected Lsp row — the
+    /// renderer appends the per-LSP install command.
+    SettingsDescLsp,
+    SettingsLspStateReady,
+    SettingsLspStateMissing,
+    SettingsLspStateBooting,
+    SettingsLspStateCrashed,
 }
 
 pub fn t(m: Msg) -> &'static str {
@@ -452,6 +464,13 @@ fn t_zh(m: Msg) -> &'static str {
         SettingsValueOff => "关",
         SettingsEditorPlaceholder => "(未设置 — 使用 $VISUAL / $EDITOR / vi)",
         SettingsAutoThemeOnNextLaunch => "已切换到 auto 主题，下次启动生效",
+        SettingsSectionNav => "代码导航",
+        SettingsItemLsp => "语言服务",
+        SettingsDescLsp => "未安装时显示安装命令",
+        SettingsLspStateReady => "已就绪",
+        SettingsLspStateMissing => "未安装",
+        SettingsLspStateBooting => "启动中",
+        SettingsLspStateCrashed => "已崩溃",
     }
 }
 
@@ -628,6 +647,13 @@ fn t_en(m: Msg) -> &'static str {
         SettingsValueOff => "off",
         SettingsEditorPlaceholder => "(unset — uses $VISUAL / $EDITOR / vi)",
         SettingsAutoThemeOnNextLaunch => "Theme set to auto — takes effect on next launch",
+        SettingsSectionNav => "Code Navigation",
+        SettingsItemLsp => "Language Server",
+        SettingsDescLsp => "Shows the install command when missing",
+        SettingsLspStateReady => "Ready",
+        SettingsLspStateMissing => "Not installed",
+        SettingsLspStateBooting => "Booting",
+        SettingsLspStateCrashed => "Crashed",
     }
 }
 

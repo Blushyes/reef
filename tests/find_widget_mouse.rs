@@ -38,6 +38,7 @@ fn fresh_app() -> (App, TempDir, CwdGuard) {
                 "    bar();".to_string(),
             ],
             highlighted: None,
+            parsed: None,
         },
     });
     (app, tmp, g)
@@ -140,6 +141,7 @@ fn match_case_toggle_flips_and_rematches() {
         body: PreviewBody::Text {
             lines: vec!["Bar bar BAR".to_string()],
             highlighted: None,
+            parsed: None,
         },
     });
     select(&mut app, 0, 0, 3); // "Bar"
@@ -167,6 +169,7 @@ fn whole_word_toggle_flips_and_filters_matches() {
         body: PreviewBody::Text {
             lines: vec!["foo food foobar foo!".to_string()],
             highlighted: None,
+            parsed: None,
         },
     });
     select(&mut app, 0, 0, 3);
@@ -196,6 +199,7 @@ fn regex_toggle_reinterprets_query() {
         body: PreviewBody::Text {
             lines: vec!["abc 12 d345 ef".to_string()],
             highlighted: None,
+            parsed: None,
         },
     });
     // Seed with the literal "\d+" — without regex it matches no chars.

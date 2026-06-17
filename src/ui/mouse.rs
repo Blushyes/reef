@@ -157,6 +157,15 @@ pub enum ClickAction {
     /// Registered panel-wide underneath the popup so a stray click
     /// dismisses it without affecting the diff underneath.
     CloseFocusedPreviewFiles,
+
+    /// Click on a row in the multi-candidate code-navigation popup.
+    /// The `usize` indexes into `NavCandidatesPopup.candidates`. The
+    /// popup owns mouse input panel-wide while visible — same scheme
+    /// as `TreeContextMenuItem` / `TreeContextMenuClose`.
+    NavCandidateSelect(usize),
+    /// Registered panel-wide beneath the open candidates popup; a
+    /// click that misses every row dismisses without picking.
+    NavCandidatesClose,
 }
 
 #[derive(Debug, Clone)]

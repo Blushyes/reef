@@ -33,6 +33,13 @@ pub const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
 /// that a forgotten leader doesn't steal the next unrelated keypress.
 pub const LEADER_TIMEOUT: Duration = Duration::from_millis(800);
 
+/// How long a primed `g` chord stays live before it lapses. Covers the
+/// `gg` (scroll-to-top) double-tap and the `gd`/`gr` (goto-definition /
+/// find-references) chords. Named so the resolver in `handle_key` and
+/// the FocusedPreview bypass share one value instead of repeating the
+/// magic number (they had drifted from each other).
+pub const G_CHORD_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// One-keystroke verdict for the Space-leader chord.
 ///
 /// The chord lives in two places (global toggle and palette-side close), so
@@ -191,6 +198,14 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // accidentally leaving a menu lingering).
     if app.tree_context_menu.active {
         handle_key_tree_context_menu(key, app);
+        return;
+    }
+
+    // Multi-candidate goto-definition popup. Same exclusive-ownership
+    // contract as the context menu — Up/Down/k/j move, Enter picks,
+    // Esc/q/any-other-key dismiss without picking.
+    if app.nav_candidates.is_some() {
+        handle_key_nav_candidates(key, app);
         return;
     }
 
@@ -406,7 +421,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         if is_bare_g {
             let now = Instant::now();
             if let Some(t0) = app.g_pending_at.take() {
-                if now.duration_since(t0) < Duration::from_millis(500) {
+                if now.duration_since(t0) < G_CHORD_TIMEOUT {
                     app.scroll_active_preview_to_top();
                     return;
                 }
@@ -414,9 +429,71 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             app.g_pending_at = Some(now);
             return;
         }
-        if app.g_pending_at.is_some() {
-            // Any other keystroke breaks the chord — back to normal dispatch.
+        if let Some(t0) = app.g_pending_at {
+            let now = Instant::now();
+            let chord_fresh = now.duration_since(t0) < G_CHORD_TIMEOUT;
+            // `gd` — goto-definition at the current preview cursor
+            // (== `preview_selection.active`). A bare `d` only counts
+            // when no input/overlay is active (the `gg_suppressed`
+            // gate above ensures that), so the commit textarea and
+            // pickers still see literal `d` keystrokes — invariant
+            // 1 of references/text-input-stack.md.
+            if chord_fresh {
+                let bare = no_ctrl_alt && !key.modifiers.contains(KeyModifiers::SHIFT);
+                // When the diff panel owns focus, `gd`/`gr` resolve against
+                // the diff (workspace-index, by identifier text); otherwise
+                // they run the full preview path (tree-sitter + LSP).
+                let in_diff = matches!(app.active_tab, Tab::Git | Tab::Graph)
+                    && app.active_panel == Panel::Diff;
+                // `gd` — goto-definition.
+                if bare && key.code == KeyCode::Char('d') {
+                    app.g_pending_at = None;
+                    if in_diff {
+                        app.goto_definition_in_diff(crate::nav::NavAnchor::Keyboard);
+                    } else {
+                        app.goto_definition_at_cursor(crate::nav::NavAnchor::Keyboard);
+                    }
+                    return;
+                }
+                // `gr` — find-references. Opens the candidates popup
+                // with every workspace reference to the symbol under
+                // the cursor.
+                if bare && key.code == KeyCode::Char('r') {
+                    app.g_pending_at = None;
+                    if in_diff {
+                        app.find_references_in_diff(crate::nav::NavAnchor::Keyboard);
+                    } else {
+                        app.find_references_at_cursor(crate::nav::NavAnchor::Keyboard);
+                    }
+                    return;
+                }
+            }
+            // Anything else (or an expired chord) breaks it.
             app.g_pending_at = None;
+        }
+    }
+
+    // Alt+Left / Alt+Right — navigation back/forward stack. Bound to
+    // Alt rather than Ctrl+O/I because Ctrl+O is already the hosts-
+    // picker shortcut (vim-style Ctrl-o would conflict). Matches
+    // VSCode's primary back/forward binding. Gated above by
+    // `in_input_mode` / overlay flags — text inputs reach
+    // `input_edit`'s Alt+Left word-move first.
+    if !in_input_mode
+        && key.modifiers.contains(KeyModifiers::ALT)
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+    {
+        match key.code {
+            KeyCode::Left => {
+                app.nav_back();
+                return;
+            }
+            KeyCode::Right => {
+                app.nav_forward();
+                return;
+            }
+            _ => {}
         }
     }
 
@@ -748,6 +825,26 @@ fn handle_key_focused_preview(key: KeyEvent, app: &mut App) -> bool {
     if app
         .space_leader_at
         .is_some_and(|t| Instant::now().duration_since(t) < LEADER_TIMEOUT)
+    {
+        return false;
+    }
+
+    // Same logic for the `gd` / `gr` chord. `g` arms the chord (it's in
+    // the allowlist below and falls through), but the chord *targets*
+    // `d` / `r` are deliberately NOT in that allowlist — bare `d`/`r` are
+    // destructive on the per-tab handlers (discard / refresh). So when a
+    // `g` chord is armed and still fresh, let a bare `d`/`r` fall through
+    // to `handle_key`'s chord resolver, where it becomes goto-definition
+    // / find-references. Without this, both are unreachable via keyboard
+    // in 纯预览 and the chord strands armed. Narrowly scoped to `d`/`r`
+    // so no other key gains a destructive fallthrough.
+    if app
+        .g_pending_at
+        .is_some_and(|t| Instant::now().duration_since(t) < G_CHORD_TIMEOUT)
+        && !ctrl
+        && !key.modifiers.contains(KeyModifiers::ALT)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+        && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('r'))
     {
         return false;
     }
@@ -2014,6 +2111,23 @@ fn handle_key_tree_context_menu(key: KeyEvent, app: &mut App) {
     }
 }
 
+/// Keyboard handler for the multi-candidate goto-definition popup.
+/// Same UX shape as the tree context menu: arrow keys / `j`/`k` move,
+/// Enter picks, Esc / `q` / Ctrl+C / any other key dismisses without
+/// jumping.
+fn handle_key_nav_candidates(key: KeyEvent, app: &mut App) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.nav_close_candidates(),
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.nav_close_candidates();
+        }
+        KeyCode::Up | KeyCode::Char('k') => app.nav_candidates_move(-1),
+        KeyCode::Down | KeyCode::Char('j') => app.nav_candidates_move(1),
+        KeyCode::Enter => app.nav_pick_candidate(),
+        _ => app.nav_close_candidates(),
+    }
+}
+
 /// Keyboard handler for the Ctrl+O hosts picker overlay.
 ///
 /// Splits along the picker's input-mode:
@@ -2534,6 +2648,76 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
         return;
     }
 
+    // Nav candidates popup owns mouse input while open. Scroll wheel
+    // moves the visible window; left-clicks on a row or the
+    // fallthrough-close zone dispatch via the registry. Both must
+    // preempt the preview drag-select fast-path, which only checks
+    // `point_in_rect(last_preview_rect, ...)` and would otherwise
+    // start a text selection on the pane underneath.
+    if app.nav_candidates.is_some() {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                app.nav_candidates_scroll(-1);
+                return;
+            }
+            MouseEventKind::ScrollDown => {
+                app.nav_candidates_scroll(1);
+                return;
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(action) = app.hit_registry.hit_test(mouse.column, mouse.row)
+                    && matches!(
+                        action,
+                        ui::mouse::ClickAction::NavCandidateSelect(_)
+                            | ui::mouse::ClickAction::NavCandidatesClose
+                    )
+                {
+                    app.handle_action(action);
+                    return;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Ctrl+click on the preview pane → goto-definition. Sits in front
+    // of the drag-select fast-path so the click doesn't accidentally
+    // start a new text selection. Cmd / SUPER is deliberately NOT
+    // honored: macOS Terminal.app and (by default) iTerm2 intercept
+    // Cmd+click before it reaches reef, so binding it would give
+    // inconsistent behaviour across terminals. Documented in the
+    // plan file. Users wanting parity can remap in their terminal.
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+        && mouse.modifiers.contains(KeyModifiers::CONTROL)
+        && let Some(rect) = app.last_preview_rect
+        && point_in_rect(rect, mouse.column, mouse.row)
+    {
+        app.goto_definition_at_cursor(crate::nav::NavAnchor::Mouse {
+            col: mouse.column,
+            row: mouse.row,
+        });
+        return;
+    }
+
+    // Ctrl+click inside the diff panel → goto-definition, the diff-view
+    // analogue of the preview branch above. Gated on `last_diff_rect`
+    // (set only when a real diff renders — Git working-tree/staged or
+    // Graph commit), so it never competes with the preview branch (whose
+    // `last_preview_rect` is None on those tabs). Must precede the diff
+    // drag-selection handler so a Ctrl-modified Down resolves a jump
+    // instead of starting a selection.
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+        && mouse.modifiers.contains(KeyModifiers::CONTROL)
+        && let Some(rect) = app.last_diff_rect
+        && point_in_rect(rect, mouse.column, mouse.row)
+    {
+        app.goto_definition_in_diff(crate::nav::NavAnchor::Mouse {
+            col: mouse.column,
+            row: mouse.row,
+        });
+        return;
+    }
+
     // Preview drag-selection fast-path. Owns Down/Drag/Up(Left) when the
     // gesture starts inside the preview panel. Scroll wheel, right-click,
     // and Down outside the panel fall through to the normal match below.
@@ -2729,6 +2913,57 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
         MouseEventKind::Moved => {
             app.hover_row = Some(mouse.row);
             app.hover_col = Some(mouse.column);
+
+            let has_ctrl = mouse.modifiers.contains(KeyModifiers::CONTROL);
+            // UX: a popup opened by Ctrl+click closes the moment the
+            // user releases Ctrl. Popups opened by keyboard `gd` are
+            // left alone — mouse motion shouldn't dismiss them.
+            if !has_ctrl
+                && app
+                    .nav_candidates
+                    .as_ref()
+                    .is_some_and(|p| p.opened_by_ctrl_click)
+            {
+                app.nav_close_candidates();
+            }
+            // Track the identifier under a Ctrl+hover for the
+            // underline-on-hover affordance. Cleared whenever Ctrl
+            // isn't held or the cursor leaves the preview pane —
+            // matches editor convention.
+            if has_ctrl
+                && let Some(rect) = app.last_preview_rect
+                && point_in_rect(rect, mouse.column, mouse.row)
+                && let Some(origin) = app.last_preview_content_origin
+                && let Some(cursor) = mouse_to_file_coord(app, mouse.column, mouse.row, origin)
+            {
+                let id_range = app.preview_content.as_ref().and_then(|p| match &p.body {
+                    crate::file_tree::PreviewBody::Text {
+                        parsed: Some(parse),
+                        ..
+                    } => crate::nav::identifier_range_at(parse, cursor),
+                    _ => None,
+                });
+                app.ctrl_hover_target = id_range;
+            } else {
+                app.ctrl_hover_target = None;
+            }
+
+            // Same affordance for the diff panel. No `FileParse` here, so
+            // the hovered identifier is found by `word_at_byte` on the
+            // row text (matching `resolve_diff_nav`). Computed in a scope
+            // that drops the `last_diff_hit` borrow before assigning.
+            let diff_hover = if has_ctrl
+                && let Some(rect) = app.last_diff_rect
+                && point_in_rect(rect, mouse.column, mouse.row)
+            {
+                app.last_diff_hit
+                    .as_ref()
+                    .and_then(|hit| hit.identifier_at(mouse.column, mouse.row))
+                    .map(|(row, range, side)| crate::ui::selection::DiffHover { row, range, side })
+            } else {
+                None
+            };
+            app.diff_ctrl_hover = diff_hover;
         }
         _ => {}
     }
@@ -3038,7 +3273,7 @@ fn point_in_rect(rect: Rect, col: u16, row: u16) -> bool {
 /// collapse to file line `preview_scroll` (first visible line). Rows past the
 /// last line clamp to the last line's terminator (so "drag past end" selects
 /// through the final line cleanly).
-fn mouse_to_file_coord(
+pub(crate) fn mouse_to_file_coord(
     app: &App,
     col: u16,
     row: u16,

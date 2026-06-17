@@ -88,6 +88,15 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     // Skips itself when `find_widget.active == false`.
     find_widget_panel::render(f, app);
 
+    // Same story for the nav candidates popup: `ui::render` draws it
+    // only in the normal frame, *after* the FocusedPreview early
+    // return. Without this hop, Ctrl+click / `gd` in focused mode
+    // would set `nav_candidates` but the popup would never paint —
+    // the user sees "no reaction". Render over the full takeover area.
+    if app.nav_candidates.is_some() {
+        super::nav_candidates_popup::render(f, app, area);
+    }
+
     // FocusedPreview replaces the normal status bar entirely, so the search
     // prompt would never render here without this branch — `/` would silently
     // capture keystrokes against an invisible input. Mirror the same

@@ -535,6 +535,7 @@ fn snapshot_image_preview_halfblocks() {
     wait_for_inner_some(&mut app);
     let _warmup = render_app(&mut app, 80, 20);
     wait_for_inner_some(&mut app);
+    wait_for_file_tree(&mut app);
     let output = render_app(&mut app, 80, 20);
     with_filters(&[], || {
         insta::assert_snapshot!("image_preview_halfblocks", output)

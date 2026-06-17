@@ -27,6 +27,7 @@ grep-regex    = "0.1.14"
 grep-matcher  = "0.1.8"
 serde         = { workspace = true }
 serde_json    = { workspace = true }
+url           = "2"
 terminal-colorsaurus = "1.0.3"
 reef-proto    = { path = "crates/reef-proto" }
 # Cross-platform "Move to Trash" for the file-tree delete action.
@@ -58,6 +59,21 @@ tempfile     = "3"
 # but the crate is unavoidable once the toggle exists since literal
 # substring matching can't express word boundaries / alternation.
 regex        = "1"
+# Code navigation (goto-definition / find-references). `tree-sitter` is the
+# always-on engine — grammars are statically linked C source so the binary
+# stays self-contained and works offline. Phase 2 layers stack-graphs on top
+# for cross-file resolution (Python / TypeScript). Phase 3 layers rust-
+# analyzer (and other LSPs) lazily for local-only refinement; SSH mode keeps
+# only the tree-sitter tier.
+tree-sitter            = "0.26"
+tree-sitter-rust       = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-python     = "0.25"
+tree-sitter-go         = "0.25"
+# Vue grammar — `tree-sitter-vue` 0.0.3 (upstream) is dormant and
+# pre-dates the `LanguageFn` constant pattern; `tree-sitter-vue-updated`
+# is the community fork tracking modern tree-sitter releases.
+tree-sitter-vue        = { package = "tree-sitter-vue-updated", version = "0.1" }
 
 [dev-dependencies]
 insta        = { version = "1", features = ["filters"] }

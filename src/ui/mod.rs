@@ -17,6 +17,7 @@ pub mod hosts_picker_panel;
 pub mod hover;
 pub mod layout;
 pub mod mouse;
+pub mod nav_candidates_popup;
 pub mod quick_open_panel;
 pub mod search_tab;
 pub mod selection;
@@ -253,6 +254,13 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if app.tree_context_menu.active {
         context_menu_panel::render(f, app, size);
     }
+    // Navigation candidates popup — same priority bucket as the
+    // context menu (overlays everything except the modal). Mutually
+    // exclusive with `tree_context_menu` by design: a `gd` while a
+    // context menu is open is suppressed in `goto_definition_at_cursor`.
+    if app.nav_candidates.is_some() {
+        nav_candidates_popup::render(f, app, size);
+    }
     // ConfirmModal sits on top of everything — including context menu —
     // because once the user has committed to a destructive choice, the
     // confirm must be the only thing eligible to receive input.
@@ -397,6 +405,7 @@ fn render_graph_diff_column(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let d = guard.held.as_ref().expect("just took it");
     let selection = app.diff_selection;
+    let ctrl_hover = app.diff_ctrl_hover.clone();
     diff_panel::render_diff(
         f,
         inner,
@@ -410,6 +419,7 @@ fn render_graph_diff_column(f: &mut Frame, app: &mut App, area: Rect) {
         &app.find_widget,
         crate::find_widget::FindTarget::GraphDiffUnified,
         selection.as_ref(),
+        ctrl_hover.as_ref(),
         &mut diff_panel::DiffView {
             scroll: &mut app.commit_detail.file_diff_scroll,
             h_scroll: &mut app.commit_detail.file_diff_h_scroll,
@@ -702,13 +712,20 @@ fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let settings_btn = " ⚙ ";
     let settings_btn_w = UnicodeWidthStr::width(settings_btn) as u16;
 
+    // Phase 3 LSP badge. Compact glyph per-language; absent when no
+    // supervisor exists for the current preview's language. Sits
+    // between the activity area and the panel chip per plan.
+    let lsp_badge = nav_lsp_badge_text(app);
+    let lsp_badge_w = UnicodeWidthStr::width(lsp_badge.as_str()) as u16;
+
     let pad_w = area
         .width
         .saturating_sub(hosts_btn_w)
         .saturating_sub(notif_w)
         .saturating_sub(settings_btn_w)
         .saturating_sub(hint_w)
-        .saturating_sub(chip_w);
+        .saturating_sub(chip_w)
+        .saturating_sub(lsp_badge_w);
 
     app.hit_registry
         .register_row(area.x, area.y, hosts_btn_w, ClickAction::OpenHostsPicker);
@@ -745,9 +762,64 @@ fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
             hint_text,
             Style::default().fg(th.chrome_muted_fg).bg(th.chrome_bg),
         ),
+        Span::styled(
+            lsp_badge,
+            Style::default()
+                .fg(th.accent)
+                .bg(th.chrome_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(chip, chip_style),
     ]);
     f.render_widget(status, area);
+}
+
+/// Compose the LSP badge text for the currently-previewed file's
+/// language. Returns an empty string when there's nothing to surface
+/// (no preview, language has no LSP wired, or the supervisor is at
+/// `Off`). Pulls the per-language glyph from `LangProfile` so
+/// adding a language doesn't require touching this function.
+fn nav_lsp_badge_text(app: &App) -> String {
+    use crate::file_tree::PreviewBody;
+    use crate::nav::LspBadge;
+
+    let Some(preview) = app.preview_content.as_ref() else {
+        return String::new();
+    };
+    let parsed = match &preview.body {
+        PreviewBody::Text {
+            parsed: Some(p), ..
+        } => p,
+        _ => return String::new(),
+    };
+    let lang = parsed.language;
+    // Skip languages we have no LSP wired for — saves a noisy badge
+    // on languages where tree-sitter is the only tier.
+    let profile = lang.profile();
+    if profile.lsp.is_none() {
+        return String::new();
+    }
+    let glyph = profile.badge_glyph;
+    let state = app.lsp_states.get(&lang).cloned().unwrap_or(LspBadge::Off);
+    match state {
+        LspBadge::Off => {
+            // Promote `Off` to `Available` when the binary is on PATH
+            // but the supervisor hasn't been kicked yet — so the user
+            // sees e.g. `vue-language-server` is detected before their
+            // first `gd`. Reads the cached PATH-probe (`lsp_installed`,
+            // refreshed off the render path) instead of walking PATH
+            // every frame.
+            let installed = app.lsp_installed.get(&lang).copied().unwrap_or(false);
+            if installed {
+                format!(" {glyph}○ ")
+            } else {
+                String::new()
+            }
+        }
+        LspBadge::Booting => format!(" {glyph}… "),
+        LspBadge::Ready => format!(" {glyph}● "),
+        LspBadge::Crashed => format!(" {glyph}✕ "),
+    }
 }
 
 /// i18n short label for the currently-focused panel — drives the

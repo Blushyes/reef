@@ -171,6 +171,17 @@ pub struct DiffSelection {
     pub side: DiffSide,
 }
 
+/// Identifier under a Ctrl+hover in the diff panel — drives the
+/// underline-on-hover affordance (the diff analogue of
+/// `App::ctrl_hover_target`). `row` is the display-row index; `range` is
+/// the byte range within that row's side text; `side` picks the SBS half.
+#[derive(Debug, Clone)]
+pub struct DiffHover {
+    pub row: usize,
+    pub range: Range<usize>,
+    pub side: DiffSide,
+}
+
 /// Snapshot of what a single display row carried at the time of render.
 /// Mouse-selection handlers read this to know how to extract the side-
 /// specific text for the row that was hit — without walking back into
@@ -290,6 +301,46 @@ impl DiffHit {
         let visible_col = (col.saturating_sub(content_x) as usize) + h_scroll;
         let byte_offset = col_to_byte_offset(text, visible_col);
         Some((row_idx, byte_offset))
+    }
+
+    /// Identifier-shaped word at byte `byte_col` of display row `row_idx`
+    /// on `side`. Returns its byte range, or `None` when the byte lands on
+    /// whitespace / punctuation / past the end — i.e. nothing jump-worthy.
+    /// The single definition of "what counts as a clickable identifier in
+    /// a diff", shared by the Ctrl+hover underline and the `gd`/`gr`
+    /// resolver so the affordance and the action can never disagree.
+    pub fn identifier_in_row(
+        &self,
+        row_idx: usize,
+        byte_col: usize,
+        side: DiffSide,
+    ) -> Option<Range<usize>> {
+        let text = self.rows.get(row_idx)?.text_for(side);
+        let range = word_at_byte(text, byte_col);
+        if range.start >= range.end {
+            return None;
+        }
+        // First char must start an identifier — skips whitespace and
+        // punctuation runs (`->`, `::`) that `word_at_byte` also groups.
+        if !text
+            .get(range.clone())?
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || c == '_')
+        {
+            return None;
+        }
+        Some(range)
+    }
+
+    /// Mouse-coordinate convenience over `identifier_in_row`: resolves the
+    /// SBS side + display row + byte from a terminal `(col, row)` first.
+    /// Returns `(display_row_index, byte_range, side)`.
+    pub fn identifier_at(&self, col: u16, row: u16) -> Option<(usize, Range<usize>, DiffSide)> {
+        let side = self.side_for_column(col);
+        let (row_idx, byte_col) = self.coord_for(col, row, side)?;
+        let range = self.identifier_in_row(row_idx, byte_col, side)?;
+        Some((row_idx, range, side))
     }
 }
 

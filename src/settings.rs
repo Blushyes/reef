@@ -5,6 +5,7 @@
 //! [`current_value`]/[`cycle`].
 
 use crate::app::{App, DiffLayout, DiffMode};
+use crate::nav::NavLang;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingSection {
@@ -12,6 +13,9 @@ pub enum SettingSection {
     Editor,
     Git,
     Graph,
+    /// Phase 3 LSP / code-nav rows: state + click-to-install per
+    /// language. See `SettingItem::Lsp(NavLang)`.
+    Nav,
 }
 
 impl SettingSection {
@@ -22,6 +26,7 @@ impl SettingSection {
             SettingSection::Editor => Msg::SettingsSectionEditor,
             SettingSection::Git => Msg::SettingsSectionGit,
             SettingSection::Graph => Msg::SettingsSectionGraph,
+            SettingSection::Nav => Msg::SettingsSectionNav,
         }
     }
 }
@@ -36,6 +41,11 @@ pub enum SettingItem {
     CommitDiffLayout,
     CommitDiffMode,
     CommitFilesTreeMode,
+    /// One row per language served by the navigation engine. The
+    /// renderer pulls the language name + LSP binary from
+    /// `NavLang::profile()` rather than going through i18n, so adding
+    /// a language doesn't require new translation strings.
+    Lsp(NavLang),
 }
 
 impl SettingItem {
@@ -48,6 +58,12 @@ impl SettingItem {
         SettingItem::CommitDiffLayout,
         SettingItem::CommitDiffMode,
         SettingItem::CommitFilesTreeMode,
+        SettingItem::Lsp(NavLang::Rust),
+        SettingItem::Lsp(NavLang::TypeScript),
+        SettingItem::Lsp(NavLang::Tsx),
+        SettingItem::Lsp(NavLang::Python),
+        SettingItem::Lsp(NavLang::Go),
+        SettingItem::Lsp(NavLang::Vue),
     ];
 
     pub(crate) fn section(self) -> SettingSection {
@@ -60,6 +76,7 @@ impl SettingItem {
             SettingItem::CommitDiffLayout
             | SettingItem::CommitDiffMode
             | SettingItem::CommitFilesTreeMode => SettingSection::Graph,
+            SettingItem::Lsp(_) => SettingSection::Nav,
         }
     }
 
@@ -74,6 +91,11 @@ impl SettingItem {
             SettingItem::CommitDiffLayout => Msg::SettingsItemCommitDiffLayout,
             SettingItem::CommitDiffMode => Msg::SettingsItemCommitDiffMode,
             SettingItem::CommitFilesTreeMode => Msg::SettingsItemCommitFilesTreeMode,
+            // The render path special-cases `Lsp(lang)` and replaces
+            // this label with the language's `display_name`. Keep
+            // this Msg as the generic fallback so any path that
+            // doesn't special-case still surfaces something readable.
+            SettingItem::Lsp(_) => Msg::SettingsItemLsp,
         }
     }
 
@@ -88,6 +110,7 @@ impl SettingItem {
             SettingItem::CommitDiffLayout => Msg::SettingsDescCommitDiffLayout,
             SettingItem::CommitDiffMode => Msg::SettingsDescCommitDiffMode,
             SettingItem::CommitFilesTreeMode => Msg::SettingsDescCommitFilesTreeMode,
+            SettingItem::Lsp(_) => Msg::SettingsDescLsp,
         }
     }
 }
@@ -193,6 +216,31 @@ pub enum ItemValue {
     Bool(bool),
     Choice(&'static str),
     Text(String),
+    /// LSP row state — driven by `App::lsp_view_for(lang)`.
+    LspStatus {
+        lang: NavLang,
+        state: LspRowState,
+    },
+}
+
+/// Resolved render state for an LSP settings row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LspRowState {
+    /// Binary is on PATH AND supervisor has reported `Ready`. Both
+    /// signals required because PATH-only means "installed but never
+    /// asked" — still usable, but we hide the green dot until a real
+    /// session lights it up.
+    Ready,
+    /// Binary on PATH but supervisor hasn't been spawned yet (no
+    /// nav request for this language has fired).
+    Available,
+    /// Booting / Indexing.
+    Booting,
+    /// Last refine errored out — supervisor will respawn on the next
+    /// request. Shown with a warning glyph.
+    Crashed,
+    /// Binary missing from PATH.
+    Missing,
 }
 
 pub(crate) fn current_value(item: SettingItem, app: &App) -> ItemValue {
@@ -210,6 +258,10 @@ pub(crate) fn current_value(item: SettingItem, app: &App) -> ItemValue {
             ItemValue::Choice(diff_mode_label(app.commit_detail.diff_mode))
         }
         SettingItem::CommitFilesTreeMode => ItemValue::Bool(app.commit_detail.files_tree_mode),
+        SettingItem::Lsp(lang) => ItemValue::LspStatus {
+            lang,
+            state: app.lsp_view_for(lang),
+        },
     }
 }
 
@@ -241,6 +293,10 @@ pub fn cycle(app: &mut App, item: SettingItem) {
         SettingItem::CommitDiffLayout => app.toggle_commit_diff_layout(),
         SettingItem::CommitDiffMode => app.toggle_commit_diff_mode(),
         SettingItem::CommitFilesTreeMode => app.toggle_commit_files_tree_mode(),
+        SettingItem::Lsp(lang) => {
+            app.activate_lsp_row(lang);
+            return;
+        }
     }
     refresh_pref_cache(&mut app.settings);
 }

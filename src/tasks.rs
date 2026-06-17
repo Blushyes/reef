@@ -204,6 +204,37 @@ pub enum WorkerResult {
         generation: u64,
         result: Result<ReplaceSummary, String>,
     },
+    /// Phase 2 code-navigation: workspace symbol index build finished.
+    /// Carries the whole `WorkspaceIndex` since cross-file `gd` /
+    /// `gr` query against it from the main thread. Stale results are
+    /// dropped via `nav_workspace_load`'s generation token.
+    NavWorkspaceBuilt {
+        generation: u64,
+        result: Result<crate::nav::WorkspaceIndex, String>,
+    },
+    /// Phase 3 LSP refinement. `location` is `Some` when rust-analyzer
+    /// returned a definition for the identifier; `None` when it
+    /// declined or the request failed. Either way, the main thread
+    /// writes to `nav_refine_cache` so the next `gd` on the same
+    /// `(lang, identifier)` skips the round-trip.
+    LspRefineDone {
+        generation: u64,
+        /// Refine-cache epoch captured at dispatch. The main thread
+        /// compares it against the current epoch before inserting: a
+        /// response whose epoch predates an `fs_dirty` cache-clear
+        /// carries a location snapshotted from now-stale bytes, so it
+        /// must NOT repopulate the just-cleared cache (it would jump to
+        /// a pre-edit line on the next `gd`).
+        epoch: u64,
+        lang: crate::nav::NavLang,
+        identifier: String,
+        location: Option<crate::nav::LspLocation>,
+    },
+    /// Phase 3 supervisor state change — drives the status-bar badge.
+    LspStateChange {
+        lang: crate::nav::NavLang,
+        state: crate::nav::LspBadge,
+    },
 }
 
 /// Per-file unit of work for `FilesTask::ReplaceInFiles`. The worker
@@ -478,6 +509,27 @@ enum GlobalSearchTask {
     },
 }
 
+/// Phase 3 LSP-refine task — serviced by the dedicated LSP worker.
+/// Fire-and-forget: the answer lands in `nav_refine_cache` on the main
+/// thread when (or if) it arrives. `identifier` carries the position
+/// cache key (`refine_key`), not a symbol name.
+enum LspTask {
+    RefineDefinition {
+        generation: u64,
+        /// Refine-cache epoch at dispatch time — round-tripped back in
+        /// `WorkerResult::LspRefineDone` so the main thread can drop a
+        /// response that raced a cache-clear. See that variant's doc.
+        epoch: u64,
+        lang: crate::nav::NavLang,
+        identifier: String,
+        workspace_root: PathBuf,
+        file_path: PathBuf,
+        source: Arc<[u8]>,
+        line: u32,
+        character: u32,
+    },
+}
+
 enum GraphTask {
     RefreshGraph {
         generation: u64,
@@ -528,6 +580,10 @@ pub struct TaskCoordinator {
     git_tx: mpsc::Sender<GitTask>,
     graph_tx: mpsc::Sender<GraphTask>,
     global_search_tx: mpsc::Sender<GlobalSearchTask>,
+    result_tx: mpsc::Sender<WorkerResult>,
+    /// Phase 3 LSP worker. Holds the per-language `LspClient`s +
+    /// spawn-failure backoff.
+    lsp_tx: mpsc::Sender<LspTask>,
     result_rx: mpsc::Receiver<WorkerResult>,
 }
 
@@ -539,9 +595,53 @@ impl TaskCoordinator {
             preview_tx: spawn_preview_worker(result_tx.clone()),
             git_tx: spawn_git_worker(result_tx.clone()),
             graph_tx: spawn_graph_worker(result_tx.clone()),
-            global_search_tx: spawn_global_search_worker(result_tx),
+            global_search_tx: spawn_global_search_worker(result_tx.clone()),
+            lsp_tx: spawn_lsp_worker(result_tx.clone()),
+            result_tx,
             result_rx,
         }
+    }
+
+    pub fn build_nav_workspace(&self, generation: u64, root: PathBuf) {
+        let result_tx = self.result_tx.clone();
+        let _ = thread::Builder::new()
+            .name("reef-nav-index".into())
+            .spawn(move || {
+                let index = crate::nav::build_workspace_index(root);
+                let _ = result_tx.send(WorkerResult::NavWorkspaceBuilt {
+                    generation,
+                    result: Ok(index),
+                });
+            });
+    }
+
+    /// Dispatch a Phase 3 LSP refine. Fire-and-forget; the answer (or
+    /// a state-change update on failure) arrives as
+    /// `WorkerResult::LspRefineDone` / `LspStateChange`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lsp_refine_definition(
+        &self,
+        generation: u64,
+        epoch: u64,
+        lang: crate::nav::NavLang,
+        identifier: String,
+        workspace_root: PathBuf,
+        file_path: PathBuf,
+        source: Arc<[u8]>,
+        line: u32,
+        character: u32,
+    ) {
+        let _ = self.lsp_tx.send(LspTask::RefineDefinition {
+            generation,
+            epoch,
+            lang,
+            identifier,
+            workspace_root,
+            file_path,
+            source,
+            line,
+            character,
+        });
     }
 
     pub fn try_recv(&self) -> Result<WorkerResult, mpsc::TryRecvError> {
@@ -2317,6 +2417,108 @@ fn spawn_global_search_worker(
     tx
 }
 
+/// Dedicated LSP worker thread. Owns the per-language `LspClient`s
+/// and a spawn-failure backoff so a missing/broken server isn't
+/// re-spawned (with its 15s init handshake) on every single click.
+fn spawn_lsp_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<LspTask> {
+    let (tx, rx) = mpsc::channel();
+    let _ = thread::Builder::new()
+        .name("reef-lsp-worker".into())
+        .spawn(move || {
+            use std::collections::HashMap;
+            use std::time::{Duration, Instant};
+            // Don't re-attempt a spawn that just failed for this long.
+            // Auto-recovers without cross-thread signaling: after the
+            // window, the next `gd` retries (so a completed install is
+            // picked up within ~30s with no extra plumbing).
+            const SPAWN_BACKOFF: Duration = Duration::from_secs(30);
+
+            let mut clients: HashMap<crate::nav::NavLang, crate::nav::LspClient> = HashMap::new();
+            let mut failed_spawn: HashMap<crate::nav::NavLang, Instant> = HashMap::new();
+
+            while let Ok(task) = rx.recv() {
+                let LspTask::RefineDefinition {
+                    generation,
+                    epoch,
+                    lang,
+                    identifier,
+                    workspace_root,
+                    file_path,
+                    source,
+                    line,
+                    character,
+                } = task;
+                if lang.profile().lsp.is_none() {
+                    continue;
+                }
+                if let std::collections::hash_map::Entry::Vacant(slot) = clients.entry(lang) {
+                    // Backoff: skip the (potentially 15s-blocking)
+                    // spawn if we failed recently. Emits Off so a
+                    // waiting pending-jump is cleared rather than
+                    // hanging forever.
+                    if let Some(t) = failed_spawn.get(&lang) {
+                        if t.elapsed() < SPAWN_BACKOFF {
+                            let _ = result_tx.send(WorkerResult::LspStateChange {
+                                lang,
+                                state: crate::nav::LspBadge::Off,
+                            });
+                            continue;
+                        }
+                        failed_spawn.remove(&lang);
+                    }
+                    let _ = result_tx.send(WorkerResult::LspStateChange {
+                        lang,
+                        state: crate::nav::LspBadge::Booting,
+                    });
+                    match crate::nav::LspClient::spawn(lang, workspace_root.clone()) {
+                        Ok(c) => {
+                            slot.insert(c);
+                            let _ = result_tx.send(WorkerResult::LspStateChange {
+                                lang,
+                                state: crate::nav::LspBadge::Ready,
+                            });
+                        }
+                        Err(_) => {
+                            failed_spawn.insert(lang, Instant::now());
+                            let _ = result_tx.send(WorkerResult::LspStateChange {
+                                lang,
+                                state: crate::nav::LspBadge::Off,
+                            });
+                            continue;
+                        }
+                    }
+                }
+                let Some(client) = clients.get(&lang) else {
+                    continue;
+                };
+                let location =
+                    match client.goto_definition(&file_path, &source, line, character, lang) {
+                        Ok(loc) => loc,
+                        Err(_) => {
+                            // Client crashed mid-request — drop it so
+                            // the next refine respawns (subject to
+                            // backoff).
+                            clients.remove(&lang);
+                            failed_spawn.insert(lang, Instant::now());
+                            let _ = result_tx.send(WorkerResult::LspStateChange {
+                                lang,
+                                state: crate::nav::LspBadge::Crashed,
+                            });
+                            None
+                        }
+                    };
+                let _ = result_tx.send(WorkerResult::LspRefineDone {
+                    generation,
+                    epoch,
+                    lang,
+                    identifier,
+                    location,
+                });
+            }
+        });
+    tx
+}
+
 /// Run one global search via `backend.search_content`, forwarding each
 /// backend-emitted chunk as a `WorkerResult::GlobalSearchChunk` so the
 /// UI sees partial results within ~one chunk of walker output instead
@@ -3460,6 +3662,7 @@ mod preview_panic_guard_tests {
             body: crate::file_tree::PreviewBody::Text {
                 lines: vec!["hi".into()],
                 highlighted: None,
+                parsed: None,
             },
         };
         let result = run_preview_with_panic_guard(Path::new("x.txt"), move || Some(preview));

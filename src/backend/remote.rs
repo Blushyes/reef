@@ -545,15 +545,36 @@ impl Backend for RemoteBackend {
             lines
         };
 
-        let highlighted = if raw.len() <= 512 * 1024 && lines.len() <= 5_000 {
+        let within_cap = raw.len() <= 512 * 1024 && lines.len() <= 5_000;
+        let highlighted = if within_cap {
             crate::ui::highlight::highlight_file(&rel_str, &lines, dark)
+        } else {
+            None
+        };
+
+        // SSH mode: tree-sitter still runs locally — file bytes have
+        // already crossed the SSH boundary into `raw`. The result is
+        // intra-file `gd` parity with local mode. Cross-file
+        // (Phase 2 stack-graphs) is local-only; LSP (Phase 3) is also
+        // local-only — both gate on `Backend::is_remote()`.
+        let parsed = if within_cap {
+            let path_buf = std::path::PathBuf::from(&rel_str);
+            crate::nav::NavLang::from_path(&path_buf).and_then(|lang| {
+                let source: std::sync::Arc<[u8]> =
+                    std::sync::Arc::from(raw.clone().into_boxed_slice());
+                crate::nav::parse_file_if_supported(lang, source).map(std::sync::Arc::new)
+            })
         } else {
             None
         };
 
         Some(PreviewContent {
             file_path: rel_str,
-            body: PreviewBody::Text { lines, highlighted },
+            body: PreviewBody::Text {
+                lines,
+                highlighted,
+                parsed,
+            },
         })
     }
 

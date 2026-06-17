@@ -7,7 +7,7 @@ When AI writes your code, 90% of an IDE becomes dead weight. Reef is the other 1
 <a href="./README.md"><img alt="English" src="https://img.shields.io/badge/lang-EN-blue?style=flat-square"></a>
 <a href="./README.zh-CN.md"><img alt="简体中文" src="https://img.shields.io/badge/lang-%E4%B8%AD%E6%96%87-red?style=flat-square"></a>
 
-A single-binary terminal workbench for browsing, reviewing, and shipping — locally or over SSH. No editor, no language server, no autocomplete. Write with your AI of choice; come here for the rest.
+A single-binary terminal workbench for browsing, reviewing, and shipping — locally or over SSH. No editor, no autocomplete. Write with your AI of choice; come here for the rest.
 
 <p align="center">
   <img src="https://github.com/Blushyes/reef/releases/download/v0.33.0/reef.png" alt="Reef" width="900">

@@ -36,6 +36,7 @@ fn text_preview(line_count: usize) -> PreviewContent {
         body: PreviewBody::Text {
             lines: (0..line_count).map(|i| format!("line {}", i)).collect(),
             highlighted: None,
+            parsed: None,
         },
     }
 }

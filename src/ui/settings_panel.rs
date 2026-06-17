@@ -11,7 +11,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
 use crate::i18n::{Msg, t};
-use crate::settings::{ItemValue, SettingItem, SettingSection, current_value};
+use crate::settings::{ItemValue, LspRowState, SettingItem, SettingSection, current_value};
 use crate::ui::mouse::ClickAction;
 
 const LABEL_COL_WIDTH: u16 = 28;
@@ -50,23 +50,47 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     if editing_editor {
         render_inline_editor_prompt(f, app, Rect::new(inner.x, desc_y, inner.width, 1));
     } else {
-        let desc = t(selected.description());
-        let line = Line::from(Span::styled(
-            format!("  {desc}"),
-            Style::default().fg(th.fg_secondary),
-        ));
+        let desc = if let SettingItem::Lsp(lang) = selected {
+            let lsp = lang.profile().lsp.as_ref();
+            let bin = lsp.map(|p| p.bin).unwrap_or("(no LSP)");
+            match lsp.and_then(|p| p.install_command) {
+                Some(cmd) => format!("  {bin}  →  {cmd}"),
+                None => format!("  {bin}"),
+            }
+        } else {
+            format!("  {}", t(selected.description()))
+        };
+        let line = Line::from(Span::styled(desc, Style::default().fg(th.fg_secondary)));
         f.render_widget(line, Rect::new(inner.x, desc_y, inner.width, 1));
     }
 
-    let footer_msg = if editing_editor {
-        Msg::SettingsEditorEditHint
-    } else {
-        Msg::SettingsFooterHint
-    };
-    let footer = Line::from(Span::styled(
-        t(footer_msg),
-        Style::default().fg(th.chrome_muted_fg),
-    ));
+    let toast_line = app.toasts.last().map(|toast| {
+        let color = match toast.level {
+            crate::ui::toast::ToastLevel::Info => th.accent,
+            crate::ui::toast::ToastLevel::Warn => th.warn_bg,
+            crate::ui::toast::ToastLevel::Error => th.removed_accent,
+        };
+        let mut s = toast.message.clone();
+        let max = inner.width.saturating_sub(2) as usize;
+        if s.chars().count() > max {
+            s = s.chars().take(max.saturating_sub(1)).collect::<String>() + "…";
+        }
+        Line::from(Span::styled(
+            format!("  {s}"),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ))
+    });
+    let footer = toast_line.unwrap_or_else(|| {
+        let footer_msg = if editing_editor {
+            Msg::SettingsEditorEditHint
+        } else {
+            Msg::SettingsFooterHint
+        };
+        Line::from(Span::styled(
+            t(footer_msg),
+            Style::default().fg(th.chrome_muted_fg),
+        ))
+    });
     f.render_widget(footer, Rect::new(inner.x, footer_y, inner.width, 1));
 }
 
@@ -127,7 +151,13 @@ fn render_row(
     };
     let chevron = if selected { " › " } else { "   " };
 
-    let label_text = t(item.label());
+    // Lsp rows override the generic i18n label with the language's
+    // own `display_name` so adding a language doesn't require a new
+    // translation key.
+    let label_text: &str = match item {
+        SettingItem::Lsp(lang) => lang.profile().display_name,
+        _ => t(item.label()),
+    };
     let (value_text, value_style) = format_value(&current_value(item, app), th, selected);
 
     let consumed = UnicodeWidthStr::width(chevron) + UnicodeWidthStr::width(label_text);
@@ -196,6 +226,30 @@ fn format_value(value: &ItemValue, th: crate::ui::theme::Theme, selected: bool) 
                 .add_modifier(Modifier::ITALIC),
         ),
         ItemValue::Text(s) => (s.clone(), strong),
+        ItemValue::LspStatus { lang, state } => {
+            let glyph = lang.profile().badge_glyph;
+            let (state_label, color) = match state {
+                LspRowState::Ready => (t(Msg::SettingsLspStateReady), th.accent),
+                LspRowState::Available => (t(Msg::SettingsLspStateReady), th.fg_secondary),
+                LspRowState::Booting => (t(Msg::SettingsLspStateBooting), th.accent),
+                LspRowState::Crashed => (t(Msg::SettingsLspStateCrashed), th.fg_secondary),
+                LspRowState::Missing => (t(Msg::SettingsLspStateMissing), th.fg_secondary),
+            };
+            // `[GLYPH]  STATE` — kept short so the *state* always
+            // fits in the value column even on narrow terminals.
+            // The binary name lives in the description line below
+            // when the row is selected; users don't need to see it
+            // twice. Was: `[GLYPH] bin  STATE` — but long bin names
+            // like `typescript-language-server` truncated the state
+            // off-screen.
+            let text = format!("[{glyph}]  {state_label}");
+            let style = if selected {
+                Style::default().fg(color).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(color)
+            };
+            (text, style)
+        }
     }
 }
 

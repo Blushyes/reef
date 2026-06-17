@@ -32,6 +32,7 @@ fn install_text_preview(app: &mut App, lines: &[&str]) {
         body: PreviewBody::Text {
             lines: lines.iter().map(|s| s.to_string()).collect(),
             highlighted: None,
+            parsed: None,
         },
     });
 }

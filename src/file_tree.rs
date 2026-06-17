@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// A visible entry in the flattened file tree.
 #[derive(Debug, Clone)]
@@ -31,6 +32,19 @@ pub enum PreviewBody {
     Text {
         lines: Vec<String>,
         highlighted: Option<Vec<Vec<(ratatui::style::Style, String)>>>,
+        /// Tree-sitter parse for the navigation engine (`gd` /
+        /// Ctrl+click / `gr`). Populated by the preview worker when
+        /// the file's extension matches a bundled grammar AND the
+        /// content fits within the highlight caps (same 512KB / 5K
+        /// lines limits — see file_tree.rs::load_preview). `None`
+        /// otherwise; navigation falls through to a no-op.
+        ///
+        /// Held by `Arc` because `goto_definition_at_cursor` may
+        /// hand the parse off to a background refinement task
+        /// (Phase 3 LSP) without copying. The cache invalidates
+        /// automatically when `preview_load.mark_stale()` fires from
+        /// the fs_watcher drain — no separate LRU.
+        parsed: Option<Arc<crate::nav::FileParse>>,
     },
     Image(ImagePreview),
     Binary(BinaryInfo),
@@ -771,15 +785,34 @@ pub fn load_preview(
         lines
     };
 
-    let highlighted = if raw.len() <= 512 * 1024 && lines.len() <= 5_000 {
+    let within_cap = raw.len() <= 512 * 1024 && lines.len() <= 5_000;
+    let highlighted = if within_cap {
         crate::ui::highlight::highlight_file(&rel_str, &lines, dark)
+    } else {
+        None
+    };
+
+    // Tree-sitter parse for navigation. Same cap as highlight — keeps
+    // the two caches coherent: when one is populated the other is too,
+    // and `preview_load.mark_stale()` from the fs_watcher drain
+    // invalidates both at once (see app.rs::tick).
+    let parsed = if within_cap {
+        let path_buf = std::path::PathBuf::from(&rel_str);
+        crate::nav::NavLang::from_path(&path_buf).and_then(|lang| {
+            let source: Arc<[u8]> = Arc::from(raw.clone().into_boxed_slice());
+            crate::nav::parse_file_if_supported(lang, source).map(Arc::new)
+        })
     } else {
         None
     };
 
     Some(PreviewContent {
         file_path: rel_str,
-        body: PreviewBody::Text { lines, highlighted },
+        body: PreviewBody::Text {
+            lines,
+            highlighted,
+            parsed,
+        },
     })
 }
 

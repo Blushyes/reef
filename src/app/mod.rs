@@ -13,6 +13,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+/// Code-navigation request side (gd / gr / Ctrl+click / nav stack /
+/// LSP refine / post-jump highlight). A child `impl App` block, kept in
+/// its own file so the ~900-line subsystem doesn't bloat this module.
+mod nav;
+
 /// Worker-produced `StatefulProtocol` carried back to the main thread
 /// so it can be slotted into the current `ThreadProtocol`. The
 /// `generation` matches the corresponding `preview_load` request — a
@@ -880,6 +885,107 @@ pub struct App {
     /// `ui::file_preview_panel` alongside the in-panel `/` search highlight.
     pub preview_highlight: Option<PreviewHighlight>,
 
+    /// Code-navigation back stack. `gd` / Ctrl+click push the
+    /// **pre-jump** state here before the async jump chain starts; a
+    /// later `Ctrl-o` pops it back. Capped at `NAV_HISTORY_CAP` (oldest
+    /// dropped on overflow). Persists across tab changes — the user
+    /// usually wants `Ctrl-o` to work after digit-switching tabs.
+    pub nav_history: Vec<crate::nav::NavStackEntry>,
+
+    /// Forward stack populated by `Ctrl-o` (so `Ctrl-i` can redo).
+    /// Cleared the next time a fresh `gd` lands — same semantics as
+    /// any other history-stack UX (browser back/forward).
+    pub nav_history_forward: Vec<crate::nav::NavStackEntry>,
+
+    /// Multi-candidate popup overlay. `Some` while the user is picking
+    /// between several intra-file definitions; closes on Enter / Esc /
+    /// click-outside. While open, owns keyboard navigation (Up/Down)
+    /// and routes click via `HitTestRegistry`.
+    pub nav_candidates: Option<crate::nav::NavCandidatesPopup>,
+
+    /// Identifier currently lit up under a Ctrl+hover gesture. `Some`
+    /// while the user holds Ctrl over a clickable token in the preview
+    /// pane; the render path overlays an UNDERLINE + accent fg on
+    /// `(line, byte_range)` to advertise that a click would jump.
+    /// Cleared on every Mouse Moved event that lacks CONTROL.
+    pub ctrl_hover_target: Option<(usize, std::ops::Range<usize>)>,
+
+    /// Same Ctrl+hover affordance, but for the diff panel (which carries
+    /// no `FileParse`, so the hovered identifier is found by `word_at_byte`
+    /// on the row text). Carries the display-row + byte range + SBS side so
+    /// the diff renderer underlines the right half. Cleared on any Moved
+    /// without CONTROL or off the diff.
+    pub diff_ctrl_hover: Option<crate::ui::selection::DiffHover>,
+
+    /// Workspace symbol index for cross-file `gd` / `gr`. Built once
+    /// on repo open (`build_nav_workspace`), rebuilt lazily after
+    /// fs_watcher invalidations. `None` before the first build
+    /// completes — cross-file resolution falls back to intra-file
+    /// during that window.
+    ///
+    /// Held by `Arc` because the popup can outlive the index when a
+    /// rebuild kicks off mid-display.
+    pub nav_workspace: Option<std::sync::Arc<crate::nav::WorkspaceIndex>>,
+
+    /// Inflight-tracker for workspace index builds. Uses the standard
+    /// generation / loading / stale flags — unlike `goto_definition`
+    /// (which is intent dispatch), a workspace build is a snapshot
+    /// load that benefits from the full AsyncState contract.
+    pub nav_workspace_load: AsyncState,
+
+    /// Phase 3 supervisor state per language — drives the status-bar
+    /// badge. Missing keys are treated as `LspBadge::Off`.
+    pub lsp_states: std::collections::HashMap<crate::nav::NavLang, crate::nav::LspBadge>,
+
+    /// Cached "is this LSP binary on PATH?" per language. Populated off
+    /// the render path by `refresh_lsp_installed` so the status-bar badge and Settings rows
+    /// never stat the filesystem during render — `locate_binary` walks
+    /// every PATH dir and was previously called every frame.
+    pub lsp_installed: std::collections::HashMap<crate::nav::NavLang, bool>,
+
+    /// Phase 3 LSP refine cache. Keyed by `(lang, identifier_text)`
+    /// rather than byte offset so a click on `foo` anywhere benefits
+    /// from a prior LSP refine on `foo`. The next `gd` consults this
+    /// before falling back to tree-sitter / workspace results — never
+    /// re-jumps the cursor from a refine that lands after the jump.
+    pub nav_refine_cache:
+        std::collections::HashMap<(crate::nav::NavLang, String), crate::nav::LspLocation>,
+
+    /// Generation counter for LSP refine dispatches. Used by
+    /// `nav_pending_lsp_jump` to drop stale responses when the user
+    /// clicks somewhere else mid-flight.
+    pub nav_refine_gen: u64,
+
+    /// Monotonic epoch bumped every time `nav_refine_cache` is cleared
+    /// (an `fs_dirty` pulse — a file may have moved the symbol). Each
+    /// refine dispatch captures the current epoch; the `LspRefineDone`
+    /// handler refuses to insert a response whose epoch is older than
+    /// the current one, since its location was resolved against a
+    /// now-stale source snapshot. Without this guard a refine in flight
+    /// across a cache-clear repopulates the cache with a pre-edit
+    /// location, and the next `gd` jumps to the wrong line.
+    ///
+    /// Because `fs_watcher` is coarse (a path-less `()` pulse), this is
+    /// conservative: ANY fs event between a refine's dispatch and its
+    /// response drops the insert, even when the edited file is unrelated
+    /// to the clicked symbol. That is self-healing — the dropped result
+    /// only skips a cache *write*; the jump still happens, and the next
+    /// `gd` at the same position re-dispatches with the current epoch and
+    /// caches normally once the fs quiets. The precise fix (invalidate
+    /// only the changed paths) needs `Backend::subscribe_fs_events` to
+    /// carry paths and is deferred; under continuous churn the whole
+    /// cache is being legitimately cleared anyway, so little is lost.
+    pub nav_refine_epoch: u64,
+
+    /// Pending LSP-only goto-def request — Vue (and any future
+    /// `has_semantic_queries() == false` language). Set when `gd` /
+    /// Ctrl+click fires the LSP request; consumed by tick's
+    /// `LspRefineDone` drain when the matching response arrives.
+    /// Mirrors VSCode's Vue extension: the client sends
+    /// `textDocument/definition { uri, position }` and waits for the
+    /// server (Volar) to do the SFC → virtual TS mapping.
+    pub nav_pending_lsp_jump: Option<crate::nav::NavPendingJump>,
+
     /// VSCode-style drag-and-drop destination picker. While `place_mode.active`,
     /// input is routed exclusively to `input::handle_key` / `handle_mouse`
     /// place-mode branches (see `crate::place_mode`).
@@ -1015,6 +1121,37 @@ pub struct PreviewHighlight {
     pub path: std::path::PathBuf,
     pub row: usize,
     pub byte_range: std::ops::Range<usize>,
+    /// Fade lifecycle, carried INSIDE the highlight so it can never
+    /// desync from the highlight's presence (one `Option`, not two
+    /// loosely-coupled fields). Set by `set_preview_highlight`
+    /// (fading) / `set_preview_highlight_persistent`.
+    pub fade: HighlightFade,
+    /// UTF-16 `start..end` columns awaiting byte-range resolution. Set
+    /// for a CROSS-FILE LSP definition jump, whose target source isn't
+    /// loaded yet when the highlight is created — so `byte_range` starts
+    /// empty and `resolve_pending_highlight` converts these columns to a
+    /// real byte range (highlighting the symbol, not just the row) once
+    /// the destination preview lands. `None` for same-file jumps (already
+    /// resolved) and non-LSP highlights (global search carries its own
+    /// byte range).
+    pub pending_utf16: Option<std::ops::Range<u32>>,
+}
+
+/// Fade lifecycle of a `preview_highlight`.
+///
+/// - `Persistent` — global-search locator band; never auto-fades (the
+///   user reads against it).
+/// - `Pending` — a nav-jump reveal band whose target file is still
+///   loading (cross-file). The TTL countdown is deferred until the
+///   file is on screen so the band isn't gone before the user sees the
+///   destination — but a hard `armed_at` cap clears it if the load
+///   never lands (deleted/unreadable file), so it can't leak.
+/// - `Counting` — reveal band on screen; clears `since + TTL`.
+#[derive(Debug, Clone, Copy)]
+pub enum HighlightFade {
+    Persistent,
+    Pending { armed_at: std::time::Instant },
+    Counting { since: std::time::Instant },
 }
 
 /// Pure predicate: does the Graph tab want 3-col layout given these
@@ -1239,6 +1376,19 @@ impl App {
             pending_ssh_target: None,
             should_quit_session: false,
             preview_highlight: None,
+            nav_history: Vec::new(),
+            nav_history_forward: Vec::new(),
+            nav_candidates: None,
+            ctrl_hover_target: None,
+            diff_ctrl_hover: None,
+            nav_workspace: None,
+            nav_workspace_load: AsyncState::default(),
+            lsp_states: std::collections::HashMap::new(),
+            lsp_installed: std::collections::HashMap::new(),
+            nav_refine_cache: std::collections::HashMap::new(),
+            nav_refine_gen: 0,
+            nav_refine_epoch: 0,
+            nav_pending_lsp_jump: None,
             place_mode: crate::place_mode::PlaceModeState::default(),
             tree_edit: crate::tree_edit::TreeEditState::default(),
             tree_context_menu: crate::tree_context_menu::ContextMenuState::default(),
@@ -1270,6 +1420,15 @@ impl App {
         };
         app.refresh_status();
         app.refresh_file_tree();
+        // Phase 2: kick the workspace symbol index build immediately on
+        // repo open (user decision — "立即构建"). Skipped in SSH mode:
+        // the index walks the local filesystem, and the index isn't
+        // useful for files that live on a remote host.
+        app.dispatch_nav_workspace_build();
+        // Probe which LSP binaries are installed ONCE here (off the
+        // render path) so the status-bar badge / Settings rows read a
+        // cached map instead of walking PATH every frame.
+        app.refresh_lsp_installed();
         app
     }
 
@@ -4086,15 +4245,17 @@ impl App {
                         // scroll has to happen here — setting it inside
                         // `accept()` before the preview exists wouldn't know
                         // the final line count / view height.
-                        if let (Some(hl), Some(preview)) = (
-                            self.preview_highlight.as_ref(),
-                            self.preview_content.as_ref(),
-                        ) {
-                            if preview.file_path == hl.path.to_string_lossy() {
+                        if let Some(hl) = self.preview_highlight.as_ref() {
+                            if self.preview_is_for(&hl.path) {
                                 let view_h = self.last_preview_view_h as usize;
                                 self.preview_scroll = crate::search::center_scroll(hl.row, view_h);
                             }
                         }
+                        // A cross-file LSP jump deferred its symbol-range
+                        // resolution until the destination source was
+                        // loaded — do it now so the identifier (not just
+                        // the row) lights up.
+                        self.resolve_pending_highlight();
                         // Defer prefetch: if we fired right now, a user
                         // who presses ↓ within ~50 ms of this landing
                         // would find two prefetch decodes already
@@ -4504,6 +4665,104 @@ impl App {
                     }
                 }
             }
+            WorkerResult::NavWorkspaceBuilt { generation, result } => {
+                if !self.nav_workspace_load.complete_ok(generation) {
+                    return;
+                }
+                match result {
+                    Ok(index) => {
+                        self.nav_workspace = Some(std::sync::Arc::new(index));
+                    }
+                    Err(_) => {
+                        // Phase 2 build failures are silent for now —
+                        // intra-file nav (Phase 1) still works without
+                        // the workspace index. Phase 3 may surface
+                        // these via a status-bar badge.
+                        self.nav_workspace = None;
+                    }
+                }
+            }
+            WorkerResult::LspRefineDone {
+                generation,
+                epoch,
+                lang,
+                identifier,
+                location,
+            } => {
+                // The cache is keyed by POSITION (`lang, path:line:col`
+                // via `refine_key`), never by bare name. We ALSO check
+                // `nav_pending_lsp_jump` and execute the jump when the
+                // response matches the request currently waiting (the
+                // Vue / LSP-only path). Mirrors VSCode's Vue extension:
+                // send request, wait, jump.
+                //
+                // Convert the server's absolute path to workdir-relative
+                // ONCE, here at cache-write time, so every cache reader
+                // gets a ready-to-use relative path. `None` = no
+                // definition OR outside the workspace (e.g. a dep).
+                let rel_location = location.as_ref().and_then(|loc| {
+                    self.workdir_relative(&loc.path)
+                        .map(|rel| crate::nav::LspLocation {
+                            path: rel,
+                            line: loc.line,
+                            character: loc.character,
+                            character_end: loc.character_end,
+                        })
+                });
+                let key = (lang, identifier.clone());
+                // Only ever INSERT on a hit. A `None` must NOT remove a
+                // cached entry: two requests for the same position key
+                // can be in flight (impatient double-`gd` while the
+                // server is still indexing), and a late "no definition"
+                // response would otherwise evict the good answer a
+                // newer request just cached. Stale entries are bounded
+                // anyway — the whole cache is cleared on any fs change.
+                //
+                // Epoch guard: if the cache was cleared (a file edit)
+                // since this refine was dispatched, the response's
+                // location was resolved from now-stale bytes. Skip the
+                // insert so it can't repopulate the just-cleared cache
+                // with a pre-edit line. The pending-jump branch below is
+                // still allowed to run for `generation`-matched requests
+                // — a slightly stale one-shot jump is acceptable, but
+                // poisoning the cache for every future `gd` is not.
+                let epoch_fresh = epoch == self.nav_refine_epoch;
+                if let Some(loc) = &rel_location
+                    && epoch_fresh
+                {
+                    self.nav_refine_cache.insert(key.clone(), loc.clone());
+                }
+                if let Some(pending) = self.nav_pending_lsp_jump.as_ref()
+                    && pending.lang == lang
+                    && pending.cache_key == identifier
+                    && pending.generation == generation
+                {
+                    let pending = self.nav_pending_lsp_jump.take().expect("just checked");
+                    match rel_location {
+                        Some(loc) => {
+                            // A stale popup must not survive underneath
+                            // an async jump.
+                            self.nav_candidates = None;
+                            self.nav_push_back(pending.origin);
+                            self.nav_history_forward.clear();
+                            self.nav_jump_to_lsp(&loc);
+                        }
+                        None if location.is_some() => {
+                            self.toasts.push(Toast::info(
+                                "Definition is outside the workspace".to_string(),
+                            ));
+                        }
+                        None => {
+                            // Server answered "no definition".
+                            self.toasts
+                                .push(Toast::info("No definition found".to_string()));
+                        }
+                    }
+                }
+            }
+            WorkerResult::LspStateChange { lang, state } => {
+                self.handle_lsp_state_change(lang, state);
+            }
         }
     }
 
@@ -4518,6 +4777,12 @@ impl App {
         self.view_mode = ViewMode::Settings;
         self.settings.editor_edit = None;
         crate::settings::refresh_pref_cache(&mut self.settings);
+        // Re-probe LSP binaries so the Code Navigation rows reflect any
+        // out-of-band install (e.g. the user ran `cargo install
+        // rust-analyzer` in another terminal since launch). Cheap, and
+        // off the render path. Without this, a row could read "Missing"
+        // and re-install an already-present server.
+        self.refresh_lsp_installed();
     }
 
     /// Esc semantics — uncommitted buffer discarded, Enter is the
@@ -5037,6 +5302,21 @@ impl App {
             ClickAction::TreeContextMenuClose => {
                 self.close_tree_context_menu();
             }
+            ClickAction::NavCandidateSelect(idx) => {
+                // Move selection to the clicked row, then commit. A
+                // double-click semantics here would be safer (single
+                // = move, double = pick), but the tree context menu
+                // commits on single click too — keep them consistent.
+                if let Some(popup) = self.nav_candidates.as_mut() {
+                    if idx < popup.candidates.len() {
+                        popup.selected = idx;
+                    }
+                }
+                self.nav_pick_candidate();
+            }
+            ClickAction::NavCandidatesClose => {
+                self.nav_close_candidates();
+            }
             ClickAction::HostsPickerSelect(idx) => {
                 // Mouse click on a hosts-picker row: move selection to
                 // that row and (for paths that already have a target)
@@ -5135,6 +5415,15 @@ impl App {
             ClickAction::SettingsRow(idx) => {
                 if self.view_mode == ViewMode::Settings {
                     self.settings.select(idx);
+                    // LSP rows are actionable buttons ("Enter to
+                    // install") — a click should install, matching the
+                    // user's expectation and every other clickable list
+                    // in the UI. Other settings rows keep the
+                    // click-selects / Enter-activates convention so a
+                    // stray click can't flip a pref.
+                    if let crate::settings::SettingItem::Lsp(lang) = self.settings.selected() {
+                        self.activate_lsp_row(lang);
+                    }
                 }
             }
             ClickAction::ConfirmModalPrimary => {
@@ -5388,9 +5677,40 @@ impl App {
             // the new/deleted files. Rebuilding immediately on every fs
             // event would be wasteful for a palette the user may not open.
             crate::quick_open::mark_stale(&mut self.quick_open);
+            // Workspace symbol index follows the same lazy-rebuild rule
+            // as quick_open. fs_watcher is coarse — a single `()`
+            // pulse with no path info — so we invalidate the entire
+            // index and let the next `kick_active_tab_work` rebuild it.
+            self.nav_workspace_load.mark_stale();
+            // The LSP refine cache maps a click position to a resolved
+            // definition location. A file edit can move that symbol, so
+            // a cached entry would jump to a stale line. Drop the whole
+            // cache on any fs change — it refills lazily on the next
+            // `gd`. (Same coarse-invalidation rationale as above.)
+            self.nav_refine_cache.clear();
+            // Bump the epoch so any refine dispatched before this clear
+            // (its location snapshotted from pre-edit bytes) is dropped
+            // by the `LspRefineDone` handler instead of repopulating the
+            // cache we just emptied.
+            self.nav_refine_epoch = self.nav_refine_epoch.wrapping_add(1);
         }
 
+        // VSCode "Reveal" fade — clear `preview_highlight` after
+        // `PREVIEW_HIGHLIGHT_TTL` so the highlight doesn't linger
+        // forever on the destination line. Set on the rising edge
+        // (None → Some) and consumed on expiry. Cleared synchronously
+        // here so the next render sees no highlight.
+        self.advance_preview_highlight_fade();
+
         self.maybe_kick_global_search();
+        // Lazy rebuild of the nav workspace index when stale and idle.
+        // Same pattern as quick_open's lazy rebuild — index work is
+        // wasteful to re-trigger on every fs event, but the next
+        // `gd` / `gr` after the user-visible quiet period gets a
+        // fresh index.
+        if self.nav_workspace_load.should_request() {
+            self.dispatch_nav_workspace_build();
+        }
         self.drain_preview_sync_debounce();
         self.drain_preview_schedule();
         self.drain_prefetch_schedule();

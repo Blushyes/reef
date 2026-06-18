@@ -377,14 +377,27 @@ pub fn collect_diff_selected_text(hit: &DiffHit, sel: &DiffSelection) -> String 
 
 /// 把选中范围从 `lines` 提取成一段纯文本。多行之间用 `\n` 连接。
 pub fn collect_selected_text(lines: &[String], sel: &PreviewSelection) -> String {
+    collect_selected_text_from_rows(lines.iter().map(String::as_str), lines.len(), sel)
+}
+
+pub fn collect_selected_text_from_rows<'a>(
+    rows: impl Iterator<Item = &'a str>,
+    row_count: usize,
+    sel: &PreviewSelection,
+) -> String {
     if sel.is_empty() {
         return String::new();
     }
+    if row_count == 0 {
+        return String::new();
+    }
     let (start, end) = sel.normalized();
-    let last = end.0.min(lines.len().saturating_sub(1));
+    let last = end.0.min(row_count - 1);
+    if start.0 > last {
+        return String::new();
+    }
     let mut out = String::new();
-    for row in start.0..=last {
-        let line = &lines[row];
+    for (row, line) in rows.enumerate().skip(start.0).take(last + 1 - start.0) {
         let range = match sel.line_byte_range(row, line) {
             Some(r) => r,
             None => continue,

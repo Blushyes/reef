@@ -402,12 +402,9 @@ fn diff_target_from_layout(
 /// `display.unified_row_texts` / `display.sbs_row_texts` rather than
 /// re-flattening the diff on every keystroke.
 fn collect_rows(app: &App, target: FindTarget) -> Vec<std::borrow::Cow<'_, str>> {
-    use std::borrow::Cow;
     match target {
         FindTarget::FilePreview => match app.preview_content.as_ref().map(|p| &p.body) {
-            Some(crate::file_tree::PreviewBody::Text { lines, .. }) => {
-                lines.iter().map(|l| Cow::Borrowed(l.as_str())).collect()
-            }
+            Some(body) => body.display_text_rows(),
             _ => Vec::new(),
         },
         FindTarget::DiffUnified => match &app.diff_content {

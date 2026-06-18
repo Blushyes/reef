@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -71,6 +72,25 @@ impl PreviewContent {
     /// pagination flow vs the standard text-scroll flow.
     pub fn is_database(&self) -> bool {
         matches!(self.body, PreviewBody::Database(_))
+    }
+}
+
+impl PreviewBody {
+    pub fn display_text_rows(&self) -> Vec<Cow<'_, str>> {
+        match self {
+            PreviewBody::Text {
+                markdown: Some(markdown),
+                ..
+            } => markdown
+                .text_rows
+                .iter()
+                .map(|l| Cow::Borrowed(l.as_str()))
+                .collect(),
+            PreviewBody::Text { lines, .. } => {
+                lines.iter().map(|l| Cow::Borrowed(l.as_str())).collect()
+            }
+            _ => Vec::new(),
+        }
     }
 }
 

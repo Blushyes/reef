@@ -339,9 +339,14 @@ pub(crate) fn current_text_selection(app: &App) -> Option<String> {
     if let (Some(sel), Some(preview)) =
         (app.preview_selection.as_ref(), app.preview_content.as_ref())
         && !sel.is_empty()
-        && let crate::file_tree::PreviewBody::Text { lines, .. } = &preview.body
+        && matches!(&preview.body, crate::file_tree::PreviewBody::Text { .. })
     {
-        let text = crate::ui::selection::collect_selected_text(lines, sel);
+        let rows = preview.body.display_text_rows();
+        let text = crate::ui::selection::collect_selected_text_from_rows(
+            rows.iter().map(|row| row.as_ref()),
+            rows.len(),
+            sel,
+        );
         if let Some(line) = first_nonempty_trimmed_line(&text) {
             return Some(line);
         }

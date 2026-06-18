@@ -8,6 +8,7 @@ use unicode_width::UnicodeWidthStr;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownPreview {
     pub rows: Vec<Vec<MarkdownSpan>>,
+    pub text_rows: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +38,10 @@ pub enum MarkdownRole {
 impl MarkdownPreview {
     pub fn spans_for_row(&self, row: usize) -> Option<&[MarkdownSpan]> {
         self.rows.get(row).map(Vec::as_slice)
+    }
+
+    pub fn text_for_row(&self, row: usize) -> Option<&str> {
+        self.text_rows.get(row).map(String::as_str)
     }
 }
 
@@ -372,7 +377,8 @@ pub fn build_markdown_preview(path: &str, source: &str) -> Option<MarkdownPrevie
     flush_inline(&mut rows, &mut inline);
     trim_trailing_blanks(&mut rows);
 
-    Some(MarkdownPreview { rows })
+    let text_rows = rows.iter().map(|row| row_text(row)).collect();
+    Some(MarkdownPreview { rows, text_rows })
 }
 
 pub fn is_markdown_path(path: &str) -> bool {
@@ -517,6 +523,10 @@ fn spans_width(spans: &[MarkdownSpan]) -> usize {
         .sum()
 }
 
+fn row_text(row: &[MarkdownSpan]) -> String {
+    row.iter().map(|s| s.text.as_str()).collect()
+}
+
 fn table_border(s: &str) -> MarkdownSpan {
     MarkdownSpan {
         text: s.to_string(),
@@ -571,6 +581,7 @@ mod tests {
         let source = "| 名称 | Count |\n|:---|---:|\n| 鲨鱼 | 12 |\n| ray | 3 |\n";
         let md = build_markdown_preview("README.md", source).unwrap();
         let rendered = texts(&md);
+        assert_eq!(md.text_rows, rendered);
         assert_eq!(rendered[0], "┏━━━━━━┳━━━━━━━┓");
         assert_eq!(rendered[1], "┃ 名称 ┃ Count ┃");
         assert_eq!(rendered[2], "┣━━━━━━╋━━━━━━━┫");

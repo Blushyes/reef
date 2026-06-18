@@ -730,6 +730,10 @@ pub struct App {
     /// 上一帧 preview 内容行的起点(content_x, content_y)与 gutter 宽度。
     /// mouse handler 据此把终端列行坐标映射回文件行/列。
     pub last_preview_content_origin: Option<(u16, u16, u16)>,
+    /// Markdown reading view content origin. Kept separate from
+    /// `last_preview_content_origin` so source navigation never treats
+    /// rendered Markdown rows as file byte coordinates.
+    pub last_markdown_content_origin: Option<(u16, u16)>,
     /// 连击计数器:记录上一次 preview 区 Down(Left) 的时间/位置/次数,用于
     /// 检测双击(选词)和三击(选行)。与全局 `last_click` 独立,不干扰
     /// hit_registry 的 double-click 逻辑。
@@ -1314,6 +1318,7 @@ impl App {
             vertical_scroll_pacer: crate::input::ScrollPacer::new(),
             horizontal_scroll_pacer: crate::input::ScrollPacer::new(),
             last_preview_content_origin: None,
+            last_markdown_content_origin: None,
             preview_click_state: None,
             diff_selection: None,
             last_diff_rect: None,

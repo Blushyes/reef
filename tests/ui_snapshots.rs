@@ -615,6 +615,8 @@ fn snapshot_markdown_preview() {
     wait_for_preview(&mut app);
 
     let output = render_app(&mut app, 80, 20);
+    assert!(app.last_markdown_content_origin.is_some());
+    assert!(app.last_preview_content_origin.is_none());
     with_filters(&[], || insta::assert_snapshot!("markdown_preview", output));
 }
 

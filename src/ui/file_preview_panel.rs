@@ -510,7 +510,7 @@ fn render_markdown(
     let y = render_card_header(f, area, &preview.file_path, &th, focused, None);
     let content_height = (max_y - y) as usize;
     app.last_preview_view_h = content_height as u16;
-    let max_scroll = markdown.rows.len().saturating_sub(content_height);
+    let max_scroll = markdown.text_rows.len().saturating_sub(content_height);
     app.preview_scroll = app.preview_scroll.min(max_scroll);
 
     let content_w = area.width as usize;
@@ -533,14 +533,43 @@ fn render_markdown(
     // Markdown preview is a reading view; byte-position mouse mapping is
     // intentionally disabled instead of pretending rendered rows are source.
     app.last_preview_content_origin = None;
+    app.last_markdown_content_origin = Some((area.x, y));
+    let selection = app.preview_selection;
 
     for (i, row) in markdown.rows.iter().skip(app.preview_scroll).enumerate() {
         let cy = y + i as u16;
         if cy >= max_y {
             break;
         }
-        let tokens: Vec<(Style, std::borrow::Cow<'_, str>)> =
+        let real_idx = app.preview_scroll + i;
+        let base_tokens: Vec<(Style, std::borrow::Cow<'_, str>)> =
             row.iter().map(|s| s.styled_text(&th)).collect();
+        let (ranges, cur) = if app.find_widget.target == Some(FindTarget::FilePreview) {
+            app.find_widget
+                .ranges_on_row(FindTarget::FilePreview, real_idx)
+        } else {
+            app.search
+                .ranges_on_row(SearchTarget::FilePreview, real_idx)
+        };
+        let tokens = if ranges.is_empty() {
+            base_tokens
+        } else {
+            overlay_match_highlight(
+                base_tokens,
+                &ranges,
+                cur,
+                th.search_match,
+                th.search_current,
+            )
+        };
+        let tokens = match selection.as_ref().and_then(|s| {
+            markdown
+                .text_for_row(real_idx)
+                .and_then(|text| s.line_byte_range(real_idx, text))
+        }) {
+            Some(r) if r.start < r.end => overlay_selection_highlight(tokens, r),
+            _ => tokens,
+        };
         let rendered = Line::from(clip_spans(&tokens, h, content_w));
         f.render_widget(rendered, Rect::new(area.x, cy, area.width, 1));
     }

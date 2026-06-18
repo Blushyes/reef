@@ -3662,6 +3662,7 @@ mod preview_panic_guard_tests {
             body: crate::file_tree::PreviewBody::Text {
                 lines: vec!["hi".into()],
                 highlighted: None,
+                markdown: None,
                 parsed: None,
             },
         };

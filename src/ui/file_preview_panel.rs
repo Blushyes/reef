@@ -339,14 +339,21 @@ fn binary_reason_text(info: &BinaryInfo) -> String {
 }
 
 fn render_text(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewContent, focused: bool) {
-    let (lines, highlighted) = match &preview.body {
+    let (lines, highlighted, markdown) = match &preview.body {
         PreviewBody::Text {
-            lines, highlighted, ..
-        } => (lines, highlighted),
+            lines,
+            highlighted,
+            markdown,
+            ..
+        } => (lines, highlighted, markdown),
         _ => return,
     };
     let th = app.theme;
     let max_y = area.y + area.height;
+    if let Some(markdown) = markdown {
+        render_markdown(f, app, area, preview, markdown, focused);
+        return;
+    }
 
     // [i/N] match counter — shown only when an in-panel `/` search has
     // committed matches against this preview. Cleared automatically on tab
@@ -486,6 +493,55 @@ fn render_text(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewConten
         spans.extend(clip_spans(&tokens, h, content_w));
 
         let rendered = Line::from(spans);
+        f.render_widget(rendered, Rect::new(area.x, cy, area.width, 1));
+    }
+}
+
+fn render_markdown(
+    f: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    preview: &PreviewContent,
+    markdown: &crate::markdown::MarkdownPreview,
+    focused: bool,
+) {
+    let th = app.theme;
+    let max_y = area.y + area.height;
+    let y = render_card_header(f, area, &preview.file_path, &th, focused, None);
+    let content_height = (max_y - y) as usize;
+    app.last_preview_view_h = content_height as u16;
+    let max_scroll = markdown.rows.len().saturating_sub(content_height);
+    app.preview_scroll = app.preview_scroll.min(max_scroll);
+
+    let content_w = area.width as usize;
+    let max_visible_w = markdown
+        .rows
+        .iter()
+        .skip(app.preview_scroll)
+        .take(content_height)
+        .map(|row| {
+            row.iter()
+                .map(|s| UnicodeWidthStr::width(s.text.as_str()))
+                .sum::<usize>()
+        })
+        .max()
+        .unwrap_or(0);
+    let max_h = max_visible_w.saturating_sub(content_w);
+    app.preview_h_scroll = app.preview_h_scroll.min(max_h);
+    let h = app.preview_h_scroll;
+
+    // Markdown preview is a reading view; byte-position mouse mapping is
+    // intentionally disabled instead of pretending rendered rows are source.
+    app.last_preview_content_origin = None;
+
+    for (i, row) in markdown.rows.iter().skip(app.preview_scroll).enumerate() {
+        let cy = y + i as u16;
+        if cy >= max_y {
+            break;
+        }
+        let tokens: Vec<(Style, std::borrow::Cow<'_, str>)> =
+            row.iter().map(|s| s.styled_text(&th)).collect();
+        let rendered = Line::from(clip_spans(&tokens, h, content_w));
         f.render_widget(rendered, Rect::new(area.x, cy, area.width, 1));
     }
 }

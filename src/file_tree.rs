@@ -32,6 +32,7 @@ pub enum PreviewBody {
     Text {
         lines: Vec<String>,
         highlighted: Option<Vec<Vec<(ratatui::style::Style, String)>>>,
+        markdown: Option<crate::markdown::MarkdownPreview>,
         /// Tree-sitter parse for the navigation engine (`gd` /
         /// Ctrl+click / `gr`). Populated by the preview worker when
         /// the file's extension matches a bundled grammar AND the
@@ -791,6 +792,11 @@ pub fn load_preview(
     } else {
         None
     };
+    let markdown = if within_cap {
+        crate::markdown::build_markdown_preview(&rel_str, &content)
+    } else {
+        None
+    };
 
     // Tree-sitter parse for navigation. Same cap as highlight — keeps
     // the two caches coherent: when one is populated the other is too,
@@ -811,6 +817,7 @@ pub fn load_preview(
         body: PreviewBody::Text {
             lines,
             highlighted,
+            markdown,
             parsed,
         },
     })
@@ -1228,6 +1235,45 @@ mod tests {
             PreviewBody::Text { lines, .. } => {
                 assert_eq!(lines, vec!["fn main() {}".to_string()]);
             }
+            other => panic!("expected Text body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_preview_markdown_attaches_render_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bytes(
+            tmp.path(),
+            "README.md",
+            b"# Title\n\n| Name | Count |\n|:---|---:|\n| reef | 1 |\n",
+        );
+
+        let content = load_preview(tmp.path(), Path::new("README.md"), true, true).expect("some");
+        match content.body {
+            PreviewBody::Text {
+                lines, markdown, ..
+            } => {
+                assert_eq!(lines[0], "# Title");
+                let rows: Vec<String> = markdown
+                    .expect("markdown render model")
+                    .rows
+                    .iter()
+                    .map(|r| r.iter().map(|s| s.text.as_str()).collect())
+                    .collect();
+                assert!(rows.contains(&"┃ reef ┃     1 ┃".to_string()));
+            }
+            other => panic!("expected Text body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_preview_plain_text_has_no_markdown_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bytes(tmp.path(), "notes.txt", b"# not markdown here\n");
+
+        let content = load_preview(tmp.path(), Path::new("notes.txt"), true, true).expect("some");
+        match content.body {
+            PreviewBody::Text { markdown, .. } => assert!(markdown.is_none()),
             other => panic!("expected Text body, got {other:?}"),
         }
     }

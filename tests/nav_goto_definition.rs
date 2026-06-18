@@ -39,6 +39,7 @@ fn install_rust_preview(app: &mut App, file_path: &str, src: &str) {
         body: PreviewBody::Text {
             lines: src.lines().map(|s| s.to_string()).collect(),
             highlighted: None,
+            markdown: None,
             parsed,
         },
     });
@@ -198,6 +199,7 @@ fn goto_definition_on_unknown_extension_is_noop() {
         body: PreviewBody::Text {
             lines: vec!["fn helper() {}".to_string()],
             highlighted: None,
+            markdown: None,
             parsed: None,
         },
     });

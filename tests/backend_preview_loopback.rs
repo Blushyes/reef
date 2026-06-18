@@ -118,6 +118,39 @@ fn load_preview_text_lines_match() {
     assert_eq!(ll, rl, "text lines diverged");
 }
 
+#[test]
+fn load_preview_markdown_model_matches_on_local_and_remote() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, _repo) = tempdir_repo();
+    let body = "# Title\n\n| Name | Count |\n|:---|---:|\n| reef | 1 |\n";
+    std::fs::write(tmp.path().join("README.md"), body.as_bytes()).unwrap();
+
+    let local = LocalBackend::open_at(tmp.path().to_path_buf());
+    let remote = spawn_remote(tmp.path());
+
+    let l = local
+        .load_preview(Path::new("README.md"), true, true)
+        .unwrap();
+    let r = remote
+        .load_preview(Path::new("README.md"), true, true)
+        .unwrap();
+    let (
+        PreviewBody::Text {
+            markdown: Some(lm), ..
+        },
+        PreviewBody::Text {
+            markdown: Some(rm), ..
+        },
+    ) = (&l.body, &r.body)
+    else {
+        panic!(
+            "expected both Markdown Text, got {:?} / {:?}",
+            l.body, r.body
+        );
+    };
+    assert_eq!(lm, rm);
+}
+
 /// Build a tiny SQLite fixture at `path` with `SETUP_SQL` so both
 /// backends have something real to read. Bare-minimum schema —
 /// enough to exercise the table list, row count, and first-page

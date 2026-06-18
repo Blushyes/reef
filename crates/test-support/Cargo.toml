@@ -8,7 +8,7 @@ publish = false
 workspace = true
 
 [dependencies]
-git2          = { version = "0.20.4", default-features = false }
+git2          = { version = "0.21.0", default-features = false }
 tempfile      = "3"
 # Generate tiny image fixtures on the fly so tests for the image-preview
 # branch don't ship binary PNG blobs in the repo.

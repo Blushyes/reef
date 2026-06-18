@@ -221,7 +221,7 @@ impl GitRepo {
         self.repo
             .head()
             .ok()
-            .and_then(|h| h.shorthand().map(String::from))
+            .and_then(|h| h.shorthand().ok().map(String::from))
             .unwrap_or_else(|| "(detached)".into())
     }
 
@@ -263,7 +263,7 @@ impl GitRepo {
 
         for entry in statuses.iter() {
             let status = entry.status();
-            let fallback_path = entry.path().map(str::to_string);
+            let fallback_path = entry.path().ok().map(str::to_string);
 
             // Staged changes (index vs HEAD). Check RENAMED before MODIFIED
             // because libgit2 surfaces renamed+edited files with both flags
@@ -602,7 +602,7 @@ impl GitRepo {
     pub fn ahead_behind(&self) -> Option<(usize, usize)> {
         let head = self.repo.head().ok()?;
         let head_oid = head.target()?;
-        let shorthand = head.shorthand()?;
+        let shorthand = head.shorthand().ok()?;
         let branch = self
             .repo
             .find_branch(shorthand, git2::BranchType::Local)
@@ -874,7 +874,7 @@ impl GitRepo {
                 else {
                     continue;
                 };
-                let Some(name) = r.name() else { continue };
+                let Ok(name) = r.name() else { continue };
 
                 let label = if let Some(rest) = name.strip_prefix("refs/heads/") {
                     RefLabel::Branch(rest.to_string())
@@ -1078,7 +1078,7 @@ fn commit_to_info(commit: &git2::Commit) -> CommitInfo {
     let author_name = author.name().unwrap_or("").to_string();
     let author_email = author.email().unwrap_or("").to_string();
     let time = author.when().seconds();
-    let subject = commit.summary().unwrap_or("").to_string();
+    let subject = commit.summary().ok().flatten().unwrap_or("").to_string();
     CommitInfo {
         oid,
         short_oid,

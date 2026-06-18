@@ -33,6 +33,7 @@ fn install_rust_preview(app: &mut App, file_path: &str, src: &str) {
         body: PreviewBody::Text {
             lines: src.lines().map(|s| s.to_string()).collect(),
             highlighted: None,
+            markdown: None,
             parsed,
         },
     });
@@ -221,6 +222,7 @@ fn vue_goto_registers_pending_jump_and_uses_cache_on_repeat() {
         body: PreviewBody::Text {
             lines: src.lines().map(|s| s.to_string()).collect(),
             highlighted: None,
+            markdown: None,
             parsed,
         },
     });

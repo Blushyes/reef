@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 crossterm     = "0.29.0"
-git2          = { version = "0.20.4", default-features = false }
+git2          = { version = "0.21.0", default-features = false }
 ratatui       = "0.30.0"
 similar       = "3.1.0"
 unicode-width = "0.2.2"
@@ -59,6 +59,9 @@ tempfile     = "3"
 # but the crate is unavoidable once the toggle exists since literal
 # substring matching can't express word boundaries / alternation.
 regex        = "1"
+# Markdown preview parsing. HTML rendering helpers are disabled; reef builds
+# a terminal-native preview model instead.
+pulldown-cmark = { version = "0.13.4", default-features = false }
 # Code navigation (goto-definition / find-references). `tree-sitter` is the
 # always-on engine — grammars are statically linked C source so the binary
 # stays self-contained and works offline. Phase 2 layers stack-graphs on top

@@ -17,7 +17,7 @@ use crate::settings;
 use crate::ui;
 use crate::ui::selection::{
     DiffSelection, DiffSide, PreviewSelection, col_to_byte_offset, collect_diff_selected_text,
-    collect_selected_text, word_at_byte,
+    collect_selected_text_from_rows, word_at_byte,
 };
 use crate::ui::toast::Toast;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -2982,7 +2982,6 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
 /// clipboard copy. A `Drag` after a double/triple click extends the active
 /// endpoint normally (VS Code-style word-range extension).
 fn handle_preview_selection(mouse: &MouseEvent, app: &mut App) -> bool {
-    let content_origin = app.last_preview_content_origin;
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             let Some(rect) = app.last_preview_rect else {
@@ -2997,11 +2996,8 @@ fn handle_preview_selection(mouse: &MouseEvent, app: &mut App) -> bool {
             // the same line in `handle_diff_selection`.
             app.active_panel = Panel::Diff;
 
-            let Some(origin) = content_origin else {
-                return false;
-            };
             let Some((file_line, byte_offset)) =
-                mouse_to_file_coord(app, mouse.column, mouse.row, origin)
+                mouse_to_preview_coord(app, mouse.column, mouse.row)
             else {
                 return false;
             };
@@ -3022,23 +3018,13 @@ fn handle_preview_selection(mouse: &MouseEvent, app: &mut App) -> bool {
             };
             app.preview_click_state = Some((now, mouse.column, mouse.row, click_count));
 
-            let preview_lines: &[String] = app
-                .preview_content
-                .as_ref()
-                .and_then(|p| match &p.body {
-                    crate::file_tree::PreviewBody::Text { lines, .. } => Some(lines.as_slice()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            let line_len = preview_lines.get(file_line).map(|l| l.len()).unwrap_or(0);
+            let preview_line = preview_display_line(app, file_line).unwrap_or("");
+            let line_len = preview_line.len();
 
             let sel = match click_count {
                 2 => {
                     // Double-click → select word
-                    let word = preview_lines
-                        .get(file_line)
-                        .map(|l| word_at_byte(l, byte_offset))
-                        .unwrap_or(byte_offset..byte_offset);
+                    let word = word_at_byte(preview_line, byte_offset);
                     PreviewSelection {
                         anchor: (file_line, word.start),
                         active: (file_line, word.end),
@@ -3071,10 +3057,7 @@ fn handle_preview_selection(mouse: &MouseEvent, app: &mut App) -> bool {
             // the tick will guard on origin separately and we still want
             // the latest mouse position for the next valid frame.
             app.last_drag_mouse = Some((mouse.column, mouse.row));
-            let Some(origin) = content_origin else {
-                return true; // swallow even without update — the drag is ours
-            };
-            if let Some(pos) = mouse_to_file_coord(app, mouse.column, mouse.row, origin) {
+            if let Some(pos) = mouse_to_preview_coord(app, mouse.column, mouse.row) {
                 if let Some(s) = app.preview_selection.as_mut() {
                     s.active = pos;
                 }
@@ -3097,8 +3080,8 @@ fn handle_preview_selection(mouse: &MouseEvent, app: &mut App) -> bool {
                 if let Some(preview) = app.preview_content.as_ref() {
                     // Only text bodies have selectable lines — image/binary
                     // previews have no `lines` vector.
-                    if let crate::file_tree::PreviewBody::Text { lines, .. } = &preview.body {
-                        let text = collect_selected_text(lines, &sel_snapshot);
+                    if matches!(&preview.body, crate::file_tree::PreviewBody::Text { .. }) {
+                        let text = collect_preview_selected_text(preview, &sel_snapshot);
                         if !text.is_empty() {
                             match clipboard::copy_to_clipboard(&text) {
                                 Ok(()) => app.toasts.push(Toast::info(t(Msg::ClipboardCopied))),
@@ -3265,6 +3248,26 @@ fn point_in_rect(rect: Rect, col: u16, row: u16) -> bool {
     col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
 }
 
+fn preview_display_line(app: &App, row: usize) -> Option<&str> {
+    let preview = app.preview_content.as_ref()?;
+    match &preview.body {
+        crate::file_tree::PreviewBody::Text {
+            markdown: Some(markdown),
+            ..
+        } => markdown.text_for_row(row),
+        crate::file_tree::PreviewBody::Text { lines, .. } => lines.get(row).map(String::as_str),
+        _ => None,
+    }
+}
+
+fn collect_preview_selected_text(
+    preview: &crate::file_tree::PreviewContent,
+    sel: &PreviewSelection,
+) -> String {
+    let rows = preview.body.display_text_rows();
+    collect_selected_text_from_rows(rows.iter().map(|row| row.as_ref()), rows.len(), sel)
+}
+
 /// Translate a terminal `(column, row)` hit into `(file_line_index,
 /// byte_offset_in_line)` using the cached content-area origin + current
 /// scroll state. Returns `None` when the preview is empty / unloaded.
@@ -3299,6 +3302,44 @@ pub(crate) fn mouse_to_file_coord(
     let byte_offset = col_to_byte_offset(line, visible_col);
 
     Some((file_line, byte_offset))
+}
+
+fn mouse_to_preview_coord(app: &App, col: u16, row: u16) -> Option<(usize, usize)> {
+    let preview = app.preview_content.as_ref()?;
+    match &preview.body {
+        crate::file_tree::PreviewBody::Text {
+            markdown: Some(markdown),
+            ..
+        } => {
+            if markdown.text_rows.is_empty() {
+                return None;
+            }
+            let (content_x, content_y) = app.last_markdown_content_origin?;
+            let visible_row = row.saturating_sub(content_y) as usize;
+            let line_idx = (app.preview_scroll + visible_row).min(markdown.text_rows.len() - 1);
+            let visible_col = (col.saturating_sub(content_x) as usize) + app.preview_h_scroll;
+            let byte_offset = col_to_byte_offset(&markdown.text_rows[line_idx], visible_col);
+            Some((line_idx, byte_offset))
+        }
+        crate::file_tree::PreviewBody::Text { .. } => {
+            let origin = app.last_preview_content_origin?;
+            mouse_to_file_coord(app, col, row, origin)
+        }
+        _ => None,
+    }
+}
+
+fn preview_content_top(app: &App) -> Option<u16> {
+    let preview = app.preview_content.as_ref()?;
+    match &preview.body {
+        crate::file_tree::PreviewBody::Text {
+            markdown: Some(_), ..
+        } => app.last_markdown_content_origin.map(|(_, y)| y),
+        crate::file_tree::PreviewBody::Text { .. } => {
+            app.last_preview_content_origin.map(|(_, y, _)| y)
+        }
+        _ => None,
+    }
 }
 
 // ─── Drag-select auto-scroll ────────────────────────────────────────────────
@@ -3372,9 +3413,6 @@ fn tick_preview_drag_autoscroll(app: &mut App) {
     if !dragging {
         return;
     }
-    let Some(origin) = app.last_preview_content_origin else {
-        return;
-    };
     let Some((mx, my)) = app.last_drag_mouse else {
         return;
     };
@@ -3382,7 +3420,9 @@ fn tick_preview_drag_autoscroll(app: &mut App) {
     if view_h == 0 {
         return;
     }
-    let content_top = origin.1;
+    let Some(content_top) = preview_content_top(app) else {
+        return;
+    };
     let content_bottom = content_top.saturating_add(view_h);
     let step = autoscroll_step(my, content_top, content_bottom);
     if step == 0 {
@@ -3404,6 +3444,10 @@ fn tick_preview_drag_autoscroll(app: &mut App) {
         return;
     };
     let line_count = match &preview.body {
+        crate::file_tree::PreviewBody::Text {
+            markdown: Some(markdown),
+            ..
+        } => markdown.text_rows.len(),
         crate::file_tree::PreviewBody::Text { lines, .. } => lines.len(),
         _ => return,
     };
@@ -3422,7 +3466,7 @@ fn tick_preview_drag_autoscroll(app: &mut App) {
 
     // Re-translate the frozen mouse against the new scroll — this is what
     // makes the selection extend with the viewport as it scrolls.
-    if let Some(coord) = mouse_to_file_coord(app, mx, my, origin) {
+    if let Some(coord) = mouse_to_preview_coord(app, mx, my) {
         if let Some(s) = app.preview_selection.as_mut() {
             s.active = coord;
         }

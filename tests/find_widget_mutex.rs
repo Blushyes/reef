@@ -27,6 +27,7 @@ fn fresh_app() -> (App, TempDir, CwdGuard) {
         body: PreviewBody::Text {
             lines: vec!["foo bar foo".to_string(), "bar foo".to_string()],
             highlighted: None,
+            markdown: None,
             parsed: None,
         },
     });

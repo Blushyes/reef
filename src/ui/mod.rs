@@ -55,6 +55,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // handler would treat clicks on other panels as selection gestures.
     app.last_preview_rect = None;
     app.last_preview_content_origin = None;
+    app.last_markdown_content_origin = None;
     // Same story for the diff panel — both Git tab Diff and Graph tab's
     // 3-col diff column write into these slots during their own render.
     // If the active tab renders neither, wiping here keeps a stale rect

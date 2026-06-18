@@ -32,6 +32,19 @@ fn install_text_preview(app: &mut App, lines: &[&str]) {
         body: PreviewBody::Text {
             lines: lines.iter().map(|s| s.to_string()).collect(),
             highlighted: None,
+            markdown: None,
+            parsed: None,
+        },
+    });
+}
+
+fn install_markdown_preview(app: &mut App, source: &str) {
+    app.preview_content = Some(PreviewContent {
+        file_path: "README.md".to_string(),
+        body: PreviewBody::Text {
+            lines: source.lines().map(str::to_string).collect(),
+            highlighted: None,
+            markdown: reef::markdown::build_markdown_preview("README.md", source),
             parsed: None,
         },
     });
@@ -127,4 +140,24 @@ fn begin_with_empty_selection_keeps_existing_query() {
     global_search::begin(&mut app);
 
     assert_eq!(app.global_search.core.filter, "kept");
+}
+
+#[test]
+fn begin_seeds_from_markdown_rendered_rows() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut app, _tmp, _g) = fresh_app();
+    install_markdown_preview(&mut app, "| Name | Count |\n|---|---:|\n| reef | 12 |\n");
+    let rendered = match &app.preview_content.as_ref().unwrap().body {
+        PreviewBody::Text {
+            markdown: Some(markdown),
+            ..
+        } => markdown.text_rows[1].clone(),
+        _ => panic!("markdown preview expected"),
+    };
+    assert_eq!(rendered, "┃ Name ┃ Count ┃");
+    select_byte_range(&mut app, (1, 0), (1, rendered.len()));
+
+    global_search::begin(&mut app);
+
+    assert_eq!(app.global_search.core.filter, rendered);
 }

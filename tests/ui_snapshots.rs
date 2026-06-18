@@ -581,6 +581,46 @@ fn snapshot_binary_info_pdf() {
 }
 
 #[test]
+fn snapshot_markdown_preview() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
+    let (tmp, _raw) = tempdir_repo();
+    std::fs::write(
+        tmp.path().join("README.md"),
+        "# Markdown Preview\n\n| Name | Count |\n|:---|---:|\n| reef | 12 |\n",
+    )
+    .unwrap();
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    app.refresh_file_tree();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        app.tick();
+        if !app.file_tree_load.loading && !app.file_tree.entries.is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let idx = app
+        .file_tree
+        .entries
+        .iter()
+        .position(|e| e.name == "README.md")
+        .expect("README.md in tree");
+    app.file_tree.selected = idx;
+    app.load_preview();
+    wait_for_preview(&mut app);
+
+    let output = render_app(&mut app, 80, 20);
+    assert!(app.last_markdown_content_origin.is_some());
+    assert!(app.last_preview_content_origin.is_none());
+    with_filters(&[], || insta::assert_snapshot!("markdown_preview", output));
+}
+
+#[test]
 fn snapshot_search_tab_replace_open_with_excluded_row() {
     // Lock in the VSCode-style Find & Replace layout in Tab::Search:
     // chevron toggle in the find input row, second `↪ ` prompt for the

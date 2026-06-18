@@ -551,6 +551,11 @@ impl Backend for RemoteBackend {
         } else {
             None
         };
+        let markdown = if within_cap {
+            crate::markdown::build_markdown_preview(&rel_str, &content)
+        } else {
+            None
+        };
 
         // SSH mode: tree-sitter still runs locally — file bytes have
         // already crossed the SSH boundary into `raw`. The result is
@@ -573,6 +578,7 @@ impl Backend for RemoteBackend {
             body: PreviewBody::Text {
                 lines,
                 highlighted,
+                markdown,
                 parsed,
             },
         })

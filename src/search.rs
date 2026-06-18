@@ -361,12 +361,7 @@ fn collect_rows(app: &App, target: SearchTarget) -> Vec<std::borrow::Cow<'_, str
             .map(|r| Cow::Borrowed(r.commit.subject.as_str()))
             .collect(),
         SearchTarget::FilePreview => match &app.preview_content {
-            Some(p) => match &p.body {
-                crate::file_tree::PreviewBody::Text { lines, .. } => {
-                    lines.iter().map(|l| Cow::Borrowed(l.as_str())).collect()
-                }
-                _ => Vec::new(),
-            },
+            Some(p) => p.body.display_text_rows(),
             _ => Vec::new(),
         },
         SearchTarget::Diff => match &app.diff_content {

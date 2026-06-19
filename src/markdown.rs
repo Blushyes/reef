@@ -1,7 +1,7 @@
 use pulldown_cmark::{
     Alignment as MdAlignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd,
 };
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use std::borrow::Cow;
 use unicode_width::UnicodeWidthStr;
 
@@ -30,10 +30,14 @@ pub enum MarkdownRole {
     Heading,
     Quote,
     Code,
+    CodeBlockHeader,
+    CodeBlockText,
     Link,
     TableHeader,
     Border,
 }
+
+const CODE_BLOCK_LABEL_FG: Color = Color::Rgb(150, 180, 205);
 
 impl MarkdownPreview {
     pub fn spans_for_row(&self, row: usize) -> Option<&[MarkdownSpan]> {
@@ -68,6 +72,11 @@ impl MarkdownStyle {
             MarkdownRole::Heading => base.fg(theme.accent).add_modifier(Modifier::BOLD),
             MarkdownRole::Quote => base.fg(theme.fg_secondary),
             MarkdownRole::Code => base.fg(theme.accent),
+            MarkdownRole::CodeBlockHeader => base
+                .fg(code_block_label_fg(theme))
+                .bg(code_block_bg(theme))
+                .add_modifier(Modifier::BOLD),
+            MarkdownRole::CodeBlockText => base.fg(code_block_fg(theme)).bg(code_block_bg(theme)),
             MarkdownRole::Link => base.fg(theme.accent).add_modifier(Modifier::UNDERLINED),
             MarkdownRole::Border => base.fg(theme.fg_secondary),
             MarkdownRole::TableHeader => base.add_modifier(Modifier::BOLD),
@@ -79,6 +88,30 @@ impl MarkdownStyle {
             out = out.add_modifier(Modifier::ITALIC);
         }
         out
+    }
+}
+
+pub fn code_block_bg(theme: &crate::ui::theme::Theme) -> Color {
+    if theme.is_dark {
+        Color::Rgb(36, 38, 46)
+    } else {
+        Color::Rgb(246, 248, 250)
+    }
+}
+
+fn code_block_fg(theme: &crate::ui::theme::Theme) -> Color {
+    if theme.is_dark {
+        Color::Rgb(230, 232, 238)
+    } else {
+        theme.fg_primary
+    }
+}
+
+fn code_block_label_fg(theme: &crate::ui::theme::Theme) -> Color {
+    if theme.is_dark {
+        CODE_BLOCK_LABEL_FG
+    } else {
+        theme.fg_secondary
     }
 }
 
@@ -183,18 +216,17 @@ pub fn build_markdown_preview(path: &str, source: &str) -> Option<MarkdownPrevie
                 Tag::CodeBlock(kind) => {
                     flush_inline(&mut rows, &mut inline);
                     in_code_block = true;
-                    let lang = match kind {
-                        CodeBlockKind::Fenced(lang) => lang.to_string(),
-                        CodeBlockKind::Indented => String::new(),
+                    let label = match kind {
+                        CodeBlockKind::Fenced(lang) => code_block_label(lang.as_ref()),
+                        CodeBlockKind::Indented => None,
                     };
-                    rows.push(vec![MarkdownSpan {
-                        text: if lang.is_empty() {
-                            "╭─ code".to_string()
-                        } else {
-                            format!("╭─ {lang}")
-                        },
-                        style: MarkdownStyle::role(MarkdownRole::Border),
-                    }]);
+                    if let Some(label) = label {
+                        rows.push(vec![MarkdownSpan {
+                            text: format!(" {label} "),
+                            style: MarkdownStyle::role(MarkdownRole::CodeBlockHeader),
+                        }]);
+                    }
+                    rows.push(code_block_padding_row());
                 }
                 Tag::List(start) => {
                     flush_inline(&mut rows, &mut inline);
@@ -265,10 +297,7 @@ pub fn build_markdown_preview(path: &str, source: &str) -> Option<MarkdownPrevie
                     }
                 }
                 TagEnd::CodeBlock => {
-                    rows.push(vec![MarkdownSpan {
-                        text: "╰─".to_string(),
-                        style: MarkdownStyle::role(MarkdownRole::Border),
-                    }]);
+                    rows.push(code_block_padding_row());
                     push_blank(&mut rows);
                     in_code_block = false;
                 }
@@ -325,15 +354,15 @@ pub fn build_markdown_preview(path: &str, source: &str) -> Option<MarkdownPrevie
             },
             Event::Text(text) => {
                 if in_code_block {
-                    for part in text.split('\n') {
+                    for part in text.split_terminator('\n') {
                         rows.push(vec![
                             MarkdownSpan {
-                                text: "│ ".to_string(),
-                                style: MarkdownStyle::role(MarkdownRole::Border),
+                                text: "  ".to_string(),
+                                style: MarkdownStyle::role(MarkdownRole::CodeBlockText),
                             },
                             MarkdownSpan {
                                 text: part.to_string(),
-                                style: MarkdownStyle::role(MarkdownRole::Code),
+                                style: MarkdownStyle::role(MarkdownRole::CodeBlockText),
                             },
                         ]);
                     }
@@ -419,6 +448,17 @@ fn trim_trailing_blanks(rows: &mut Vec<Vec<MarkdownSpan>>) {
     while rows.last().is_some_and(Vec::is_empty) {
         rows.pop();
     }
+}
+
+fn code_block_label(info: &str) -> Option<String> {
+    info.split_whitespace().next().map(str::to_string)
+}
+
+fn code_block_padding_row() -> Vec<MarkdownSpan> {
+    vec![MarkdownSpan {
+        text: String::new(),
+        style: MarkdownStyle::role(MarkdownRole::CodeBlockText),
+    }]
 }
 
 fn render_table(table: TableBuild) -> Vec<Vec<MarkdownSpan>> {
@@ -572,8 +612,26 @@ mod tests {
                 .any(|l| l.contains("• bold site (https://x.test)"))
         );
         assert!(rendered.iter().any(|l| l == "│ quote"));
-        assert!(rendered.iter().any(|l| l == "╭─ rs"));
-        assert!(rendered.iter().any(|l| l == "│ fn main() {}"));
+        assert!(rendered.iter().any(|l| l == " rs "));
+        assert!(rendered.iter().any(|l| l == "  fn main() {}"));
+        let code_row = md
+            .rows
+            .iter()
+            .find(|row| row_text(row) == "  fn main() {}")
+            .expect("code row");
+        assert!(
+            code_row
+                .iter()
+                .all(|span| span.style.role == MarkdownRole::CodeBlockText)
+        );
+    }
+
+    #[test]
+    fn unlabeled_code_block_has_no_header() {
+        let md = build_markdown_preview("README.md", "```\nplain\n```\n").unwrap();
+        let rendered = texts(&md);
+
+        assert_eq!(rendered, vec!["", "  plain", ""]);
     }
 
     #[test]

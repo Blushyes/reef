@@ -552,7 +552,7 @@ impl Backend for RemoteBackend {
             None
         };
         let markdown = if within_cap {
-            crate::markdown::build_markdown_preview(&rel_str, &content)
+            crate::markdown::build_markdown_preview(&rel_str, &content, dark)
         } else {
             None
         };

@@ -2680,13 +2680,22 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
         }
     }
 
+    // Clicking a rendered Markdown link opens it. Sits before preview
+    // drag-selection so links behave like links; non-link text still
+    // falls through to selectable reading-view text.
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+        && let Some(rect) = app.last_preview_rect
+        && point_in_rect(rect, mouse.column, mouse.row)
+        && let Some(action @ ui::mouse::ClickAction::OpenMarkdownLink(_)) =
+            app.hit_registry.hit_test(mouse.column, mouse.row)
+    {
+        app.handle_action(action);
+        return;
+    }
+
     // Ctrl+click on the preview pane → goto-definition. Sits in front
     // of the drag-select fast-path so the click doesn't accidentally
-    // start a new text selection. Cmd / SUPER is deliberately NOT
-    // honored: macOS Terminal.app and (by default) iTerm2 intercept
-    // Cmd+click before it reaches reef, so binding it would give
-    // inconsistent behaviour across terminals. Documented in the
-    // plan file. Users wanting parity can remap in their terminal.
+    // start a new text selection.
     if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
         && mouse.modifiers.contains(KeyModifiers::CONTROL)
         && let Some(rect) = app.last_preview_rect

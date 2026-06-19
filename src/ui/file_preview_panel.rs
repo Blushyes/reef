@@ -4,6 +4,7 @@ use crate::find_widget::FindTarget;
 use crate::i18n::{Msg, t};
 use crate::search::SearchTarget;
 use crate::ui::focus::header_title_style;
+use crate::ui::mouse::ClickAction;
 use crate::ui::text::{clip_spans, overlay_match_highlight, overlay_selection_highlight, spaces};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -542,8 +543,20 @@ fn render_markdown(
             break;
         }
         let real_idx = app.preview_scroll + i;
-        let base_tokens: Vec<(Style, std::borrow::Cow<'_, str>)> =
-            row.iter().map(|s| s.styled_text(&th)).collect();
+        let base_tokens: Vec<(Style, std::borrow::Cow<'_, str>)> = row
+            .iter()
+            .scan(0usize, |pos, span| {
+                let start = *pos;
+                *pos += UnicodeWidthStr::width(span.text.as_str());
+                let (mut style, text) = span.styled_text(&th);
+                if span.link.is_some()
+                    && markdown_span_hovered(app, area.x, cy, start, *pos, h, content_w)
+                {
+                    style = markdown_link_hover_style(style, &th);
+                }
+                Some((style, text))
+            })
+            .collect();
         let (ranges, cur) = if app.find_widget.target == Some(FindTarget::FilePreview) {
             app.find_widget
                 .ranges_on_row(FindTarget::FilePreview, real_idx)
@@ -572,8 +585,72 @@ fn render_markdown(
         };
         let mut spans = clip_spans(&tokens, h, content_w);
         pad_markdown_row_bg(&mut spans, content_w, markdown_row_bg(row, &th));
+        register_markdown_links(app, row, area.x, cy, h, content_w);
         let rendered = Line::from(spans);
         f.render_widget(rendered, Rect::new(area.x, cy, area.width, 1));
+    }
+}
+
+fn register_markdown_links(
+    app: &mut App,
+    row: &[crate::markdown::MarkdownSpan],
+    x: u16,
+    y: u16,
+    h_scroll: usize,
+    content_w: usize,
+) {
+    let mut pos = 0usize;
+    for span in row {
+        let width = UnicodeWidthStr::width(span.text.as_str());
+        if let Some(link) = span.link.as_ref() {
+            let start = pos.saturating_sub(h_scroll);
+            let end = (pos + width).saturating_sub(h_scroll).min(content_w);
+            if start < end {
+                app.hit_registry.register_row(
+                    x + start as u16,
+                    y,
+                    (end - start) as u16,
+                    ClickAction::OpenMarkdownLink(link.clone()),
+                );
+            }
+        }
+        pos += width;
+    }
+}
+
+fn markdown_span_hovered(
+    app: &App,
+    x: u16,
+    y: u16,
+    start: usize,
+    end: usize,
+    h_scroll: usize,
+    content_w: usize,
+) -> bool {
+    let Some((hover_x, hover_y)) = app.hover_col.zip(app.hover_row) else {
+        return false;
+    };
+    if hover_y != y {
+        return false;
+    }
+    let screen_start = start.saturating_sub(h_scroll).min(content_w);
+    let screen_end = end.saturating_sub(h_scroll).min(content_w);
+    screen_start < screen_end
+        && hover_x >= x + screen_start as u16
+        && hover_x < x + screen_end as u16
+}
+
+fn markdown_link_hover_style(style: Style, th: &crate::ui::theme::Theme) -> Style {
+    style
+        .fg(markdown_link_hover_fg(th))
+        .add_modifier(Modifier::BOLD)
+}
+
+fn markdown_link_hover_fg(th: &crate::ui::theme::Theme) -> Color {
+    if th.is_dark {
+        Color::Rgb(255, 220, 120)
+    } else {
+        Color::Rgb(130, 80, 223)
     }
 }
 
@@ -622,5 +699,17 @@ mod tests {
         assert_eq!(spans[1].content.as_ref(), "    ");
         assert_eq!(spans[1].style.bg, Some(bg));
         assert_eq!(bg, Color::Rgb(246, 248, 250));
+    }
+
+    #[test]
+    fn markdown_link_hover_changes_foreground_color() {
+        let th = crate::ui::theme::Theme::dark();
+        let base = Style::default().fg(th.accent);
+        let hovered = markdown_link_hover_style(base, &th);
+
+        assert_ne!(hovered.fg, Some(th.accent));
+        assert_eq!(hovered.fg, Some(Color::Rgb(255, 220, 120)));
+        assert!(hovered.add_modifier.contains(Modifier::BOLD));
+        assert!(hovered.bg.is_none());
     }
 }

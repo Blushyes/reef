@@ -62,6 +62,36 @@ fn resolve_syntax(path: &str, lines: &[String]) -> Option<&'static SyntaxReferen
 
 pub fn highlight_file(path: &str, lines: &[String], dark: bool) -> Option<Vec<Vec<StyledToken>>> {
     let syntax = resolve_syntax(path, lines)?;
+    Some(highlight_lines(syntax, lines, dark))
+}
+
+pub fn highlight_code_block(
+    language: &str,
+    lines: &[String],
+    dark: bool,
+) -> Option<Vec<Vec<StyledToken>>> {
+    let language = code_block_language_token(language);
+    let syntax = SYNTAX_SET
+        .find_syntax_by_token(language)
+        .or_else(|| SYNTAX_SET.find_syntax_by_extension(language))?;
+    Some(highlight_lines(syntax, lines, dark))
+}
+
+fn code_block_language_token(language: &str) -> &str {
+    match language {
+        "bash" | "shell" | "zsh" => "sh",
+        "javascript" => "js",
+        "typescript" => "ts",
+        "rust" => "rs",
+        _ => language,
+    }
+}
+
+fn highlight_lines(
+    syntax: &'static SyntaxReference,
+    lines: &[String],
+    dark: bool,
+) -> Vec<Vec<StyledToken>> {
     let theme: &Theme = if dark { &THEME_DARK } else { &THEME_LIGHT };
     let mut h = HighlightLines::new(syntax, theme);
 
@@ -76,7 +106,7 @@ pub fn highlight_file(path: &str, lines: &[String], dark: bool) -> Option<Vec<Ve
         };
         out.push(tokens);
     }
-    Some(out)
+    out
 }
 
 fn convert_style(s: syntect::highlighting::Style) -> Style {
@@ -199,6 +229,13 @@ mod tests {
         let lines = vec!["fn main() { let x = \"hi\"; }".to_string()];
         let out = highlight_file("foo.rs", &lines, false).expect("light theme must highlight");
         assert_eq!(out.len(), 1);
+        assert!(out[0].len() > 1);
+    }
+
+    #[test]
+    fn highlight_code_block_accepts_common_language_names() {
+        let lines = vec!["fn main() {}".to_string()];
+        let out = highlight_code_block("rust", &lines, true).expect("rust fence highlights");
         assert!(out[0].len() > 1);
     }
 }

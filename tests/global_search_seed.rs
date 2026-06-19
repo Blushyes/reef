@@ -44,7 +44,7 @@ fn install_markdown_preview(app: &mut App, source: &str) {
         body: PreviewBody::Text {
             lines: source.lines().map(str::to_string).collect(),
             highlighted: None,
-            markdown: reef::markdown::build_markdown_preview("README.md", source),
+            markdown: reef::markdown::build_markdown_preview("README.md", source, true),
             parsed: None,
         },
     });

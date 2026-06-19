@@ -166,6 +166,8 @@ pub enum ClickAction {
     /// Registered panel-wide beneath the open candidates popup; a
     /// click that misses every row dismisses without picking.
     NavCandidatesClose,
+    /// Click a rendered Markdown link in the file preview.
+    OpenMarkdownLink(String),
 }
 
 #[derive(Debug, Clone)]

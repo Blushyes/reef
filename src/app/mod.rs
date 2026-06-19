@@ -9,6 +9,7 @@ use crate::ui::mouse::{ClickAction, HitTestRegistry};
 use crate::ui::theme::Theme;
 use crate::ui::toast::Toast;
 use std::collections::{HashMap, HashSet};
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -5322,6 +5323,9 @@ impl App {
             ClickAction::NavCandidatesClose => {
                 self.nav_close_candidates();
             }
+            ClickAction::OpenMarkdownLink(target) => {
+                self.open_markdown_link(&target);
+            }
             ClickAction::HostsPickerSelect(idx) => {
                 // Mouse click on a hosts-picker row: move selection to
                 // that row and (for paths that already have a target)
@@ -5447,6 +5451,108 @@ impl App {
                 self.close_focused_preview_files();
             }
         }
+    }
+
+    pub fn open_markdown_link(&mut self, target: &str) {
+        if Self::is_url_link(target) {
+            match Self::open_external_url(target) {
+                Ok(()) => self.toasts.push(Toast::info(format!("Opened {target}"))),
+                Err(e) => self
+                    .toasts
+                    .push(Toast::error(format!("Open link failed: {e}"))),
+            }
+            return;
+        }
+
+        let Some(rel) = self.markdown_file_link_target(target) else {
+            self.toasts
+                .push(Toast::warn(format!("Markdown link not found: {target}")));
+            return;
+        };
+        self.set_active_tab(Tab::Files);
+        self.file_tree.reveal(&rel);
+        self.refresh_file_tree_with_target(Some(rel.clone()));
+        self.load_preview_for_path(rel);
+    }
+
+    fn is_url_link(target: &str) -> bool {
+        url::Url::parse(target).is_ok_and(|url| matches!(url.scheme(), "http" | "https" | "mailto"))
+    }
+
+    fn open_external_url(target: &str) -> Result<(), String> {
+        let mut command = Self::open_external_url_command(target)?;
+        command.spawn().map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn open_external_url_command(target: &str) -> Result<std::process::Command, String> {
+        let mut command = std::process::Command::new("open");
+        command.arg(target);
+        Ok(command)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn open_external_url_command(target: &str) -> Result<std::process::Command, String> {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "start", "", target]);
+        Ok(command)
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn open_external_url_command(target: &str) -> Result<std::process::Command, String> {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(target);
+        Ok(command)
+    }
+
+    #[cfg(not(any(unix, target_os = "windows")))]
+    fn open_external_url_command(_target: &str) -> Result<std::process::Command, String> {
+        Err("opening URLs is not supported on this platform".to_string())
+    }
+
+    fn markdown_file_link_target(&self, target: &str) -> Option<PathBuf> {
+        let path_part = target
+            .split_once('#')
+            .map(|(path, _)| path)
+            .unwrap_or(target);
+        if path_part.is_empty() {
+            return None;
+        }
+
+        let path = Path::new(path_part);
+        if path.is_absolute() {
+            if self.backend.is_remote() {
+                return Self::remote_workdir_relative(&self.backend.workdir_path(), path);
+            }
+            return self.workdir_relative(path);
+        }
+
+        let preview_path = self
+            .preview_content
+            .as_ref()
+            .map(|preview| Path::new(&preview.file_path))?;
+        let base = preview_path.parent().unwrap_or_else(|| Path::new(""));
+        Self::normalize_relative_path(base.join(path))
+    }
+
+    fn remote_workdir_relative(root: &Path, abs: &Path) -> Option<PathBuf> {
+        let rel = abs.strip_prefix(root).ok()?;
+        Self::normalize_relative_path(rel.to_path_buf())
+    }
+
+    fn normalize_relative_path(path: PathBuf) -> Option<PathBuf> {
+        let mut out = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::Normal(part) => out.push(part),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    out.pop().then_some(())?;
+                }
+                Component::RootDir | Component::Prefix(_) => return None,
+            }
+        }
+        Some(out)
     }
 
     /// Pick the "create anchor" target for a toolbar `+ File` / `+ Folder`
@@ -6067,9 +6173,11 @@ mod tests {
         folder_contains, load_graph_scope_pref, persist_graph_scope,
     };
     use crate::backend::LocalBackend;
+    use crate::file_tree::{PreviewBody, PreviewContent};
     use crate::git::GraphScope;
     use crate::tasks::{GraphPayload, WorkerResult};
     use crate::ui::theme::Theme;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use test_support::{HOME_LOCK, HomeGuard, commit_file, tempdir_repo};
 
@@ -6116,6 +6224,49 @@ mod tests {
         };
         assert_eq!(g.selected_range(), (4, 9));
         assert!(g.is_range());
+    }
+
+    #[test]
+    fn markdown_link_targets_resolve_from_preview_directory() {
+        assert_eq!(
+            App::normalize_relative_path(PathBuf::from("docs/../README.md")),
+            Some(PathBuf::from("README.md"))
+        );
+        assert_eq!(
+            App::normalize_relative_path(PathBuf::from("../outside.md")),
+            None
+        );
+        assert!(App::is_url_link("https://example.com/a"));
+
+        let mut fx = make_scope_fixture();
+        fx.app.preview_content = Some(PreviewContent {
+            file_path: "docs/guide/index.md".into(),
+            body: PreviewBody::Text {
+                lines: vec![],
+                highlighted: None,
+                parsed: None,
+                markdown: None,
+            },
+        });
+
+        assert_eq!(
+            fx.app.markdown_file_link_target("../intro.md#top"),
+            Some(PathBuf::from("docs/intro.md"))
+        );
+        assert_eq!(fx.app.markdown_file_link_target("#local"), None);
+    }
+
+    #[test]
+    fn remote_markdown_absolute_links_resolve_under_workdir() {
+        let root = PathBuf::from("/home/me/repo");
+        assert_eq!(
+            App::remote_workdir_relative(&root, Path::new("/home/me/repo/docs/a.md")),
+            Some(PathBuf::from("docs/a.md"))
+        );
+        assert_eq!(
+            App::remote_workdir_relative(&root, Path::new("/etc/passwd")),
+            None
+        );
     }
 
     // ── Graph scope: set / fallback / cache ─────────────────────────────

@@ -15,6 +15,7 @@ pub struct MarkdownPreview {
 pub struct MarkdownSpan {
     pub text: String,
     pub style: MarkdownStyle,
+    pub link: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,11 +118,13 @@ fn code_block_label_fg(theme: &crate::ui::theme::Theme) -> Color {
 
 impl MarkdownSpan {
     pub fn styled_text<'a>(&'a self, theme: &crate::ui::theme::Theme) -> (Style, Cow<'a, str>) {
-        (
-            self.style
-                .apply(Style::default().fg(theme.fg_primary), theme),
-            Cow::Borrowed(self.text.as_str()),
-        )
+        let mut style = self
+            .style
+            .apply(Style::default().fg(theme.fg_primary), theme);
+        if self.link.is_some() {
+            style = style.fg(theme.accent).add_modifier(Modifier::UNDERLINED);
+        }
+        (style, Cow::Borrowed(self.text.as_str()))
     }
 }
 
@@ -147,6 +150,7 @@ impl InlineState {
         }
         if let Some(last) = self.spans.last_mut()
             && last.style == self.style
+            && last.link == self.link_dest
         {
             last.text.push_str(text);
             return;
@@ -154,14 +158,11 @@ impl InlineState {
         self.spans.push(MarkdownSpan {
             text: text.to_string(),
             style: self.style,
+            link: self.link_dest.clone(),
         });
     }
 
-    fn finish(mut self) -> Vec<MarkdownSpan> {
-        if let Some(dest) = self.link_dest.take() {
-            self.style.role = MarkdownRole::Link;
-            self.push(&format!(" ({dest})"));
-        }
+    fn finish(self) -> Vec<MarkdownSpan> {
         self.spans
     }
 }
@@ -224,6 +225,7 @@ pub fn build_markdown_preview(path: &str, source: &str) -> Option<MarkdownPrevie
                         rows.push(vec![MarkdownSpan {
                             text: format!(" {label} "),
                             style: MarkdownStyle::role(MarkdownRole::CodeBlockHeader),
+                            link: None,
                         }]);
                     }
                     rows.push(code_block_padding_row());
@@ -313,16 +315,15 @@ pub fn build_markdown_preview(path: &str, source: &str) -> Option<MarkdownPrevie
                 TagEnd::Strong => active_inline(&mut inline, &mut table).style.bold = false,
                 TagEnd::Link => {
                     let active = active_inline(&mut inline, &mut table);
-                    if let Some(dest) = active.link_dest.take() {
-                        active.push(&format!(" ({dest})"));
-                    }
+                    active.link_dest = None;
                     active.style.role = MarkdownRole::Normal;
                 }
                 TagEnd::Image => {
                     let active = active_inline(&mut inline, &mut table);
-                    if let Some(dest) = active.link_dest.take() {
+                    if let Some(dest) = active.link_dest.clone() {
                         active.push(&format!(" ({dest})"));
                     }
+                    active.link_dest = None;
                     active.style.role = MarkdownRole::Normal;
                 }
                 TagEnd::TableCell => {
@@ -359,10 +360,12 @@ pub fn build_markdown_preview(path: &str, source: &str) -> Option<MarkdownPrevie
                             MarkdownSpan {
                                 text: "  ".to_string(),
                                 style: MarkdownStyle::role(MarkdownRole::CodeBlockText),
+                                link: None,
                             },
                             MarkdownSpan {
                                 text: part.to_string(),
                                 style: MarkdownStyle::role(MarkdownRole::CodeBlockText),
+                                link: None,
                             },
                         ]);
                     }
@@ -388,6 +391,7 @@ pub fn build_markdown_preview(path: &str, source: &str) -> Option<MarkdownPrevie
                 rows.push(vec![MarkdownSpan {
                     text: "─".repeat(32),
                     style: MarkdownStyle::role(MarkdownRole::Border),
+                    link: None,
                 }]);
                 push_blank(&mut rows);
             }
@@ -458,6 +462,7 @@ fn code_block_padding_row() -> Vec<MarkdownSpan> {
     vec![MarkdownSpan {
         text: String::new(),
         style: MarkdownStyle::role(MarkdownRole::CodeBlockText),
+        link: None,
     }]
 }
 
@@ -499,6 +504,7 @@ fn table_rule(left: &str, join: &str, right: &str, widths: &[usize]) -> Vec<Mark
     vec![MarkdownSpan {
         text,
         style: MarkdownStyle::role(MarkdownRole::Border),
+        link: None,
     }]
 }
 
@@ -571,6 +577,7 @@ fn table_border(s: &str) -> MarkdownSpan {
     MarkdownSpan {
         text: s.to_string(),
         style: MarkdownStyle::role(MarkdownRole::Border),
+        link: None,
     }
 }
 
@@ -578,6 +585,7 @@ fn normal_spaces(width: usize) -> MarkdownSpan {
     MarkdownSpan {
         text: " ".repeat(width),
         style: MarkdownStyle::normal(),
+        link: None,
     }
 }
 
@@ -606,10 +614,19 @@ mod tests {
         let md = build_markdown_preview("README.md", source).unwrap();
         let rendered = texts(&md);
         assert!(rendered.iter().any(|l| l == "Title"));
+        assert!(rendered.iter().any(|l| l.contains("• bold site")));
+        let link = md
+            .rows
+            .iter()
+            .flatten()
+            .find(|span| span.text == "site")
+            .expect("link span");
+        assert_eq!(link.link.as_deref(), Some("https://x.test"));
         assert!(
-            rendered
-                .iter()
-                .any(|l| l.contains("• bold site (https://x.test)"))
+            link.styled_text(&crate::ui::theme::Theme::dark())
+                .0
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
         );
         assert!(rendered.iter().any(|l| l == "│ quote"));
         assert!(rendered.iter().any(|l| l == " rs "));

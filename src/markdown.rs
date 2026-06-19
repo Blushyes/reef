@@ -227,7 +227,6 @@ pub fn build_markdown_preview(path: &str, source: &str, dark: bool) -> Option<Ma
                     flush_inline(&mut rows, &mut inline);
                     quote_depth += 1;
                     inline.style.role = MarkdownRole::Quote;
-                    inline.push(&format!("{} ", "│".repeat(quote_depth)));
                 }
                 Tag::CodeBlock(kind) => {
                     flush_inline(&mut rows, &mut inline);
@@ -255,6 +254,7 @@ pub fn build_markdown_preview(path: &str, source: &str, dark: bool) -> Option<Ma
                 }
                 Tag::Item => {
                     flush_inline(&mut rows, &mut inline);
+                    ensure_quote_prefix(&mut inline, quote_depth);
                     let indent = "  ".repeat(list_stack.len().saturating_sub(1));
                     let marker = match list_stack.last_mut() {
                         Some(Some(n)) => {
@@ -275,6 +275,9 @@ pub fn build_markdown_preview(path: &str, source: &str, dark: bool) -> Option<Ma
                     active.link_dest = Some(dest_url.to_string());
                 }
                 Tag::Image { dest_url, .. } => {
+                    if table.is_none() {
+                        ensure_quote_prefix(&mut inline, quote_depth);
+                    }
                     let active = active_inline(&mut inline, &mut table);
                     active.push("image: ");
                     active.link_dest = Some(dest_url.to_string());
@@ -385,10 +388,16 @@ pub fn build_markdown_preview(path: &str, source: &str, dark: bool) -> Option<Ma
                     if idx > 0 {
                         flush_inline(&mut rows, &mut inline);
                     }
+                    if table.is_none() {
+                        ensure_quote_prefix(&mut inline, quote_depth);
+                    }
                     active_inline(&mut inline, &mut table).push(part);
                 }
             }
             Event::Code(text) => {
+                if table.is_none() {
+                    ensure_quote_prefix(&mut inline, quote_depth);
+                }
                 let active = active_inline(&mut inline, &mut table);
                 let old = active.style;
                 active.style.role = MarkdownRole::Code;
@@ -407,12 +416,21 @@ pub fn build_markdown_preview(path: &str, source: &str, dark: bool) -> Option<Ma
                 push_blank(&mut rows);
             }
             Event::Html(html) | Event::InlineHtml(html) => {
+                if table.is_none() {
+                    ensure_quote_prefix(&mut inline, quote_depth);
+                }
                 active_inline(&mut inline, &mut table).push(html.as_ref())
             }
             Event::FootnoteReference(name) => {
+                if table.is_none() {
+                    ensure_quote_prefix(&mut inline, quote_depth);
+                }
                 active_inline(&mut inline, &mut table).push(&format!("[^{name}]"))
             }
             Event::TaskListMarker(checked) => {
+                if table.is_none() {
+                    ensure_quote_prefix(&mut inline, quote_depth);
+                }
                 active_inline(&mut inline, &mut table).push(if checked { "☑ " } else { "☐ " })
             }
             _ => {}
@@ -450,6 +468,18 @@ fn flush_inline(rows: &mut Vec<Vec<MarkdownSpan>>, inline: &mut InlineState) {
         return;
     }
     rows.push(std::mem::take(&mut inline.spans));
+}
+
+fn ensure_quote_prefix(inline: &mut InlineState, quote_depth: usize) {
+    if quote_depth == 0 || !inline.spans.is_empty() {
+        return;
+    }
+    let style = inline.style;
+    let link_dest = inline.link_dest.take();
+    inline.style = MarkdownStyle::role(MarkdownRole::Quote);
+    inline.push(&format!("{} ", "│".repeat(quote_depth)));
+    inline.style = style;
+    inline.link_dest = link_dest;
 }
 
 fn push_blank(rows: &mut Vec<Vec<MarkdownSpan>>) {
@@ -701,6 +731,12 @@ mod tests {
 
         assert_eq!(rendered, vec!["", "  plain", ""]);
         assert!(md.rows.iter().flatten().all(|span| span.syntax.is_none()));
+    }
+
+    #[test]
+    fn consecutive_blockquote_lines_keep_quote_prefix() {
+        let md = build_markdown_preview("README.md", "> xxx\n> xxx\n", true).unwrap();
+        assert_eq!(texts(&md), vec!["│ xxx", "│ xxx"]);
     }
 
     #[test]

@@ -587,7 +587,7 @@ fn snapshot_markdown_preview() {
     let (tmp, _raw) = tempdir_repo();
     std::fs::write(
         tmp.path().join("README.md"),
-        "# Markdown Preview\n\n| Name | Count |\n|:---|---:|\n| reef | 12 |\n",
+        "# Markdown Preview\n\n```rs\nfn main() {}\n```\n\n| Name | Count |\n|:---|---:|\n| reef | 12 |\n",
     )
     .unwrap();
     let home = tempfile::TempDir::new().expect("home tempdir");

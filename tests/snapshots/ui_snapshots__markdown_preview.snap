@@ -1,6 +1,5 @@
 ---
 source: tests/ui_snapshots.rs
-assertion_line: 618
 expression: output
 ---
  reef  [TMPDIR]  ⎇ (detached)
@@ -9,16 +8,16 @@ expression: output
    README.md U         │ ──────────────────────────────────────────────────────
                        │ Markdown Preview
                        │
+                       │  rs
+                       │
+                       │   fn main() {}
+                       │
+                       │
                        │ ┏━━━━━━┳━━━━━━━┓
                        │ ┃ Name ┃ Count ┃
                        │ ┣━━━━━━╋━━━━━━━┫
                        │ ┃ reef ┃    12 ┃
                        │ ┗━━━━━━┻━━━━━━━┛
-                       │
-                       │
-                       │
-                       │
-                       │
                        │
                        │
                        │

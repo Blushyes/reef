@@ -4,10 +4,10 @@ use crate::find_widget::FindTarget;
 use crate::i18n::{Msg, t};
 use crate::search::SearchTarget;
 use crate::ui::focus::header_title_style;
-use crate::ui::text::{clip_spans, overlay_match_highlight, overlay_selection_highlight};
+use crate::ui::text::{clip_spans, overlay_match_highlight, overlay_selection_highlight, spaces};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding};
 use ratatui_image::StatefulImage;
@@ -570,7 +570,57 @@ fn render_markdown(
             Some(r) if r.start < r.end => overlay_selection_highlight(tokens, r),
             _ => tokens,
         };
-        let rendered = Line::from(clip_spans(&tokens, h, content_w));
+        let mut spans = clip_spans(&tokens, h, content_w);
+        pad_markdown_row_bg(&mut spans, content_w, markdown_row_bg(row, &th));
+        let rendered = Line::from(spans);
         f.render_widget(rendered, Rect::new(area.x, cy, area.width, 1));
+    }
+}
+
+fn pad_markdown_row_bg<'a>(spans: &mut Vec<Span<'a>>, content_w: usize, bg: Option<Color>) {
+    let Some(bg) = bg else {
+        return;
+    };
+    let used = spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum::<usize>();
+    if used < content_w {
+        spans.push(Span::styled(
+            spaces(content_w - used),
+            Style::default().bg(bg),
+        ));
+    }
+}
+
+fn markdown_row_bg(
+    row: &[crate::markdown::MarkdownSpan],
+    th: &crate::ui::theme::Theme,
+) -> Option<Color> {
+    row.iter()
+        .any(|s| {
+            matches!(
+                s.style.role,
+                crate::markdown::MarkdownRole::CodeBlockHeader
+                    | crate::markdown::MarkdownRole::CodeBlockText
+            )
+        })
+        .then_some(crate::markdown::code_block_bg(th))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn markdown_code_background_pads_to_full_row() {
+        let mut spans = vec![Span::styled(" code ", Style::default())];
+        let bg = crate::markdown::code_block_bg(&crate::ui::theme::Theme::light());
+        pad_markdown_row_bg(&mut spans, 10, Some(bg));
+
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[1].content.as_ref(), "    ");
+        assert_eq!(spans[1].style.bg, Some(bg));
+        assert_eq!(bg, Color::Rgb(246, 248, 250));
     }
 }

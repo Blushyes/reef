@@ -687,7 +687,7 @@ fn agent_trash_delete(workdir: &Path, rel_paths: &[PathBuf]) -> Result<bool, (Er
     Ok(false)
 }
 
-fn file_entry_to_dto(e: reef::git::FileEntry) -> FileEntryDto {
+fn file_entry_to_dto(e: reef_core::git::FileEntry) -> FileEntryDto {
     FileEntryDto {
         path: e.path,
         status: file_status_to_dto(e.status),
@@ -696,8 +696,8 @@ fn file_entry_to_dto(e: reef::git::FileEntry) -> FileEntryDto {
     }
 }
 
-fn file_status_to_dto(s: reef::git::FileStatus) -> FileStatusDto {
-    use reef::git::FileStatus;
+fn file_status_to_dto(s: reef_core::git::FileStatus) -> FileStatusDto {
+    use reef_core::git::FileStatus;
     match s {
         FileStatus::Modified => FileStatusDto::Modified,
         FileStatus::Added => FileStatusDto::Added,
@@ -707,21 +707,21 @@ fn file_status_to_dto(s: reef::git::FileStatus) -> FileStatusDto {
     }
 }
 
-fn diff_to_dto(d: reef::git::DiffContent) -> DiffContentDto {
+fn diff_to_dto(d: reef_core::diff::DiffContent) -> DiffContentDto {
     DiffContentDto {
-        file_path: d.file_path,
+        path: d.path,
         hunks: d.hunks.into_iter().map(diff_hunk_to_dto).collect(),
     }
 }
 
-fn diff_hunk_to_dto(h: reef::git::DiffHunk) -> DiffHunkDto {
+fn diff_hunk_to_dto(h: reef_core::diff::DiffHunk) -> DiffHunkDto {
     DiffHunkDto {
         header: h.header.to_string(),
         lines: h.lines.into_iter().map(diff_line_to_dto).collect(),
     }
 }
 
-fn diff_line_to_dto(l: reef::git::DiffLine) -> DiffLineDto {
+fn diff_line_to_dto(l: reef_core::diff::DiffLine) -> DiffLineDto {
     DiffLineDto {
         tag: line_tag_to_dto(l.tag),
         content: l.content.to_string(),
@@ -730,8 +730,8 @@ fn diff_line_to_dto(l: reef::git::DiffLine) -> DiffLineDto {
     }
 }
 
-fn line_tag_to_dto(t: reef::git::LineTag) -> LineTagDto {
-    use reef::git::LineTag;
+fn line_tag_to_dto(t: reef_core::diff::LineTag) -> LineTagDto {
+    use reef_core::diff::LineTag;
     match t {
         LineTag::Context => LineTagDto::Context,
         LineTag::Added => LineTagDto::Added,
@@ -739,7 +739,7 @@ fn line_tag_to_dto(t: reef::git::LineTag) -> LineTagDto {
     }
 }
 
-fn commit_info_to_dto(c: reef::git::CommitInfo) -> CommitInfoDto {
+fn commit_info_to_dto(c: reef_core::git::CommitInfo) -> CommitInfoDto {
     CommitInfoDto {
         oid: c.oid,
         short_oid: c.short_oid,
@@ -751,7 +751,7 @@ fn commit_info_to_dto(c: reef::git::CommitInfo) -> CommitInfoDto {
     }
 }
 
-fn commit_detail_to_dto(c: reef::git::CommitDetail) -> CommitDetailDto {
+fn commit_detail_to_dto(c: reef_core::git::CommitDetail) -> CommitDetailDto {
     CommitDetailDto {
         info: commit_info_to_dto(c.info),
         message: c.message,
@@ -761,8 +761,8 @@ fn commit_detail_to_dto(c: reef::git::CommitDetail) -> CommitDetailDto {
     }
 }
 
-fn ref_label_to_dto(r: reef::git::RefLabel) -> RefLabelDto {
-    use reef::git::RefLabel;
+fn ref_label_to_dto(r: reef_core::git::RefLabel) -> RefLabelDto {
+    use reef_core::git::RefLabel;
     match r {
         RefLabel::Head => RefLabelDto::Head,
         RefLabel::Branch(s) => RefLabelDto::Branch(s),
@@ -771,10 +771,10 @@ fn ref_label_to_dto(r: reef::git::RefLabel) -> RefLabelDto {
     }
 }
 
-fn graph_scope_from_dto(scope: reef_proto::GraphScopeDto) -> reef::git::GraphScope {
+fn graph_scope_from_dto(scope: reef_proto::GraphScopeDto) -> reef_core::git::GraphScope {
     match scope {
-        reef_proto::GraphScopeDto::AllRefs => reef::git::GraphScope::AllRefs,
-        reef_proto::GraphScopeDto::Branch(s) => reef::git::GraphScope::Branch(s),
+        reef_proto::GraphScopeDto::AllRefs => reef_core::git::GraphScope::AllRefs,
+        reef_proto::GraphScopeDto::Branch(s) => reef_core::git::GraphScope::Branch(s),
     }
 }
 

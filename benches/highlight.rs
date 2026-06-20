@@ -1,5 +1,5 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use reef::ui::highlight::highlight_file;
+use reef_core::highlight::highlight_file;
 
 fn synth_rust_lines(n: usize) -> Vec<String> {
     (0..n)

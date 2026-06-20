@@ -1,13 +1,16 @@
 use crate::backend::{Backend, LocalBackend};
-use crate::file_tree::{FileTree, PreviewBody, PreviewContent};
-use crate::git::graph::GraphRow;
-use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, GitRepo, GraphScope, RefLabel};
+use crate::file_tree::FileTree;
 use crate::tasks::{AsyncState, TaskCoordinator, WorkerResult};
 use crate::ui::confirm_modal::ConfirmModal;
 use crate::ui::highlight::StyledToken;
 use crate::ui::mouse::{ClickAction, HitTestRegistry};
 use crate::ui::theme::Theme;
 use crate::ui::toast::Toast;
+use reef_core::diff::{DiffContent, DiffDisplay, DiffLayout};
+use reef_core::git::graph::GraphRow;
+use reef_core::git::tree as git_tree;
+use reef_core::git::{CommitDetail, CommitInfo, FileEntry, GitRepo, GraphScope, RefLabel};
+use reef_core::preview::{PreviewBody, PreviewDocument as PreviewContent};
 use std::collections::{HashMap, HashSet};
 use std::path::Component;
 use std::path::{Path, PathBuf};
@@ -17,7 +20,7 @@ use std::time::{Duration, Instant};
 /// Code-navigation request side (gd / gr / Ctrl+click / nav stack /
 /// LSP refine / post-jump highlight). A child `impl App` block, kept in
 /// its own file so the ~900-line subsystem doesn't bloat this module.
-mod nav;
+pub mod nav;
 
 /// Worker-produced `StatefulProtocol` carried back to the main thread
 /// so it can be slotted into the current `ThreadProtocol`. The
@@ -57,7 +60,7 @@ const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(80);
 #[derive(Debug, Clone)]
 pub struct DbPreviewState {
     /// Workdir-relative path of the SQLite file the state belongs to.
-    /// Compared against `preview_content.file_path` on every render to
+    /// Compared against `preview_content.path` on every render to
     /// catch the "file changed but state didn't get cleared" race.
     pub path: String,
     /// Currently selected object addressed by schema-qualified key.
@@ -125,7 +128,7 @@ impl DbPreviewState {
             expanded,
             page: 0,
             current_rows: info.initial_page.rows.clone(),
-            rows_per_page: crate::file_tree::INITIAL_DB_PAGE_ROWS,
+            rows_per_page: reef_core::preview::INITIAL_DB_PAGE_ROWS,
             col_widths: Vec::new(),
             total_table_w: 0,
             detail: None,
@@ -237,33 +240,6 @@ pub enum FocusedPreviewFileSource {
     GitStaged,
     GitUnstaged,
     GraphCommit,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiffLayout {
-    Unified,    // 上下统一视图
-    SideBySide, // 左右对比视图
-}
-
-impl DiffLayout {
-    /// Stable string used in `~/.config/reef/prefs`. Must round-trip via
-    /// `from_pref_str` — every reader (`load_prefs`, `App::new`,
-    /// `settings::current_value`) and every writer (`save_prefs`,
-    /// `settings::cycle`) must go through these two methods so the spelling
-    /// stays consistent.
-    pub fn pref_str(self) -> &'static str {
-        match self {
-            DiffLayout::Unified => "unified",
-            DiffLayout::SideBySide => "side_by_side",
-        }
-    }
-
-    pub fn from_pref_str(s: &str) -> Self {
-        match s {
-            "side_by_side" => DiffLayout::SideBySide,
-            _ => DiffLayout::Unified,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -421,7 +397,7 @@ pub type LineTokens = Arc<Vec<StyledToken>>;
 /// tokens for the line at that position in `DiffContent.hunks[h].lines[l]`.
 /// `None` means the file's extension / name didn't resolve a syntax; rendering
 /// falls back to plain per-tag colors.
-pub type DiffHighlighted = Vec<Vec<LineTokens>>;
+pub type DiffHighlighted = reef_core::diff::DiffHighlighted<LineTokens>;
 
 /// A diff plus its optional syntax-highlighted tokens. Used for the Git-tab
 /// working/staged diff (no path needed — the selected file is tracked
@@ -448,7 +424,7 @@ pub struct HighlightedDiff {
     /// `None` means the file's extension didn't resolve a syntax (or we
     /// skipped highlighting due to size guards).
     pub highlighted: Option<Arc<DiffHighlighted>>,
-    pub display: Arc<crate::ui::diff_panel::DiffDisplay>,
+    pub display: Arc<DiffDisplay<LineTokens>>,
 }
 
 impl HighlightedDiff {
@@ -457,10 +433,7 @@ impl HighlightedDiff {
     /// cache wiring; pass the highlight result (or `None` if no syntax
     /// resolved / highlighting was skipped).
     pub fn new(diff: DiffContent, highlighted: Option<Arc<DiffHighlighted>>) -> Self {
-        let display = Arc::new(crate::ui::diff_panel::DiffDisplay::build(
-            &diff,
-            highlighted.as_deref(),
-        ));
+        let display = Arc::new(DiffDisplay::build(&diff, highlighted.as_deref()));
         Self {
             diff,
             highlighted,
@@ -477,15 +450,12 @@ pub struct CommitFileDiff {
     pub path: String,
     pub diff: DiffContent,
     pub highlighted: Option<Arc<DiffHighlighted>>,
-    pub display: Arc<crate::ui::diff_panel::DiffDisplay>,
+    pub display: Arc<DiffDisplay<LineTokens>>,
 }
 
 impl CommitFileDiff {
     pub fn new(path: String, diff: DiffContent, highlighted: Option<Arc<DiffHighlighted>>) -> Self {
-        let display = Arc::new(crate::ui::diff_panel::DiffDisplay::build(
-            &diff,
-            highlighted.as_deref(),
-        ));
+        let display = Arc::new(DiffDisplay::build(&diff, highlighted.as_deref()));
         Self {
             path,
             diff,
@@ -887,26 +857,20 @@ pub struct App {
     /// `global_search::accept` right before it kicks off an async preview
     /// load, consumed when that preview arrives (for scroll centering) and
     /// cleared when the active preview path changes. Rendered by
-    /// `ui::file_preview_panel` alongside the in-panel `/` search highlight.
+    /// `ui::preview` alongside the in-panel `/` search highlight.
     pub preview_highlight: Option<PreviewHighlight>,
 
-    /// Code-navigation back stack. `gd` / Ctrl+click push the
-    /// **pre-jump** state here before the async jump chain starts; a
-    /// later `Ctrl-o` pops it back. Capped at `NAV_HISTORY_CAP` (oldest
-    /// dropped on overflow). Persists across tab changes — the user
-    /// usually wants `Ctrl-o` to work after digit-switching tabs.
-    pub nav_history: Vec<crate::nav::NavStackEntry>,
-
-    /// Forward stack populated by `Ctrl-o` (so `Ctrl-i` can redo).
-    /// Cleared the next time a fresh `gd` lands — same semantics as
-    /// any other history-stack UX (browser back/forward).
-    pub nav_history_forward: Vec<crate::nav::NavStackEntry>,
+    /// Explicit location history. `gd` / `gr` / picker accepts push the
+    /// **pre-jump** state here before switching surfaces; later
+    /// Alt/Ctrl+Alt Left/Right restore snapshots across preview, diff,
+    /// search, quick-open, and LSP jumps.
+    pub location_history: reef_core::history::History<crate::app::nav::LocationSnapshot>,
 
     /// Multi-candidate popup overlay. `Some` while the user is picking
     /// between several intra-file definitions; closes on Enter / Esc /
     /// click-outside. While open, owns keyboard navigation (Up/Down)
     /// and routes click via `HitTestRegistry`.
-    pub nav_candidates: Option<crate::nav::NavCandidatesPopup>,
+    pub nav_candidates: Option<crate::app::nav::NavCandidatesPopup>,
 
     /// Identifier currently lit up under a Ctrl+hover gesture. `Some`
     /// while the user holds Ctrl over a clickable token in the preview
@@ -930,7 +894,7 @@ pub struct App {
     ///
     /// Held by `Arc` because the popup can outlive the index when a
     /// rebuild kicks off mid-display.
-    pub nav_workspace: Option<std::sync::Arc<crate::nav::WorkspaceIndex>>,
+    pub nav_workspace: Option<std::sync::Arc<reef_core::nav::WorkspaceIndex>>,
 
     /// Inflight-tracker for workspace index builds. Uses the standard
     /// generation / loading / stale flags — unlike `goto_definition`
@@ -940,13 +904,13 @@ pub struct App {
 
     /// Phase 3 supervisor state per language — drives the status-bar
     /// badge. Missing keys are treated as `LspBadge::Off`.
-    pub lsp_states: std::collections::HashMap<crate::nav::NavLang, crate::nav::LspBadge>,
+    pub lsp_states: std::collections::HashMap<reef_core::nav::NavLang, reef_core::nav::LspBadge>,
 
     /// Cached "is this LSP binary on PATH?" per language. Populated off
     /// the render path by `refresh_lsp_installed` so the status-bar badge and Settings rows
     /// never stat the filesystem during render — `locate_binary` walks
     /// every PATH dir and was previously called every frame.
-    pub lsp_installed: std::collections::HashMap<crate::nav::NavLang, bool>,
+    pub lsp_installed: std::collections::HashMap<reef_core::nav::NavLang, bool>,
 
     /// Phase 3 LSP refine cache. Keyed by `(lang, identifier_text)`
     /// rather than byte offset so a click on `foo` anywhere benefits
@@ -954,7 +918,7 @@ pub struct App {
     /// before falling back to tree-sitter / workspace results — never
     /// re-jumps the cursor from a refine that lands after the jump.
     pub nav_refine_cache:
-        std::collections::HashMap<(crate::nav::NavLang, String), crate::nav::LspLocation>,
+        std::collections::HashMap<(reef_core::nav::NavLang, String), reef_core::nav::LspLocation>,
 
     /// Generation counter for LSP refine dispatches. Used by
     /// `nav_pending_lsp_jump` to drop stale responses when the user
@@ -989,7 +953,7 @@ pub struct App {
     /// Mirrors VSCode's Vue extension: the client sends
     /// `textDocument/definition { uri, position }` and waits for the
     /// server (Volar) to do the SFC → virtual TS mapping.
-    pub nav_pending_lsp_jump: Option<crate::nav::NavPendingJump>,
+    pub nav_pending_lsp_jump: Option<crate::app::nav::NavPendingJump>,
 
     /// VSCode-style drag-and-drop destination picker. While `place_mode.active`,
     /// input is routed exclusively to `input::handle_key` / `handle_mouse`
@@ -1033,7 +997,7 @@ pub struct App {
     /// decisions in the status bar. `paste_into` opens it; `input`
     /// keys advance it; `complete_paste_resolution` dispatches the
     /// final batch when it drains.
-    pub paste_conflict: Option<crate::paste_conflict::PasteConflictPrompt>,
+    pub paste_conflict: Option<reef_core::file_ops::PasteConflictPrompt>,
 
     /// Timestamp of the most recent bare-Space keystroke in the global
     /// keymap. `Some(t)` means a Space leader is primed and waiting for a
@@ -1118,7 +1082,7 @@ pub struct SelectedFile {
 }
 
 /// Row-scoped preview highlight carried from `global_search::accept()` to
-/// the `file_preview_panel` renderer. Survives the async preview round-trip
+/// the `ui::preview` renderer. Survives the async preview round-trip
 /// so the match row gets highlighted the frame the preview lands. Cleared
 /// whenever the active preview path no longer matches `path`.
 #[derive(Debug, Clone)]
@@ -1382,8 +1346,7 @@ impl App {
             pending_ssh_target: None,
             should_quit_session: false,
             preview_highlight: None,
-            nav_history: Vec::new(),
-            nav_history_forward: Vec::new(),
+            location_history: reef_core::history::History::new(Self::NAV_HISTORY_CAP),
             nav_candidates: None,
             ctrl_hover_target: None,
             diff_ctrl_hover: None,
@@ -1740,14 +1703,14 @@ impl App {
     /// visible row so there's no eager stamping to do here.
     pub fn mark_cut(&mut self, paths: Vec<PathBuf>) {
         self.file_clipboard
-            .set(crate::file_clipboard::ClipMode::Cut, paths);
+            .set(reef_core::file_ops::ClipMode::Cut, paths);
     }
 
     /// Mark `paths` as Copy. Copy mode does not visually mark source
     /// rows (matches VS Code).
     pub fn mark_copy(&mut self, paths: Vec<PathBuf>) {
         self.file_clipboard
-            .set(crate::file_clipboard::ClipMode::Copy, paths);
+            .set(reef_core::file_ops::ClipMode::Copy, paths);
     }
 
     pub fn clear_clipboard(&mut self) {
@@ -1861,7 +1824,7 @@ impl App {
             by_parent.entry(parent).or_default().push(s);
         }
         for (parent, group) in by_parent {
-            self.dispatch_paste_op(crate::file_clipboard::ClipMode::Copy, parent, group);
+            self.dispatch_paste_op(reef_core::file_ops::ClipMode::Copy, parent, group);
             // Multiple parents → multiple batches; but `fs_mutation_load`
             // serialises them: we only fire the first, the rest get the
             // "operation in flight" toast. Acceptable v1 behaviour —
@@ -1884,7 +1847,7 @@ impl App {
     /// blocks, same-dir Cut no-ops), and dispatch.
     fn dispatch_paste_op(
         &mut self,
-        op: crate::file_clipboard::ClipMode,
+        op: reef_core::file_ops::ClipMode,
         dest_rel: PathBuf,
         sources: Vec<PathBuf>,
     ) {
@@ -1900,7 +1863,7 @@ impl App {
         //   - Same-dir auto-rename uses the snapshot transiently;
         //     intra-batch collisions are tracked by `classify_paste`.
         let existing = self.existing_basenames_in_dir(&dest_rel);
-        let cls = crate::paste_conflict::classify_paste(op, &dest_rel, &sources, &existing);
+        let cls = reef_core::file_ops::classify_paste(op, &dest_rel, &sources, &existing);
 
         // Advisory toast on blocked items — single toast for the
         // whole batch rather than one per row, matches VS Code's
@@ -1914,7 +1877,7 @@ impl App {
         if cls.pending.is_empty() {
             self.dispatch_paste_resolved(op, dest_rel, cls.auto_decisions);
         } else {
-            self.paste_conflict = Some(crate::paste_conflict::PasteConflictPrompt::new(
+            self.paste_conflict = Some(reef_core::file_ops::PasteConflictPrompt::new(
                 op,
                 dest_rel,
                 cls.auto_decisions,
@@ -1926,11 +1889,11 @@ impl App {
     /// Send a fully-resolved paste batch to the worker.
     fn dispatch_paste_resolved(
         &mut self,
-        op: crate::file_clipboard::ClipMode,
+        op: reef_core::file_ops::ClipMode,
         dest_rel: PathBuf,
-        decisions: Vec<(PathBuf, crate::paste_conflict::Resolution)>,
+        decisions: Vec<(PathBuf, reef_core::file_ops::Resolution)>,
     ) {
-        use crate::paste_conflict::Resolution;
+        use reef_core::file_ops::Resolution;
         // Filter Skip/Cancel so the worker doesn't see noops, but
         // emit a "nothing to paste" toast if everything got skipped.
         let actionable: Vec<_> = decisions
@@ -1974,14 +1937,14 @@ impl App {
 
         let generation = self.fs_mutation_load.begin();
         match op {
-            crate::file_clipboard::ClipMode::Cut => {
+            reef_core::file_ops::ClipMode::Cut => {
                 self.tasks
                     .move_paths(generation, Arc::clone(&self.backend), items, dest_rel);
                 // Cut-paste consumes the clipboard. VS Code's
                 // semantics: a single Cut feeds one Paste.
                 self.clear_clipboard();
             }
-            crate::file_clipboard::ClipMode::Copy => {
+            reef_core::file_ops::ClipMode::Copy => {
                 self.tasks
                     .copy_paths(generation, Arc::clone(&self.backend), items, dest_rel);
                 // Copy-paste leaves the clipboard intact so a second
@@ -2001,7 +1964,7 @@ impl App {
     /// Cancel is independent of apply-to-all).
     pub fn resolve_paste_conflict(
         &mut self,
-        r: crate::paste_conflict::Resolution,
+        r: reef_core::file_ops::Resolution,
         apply_to_all: bool,
     ) {
         let Some(prompt) = self.paste_conflict.as_mut() else {
@@ -2045,7 +2008,7 @@ impl App {
         let item = prompt.current()?;
         let basename = item.source.file_name().and_then(|s| s.to_str())?;
         let existing = self.existing_basenames_in_dir(prompt.dest_dir());
-        Some(crate::paste_conflict::next_copy_name(basename, &existing))
+        Some(reef_core::file_ops::next_copy_name(basename, &existing))
     }
 
     /// Write the absolute (or workdir-relative) paths of the active
@@ -2203,9 +2166,9 @@ impl App {
         let sources = std::mem::take(&mut self.tree_drag.sources);
         self.tree_drag.cancel();
         let op = if is_copy {
-            crate::file_clipboard::ClipMode::Copy
+            reef_core::file_ops::ClipMode::Copy
         } else {
-            crate::file_clipboard::ClipMode::Cut
+            reef_core::file_ops::ClipMode::Cut
         };
         if self.fs_mutation_load.loading {
             self.toasts
@@ -2292,7 +2255,7 @@ impl App {
             self.tree_edit.clear();
             return;
         };
-        let name = match crate::tree_edit::validate_basename(&self.tree_edit.buffer) {
+        let name = match reef_core::file_ops::validate_basename(&self.tree_edit.buffer) {
             Ok(n) => n,
             Err(err) => {
                 self.tree_edit.error = Some(err);
@@ -2312,7 +2275,8 @@ impl App {
             }
         }
         if target_path.exists() {
-            self.tree_edit.error = Some(crate::tree_edit::TreeEditError::NameAlreadyExists(name));
+            self.tree_edit.error =
+                Some(reef_core::file_ops::FileNameError::NameAlreadyExists(name));
             return;
         }
 
@@ -2627,7 +2591,7 @@ impl App {
         let display_name = path
             .file_name()
             .and_then(|n| n.to_str())
-            .map(crate::tree_edit::sanitize_filename)
+            .map(reef_core::file_ops::sanitize_filename)
             .unwrap_or_else(|| path.to_string_lossy().to_string());
         self.tree_context_menu.close();
         let body = crate::i18n::tree_delete_body(&display_name, is_dir, hard);
@@ -2732,7 +2696,7 @@ impl App {
     /// reading the config aren't fatal — we show an empty picker so the
     /// user can still switch via the path-input mode.
     pub fn open_hosts_picker(&mut self) {
-        let parsed = crate::hosts::parse_ssh_config().unwrap_or_default();
+        let parsed = reef_core::hosts::parse_ssh_config().unwrap_or_default();
         let recent = crate::hosts_picker::load_recent();
         self.hosts_picker.open(parsed, recent);
     }
@@ -3001,7 +2965,7 @@ impl App {
     /// `None` when the preview is missing / not a database.
     fn preview_database_info(&self) -> Option<&reef_sqlite_preview::DatabaseInfoV2> {
         match self.preview_content.as_ref()?.body {
-            crate::file_tree::PreviewBody::Database(ref info) => Some(info),
+            reef_core::preview::PreviewBody::Database(ref info) => Some(info),
             _ => None,
         }
     }
@@ -4116,7 +4080,7 @@ impl App {
                         self.preview_in_flight_path = None;
                         let same_file = matches!(
                             (self.preview_content.as_ref(), content.as_ref()),
-                            (Some(old), Some(new)) if old.file_path == new.file_path
+                            (Some(old), Some(new)) if old.path == new.path
                         );
                         // Decide the protocol fate in three buckets:
                         //
@@ -4142,8 +4106,8 @@ impl App {
                                     content.as_ref().map(|c| &c.body),
                                 ),
                                 (
-                                    Some(crate::file_tree::PreviewBody::Image(old)),
-                                    Some(crate::file_tree::PreviewBody::Image(new)),
+                                    Some(reef_core::preview::PreviewBody::Image(old)),
+                                    Some(reef_core::preview::PreviewBody::Image(new)),
                                 ) if old.bytes_on_disk == new.bytes_on_disk
                                     && old.width_px == new.width_px
                                     && old.height_px == new.height_px
@@ -4167,7 +4131,7 @@ impl App {
                                 self.image_picker.as_ref(),
                                 content.as_mut().map(|c| &mut c.body),
                             ) {
-                                (Some(_), Some(crate::file_tree::PreviewBody::Image(img))) => {
+                                (Some(_), Some(reef_core::preview::PreviewBody::Image(img))) => {
                                     img.image.take()
                                 }
                                 _ => None,
@@ -4198,7 +4162,7 @@ impl App {
                                 // Non-image body, or no picker available.
                                 self.preview_image_protocol = None;
                             }
-                        } else if let Some(crate::file_tree::PreviewBody::Image(img)) =
+                        } else if let Some(reef_core::preview::PreviewBody::Image(img)) =
                             content.as_mut().map(|c| &mut c.body)
                         {
                             // Drop the new DynamicImage — the kept
@@ -4220,11 +4184,7 @@ impl App {
                         // (theme change, fs-watcher kick) so the user
                         // doesn't snap back to page 0 on an unrelated
                         // re-decode.
-                        match self
-                            .preview_content
-                            .as_ref()
-                            .map(|p| (&p.body, &p.file_path))
-                        {
+                        match self.preview_content.as_ref().map(|p| (&p.body, &p.path)) {
                             Some((PreviewBody::Database(info), path)) => {
                                 let state_matches = self
                                     .db_preview_state
@@ -4708,7 +4668,7 @@ impl App {
                 // definition OR outside the workspace (e.g. a dep).
                 let rel_location = location.as_ref().and_then(|loc| {
                     self.workdir_relative(&loc.path)
-                        .map(|rel| crate::nav::LspLocation {
+                        .map(|rel| reef_core::nav::LspLocation {
                             path: rel,
                             line: loc.line,
                             character: loc.character,
@@ -4750,7 +4710,6 @@ impl App {
                             // an async jump.
                             self.nav_candidates = None;
                             self.nav_push_back(pending.origin);
-                            self.nav_history_forward.clear();
                             self.nav_jump_to_lsp(&loc);
                         }
                         None if location.is_some() => {
@@ -5469,6 +5428,7 @@ impl App {
                 .push(Toast::warn(format!("Markdown link not found: {target}")));
             return;
         };
+        self.push_location_before_jump();
         self.set_active_tab(Tab::Files);
         self.file_tree.reveal(&rel);
         self.refresh_file_tree_with_target(Some(rel.clone()));
@@ -5530,7 +5490,7 @@ impl App {
         let preview_path = self
             .preview_content
             .as_ref()
-            .map(|preview| Path::new(&preview.file_path))?;
+            .map(|preview| Path::new(&preview.path))?;
         let base = preview_path.parent().unwrap_or_else(|| Path::new(""));
         Self::normalize_relative_path(base.join(path))
     }
@@ -5593,13 +5553,33 @@ impl App {
         let mut items: Vec<(String, bool)> = Vec::new();
 
         if !self.staged_files.is_empty() && !self.staged_collapsed {
-            for f in &self.staged_files {
-                items.push((f.path.clone(), true));
+            if self.git_status.tree_mode {
+                for path in git_tree::visible_file_paths(
+                    &self.staged_files,
+                    true,
+                    &self.git_status.collapsed_dirs,
+                ) {
+                    items.push((path, true));
+                }
+            } else {
+                for f in &self.staged_files {
+                    items.push((f.path.clone(), true));
+                }
             }
         }
         if !self.unstaged_collapsed {
-            for f in &self.unstaged_files {
-                items.push((f.path.clone(), false));
+            if self.git_status.tree_mode {
+                for path in git_tree::visible_file_paths(
+                    &self.unstaged_files,
+                    false,
+                    &self.git_status.collapsed_dirs,
+                ) {
+                    items.push((path, false));
+                }
+            } else {
+                for f in &self.unstaged_files {
+                    items.push((f.path.clone(), false));
+                }
             }
         }
 
@@ -5708,7 +5688,7 @@ impl App {
     /// Vim `G` — jump the active content panel to its bottom. List panels
     /// move selection to the last row; content panels set the scroll to
     /// `usize::MAX` and rely on the render-layer clamp
-    /// (file_preview_panel / diff_panel / commit_detail_panel all clamp
+    /// (ui::preview / diff_panel / commit_detail_panel all clamp
     /// against `lines.len() - viewport`).
     pub fn scroll_active_preview_to_bottom(&mut self) {
         if self.is_sqlite_preview() {
@@ -6173,10 +6153,10 @@ mod tests {
         folder_contains, load_graph_scope_pref, persist_graph_scope,
     };
     use crate::backend::LocalBackend;
-    use crate::file_tree::{PreviewBody, PreviewContent};
-    use crate::git::GraphScope;
     use crate::tasks::{GraphPayload, WorkerResult};
     use crate::ui::theme::Theme;
+    use reef_core::git::{FileEntry, FileStatus, GraphScope};
+    use reef_core::preview::{PreviewBody, PreviewDocument as PreviewContent};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use test_support::{HOME_LOCK, HomeGuard, commit_file, tempdir_repo};
@@ -6240,13 +6220,12 @@ mod tests {
 
         let mut fx = make_scope_fixture();
         fx.app.preview_content = Some(PreviewContent {
-            file_path: "docs/guide/index.md".into(),
-            body: PreviewBody::Text {
+            path: "docs/guide/index.md".into(),
+            body: PreviewBody::Text(reef_core::preview::TextPreview {
                 lines: vec![],
                 highlighted: None,
                 parsed: None,
-                markdown: None,
-            },
+            }),
         });
 
         assert_eq!(
@@ -6266,6 +6245,70 @@ mod tests {
         assert_eq!(
             App::remote_workdir_relative(&root, Path::new("/etc/passwd")),
             None
+        );
+    }
+
+    fn git_entry(path: &str) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            status: FileStatus::Modified,
+            additions: 0,
+            deletions: 0,
+        }
+    }
+
+    #[test]
+    fn navigate_files_tree_mode_follows_visible_tree_order() {
+        let mut fx = make_scope_fixture();
+        fx.app.git_status.tree_mode = true;
+        fx.app.unstaged_files = vec![
+            git_entry("z.txt"),
+            git_entry("src/z.rs"),
+            git_entry("README.md"),
+            git_entry("src/a.rs"),
+            git_entry("assets/logo.png"),
+        ];
+        fx.app.selected_file = Some(super::SelectedFile {
+            path: "assets/logo.png".to_string(),
+            is_staged: false,
+        });
+
+        fx.app.navigate_files(1);
+        assert_eq!(
+            fx.app.selected_file.as_ref().map(|s| s.path.as_str()),
+            Some("src/a.rs")
+        );
+
+        fx.app.navigate_files(1);
+        assert_eq!(
+            fx.app.selected_file.as_ref().map(|s| s.path.as_str()),
+            Some("src/z.rs")
+        );
+    }
+
+    #[test]
+    fn navigate_files_tree_mode_skips_collapsed_dirs() {
+        let mut fx = make_scope_fixture();
+        fx.app.git_status.tree_mode = true;
+        fx.app.unstaged_files = vec![
+            git_entry("src/a.rs"),
+            git_entry("README.md"),
+            git_entry("src/z.rs"),
+            git_entry("z.txt"),
+        ];
+        fx.app
+            .git_status
+            .collapsed_dirs
+            .insert(reef_core::git::tree::collapsed_key(false, "src"));
+        fx.app.selected_file = Some(super::SelectedFile {
+            path: "README.md".to_string(),
+            is_staged: false,
+        });
+
+        fx.app.navigate_files(-1);
+        assert_eq!(
+            fx.app.selected_file.as_ref().map(|s| s.path.as_str()),
+            Some("README.md")
         );
     }
 
@@ -6477,11 +6520,11 @@ mod tests {
         fx.app.git_graph.scope = GraphScope::Branch("refs/heads/feature".into());
         fx.app.git_graph.recent_branches = vec!["refs/heads/feature".into()];
 
-        let mut ref_map: std::collections::HashMap<String, Vec<crate::git::RefLabel>> =
+        let mut ref_map: std::collections::HashMap<String, Vec<reef_core::git::RefLabel>> =
             std::collections::HashMap::new();
         ref_map.insert(
             "abc123".to_string(),
-            vec![crate::git::RefLabel::Branch("feature".into())],
+            vec![reef_core::git::RefLabel::Branch("feature".into())],
         );
 
         let generation = fx.app.graph_load.begin();
@@ -6615,7 +6658,7 @@ mod tests {
         // succeeds.
         fx.app.git_graph.ref_map.insert(
             "oid".into(),
-            vec![crate::git::RefLabel::Branch("main".into())],
+            vec![reef_core::git::RefLabel::Branch("main".into())],
         );
         fx.app.open_graph_branch_picker();
         assert!(fx.app.graph_branch_picker.core.active);

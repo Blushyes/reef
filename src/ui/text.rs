@@ -313,7 +313,7 @@ fn byte_in_range(abs: usize, range: &Range<usize>) -> bool {
 /// range. Modeled on `overlay_selection_highlight` (same byte-walking
 /// pattern) but applies an additive style instead of REVERSED so the
 /// underlying syntect colour shows through, just underlined and
-/// recoloured. Used by `file_preview_panel` to advertise that
+/// recoloured. Used by `ui::preview` to advertise that
 /// Ctrl+click would jump.
 pub fn overlay_ctrl_hover_underline<'a>(
     tokens: Vec<(Style, Cow<'a, str>)>,

@@ -56,7 +56,7 @@ impl FileParse {
 
 /// A jump target. `byte_range` is **per-line** — same convention as
 /// `MatchHit` and `PreviewHighlight` so they share the highlight
-/// pathway in `file_preview_panel`. Intra-file results omit `path`
+/// pathway in `ui::preview`. Intra-file results omit `path`
 /// (caller knows the current file); cross-file results (Phase 2)
 /// populate it.
 #[derive(Debug, Clone)]
@@ -69,117 +69,6 @@ pub struct Location {
     /// newlines).
     pub byte_range: Range<usize>,
     pub snippet: String,
-}
-
-/// How a navigation request was triggered. Determines where the
-/// candidates popup anchors if there's more than one result, and how
-/// the engine picks the originating `(line, byte_col)` cursor:
-///   - `Keyboard` reads `preview_selection.active` (a click without
-///     drag leaves an "empty selection" at the click point — that's
-///     the user's focus).
-///   - `Mouse` carries the click coordinates so the engine routes them
-///     through `mouse_to_file_coord` itself.
-#[derive(Debug, Clone, Copy)]
-pub enum NavAnchor {
-    Keyboard,
-    Mouse { col: u16, row: u16 },
-}
-
-/// One entry on the navigation back/forward stack. Captures *the
-/// state we're leaving* — path + cursor + scroll — so
-/// `Ctrl-o` restores the user to the exact row they were looking at, not
-/// just the file. Pushed BEFORE the async jump chain so a rapid
-/// `gd` → `Ctrl-o` finds the entry it expects.
-#[derive(Debug, Clone)]
-pub struct NavStackEntry {
-    pub path: std::path::PathBuf,
-    pub line: usize,
-    pub byte_col: usize,
-    pub scroll_row: usize,
-}
-
-/// Async-jump intent registered when an LSP-only language (Vue) fires
-/// a `textDocument/definition` and is waiting on the response. The
-/// `tick`-time `LspRefineDone` drain matches by `(lang, cache_key)`
-/// and `generation`, executes the jump, and drops this slot. Modeled
-/// on VSCode's Vue extension behavior: the client is "dumb" — it
-/// just sends `(uri, line, character)`, all SFC virtual-file
-/// mapping happens server-side via Volar's `@vue/typescript-plugin`
-/// (`postprocessLanguageService`).
-#[derive(Debug, Clone)]
-pub struct NavPendingJump {
-    pub lang: NavLang,
-    /// The same string used as the LSP refine task's `identifier`
-    /// field — a position key (`<path>:<line>:<col>` via `refine_key`)
-    /// since there's no real identifier to key by. Tick matches by this.
-    pub cache_key: String,
-    pub origin: NavStackEntry,
-    pub generation: u64,
-}
-
-/// Floating candidates popup, shown when a single `gd` resolves to
-/// more than one definition. Modeled on `tree_context_menu` — small
-/// overlay anchored near the click/cursor, list of rows, Up/Down/
-/// Enter/Esc + mouse-click. v1 is a list-style picker, not a code
-/// preview peek (terminals can't host a mini-editor inline).
-#[derive(Debug, Clone)]
-pub struct NavCandidatesPopup {
-    /// Screen-space anchor for the top-left of the popup. Computed by
-    /// the caller to land just *below* the click point / cursor row.
-    pub anchor_col: u16,
-    pub anchor_row: u16,
-    pub candidates: Vec<Location>,
-    pub selected: usize,
-    /// Index of the first visible row. The popup body is capped at
-    /// `MAX_VISIBLE_ROWS` (see the UI module); when the candidate list
-    /// is longer, this offset slides so `selected` stays on-screen.
-    /// Also driven directly by the mouse wheel.
-    pub scroll: usize,
-    /// File the candidates apply to. Phase 1 is intra-file only, so
-    /// every candidate's `path` is implicitly this; Phase 2 may mix.
-    pub current_path: std::path::PathBuf,
-    /// The originating cursor — captured so picking a candidate can
-    /// push the right back-stack entry (we don't push at `gd` time
-    /// when the popup opens; the pick is what commits the navigation).
-    pub origin: NavStackEntry,
-    /// `true` when the popup was opened by a Ctrl+click rather than
-    /// the `gd` keyboard chord. Drives the "release Ctrl → close popup"
-    /// UX: we only honour Ctrl release for popups the user opened
-    /// with Ctrl, so a `gd`-opened popup isn't dismissed by
-    /// unrelated mouse movement.
-    pub opened_by_ctrl_click: bool,
-    /// Widest row's display width, in columns.
-    pub max_row_width: u16,
-}
-
-impl NavCandidatesPopup {
-    /// Max rows shown at once before the body scrolls. Fixed so the
-    /// popup never overflows the screen on a 100-candidate
-    /// find-references result.
-    pub const MAX_VISIBLE_ROWS: usize = 8;
-
-    /// Number of rows actually drawn this frame.
-    pub fn visible_rows(&self) -> usize {
-        self.candidates.len().min(Self::MAX_VISIBLE_ROWS)
-    }
-
-    /// Re-clamp `scroll` so `selected` is within the visible window.
-    /// Called after any `selected` change (keyboard nav) and after a
-    /// wheel scroll so the two stay coherent.
-    pub fn clamp_scroll(&mut self) {
-        let visible = self.visible_rows();
-        if visible == 0 {
-            self.scroll = 0;
-            return;
-        }
-        let max_scroll = self.candidates.len().saturating_sub(visible);
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
-        } else if self.selected >= self.scroll + visible {
-            self.scroll = self.selected + 1 - visible;
-        }
-        self.scroll = self.scroll.min(max_scroll);
-    }
 }
 
 /// Parse `source` for `lang`. Returns `None` if the parser refused

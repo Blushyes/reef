@@ -4,8 +4,9 @@
 //! [`SettingItem::ALL`] + match arms in `section`/`label`/`description`/
 //! [`current_value`]/[`cycle`].
 
-use crate::app::{App, DiffLayout, DiffMode};
-use crate::nav::NavLang;
+use crate::app::{App, DiffMode};
+use reef_core::diff::DiffLayout;
+use reef_core::nav::NavLang;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingSection {

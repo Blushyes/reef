@@ -65,7 +65,7 @@ fn wait_for_file_tree(app: &mut App) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         app.tick();
-        if !app.file_tree_load.loading {
+        if !app.file_tree_load.loading && !app.file_tree_load.stale {
             return;
         }
         thread::sleep(Duration::from_millis(10));
@@ -147,18 +147,8 @@ fn snapshot_place_mode_renders_banner_and_border() {
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new(Theme::dark(), None);
-    // Force a tree rebuild so `src/` and `README.md` show up before the
-    // snapshot draw (the async load fires from `App::new` via tick).
     app.refresh_file_tree();
-    // Drain worker results until the tree is populated.
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        app.tick();
-        if !app.file_tree_load.loading && !app.file_tree.entries.is_empty() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_file_tree(&mut app);
 
     // Source file used for the banner — has to exist on disk because
     // place mode itself is entered via `enter_place_mode` which accepts
@@ -190,14 +180,7 @@ fn snapshot_tree_edit_row_new_file() {
 
     let mut app = App::new(Theme::dark(), None);
     app.refresh_file_tree();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        app.tick();
-        if !app.file_tree_load.loading && !app.file_tree.entries.is_empty() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_file_tree(&mut app);
 
     // Kick off a NewFile edit anchored on the first top-level folder so
     // the editable row renders indented one deeper than the folder.
@@ -232,14 +215,7 @@ fn snapshot_tree_context_menu() {
 
     let mut app = App::new(Theme::dark(), None);
     app.refresh_file_tree();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        app.tick();
-        if !app.file_tree_load.loading && !app.file_tree.entries.is_empty() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_file_tree(&mut app);
 
     // Open menu anchored at column 4, row 5 — arbitrary coords that
     // leave room for the popup to render inline without getting
@@ -346,8 +322,8 @@ fn snapshot_hosts_picker_empty() {
 /// and the two-column alias/hostname layout.
 #[test]
 fn snapshot_hosts_picker_populated() {
-    use reef::hosts::HostEntry;
     use reef::hosts_picker::SshTarget;
+    use reef_core::hosts::HostEntry;
 
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     force_en_lang();
@@ -391,7 +367,7 @@ fn snapshot_hosts_picker_populated() {
 /// [user@]host[:path]` and the prompt glyph changes `›` → `➜`.
 #[test]
 fn snapshot_hosts_picker_path_mode() {
-    use reef::hosts::HostEntry;
+    use reef_core::hosts::HostEntry;
 
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     force_en_lang();
@@ -452,7 +428,13 @@ fn wait_for_preview(app: &mut App) {
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
         app.tick();
-        if !app.preview_load.loading && app.preview_content.is_some() {
+        if !app.preview_load.loading
+            && app.preview_content.is_some()
+            && !app.preview_load.stale
+            && app.preview_schedule.is_none()
+            && !app.file_tree_load.loading
+            && !app.file_tree_load.stale
+        {
             return;
         }
         thread::sleep(Duration::from_millis(10));
@@ -487,14 +469,7 @@ fn snapshot_image_preview_halfblocks() {
     // queues a preview load. `navigate_files` also fires the preview
     // request internally.
     app.refresh_file_tree();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        app.tick();
-        if !app.file_tree_load.loading && !app.file_tree.entries.is_empty() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_file_tree(&mut app);
     // Seed `selected_file` on whichever row is "striped.png".
     let idx = app
         .file_tree
@@ -558,14 +533,7 @@ fn snapshot_binary_info_pdf() {
 
     let mut app = App::new(Theme::dark(), None);
     app.refresh_file_tree();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        app.tick();
-        if !app.file_tree_load.loading && !app.file_tree.entries.is_empty() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_file_tree(&mut app);
     let idx = app
         .file_tree
         .entries
@@ -596,14 +564,7 @@ fn snapshot_markdown_preview() {
 
     let mut app = App::new(Theme::dark(), None);
     app.refresh_file_tree();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        app.tick();
-        if !app.file_tree_load.loading && !app.file_tree.entries.is_empty() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_file_tree(&mut app);
     let idx = app
         .file_tree
         .entries

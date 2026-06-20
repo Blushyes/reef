@@ -27,8 +27,10 @@ use super::{
     Backend, BackendError, ContentMatchHit, ContentSearchCompleted, ContentSearchRequest,
     EditorLaunchSpec, SearchChunkSink, StatusSnapshot, TrashOutcome, WalkOpts, WalkResponse,
 };
-use crate::file_tree::{PreviewContent, TreeEntry};
-use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, GraphScope, RefLabel};
+use crate::file_tree::TreeEntry;
+use reef_core::diff::DiffContent;
+use reef_core::git::{CommitDetail, CommitInfo, FileEntry, GraphScope, RefLabel};
+use reef_core::preview::PreviewDocument as PreviewContent;
 use std::ops::ControlFlow;
 
 /// Default timeout for a single RPC round-trip. Applied to every `request`
@@ -483,7 +485,7 @@ impl Backend for RemoteBackend {
         // as the generic Binary metadata card regardless of the decode
         // hint. Image rendering over SSH would need raw bytes +
         // client-side decode; tracked in issue #31.
-        use crate::file_tree::{BinaryInfo, BinaryReason, PreviewBody};
+        use reef_core::preview::{BinaryInfo, BinaryReason, PreviewBody, TextPreview};
         let rel_str = rel_path.to_string_lossy().to_string();
 
         // SQLite branch — client-side extension check, agent does the
@@ -498,11 +500,11 @@ impl Backend for RemoteBackend {
             && let Ok(Some(dto)) =
                 self.request::<Option<reef_proto::DatabaseInfoV2Dto>>(Request::LoadDbInitialV2 {
                     rel_path: rel_str.clone(),
-                    page_size: crate::file_tree::INITIAL_DB_PAGE_ROWS,
+                    page_size: reef_core::preview::INITIAL_DB_PAGE_ROWS,
                 })
         {
             return Some(PreviewContent {
-                file_path: rel_str,
+                path: rel_str,
                 body: PreviewBody::Database(database_info_v2_from_dto(dto)),
             });
         }
@@ -520,7 +522,7 @@ impl Backend for RemoteBackend {
 
         if raw.is_empty() {
             return Some(PreviewContent {
-                file_path: rel_str,
+                path: rel_str,
                 body: PreviewBody::Binary(BinaryInfo::new(0, None, BinaryReason::Empty)),
             });
         }
@@ -528,7 +530,7 @@ impl Backend for RemoteBackend {
         let check_len = raw.len().min(8192);
         if raw[..check_len].contains(&0) {
             return Some(PreviewContent {
-                file_path: rel_str,
+                path: rel_str,
                 body: PreviewBody::Binary(BinaryInfo::new(
                     bytes_on_disk,
                     None,
@@ -546,13 +548,18 @@ impl Backend for RemoteBackend {
         };
 
         let within_cap = raw.len() <= 512 * 1024 && lines.len() <= 5_000;
+        if within_cap
+            && let Some(markdown) =
+                reef_core::markdown::build_markdown_preview(&rel_str, &content, dark)
+        {
+            return Some(PreviewContent {
+                path: rel_str,
+                body: PreviewBody::Markdown(markdown),
+            });
+        }
+
         let highlighted = if within_cap {
-            crate::ui::highlight::highlight_file(&rel_str, &lines, dark)
-        } else {
-            None
-        };
-        let markdown = if within_cap {
-            crate::markdown::build_markdown_preview(&rel_str, &content, dark)
+            reef_core::highlight::highlight_file(&rel_str, &lines, dark)
         } else {
             None
         };
@@ -564,23 +571,22 @@ impl Backend for RemoteBackend {
         // local-only — both gate on `Backend::is_remote()`.
         let parsed = if within_cap {
             let path_buf = std::path::PathBuf::from(&rel_str);
-            crate::nav::NavLang::from_path(&path_buf).and_then(|lang| {
+            reef_core::nav::NavLang::from_path(&path_buf).and_then(|lang| {
                 let source: std::sync::Arc<[u8]> =
                     std::sync::Arc::from(raw.clone().into_boxed_slice());
-                crate::nav::parse_file_if_supported(lang, source).map(std::sync::Arc::new)
+                reef_core::nav::parse_file_if_supported(lang, source).map(std::sync::Arc::new)
             })
         } else {
             None
         };
 
         Some(PreviewContent {
-            file_path: rel_str,
-            body: PreviewBody::Text {
+            path: rel_str,
+            body: PreviewBody::Text(TextPreview {
                 lines,
                 highlighted,
-                markdown,
                 parsed,
-            },
+            }),
         })
     }
 
@@ -636,8 +642,8 @@ impl Backend for RemoteBackend {
             *cache = snap.branch_name.clone();
         }
         Ok(StatusSnapshot {
-            staged: snap.staged.into_iter().map(Into::into).collect(),
-            unstaged: snap.unstaged.into_iter().map(Into::into).collect(),
+            staged: snap.staged.into_iter().map(file_entry_from_dto).collect(),
+            unstaged: snap.unstaged.into_iter().map(file_entry_from_dto).collect(),
             branch_name: snap.branch_name,
             ahead_behind: snap.ahead_behind,
         })
@@ -652,7 +658,7 @@ impl Backend for RemoteBackend {
             path: path.to_string(),
             context_lines,
         })?;
-        Ok(resp.map(Into::into))
+        Ok(resp.map(diff_content_from_dto))
     }
 
     fn unstaged_diff(
@@ -664,14 +670,14 @@ impl Backend for RemoteBackend {
             path: path.to_string(),
             context_lines,
         })?;
-        Ok(resp.map(Into::into))
+        Ok(resp.map(diff_content_from_dto))
     }
 
     fn untracked_diff(&self, path: &str) -> Result<Option<DiffContent>, BackendError> {
         let resp: Option<reef_proto::DiffContentDto> = self.request(Request::UntrackedDiff {
             path: path.to_string(),
         })?;
-        Ok(resp.map(Into::into))
+        Ok(resp.map(diff_content_from_dto))
     }
 
     fn stage(&self, path: &str) -> Result<(), BackendError> {
@@ -724,14 +730,14 @@ impl Backend for RemoteBackend {
             limit: limit as u64,
             scope: graph_scope_to_dto(scope),
         })?;
-        Ok(list.into_iter().map(Into::into).collect())
+        Ok(list.into_iter().map(commit_info_from_dto).collect())
     }
 
     fn list_refs(&self) -> Result<HashMap<String, Vec<RefLabel>>, BackendError> {
         let map: HashMap<String, Vec<reef_proto::RefLabelDto>> = self.request(Request::ListRefs)?;
         Ok(map
             .into_iter()
-            .map(|(k, v)| (k, v.into_iter().map(Into::into).collect()))
+            .map(|(k, v)| (k, v.into_iter().map(ref_label_from_dto).collect()))
             .collect())
     }
 
@@ -743,7 +749,7 @@ impl Backend for RemoteBackend {
         let resp: Option<reef_proto::CommitDetailDto> = self.request(Request::CommitDetail {
             oid: oid.to_string(),
         })?;
-        Ok(resp.map(Into::into))
+        Ok(resp.map(commit_detail_from_dto))
     }
 
     fn commit_file_diff(
@@ -757,7 +763,7 @@ impl Backend for RemoteBackend {
             path: path.to_string(),
             context_lines,
         })?;
-        Ok(resp.map(Into::into))
+        Ok(resp.map(diff_content_from_dto))
     }
 
     fn range_files(
@@ -769,7 +775,7 @@ impl Backend for RemoteBackend {
             oldest_oid: oldest_oid.to_string(),
             newest_oid: newest_oid.to_string(),
         })?;
-        Ok(resp.into_iter().map(Into::into).collect())
+        Ok(resp.into_iter().map(file_entry_from_dto).collect())
     }
 
     fn range_file_diff(
@@ -785,7 +791,7 @@ impl Backend for RemoteBackend {
             path: path.to_string(),
             context_lines,
         })?;
-        Ok(resp.map(Into::into))
+        Ok(resp.map(diff_content_from_dto))
     }
 
     fn subscribe_fs_events(&self) -> mpsc::Receiver<()> {
@@ -1185,103 +1191,85 @@ fn walk_remote(
 
 // ── DTO -> domain conversions ─────────────────────────────────────────────
 
-impl From<reef_proto::FileEntryDto> for FileEntry {
-    fn from(v: reef_proto::FileEntryDto) -> Self {
-        FileEntry {
-            path: v.path,
-            status: v.status.into(),
-            additions: v.additions,
-            deletions: v.deletions,
-        }
+fn file_entry_from_dto(v: reef_proto::FileEntryDto) -> FileEntry {
+    FileEntry {
+        path: v.path,
+        status: file_status_from_dto(v.status),
+        additions: v.additions,
+        deletions: v.deletions,
     }
 }
 
-impl From<reef_proto::FileStatusDto> for crate::git::FileStatus {
-    fn from(v: reef_proto::FileStatusDto) -> Self {
-        use crate::git::FileStatus;
-        match v {
-            reef_proto::FileStatusDto::Modified => FileStatus::Modified,
-            reef_proto::FileStatusDto::Added => FileStatus::Added,
-            reef_proto::FileStatusDto::Deleted => FileStatus::Deleted,
-            reef_proto::FileStatusDto::Renamed => FileStatus::Renamed,
-            reef_proto::FileStatusDto::Untracked => FileStatus::Untracked,
-        }
+fn file_status_from_dto(v: reef_proto::FileStatusDto) -> reef_core::git::FileStatus {
+    use reef_core::git::FileStatus;
+    match v {
+        reef_proto::FileStatusDto::Modified => FileStatus::Modified,
+        reef_proto::FileStatusDto::Added => FileStatus::Added,
+        reef_proto::FileStatusDto::Deleted => FileStatus::Deleted,
+        reef_proto::FileStatusDto::Renamed => FileStatus::Renamed,
+        reef_proto::FileStatusDto::Untracked => FileStatus::Untracked,
     }
 }
 
-impl From<reef_proto::DiffContentDto> for DiffContent {
-    fn from(v: reef_proto::DiffContentDto) -> Self {
-        DiffContent {
-            file_path: v.file_path,
-            hunks: v.hunks.into_iter().map(Into::into).collect(),
-        }
+fn diff_content_from_dto(v: reef_proto::DiffContentDto) -> DiffContent {
+    DiffContent {
+        path: v.path,
+        hunks: v.hunks.into_iter().map(diff_hunk_from_dto).collect(),
     }
 }
 
-impl From<reef_proto::DiffHunkDto> for crate::git::DiffHunk {
-    fn from(v: reef_proto::DiffHunkDto) -> Self {
-        crate::git::DiffHunk {
-            header: std::sync::Arc::from(v.header),
-            lines: v.lines.into_iter().map(Into::into).collect(),
-        }
+fn diff_hunk_from_dto(v: reef_proto::DiffHunkDto) -> reef_core::diff::DiffHunk {
+    reef_core::diff::DiffHunk {
+        header: std::sync::Arc::from(v.header),
+        lines: v.lines.into_iter().map(diff_line_from_dto).collect(),
     }
 }
 
-impl From<reef_proto::DiffLineDto> for crate::git::DiffLine {
-    fn from(v: reef_proto::DiffLineDto) -> Self {
-        crate::git::DiffLine {
-            tag: v.tag.into(),
-            content: std::sync::Arc::from(v.content),
-            old_lineno: v.old_lineno,
-            new_lineno: v.new_lineno,
-        }
+fn diff_line_from_dto(v: reef_proto::DiffLineDto) -> reef_core::diff::DiffLine {
+    reef_core::diff::DiffLine {
+        tag: line_tag_from_dto(v.tag),
+        content: std::sync::Arc::from(v.content),
+        old_lineno: v.old_lineno,
+        new_lineno: v.new_lineno,
     }
 }
 
-impl From<reef_proto::LineTagDto> for crate::git::LineTag {
-    fn from(v: reef_proto::LineTagDto) -> Self {
-        match v {
-            reef_proto::LineTagDto::Context => crate::git::LineTag::Context,
-            reef_proto::LineTagDto::Added => crate::git::LineTag::Added,
-            reef_proto::LineTagDto::Removed => crate::git::LineTag::Removed,
-        }
+fn line_tag_from_dto(v: reef_proto::LineTagDto) -> reef_core::diff::LineTag {
+    match v {
+        reef_proto::LineTagDto::Context => reef_core::diff::LineTag::Context,
+        reef_proto::LineTagDto::Added => reef_core::diff::LineTag::Added,
+        reef_proto::LineTagDto::Removed => reef_core::diff::LineTag::Removed,
     }
 }
 
-impl From<reef_proto::CommitInfoDto> for CommitInfo {
-    fn from(v: reef_proto::CommitInfoDto) -> Self {
-        CommitInfo {
-            oid: v.oid,
-            short_oid: v.short_oid,
-            parents: v.parents,
-            author_name: v.author_name,
-            author_email: v.author_email,
-            time: v.time,
-            subject: v.subject,
-        }
+fn commit_info_from_dto(v: reef_proto::CommitInfoDto) -> CommitInfo {
+    CommitInfo {
+        oid: v.oid,
+        short_oid: v.short_oid,
+        parents: v.parents,
+        author_name: v.author_name,
+        author_email: v.author_email,
+        time: v.time,
+        subject: v.subject,
     }
 }
 
-impl From<reef_proto::CommitDetailDto> for CommitDetail {
-    fn from(v: reef_proto::CommitDetailDto) -> Self {
-        CommitDetail {
-            info: v.info.into(),
-            message: v.message,
-            committer_name: v.committer_name,
-            committer_time: v.committer_time,
-            files: v.files.into_iter().map(Into::into).collect(),
-        }
+fn commit_detail_from_dto(v: reef_proto::CommitDetailDto) -> CommitDetail {
+    CommitDetail {
+        info: commit_info_from_dto(v.info),
+        message: v.message,
+        committer_name: v.committer_name,
+        committer_time: v.committer_time,
+        files: v.files.into_iter().map(file_entry_from_dto).collect(),
     }
 }
 
-impl From<reef_proto::RefLabelDto> for RefLabel {
-    fn from(v: reef_proto::RefLabelDto) -> Self {
-        match v {
-            reef_proto::RefLabelDto::Head => RefLabel::Head,
-            reef_proto::RefLabelDto::Branch(s) => RefLabel::Branch(s),
-            reef_proto::RefLabelDto::RemoteBranch(s) => RefLabel::RemoteBranch(s),
-            reef_proto::RefLabelDto::Tag(s) => RefLabel::Tag(s),
-        }
+fn ref_label_from_dto(v: reef_proto::RefLabelDto) -> RefLabel {
+    match v {
+        reef_proto::RefLabelDto::Head => RefLabel::Head,
+        reef_proto::RefLabelDto::Branch(s) => RefLabel::Branch(s),
+        reef_proto::RefLabelDto::RemoteBranch(s) => RefLabel::RemoteBranch(s),
+        reef_proto::RefLabelDto::Tag(s) => RefLabel::Tag(s),
     }
 }
 

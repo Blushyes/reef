@@ -1,11 +1,11 @@
 //! SQLite preview body — the rendering path for `PreviewBody::Database`.
 //!
-//! Split out from [`crate::ui::file_preview_panel`] because the body
+//! Split out from [`crate::ui::preview`] because the body
 //! is significantly heavier than the Text / Image / Binary peers
 //! (multi-pane layout with tables list + data grid + clickable
 //! pagination chips + a goto-page input prompt) and the helpers
 //! (column-width math, affinity colors, page-chip windowing) all
-//! belong with it. The dispatch in `file_preview_panel::render`
+//! belong with it. The dispatch in `preview::render`
 //! calls into [`render`] for the Database arm; everything else here
 //! is private.
 //!
@@ -88,8 +88,7 @@ pub(in crate::ui) fn render(
     }
     let th = app.theme;
     let max_y = area.y + area.height;
-    let mut y =
-        crate::ui::file_preview_panel::render_card_header(f, area, path, &th, focused, None);
+    let mut y = crate::ui::preview::chrome::render_card_header(f, area, path, &th, focused, None);
 
     let total_objects: usize = info.schemas.iter().map(|s| s.objects.len()).sum();
     let row_bearing_total: usize = info.iter_row_bearing().count();
@@ -101,7 +100,7 @@ pub(in crate::ui) fn render(
             "sqlite · {} {} · {}",
             row_bearing_total,
             t(Msg::DbTablesHeader),
-            crate::file_tree::human_bytes(info.bytes_on_disk),
+            reef_core::preview::binary::human_bytes(info.bytes_on_disk),
         );
         f.render_widget(
             Line::from(Span::styled(meta, Style::default().fg(th.fg_secondary))),

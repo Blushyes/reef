@@ -1,9 +1,9 @@
 use pulldown_cmark::{
     Alignment as MdAlignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd,
 };
-use ratatui::style::{Color, Modifier, Style};
-use std::borrow::Cow;
 use unicode_width::UnicodeWidthStr;
+
+use crate::text::TextStyle;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownPreview {
@@ -16,7 +16,7 @@ pub struct MarkdownSpan {
     pub text: String,
     pub style: MarkdownStyle,
     pub link: Option<String>,
-    pub syntax: Option<Style>,
+    pub syntax: Option<TextStyle>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,8 +38,6 @@ pub enum MarkdownRole {
     TableHeader,
     Border,
 }
-
-const CODE_BLOCK_LABEL_FG: Color = Color::Rgb(150, 180, 205);
 
 impl MarkdownPreview {
     pub fn spans_for_row(&self, row: usize) -> Option<&[MarkdownSpan]> {
@@ -66,72 +64,6 @@ impl MarkdownStyle {
             bold: false,
             italic: false,
         }
-    }
-
-    fn apply(self, base: Style, theme: &crate::ui::theme::Theme) -> Style {
-        let mut out = match self.role {
-            MarkdownRole::Normal => base,
-            MarkdownRole::Heading => base.fg(theme.accent).add_modifier(Modifier::BOLD),
-            MarkdownRole::Quote => base.fg(theme.fg_secondary),
-            MarkdownRole::Code => base.fg(theme.accent),
-            MarkdownRole::CodeBlockHeader => base
-                .fg(code_block_label_fg(theme))
-                .bg(code_block_bg(theme))
-                .add_modifier(Modifier::BOLD),
-            MarkdownRole::CodeBlockText => base.fg(code_block_fg(theme)).bg(code_block_bg(theme)),
-            MarkdownRole::Link => base.fg(theme.accent).add_modifier(Modifier::UNDERLINED),
-            MarkdownRole::Border => base.fg(theme.fg_secondary),
-            MarkdownRole::TableHeader => base.add_modifier(Modifier::BOLD),
-        };
-        if self.bold {
-            out = out.add_modifier(Modifier::BOLD);
-        }
-        if self.italic {
-            out = out.add_modifier(Modifier::ITALIC);
-        }
-        out
-    }
-}
-
-pub fn code_block_bg(theme: &crate::ui::theme::Theme) -> Color {
-    if theme.is_dark {
-        Color::Rgb(36, 38, 46)
-    } else {
-        Color::Rgb(246, 248, 250)
-    }
-}
-
-fn code_block_fg(theme: &crate::ui::theme::Theme) -> Color {
-    if theme.is_dark {
-        Color::Rgb(230, 232, 238)
-    } else {
-        theme.fg_primary
-    }
-}
-
-fn code_block_label_fg(theme: &crate::ui::theme::Theme) -> Color {
-    if theme.is_dark {
-        CODE_BLOCK_LABEL_FG
-    } else {
-        theme.fg_secondary
-    }
-}
-
-impl MarkdownSpan {
-    pub fn styled_text<'a>(&'a self, theme: &crate::ui::theme::Theme) -> (Style, Cow<'a, str>) {
-        let mut style = self
-            .style
-            .apply(Style::default().fg(theme.fg_primary), theme);
-        if let Some(syntax) = self.syntax {
-            if let Some(fg) = syntax.fg {
-                style = style.fg(fg);
-            }
-            style = style.add_modifier(syntax.add_modifier);
-        }
-        if self.link.is_some() {
-            style = style.fg(theme.accent).add_modifier(Modifier::UNDERLINED);
-        }
-        (style, Cow::Borrowed(self.text.as_str()))
     }
 }
 
@@ -512,7 +444,7 @@ fn render_code_block_lines(code: CodeBlockBuild, dark: bool) -> Vec<Vec<Markdown
     let highlighted = code
         .label
         .as_deref()
-        .and_then(|lang| crate::ui::highlight::highlight_code_block(lang, &code.lines, dark));
+        .and_then(|lang| crate::highlight::highlight_code_block(lang, &code.lines, dark));
 
     code.lines
         .iter()
@@ -525,11 +457,11 @@ fn render_code_block_lines(code: CodeBlockBuild, dark: bool) -> Vec<Vec<Markdown
                 syntax: None,
             }];
             match highlighted.as_ref().and_then(|rows| rows.get(idx)) {
-                Some(tokens) => row.extend(tokens.iter().map(|(syntax, text)| MarkdownSpan {
-                    text: text.clone(),
+                Some(tokens) => row.extend(tokens.iter().map(|token| MarkdownSpan {
+                    text: token.text.clone(),
                     style: MarkdownStyle::role(MarkdownRole::CodeBlockText),
                     link: None,
-                    syntax: Some(*syntax),
+                    syntax: Some(token.style),
                 })),
                 None => row.push(MarkdownSpan {
                     text: line.clone(),
@@ -702,12 +634,7 @@ mod tests {
             .find(|span| span.text == "site")
             .expect("link span");
         assert_eq!(link.link.as_deref(), Some("https://x.test"));
-        assert!(
-            link.styled_text(&crate::ui::theme::Theme::dark())
-                .0
-                .add_modifier
-                .contains(Modifier::UNDERLINED)
-        );
+        assert_eq!(link.style.role, MarkdownRole::Link);
         assert!(rendered.iter().any(|l| l == "│ quote"));
         assert!(rendered.iter().any(|l| l == " rs "));
         assert!(rendered.iter().any(|l| l == "  fn main() {}"));

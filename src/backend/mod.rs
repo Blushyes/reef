@@ -22,9 +22,11 @@ use std::ops::{ControlFlow, Range};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
-use crate::file_tree::{PreviewContent, TreeEntry};
-use crate::git::graph::GraphRow;
-use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, GraphScope, RefLabel};
+use crate::file_tree::TreeEntry;
+use reef_core::diff::DiffContent;
+use reef_core::git::graph::GraphRow;
+use reef_core::git::{CommitDetail, CommitInfo, FileEntry, GraphScope, RefLabel};
+use reef_core::preview::PreviewDocument as PreviewContent;
 use std::collections::{HashMap, HashSet};
 
 pub mod local;

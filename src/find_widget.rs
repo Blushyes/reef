@@ -12,9 +12,10 @@
 use crate::app::App;
 use crate::input;
 use crate::input_edit;
+use crate::keymap::{Command, InputScope, Keymap};
 use crate::search::{MatchLoc, Snapshot, center_scroll, find_all, restore_snapshot, take_snapshot};
-use crate::ui::selection::{DiffRowText, DiffSide};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use reef_core::diff::{DiffLayout, DiffRowText, DiffSide};
 use std::ops::Range;
 use std::time::Instant;
 
@@ -265,44 +266,40 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         input::LeaderVerdict::None => {}
     }
 
-    match key.code {
-        KeyCode::Esc => {
+    match Keymap::resolve(InputScope::FindWidget, &key) {
+        Some(Command::Close) | Some(Command::Quit) => {
             close(app);
             return;
         }
-        KeyCode::Char('c') if ctrl => {
-            close(app);
-            return;
-        }
-        KeyCode::Enter => {
+        Some(Command::Confirm) => {
             // Enter = next match (Shift+Enter = previous), VSCode-style.
             if !app.find_widget.matches.is_empty() {
                 step(app, /*reverse=*/ shift);
             }
             return;
         }
-        KeyCode::Down => {
+        Some(Command::MoveDown) => {
             step(app, /*reverse=*/ false);
             return;
         }
-        KeyCode::Up => {
+        Some(Command::MoveUp) => {
             step(app, /*reverse=*/ true);
             return;
         }
         // Alt+C / Alt+W / Alt+R are the three toggles. Must match
         // before `input_edit::dispatch_key`, which binds Alt+B / Alt+F /
         // Alt+D and would otherwise eat them as word-motion / delete.
-        KeyCode::Char(c) if alt && !ctrl && matches!(c, 'c' | 'C') => {
+        Some(Command::ToggleCase) => {
             app.find_widget.match_case = !app.find_widget.match_case;
             recompute(app);
             return;
         }
-        KeyCode::Char(c) if alt && !ctrl && matches!(c, 'w' | 'W') => {
+        Some(Command::ToggleWholeWord) => {
             app.find_widget.whole_word = !app.find_widget.whole_word;
             recompute(app);
             return;
         }
-        KeyCode::Char(c) if alt && !ctrl && matches!(c, 'r' | 'R') => {
+        Some(Command::ToggleRegex) => {
             app.find_widget.regex = !app.find_widget.regex;
             recompute(app);
             return;
@@ -362,11 +359,10 @@ fn resolve_target(app: &App) -> Option<FindTarget> {
 }
 
 fn diff_target_from_layout(
-    layout: crate::app::DiffLayout,
+    layout: DiffLayout,
     selection_side: Option<DiffSide>,
     graph: bool,
 ) -> FindTarget {
-    use crate::app::DiffLayout;
     match layout {
         DiffLayout::Unified => {
             if graph {

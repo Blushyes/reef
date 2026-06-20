@@ -7,8 +7,6 @@
 //! …) which keeps host side state coherent.
 
 use crate::app::{App, DiscardTarget, Panel, SelectedFile, Tab};
-use crate::git::tree::{self as gtree, Node};
-use crate::git::{FileEntry, FileStatus};
 use crate::i18n::{Msg, t};
 use crate::search::SearchTarget;
 use crate::ui::mouse::ClickAction;
@@ -18,6 +16,8 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use reef_core::git::tree::{self as gtree, Node};
+use reef_core::git::{FileEntry, FileStatus};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use unicode_width::UnicodeWidthStr;
@@ -831,18 +831,7 @@ fn walk_tree(
     search_base: usize,
     pending_discard: Option<&DiscardTarget>,
 ) {
-    let mut entries: Vec<(&String, &Node)> = tree.iter().collect();
-    entries.sort_by(|a, b| {
-        let a_dir = matches!(a.1, Node::Dir { .. });
-        let b_dir = matches!(b.1, Node::Dir { .. });
-        match (a_dir, b_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
-        }
-    });
-
-    for (name, node) in entries {
+    for (name, node) in gtree::sorted_entries(tree) {
         match node {
             Node::Dir { path, children } => {
                 let key = gtree::collapsed_key(is_staged, path);

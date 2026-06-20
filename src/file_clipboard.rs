@@ -16,15 +16,8 @@
 //! - Successful Paste of a Copy → caller leaves the clipboard alone
 //!   so a second Paste reuses the same sources (matches VS Code).
 
+use reef_core::file_ops::ClipMode;
 use std::path::{Path, PathBuf};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClipMode {
-    /// Move on Paste. Source row rendered dimmed until cleared.
-    Cut,
-    /// Duplicate on Paste. No visual change to source.
-    Copy,
-}
 
 #[derive(Debug, Default, Clone)]
 pub struct FileClipboard {

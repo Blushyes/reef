@@ -18,7 +18,7 @@ use crate::app::{App, Tab};
 use crate::i18n::{Msg, t};
 use crate::ui::mouse::ClickAction;
 use crate::ui::text::truncate_to_width;
-use crate::ui::{diff_panel, file_preview_panel, find_widget_panel, hover};
+use crate::ui::{diff_panel, find_widget_panel, hover, preview};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -43,7 +43,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
 
     match app.active_tab {
         Tab::Files | Tab::Search => {
-            file_preview_panel::render(f, app, body, true);
+            preview::render(f, app, body, true);
         }
         Tab::Git => {
             if app.backend.has_repo() {
@@ -187,7 +187,7 @@ fn render_chip(f: &mut Frame, app: &mut App, body: Rect) {
 fn interactive_width(app: &App, body_w: u16) -> u16 {
     let chip_w = UnicodeWidthStr::width(FOCUSED_PREVIEW_CHIP) as u16;
     let path: Option<&str> = match app.active_tab {
-        Tab::Git => app.diff_content.as_ref().map(|d| d.diff.file_path.as_str()),
+        Tab::Git => app.diff_content.as_ref().map(|d| d.diff.path.as_str()),
         Tab::Graph => app
             .commit_detail
             .file_diff
@@ -207,8 +207,8 @@ fn interactive_width(app: &App, body_w: u16) -> u16 {
         _ => (app.diff_layout, app.diff_mode),
     };
     let layout_label = match layout {
-        crate::app::DiffLayout::Unified => t(Msg::LayoutUnified),
-        crate::app::DiffLayout::SideBySide => t(Msg::LayoutSideBySide),
+        reef_core::diff::DiffLayout::Unified => t(Msg::LayoutUnified),
+        reef_core::diff::DiffLayout::SideBySide => t(Msg::LayoutSideBySide),
     };
     let mode_label = match mode {
         crate::app::DiffMode::Compact => t(Msg::ModeCompact),

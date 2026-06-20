@@ -16,8 +16,10 @@ use super::{
     Backend, BackendError, ContentMatchHit, ContentSearchCompleted, ContentSearchRequest,
     EditorLaunchSpec, SearchChunkSink, StatusSnapshot, TrashOutcome, WalkOpts, WalkResponse,
 };
-use crate::file_tree::{self, PreviewContent, TreeEntry};
-use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, GitRepo, GraphScope, RefLabel};
+use crate::file_tree::{self, TreeEntry};
+use reef_core::diff::DiffContent;
+use reef_core::git::{CommitDetail, CommitInfo, FileEntry, GitRepo, GraphScope, RefLabel};
+use reef_core::preview::PreviewDocument as PreviewContent;
 use std::ops::ControlFlow;
 
 /// How many decoded previews to keep around. 8 covers the typical
@@ -362,7 +364,8 @@ impl Backend for LocalBackend {
         let canon_root = self.canonical_workdir().ok()?;
         canonical_child_within(canon_root, rel_path).ok()?;
 
-        let fresh = file_tree::load_preview(&self.workdir, rel_path, dark, wants_decoded_image)?;
+        let fresh =
+            reef_core::preview::load_preview(&self.workdir, rel_path, dark, wants_decoded_image)?;
 
         if let Ok(mut cache) = self.preview_cache.lock() {
             cache.put(key, fresh.clone());
@@ -506,11 +509,11 @@ impl Backend for LocalBackend {
         // Reuse the free function so we don't need a GitRepo handle — it
         // shells out to `git push` and is the same thing the foreground
         // App::run_push() uses on its worker thread.
-        crate::git::push_at(&self.workdir, force).map_err(BackendError::Git)
+        reef_core::git::push_at(&self.workdir, force).map_err(BackendError::Git)
     }
 
     fn commit(&self, message: &str) -> Result<(), BackendError> {
-        crate::git::commit_at(&self.workdir, message).map_err(BackendError::Git)
+        reef_core::git::commit_at(&self.workdir, message).map_err(BackendError::Git)
     }
 
     fn list_commits(

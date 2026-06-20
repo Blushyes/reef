@@ -5,10 +5,10 @@
 //! Esc-peek-and-return is non-destructive.
 
 use reef::app::App;
-use reef::file_tree::{PreviewBody, PreviewContent};
 use reef::global_search;
 use reef::ui::selection::PreviewSelection;
 use reef::ui::theme::Theme;
+use reef_core::preview::{PreviewBody, PreviewDocument as PreviewContent, TextPreview};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tempfile::TempDir;
@@ -28,25 +28,21 @@ fn fresh_app() -> (App, TempDir, CwdGuard) {
 
 fn install_text_preview(app: &mut App, lines: &[&str]) {
     app.preview_content = Some(PreviewContent {
-        file_path: "scratch.txt".to_string(),
-        body: PreviewBody::Text {
+        path: "scratch.txt".to_string(),
+        body: PreviewBody::Text(TextPreview {
             lines: lines.iter().map(|s| s.to_string()).collect(),
             highlighted: None,
-            markdown: None,
             parsed: None,
-        },
+        }),
     });
 }
 
 fn install_markdown_preview(app: &mut App, source: &str) {
+    let markdown = reef_core::markdown::build_markdown_preview("README.md", source, true)
+        .expect("markdown preview");
     app.preview_content = Some(PreviewContent {
-        file_path: "README.md".to_string(),
-        body: PreviewBody::Text {
-            lines: source.lines().map(str::to_string).collect(),
-            highlighted: None,
-            markdown: reef::markdown::build_markdown_preview("README.md", source, true),
-            parsed: None,
-        },
+        path: "README.md".to_string(),
+        body: PreviewBody::Markdown(markdown),
     });
 }
 
@@ -148,10 +144,7 @@ fn begin_seeds_from_markdown_rendered_rows() {
     let (mut app, _tmp, _g) = fresh_app();
     install_markdown_preview(&mut app, "| Name | Count |\n|---|---:|\n| reef | 12 |\n");
     let rendered = match &app.preview_content.as_ref().unwrap().body {
-        PreviewBody::Text {
-            markdown: Some(markdown),
-            ..
-        } => markdown.text_rows[1].clone(),
+        PreviewBody::Markdown(markdown) => markdown.text_rows[1].clone(),
         _ => panic!("markdown preview expected"),
     };
     assert_eq!(rendered, "┃ Name ┃ Count ┃");

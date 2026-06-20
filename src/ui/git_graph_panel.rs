@@ -2,8 +2,6 @@
 //! ref-label chips.
 
 use crate::app::{App, shorthand_for_full_ref};
-use crate::git::graph::{GraphRow, LaneCell};
-use crate::git::{GraphScope, RefLabel};
 use crate::i18n::{Msg, t};
 use crate::search::SearchTarget;
 use crate::ui::mouse::ClickAction;
@@ -12,6 +10,8 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use reef_core::git::graph::{GraphRow, LaneCell};
+use reef_core::git::{GraphScope, RefLabel};
 use serde_json::Value;
 use std::ops::Range;
 use unicode_width::UnicodeWidthStr;

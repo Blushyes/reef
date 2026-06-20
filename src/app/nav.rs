@@ -10,6 +10,97 @@
 
 use super::*;
 
+/// How a navigation request was triggered. Determines where the
+/// candidates popup anchors if there's more than one result, and how
+/// the engine picks the originating cursor.
+#[derive(Debug, Clone, Copy)]
+pub enum NavAnchor {
+    Keyboard,
+    Mouse { col: u16, row: u16 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorPosition {
+    pub line: usize,
+    pub byte_col: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScrollPosition {
+    pub vertical: usize,
+    pub horizontal: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocationSurface {
+    FilePreview,
+    GitDiff {
+        file_path: String,
+        is_staged: bool,
+    },
+    GraphDiff {
+        commit_oid: String,
+        file_path: String,
+    },
+    SearchPreview,
+}
+
+/// Snapshot of the app location we are leaving before an explicit jump.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocationSnapshot {
+    pub surface: LocationSurface,
+    pub path: std::path::PathBuf,
+    pub cursor: CursorPosition,
+    pub scroll: ScrollPosition,
+}
+
+/// Async-jump intent registered when an LSP-only language fires a
+/// definition request and waits for the worker response.
+#[derive(Debug, Clone)]
+pub struct NavPendingJump {
+    pub lang: reef_core::nav::NavLang,
+    pub cache_key: String,
+    pub origin: LocationSnapshot,
+    pub generation: u64,
+}
+
+/// Floating candidates popup for multi-target gd/gr results.
+#[derive(Debug, Clone)]
+pub struct NavCandidatesPopup {
+    pub anchor_col: u16,
+    pub anchor_row: u16,
+    pub candidates: Vec<reef_core::nav::Location>,
+    pub selected: usize,
+    pub scroll: usize,
+    pub current_path: std::path::PathBuf,
+    pub origin: LocationSnapshot,
+    pub opened_by_ctrl_click: bool,
+    pub max_row_width: u16,
+}
+
+impl NavCandidatesPopup {
+    pub const MAX_VISIBLE_ROWS: usize = 8;
+
+    pub fn visible_rows(&self) -> usize {
+        self.candidates.len().min(Self::MAX_VISIBLE_ROWS)
+    }
+
+    pub fn clamp_scroll(&mut self) {
+        let visible = self.visible_rows();
+        if visible == 0 {
+            self.scroll = 0;
+            return;
+        }
+        let max_scroll = self.candidates.len().saturating_sub(visible);
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + visible {
+            self.scroll = self.selected + 1 - visible;
+        }
+        self.scroll = self.scroll.min(max_scroll);
+    }
+}
+
 // ─── Code navigation (gd / Ctrl+click / Ctrl-o-Ctrl-i) ────────────────
 // Phase 1: intra-file only. Tree-sitter parse is already attached to
 // `PreviewBody::Text.parsed` by the preview worker; these methods are
@@ -91,7 +182,7 @@ impl App {
     /// highlight for `resolve_pending_highlight` to convert once the
     /// destination preview lands — that's what lights up the actual
     /// identifier on the other file instead of just its row.
-    pub(super) fn nav_jump_to_lsp(&mut self, loc: &crate::nav::LspLocation) {
+    pub(super) fn nav_jump_to_lsp(&mut self, loc: &reef_core::nav::LspLocation) {
         // `lsp_byte_range` resolves synchronously ONLY for the on-screen
         // (intra-file) target; for a cross-file target it returns empty
         // because the source isn't loaded yet. Capture which case we're
@@ -102,7 +193,7 @@ impl App {
         let byte_range = self.lsp_byte_range(loc);
         self.nav_jump_to(
             loc.path.clone(),
-            crate::nav::Location {
+            reef_core::nav::Location {
                 path: Some(loc.path.clone()),
                 line: loc.line as usize,
                 byte_range,
@@ -210,12 +301,12 @@ impl App {
     /// user the server is unavailable.
     pub fn handle_lsp_state_change(
         &mut self,
-        lang: crate::nav::NavLang,
-        state: crate::nav::LspBadge,
+        lang: reef_core::nav::NavLang,
+        state: reef_core::nav::LspBadge,
     ) {
         if matches!(
             state,
-            crate::nav::LspBadge::Off | crate::nav::LspBadge::Crashed
+            reef_core::nav::LspBadge::Off | reef_core::nav::LspBadge::Crashed
         ) && let Some(pending) = self.nav_pending_lsp_jump.as_ref()
             && pending.lang == lang
         {
@@ -230,12 +321,12 @@ impl App {
     /// Called off the render path (construction + post-install) so
     /// render reads `lsp_installed` instead of walking PATH per frame.
     pub fn refresh_lsp_installed(&mut self) {
-        for &lang in crate::nav::NavLang::ALL {
+        for &lang in reef_core::nav::NavLang::ALL {
             let installed = lang
                 .profile()
                 .lsp
                 .as_ref()
-                .and_then(|p| crate::nav::lsp::locate_binary(p.bin))
+                .and_then(|p| reef_core::nav::lsp::locate_binary(p.bin))
                 .is_some();
             self.lsp_installed.insert(lang, installed);
         }
@@ -282,7 +373,7 @@ impl App {
     /// directly (single candidate) or opens the candidates popup
     /// (multiple). No-op when there's no parsed file, no cursor, or
     /// no candidates — Phase 3 may surface a toast for the last case.
-    pub fn goto_definition_at_cursor(&mut self, anchor: crate::nav::NavAnchor) {
+    pub fn goto_definition_at_cursor(&mut self, anchor: crate::app::nav::NavAnchor) {
         // The popup or an in-flight LSP-only jump owns navigation —
         // a bare `gd` shouldn't re-resolve under either.
         if self.nav_candidates.is_some() || self.nav_pending_lsp_jump.is_some() {
@@ -294,11 +385,12 @@ impl App {
         let Some(preview) = self.preview_content.as_ref() else {
             return;
         };
-        let current_path = std::path::PathBuf::from(&preview.file_path);
+        let current_path = std::path::PathBuf::from(&preview.path);
         let parsed = match &preview.body {
-            crate::file_tree::PreviewBody::Text {
-                parsed: Some(p), ..
-            } => std::sync::Arc::clone(p),
+            reef_core::preview::PreviewBody::Text(text) => match text.parsed.as_ref() {
+                Some(p) => std::sync::Arc::clone(p),
+                None => return,
+            },
             _ => return,
         };
 
@@ -321,20 +413,20 @@ impl App {
 
         // Snapshot the identifier text — needed for the workspace
         // fallback + the find-references fallthrough.
-        let needle = crate::nav::identifier_at(&parsed, cursor).map(str::to_owned);
+        let needle = reef_core::nav::identifier_at(&parsed, cursor).map(str::to_owned);
 
         // Phase 3 — consult the LSP refine cache FIRST, keyed by
         // POSITION (`lang, path:line:col`) not by bare name, so two
         // distinct same-named symbols don't share one cached target.
         // A hit is the authoritative answer; jump straight to it.
-        let cache_key = crate::nav::refine_key(&current_path, cursor);
+        let cache_key = reef_core::nav::refine_key(&current_path, cursor);
         // Cached paths are already workdir-relative (converted at
         // write time in the LspRefineDone handler), so a hit is the
         // authoritative answer — jump straight to it.
-        let refined: Option<crate::nav::Location> = self
+        let refined: Option<reef_core::nav::Location> = self
             .nav_refine_cache
             .get(&(parsed.language, cache_key.clone()))
-            .map(|loc| crate::nav::Location {
+            .map(|loc| reef_core::nav::Location {
                 path: Some(loc.path.clone()),
                 line: loc.line as usize,
                 byte_range: self.lsp_byte_range(loc),
@@ -345,7 +437,7 @@ impl App {
         let mut candidates = if let Some(loc) = refined {
             vec![loc]
         } else {
-            crate::nav::intrafile::resolve_definition_intrafile(&parsed, cursor)
+            reef_core::nav::intrafile::resolve_definition_intrafile(&parsed, cursor)
         };
 
         // Phase 2 cross-file fallback: append workspace-wide definitions
@@ -367,7 +459,7 @@ impl App {
                 if path_str == current_rel {
                     continue;
                 }
-                candidates.push(crate::nav::Location {
+                candidates.push(reef_core::nav::Location {
                     path: Some(d.path.clone()),
                     line: d.line,
                     byte_range: d.byte_range.clone(),
@@ -388,8 +480,8 @@ impl App {
         {
             let workspace_root = self.backend.workdir_path();
             let abs_file = workspace_root.join(&current_path);
-            let utf16_col = crate::nav::byte_col_to_utf16(
-                crate::nav::line_bytes_at(&parsed.source, cursor.0),
+            let utf16_col = reef_core::nav::byte_col_to_utf16(
+                reef_core::nav::line_bytes_at(&parsed.source, cursor.0),
                 cursor.1,
             );
             // generation 0: the semantic path is fire-and-forget and
@@ -410,13 +502,7 @@ impl App {
             );
         }
 
-        let scroll_row = self.preview_scroll;
-        let origin = crate::nav::NavStackEntry {
-            path: current_path.clone(),
-            line: cursor.0,
-            byte_col: cursor.1,
-            scroll_row,
-        };
+        let origin = self.snapshot_location();
 
         match candidates.len() {
             0 => {
@@ -436,17 +522,21 @@ impl App {
                 }
             }
             1 => {
-                self.nav_push_back(origin);
-                self.nav_history_forward.clear();
+                if let Some(origin) = origin {
+                    self.nav_push_back(origin);
+                }
                 let loc = candidates.into_iter().next().expect("len==1 above");
                 let target_path = loc.path.clone().unwrap_or(current_path);
                 self.nav_jump_to(target_path, loc);
             }
             _ => {
+                let Some(origin) = origin else {
+                    return;
+                };
                 let (anchor_col, anchor_row) = self.compute_nav_popup_anchor(anchor);
                 let max_row_width =
                     crate::ui::nav_candidates_popup::candidates_max_width(&candidates);
-                self.nav_candidates = Some(crate::nav::NavCandidatesPopup {
+                self.nav_candidates = Some(crate::app::nav::NavCandidatesPopup {
                     anchor_col,
                     anchor_row,
                     candidates,
@@ -454,7 +544,10 @@ impl App {
                     scroll: 0,
                     current_path,
                     origin,
-                    opened_by_ctrl_click: matches!(anchor, crate::nav::NavAnchor::Mouse { .. }),
+                    opened_by_ctrl_click: matches!(
+                        anchor,
+                        crate::app::nav::NavAnchor::Mouse { .. }
+                    ),
                     max_row_width,
                 });
             }
@@ -467,10 +560,10 @@ impl App {
     /// (no drag) leaves an empty selection at the click point which
     /// serves as the focus. Mouse routes through the shared
     /// `mouse_to_file_coord` helper.
-    fn resolve_nav_cursor(&self, anchor: crate::nav::NavAnchor) -> Option<(usize, usize)> {
+    fn resolve_nav_cursor(&self, anchor: crate::app::nav::NavAnchor) -> Option<(usize, usize)> {
         match anchor {
-            crate::nav::NavAnchor::Keyboard => self.preview_selection.map(|s| s.active),
-            crate::nav::NavAnchor::Mouse { col, row } => {
+            crate::app::nav::NavAnchor::Keyboard => self.preview_selection.map(|s| s.active),
+            crate::app::nav::NavAnchor::Mouse { col, row } => {
                 let origin = self.last_preview_content_origin?;
                 crate::input::mouse_to_file_coord(self, col, row, origin)
             }
@@ -481,10 +574,10 @@ impl App {
     /// below the click (so the popup doesn't cover the very token the
     /// user clicked); keyboard anchors below the focus row, defaulting
     /// to the viewport top when no selection exists.
-    fn compute_nav_popup_anchor(&self, anchor: crate::nav::NavAnchor) -> (u16, u16) {
+    fn compute_nav_popup_anchor(&self, anchor: crate::app::nav::NavAnchor) -> (u16, u16) {
         match anchor {
-            crate::nav::NavAnchor::Mouse { col, row } => (col, row.saturating_add(1)),
-            crate::nav::NavAnchor::Keyboard => {
+            crate::app::nav::NavAnchor::Mouse { col, row } => (col, row.saturating_add(1)),
+            crate::app::nav::NavAnchor::Keyboard => {
                 let Some(origin) = self.last_preview_content_origin else {
                     return (0, 0);
                 };
@@ -499,10 +592,171 @@ impl App {
     }
 
     /// Push to the back-stack with cap enforcement (oldest dropped).
-    pub(super) fn nav_push_back(&mut self, entry: crate::nav::NavStackEntry) {
-        self.nav_history.push(entry);
-        if self.nav_history.len() > Self::NAV_HISTORY_CAP {
-            self.nav_history.remove(0);
+    pub(super) fn nav_push_back(&mut self, entry: crate::app::nav::LocationSnapshot) {
+        self.location_history.push(entry);
+    }
+
+    pub fn snapshot_location(&self) -> Option<crate::app::nav::LocationSnapshot> {
+        match self.active_tab {
+            Tab::Files => self.snapshot_file_preview_location(),
+            Tab::Search => self.snapshot_search_preview_location(),
+            Tab::Git => self.snapshot_git_diff_location(),
+            Tab::Graph => self.snapshot_graph_diff_location(),
+        }
+    }
+
+    pub fn push_location_before_jump(&mut self) {
+        if let Some(snapshot) = self.snapshot_location() {
+            self.location_history.push(snapshot);
+        }
+    }
+
+    fn snapshot_file_preview_location(&self) -> Option<crate::app::nav::LocationSnapshot> {
+        let preview = self.preview_content.as_ref()?;
+        let (line, byte_col) = self
+            .preview_selection
+            .map(|s| s.active)
+            .unwrap_or((self.preview_scroll, 0));
+        Some(crate::app::nav::LocationSnapshot {
+            surface: crate::app::nav::LocationSurface::FilePreview,
+            path: std::path::PathBuf::from(&preview.path),
+            cursor: crate::app::nav::CursorPosition { line, byte_col },
+            scroll: crate::app::nav::ScrollPosition {
+                vertical: self.preview_scroll,
+                horizontal: self.preview_h_scroll,
+            },
+        })
+    }
+
+    fn snapshot_search_preview_location(&self) -> Option<crate::app::nav::LocationSnapshot> {
+        let preview = self.preview_content.as_ref()?;
+        let (line, byte_col) = self
+            .preview_selection
+            .map(|s| s.active)
+            .unwrap_or((self.preview_scroll, 0));
+        Some(crate::app::nav::LocationSnapshot {
+            surface: crate::app::nav::LocationSurface::SearchPreview,
+            path: std::path::PathBuf::from(&preview.path),
+            cursor: crate::app::nav::CursorPosition { line, byte_col },
+            scroll: crate::app::nav::ScrollPosition {
+                vertical: self.preview_scroll,
+                horizontal: self.preview_h_scroll,
+            },
+        })
+    }
+
+    fn snapshot_git_diff_location(&self) -> Option<crate::app::nav::LocationSnapshot> {
+        let selected = self.selected_file.as_ref()?;
+        Some(crate::app::nav::LocationSnapshot {
+            surface: crate::app::nav::LocationSurface::GitDiff {
+                file_path: selected.path.clone(),
+                is_staged: selected.is_staged,
+            },
+            path: std::path::PathBuf::from(&selected.path),
+            cursor: crate::app::nav::CursorPosition {
+                line: self.diff_scroll,
+                byte_col: 0,
+            },
+            scroll: crate::app::nav::ScrollPosition {
+                vertical: self.diff_scroll,
+                horizontal: self.diff_h_scroll,
+            },
+        })
+    }
+
+    fn snapshot_graph_diff_location(&self) -> Option<crate::app::nav::LocationSnapshot> {
+        let file_diff = self.commit_detail.file_diff.as_ref()?;
+        let commit_oid = self.git_graph.selected_commit.clone().or_else(|| {
+            self.git_graph
+                .rows
+                .get(self.git_graph.selected_idx)
+                .map(|row| row.commit.oid.clone())
+        })?;
+        Some(crate::app::nav::LocationSnapshot {
+            surface: crate::app::nav::LocationSurface::GraphDiff {
+                commit_oid,
+                file_path: file_diff.path.clone(),
+            },
+            path: std::path::PathBuf::from(&file_diff.path),
+            cursor: crate::app::nav::CursorPosition {
+                line: self.commit_detail.file_diff_scroll,
+                byte_col: 0,
+            },
+            scroll: crate::app::nav::ScrollPosition {
+                vertical: self.commit_detail.file_diff_scroll,
+                horizontal: self.commit_detail.file_diff_h_scroll,
+            },
+        })
+    }
+
+    fn restore_preview_cursor(&mut self, target: &crate::app::nav::LocationSnapshot) {
+        self.preview_scroll = target.scroll.vertical;
+        self.preview_h_scroll = target.scroll.horizontal;
+        self.preview_highlight = None;
+        let cursor = (target.cursor.line, target.cursor.byte_col);
+        let mut sel = crate::ui::selection::PreviewSelection::new(cursor);
+        sel.active = cursor;
+        sel.dragging = false;
+        self.preview_selection = Some(sel);
+    }
+
+    pub fn jump_to_location(&mut self, target: crate::app::nav::LocationSnapshot) {
+        self.g_pending_at = None;
+        match target.surface.clone() {
+            crate::app::nav::LocationSurface::FilePreview => {
+                self.set_active_tab(Tab::Files);
+                self.active_panel = Panel::Diff;
+                self.file_tree.reveal(&target.path);
+                self.refresh_file_tree_with_target(Some(target.path.clone()));
+                self.restore_preview_cursor(&target);
+                self.load_preview_for_path(target.path);
+            }
+            crate::app::nav::LocationSurface::SearchPreview => {
+                self.set_active_tab(Tab::Search);
+                self.active_panel = Panel::Diff;
+                self.restore_preview_cursor(&target);
+                self.load_preview_for_path(target.path);
+            }
+            crate::app::nav::LocationSurface::GitDiff {
+                file_path,
+                is_staged,
+            } => {
+                self.set_active_tab(Tab::Git);
+                self.active_panel = Panel::Diff;
+                self.select_file(&file_path, is_staged);
+                self.diff_scroll = target.scroll.vertical;
+                self.diff_h_scroll = target.scroll.horizontal;
+            }
+            crate::app::nav::LocationSurface::GraphDiff {
+                commit_oid,
+                file_path,
+            } => {
+                self.set_active_tab(Tab::Graph);
+                self.active_panel = Panel::Diff;
+                if let Some(idx) = self.git_graph.find_row_by_oid(&commit_oid) {
+                    self.git_graph.selected_idx = idx;
+                    self.git_graph.selected_commit = Some(commit_oid);
+                    self.git_graph.selection_anchor = None;
+                    self.commit_detail.range_detail = None;
+                }
+                self.load_commit_file_diff(&file_path);
+                self.commit_detail.file_diff_scroll = target.scroll.vertical;
+                self.commit_detail.file_diff_h_scroll = target.scroll.horizontal;
+            }
+        }
+    }
+
+    pub fn location_back(&mut self) {
+        let target = self.location_history.back(self.snapshot_location());
+        if let Some(target) = target {
+            self.jump_to_location(target);
+        }
+    }
+
+    pub fn location_forward(&mut self) {
+        let target = self.location_history.forward(self.snapshot_location());
+        if let Some(target) = target {
+            self.jump_to_location(target);
         }
     }
 
@@ -514,26 +768,21 @@ impl App {
     /// click at the same spot hits the cache instead of re-asking.
     fn goto_definition_lsp_only(
         &mut self,
-        _anchor: crate::nav::NavAnchor,
+        _anchor: crate::app::nav::NavAnchor,
         cursor: (usize, usize),
-        lang: crate::nav::NavLang,
+        lang: reef_core::nav::NavLang,
         current_path: &std::path::Path,
-        parsed: &crate::nav::FileParse,
+        parsed: &reef_core::nav::FileParse,
     ) {
-        let cache_key = crate::nav::refine_key(current_path, cursor);
+        let cache_key = reef_core::nav::refine_key(current_path, cursor);
 
         // Cache hit — execute the jump synchronously. Cached paths are
         // already workdir-relative (converted at write time).
         if let Some(loc) = self.nav_refine_cache.get(&(lang, cache_key.clone())) {
             let loc = loc.clone();
-            let origin = crate::nav::NavStackEntry {
-                path: current_path.to_path_buf(),
-                line: cursor.0,
-                byte_col: cursor.1,
-                scroll_row: self.preview_scroll,
-            };
-            self.nav_push_back(origin);
-            self.nav_history_forward.clear();
+            if let Some(origin) = self.snapshot_location() {
+                self.nav_push_back(origin);
+            }
             self.nav_jump_to_lsp(&loc);
             return;
         }
@@ -543,20 +792,17 @@ impl App {
         let gen_id = self.nav_refine_gen;
         let workspace_root = self.backend.workdir_path();
         let abs_file = workspace_root.join(current_path);
-        let origin = crate::nav::NavStackEntry {
-            path: current_path.to_path_buf(),
-            line: cursor.0,
-            byte_col: cursor.1,
-            scroll_row: self.preview_scroll,
+        let Some(origin) = self.snapshot_location() else {
+            return;
         };
-        self.nav_pending_lsp_jump = Some(crate::nav::NavPendingJump {
+        self.nav_pending_lsp_jump = Some(crate::app::nav::NavPendingJump {
             lang,
             cache_key: cache_key.clone(),
             origin,
             generation: gen_id,
         });
-        let utf16_col = crate::nav::byte_col_to_utf16(
-            crate::nav::line_bytes_at(&parsed.source, cursor.0),
+        let utf16_col = reef_core::nav::byte_col_to_utf16(
+            reef_core::nav::line_bytes_at(&parsed.source, cursor.0),
             cursor.1,
         );
         self.tasks.lsp_refine_definition(
@@ -577,12 +823,12 @@ impl App {
     /// True when the file currently in the preview is `path`. Single
     /// source of truth for the "is this the on-screen file?" check used
     /// by the intra-file jump fast path and `lsp_byte_range` — both
-    /// compared `preview.file_path` against a relative path the same way,
+    /// compared `preview.path` against a relative path the same way,
     /// so they share this helper rather than open-coding the stringify.
     pub(super) fn preview_is_for(&self, path: &std::path::Path) -> bool {
         self.preview_content
             .as_ref()
-            .map(|p| p.file_path == path.to_string_lossy())
+            .map(|p| p.path == path.to_string_lossy())
             .unwrap_or(false)
     }
 
@@ -610,24 +856,23 @@ impl App {
         let Some(preview) = self.preview_content.as_ref() else {
             return 0..0;
         };
-        if preview.file_path != path.to_string_lossy() {
+        if preview.path != path.to_string_lossy() {
             return 0..0;
         }
-        let crate::file_tree::PreviewBody::Text {
-            parsed: Some(parse),
-            ..
-        } = &preview.body
-        else {
+        let reef_core::preview::PreviewBody::Text(text) = &preview.body else {
             return 0..0;
         };
-        let line_bytes = crate::nav::line_bytes_at(&parse.source, row);
-        crate::nav::utf16_range_to_byte(line_bytes, start, end)
+        let Some(parse) = text.parsed.as_ref() else {
+            return 0..0;
+        };
+        let line_bytes = reef_core::nav::line_bytes_at(&parse.source, row);
+        reef_core::nav::utf16_range_to_byte(line_bytes, start, end)
     }
 
     /// Synchronous LSP-definition range, used when the target is (or may
     /// be) the on-screen file. Cross-file targets resolve later via
     /// `resolve_pending_highlight`.
-    fn lsp_byte_range(&self, loc: &crate::nav::LspLocation) -> std::ops::Range<usize> {
+    fn lsp_byte_range(&self, loc: &reef_core::nav::LspLocation) -> std::ops::Range<usize> {
         self.utf16_range_on_preview(
             &loc.path,
             loc.line as usize,
@@ -641,7 +886,7 @@ impl App {
     /// a fast path: no tab switch, no async reload, just scroll +
     /// highlight. Cross-file falls through to the full
     /// `enter_focused_preview_with_file`-shaped chain.
-    fn nav_jump_to(&mut self, path: std::path::PathBuf, target: crate::nav::Location) {
+    fn nav_jump_to(&mut self, path: std::path::PathBuf, target: reef_core::nav::Location) {
         // Any committed jump cancels a half-typed `gg`/`gd`/`gr` chord.
         // The keyboard chord paths already clear it, but mouse Ctrl+click,
         // popup-pick, and cache-hit jumps reach here via the intra-file
@@ -675,74 +920,12 @@ impl App {
     /// `Ctrl-o` — pop the back-stack, push current state to forward,
     /// restore the popped entry. No-op when the back-stack is empty.
     pub fn nav_back(&mut self) {
-        let Some(entry) = self.nav_history.pop() else {
-            return;
-        };
-        if let Some(cur) = self.snapshot_nav_entry() {
-            self.nav_history_forward.push(cur);
-            if self.nav_history_forward.len() > Self::NAV_HISTORY_CAP {
-                self.nav_history_forward.remove(0);
-            }
-        }
-        self.nav_restore_entry(entry);
+        self.location_back();
     }
 
     /// `Ctrl-i` — symmetric to `nav_back`.
     pub fn nav_forward(&mut self) {
-        let Some(entry) = self.nav_history_forward.pop() else {
-            return;
-        };
-        if let Some(cur) = self.snapshot_nav_entry() {
-            self.nav_push_back(cur);
-        }
-        self.nav_restore_entry(entry);
-    }
-
-    fn snapshot_nav_entry(&self) -> Option<crate::nav::NavStackEntry> {
-        let preview = self.preview_content.as_ref()?;
-        let path = std::path::PathBuf::from(&preview.file_path);
-        let (line, byte_col) = self
-            .preview_selection
-            .map(|s| s.active)
-            .unwrap_or((self.preview_scroll, 0));
-        Some(crate::nav::NavStackEntry {
-            path,
-            line,
-            byte_col,
-            scroll_row: self.preview_scroll,
-        })
-    }
-
-    fn nav_restore_entry(&mut self, entry: crate::nav::NavStackEntry) {
-        // Alt+Left/Right reaches here without touching the chord state;
-        // clear any pending `g` so a back/forward nav doesn't strand a
-        // half-typed `gg` that then mis-fires on the next bare `g`.
-        self.g_pending_at = None;
-
-        let intra_file = self.preview_is_for(&entry.path);
-
-        if intra_file {
-            self.preview_scroll = entry.scroll_row;
-            self.preview_highlight = None;
-            // Restore the cursor too, so a later forward-nav snapshot
-            // captures the row the user was actually on (not the
-            // location we jumped to).
-            let mut sel = crate::ui::selection::PreviewSelection::new((entry.line, entry.byte_col));
-            sel.active = (entry.line, entry.byte_col);
-            sel.dragging = false;
-            self.preview_selection = Some(sel);
-            return;
-        }
-
-        self.set_active_tab(Tab::Files);
-        self.file_tree.reveal(&entry.path);
-        self.refresh_file_tree_with_target(Some(entry.path.clone()));
-        self.set_preview_highlight(
-            entry.path.clone(),
-            entry.line,
-            entry.byte_col..entry.byte_col,
-        );
-        self.load_preview_for_path(entry.path);
+        self.location_forward();
     }
 
     /// User picked a candidate from the popup. Commits the navigation:
@@ -759,7 +942,6 @@ impl App {
         };
         let path = target.path.clone().unwrap_or(popup.current_path);
         self.nav_push_back(popup.origin);
-        self.nav_history_forward.clear();
         self.nav_jump_to(path, target);
     }
 
@@ -770,9 +952,9 @@ impl App {
     }
 
     /// Resolve the per-language Settings row state.
-    pub fn lsp_view_for(&self, lang: crate::nav::NavLang) -> crate::settings::LspRowState {
-        use crate::nav::LspBadge;
+    pub fn lsp_view_for(&self, lang: reef_core::nav::NavLang) -> crate::settings::LspRowState {
         use crate::settings::LspRowState;
+        use reef_core::nav::LspBadge;
         let badge = self.lsp_states.get(&lang).cloned().unwrap_or(LspBadge::Off);
         if matches!(badge, LspBadge::Crashed) {
             return LspRowState::Crashed;
@@ -794,7 +976,7 @@ impl App {
     }
 
     /// Settings-row click / Enter handler for an Lsp(NavLang) row.
-    pub fn activate_lsp_row(&mut self, lang: crate::nav::NavLang) {
+    pub fn activate_lsp_row(&mut self, lang: reef_core::nav::NavLang) {
         use crate::settings::LspRowState;
         if self.lsp_view_for(lang) == LspRowState::Missing {
             let Some(profile) = lang.profile().lsp.as_ref() else {
@@ -856,7 +1038,7 @@ impl App {
     /// identifier under the cursor across the workspace, then opens
     /// the candidates popup populated with the hits. Falls back to
     /// intra-file matches when the workspace index isn't ready yet.
-    pub fn find_references_at_cursor(&mut self, anchor: crate::nav::NavAnchor) {
+    pub fn find_references_at_cursor(&mut self, anchor: crate::app::nav::NavAnchor) {
         if self.nav_candidates.is_some() || self.nav_pending_lsp_jump.is_some() {
             return;
         }
@@ -866,14 +1048,15 @@ impl App {
         let Some(preview) = self.preview_content.as_ref() else {
             return;
         };
-        let current_path = std::path::PathBuf::from(&preview.file_path);
+        let current_path = std::path::PathBuf::from(&preview.path);
         let parsed = match &preview.body {
-            crate::file_tree::PreviewBody::Text {
-                parsed: Some(p), ..
-            } => std::sync::Arc::clone(p),
+            reef_core::preview::PreviewBody::Text(text) => match text.parsed.as_ref() {
+                Some(p) => std::sync::Arc::clone(p),
+                None => return,
+            },
             _ => return,
         };
-        let Some(needle) = crate::nav::identifier_at(&parsed, cursor) else {
+        let Some(needle) = reef_core::nav::identifier_at(&parsed, cursor) else {
             return;
         };
         let needle = needle.to_owned();
@@ -881,7 +1064,7 @@ impl App {
         // Pull references from the workspace index. Filter by the
         // file's NavLang so a `foo` in Python doesn't surface for a
         // `foo` in Rust.
-        let mut candidates: Vec<crate::nav::Location> = Vec::new();
+        let mut candidates: Vec<reef_core::nav::Location> = Vec::new();
         if let Some(ws) = self.nav_workspace.as_ref()
             && let Some(refs) = ws.refs_by_name.get(&needle)
         {
@@ -889,7 +1072,7 @@ impl App {
                 if r.lang != parsed.language {
                     continue;
                 }
-                candidates.push(crate::nav::Location {
+                candidates.push(reef_core::nav::Location {
                     path: Some(r.path.clone()),
                     line: r.line,
                     byte_range: r.byte_range.clone(),
@@ -908,14 +1091,11 @@ impl App {
         }
 
         let (anchor_col, anchor_row) = self.compute_nav_popup_anchor(anchor);
-        let origin = crate::nav::NavStackEntry {
-            path: current_path.clone(),
-            line: cursor.0,
-            byte_col: cursor.1,
-            scroll_row: self.preview_scroll,
+        let Some(origin) = self.snapshot_location() else {
+            return;
         };
         let max_row_width = crate::ui::nav_candidates_popup::candidates_max_width(&candidates);
-        self.nav_candidates = Some(crate::nav::NavCandidatesPopup {
+        self.nav_candidates = Some(crate::app::nav::NavCandidatesPopup {
             anchor_col,
             anchor_row,
             candidates,
@@ -923,7 +1103,7 @@ impl App {
             scroll: 0,
             current_path,
             origin,
-            opened_by_ctrl_click: matches!(anchor, crate::nav::NavAnchor::Mouse { .. }),
+            opened_by_ctrl_click: matches!(anchor, crate::app::nav::NavAnchor::Mouse { .. }),
             max_row_width,
         });
     }
@@ -944,14 +1124,14 @@ impl App {
     /// active diff panel. `line` is the 0-based file line (new side
     /// preferred); `anchor_col/row` position a candidates popup below the
     /// hit.
-    fn resolve_diff_nav(&self, anchor: crate::nav::NavAnchor) -> Option<DiffNavCursor> {
+    fn resolve_diff_nav(&self, anchor: crate::app::nav::NavAnchor) -> Option<DiffNavCursor> {
         // Pick the diff that's currently rendered (Git working-tree/staged
         // vs Graph commit). Only one renders at a time, and it owns
         // `last_diff_hit`.
         let (display, path_str) = match self.active_tab {
             Tab::Git => {
                 let d = self.diff_content.as_ref()?;
-                (&d.display, d.diff.file_path.as_str())
+                (&d.display, d.diff.path.as_str())
             }
             Tab::Graph => {
                 let f = self.commit_detail.file_diff.as_ref()?;
@@ -963,7 +1143,7 @@ impl App {
         let lang = std::path::Path::new(path_str)
             .extension()
             .and_then(|e| e.to_str())
-            .and_then(crate::nav::NavLang::from_extension)?;
+            .and_then(reef_core::nav::NavLang::from_extension)?;
 
         // Resolve (display-row index, identifier byte range, SBS side) +
         // a screen anchor for the popup. Both paths reuse `DiffHit`'s
@@ -972,19 +1152,19 @@ impl App {
         // through `identifier_at`; keyboard reads the diff selection caret
         // and goes through `identifier_in_row`.
         let (row_idx, range, side, anchor_col, anchor_row) = match anchor {
-            crate::nav::NavAnchor::Mouse { col, row } => {
+            crate::app::nav::NavAnchor::Mouse { col, row } => {
                 let (r, range, side) = hit.identifier_at(col, row)?;
                 (r, range, side, col, row.saturating_add(1))
             }
-            crate::nav::NavAnchor::Keyboard => {
+            crate::app::nav::NavAnchor::Keyboard => {
                 let sel = self.diff_selection?;
                 let (r, b) = sel.sel.active;
                 let range = hit.identifier_in_row(r, b, sel.side)?;
                 let visible = (r.saturating_sub(hit.scroll)) as u16;
                 let acol = match sel.side {
-                    crate::ui::selection::DiffSide::SbsLeft => hit.content_x_left,
-                    crate::ui::selection::DiffSide::SbsRight => hit.content_x_right,
-                    crate::ui::selection::DiffSide::Unified => hit.content_x_unified,
+                    reef_core::diff::DiffSide::SbsLeft => hit.content_x_left,
+                    reef_core::diff::DiffSide::SbsRight => hit.content_x_right,
+                    reef_core::diff::DiffSide::Unified => hit.content_x_unified,
                 };
                 let arow = hit.content_y.saturating_add(visible).saturating_add(1);
                 (r, range, sel.side, acol, arow)
@@ -1011,14 +1191,14 @@ impl App {
     /// `gd` / Ctrl+click inside a diff. Resolves the clicked identifier to
     /// its workspace definition(s); single → jump, multiple → peek popup,
     /// none → fall through to references (mirroring the preview path).
-    pub fn goto_definition_in_diff(&mut self, anchor: crate::nav::NavAnchor) {
+    pub fn goto_definition_in_diff(&mut self, anchor: crate::app::nav::NavAnchor) {
         if self.nav_candidates.is_some() || self.nav_pending_lsp_jump.is_some() {
             return;
         }
         let Some(c) = self.resolve_diff_nav(anchor) else {
             return;
         };
-        let mut candidates: Vec<crate::nav::Location> = Vec::new();
+        let mut candidates: Vec<reef_core::nav::Location> = Vec::new();
         if let Some(ws) = self.nav_workspace.as_ref()
             && let Some(defs) = ws.defs_by_name.get(&c.identifier)
         {
@@ -1032,7 +1212,7 @@ impl App {
                 if d.line == c.line && d.path.to_string_lossy() == cur_rel {
                     continue;
                 }
-                candidates.push(crate::nav::Location {
+                candidates.push(reef_core::nav::Location {
                     path: Some(d.path.clone()),
                     line: d.line,
                     byte_range: d.byte_range.clone(),
@@ -1040,12 +1220,7 @@ impl App {
                 });
             }
         }
-        let origin = crate::nav::NavStackEntry {
-            path: c.path.clone(),
-            line: c.line,
-            byte_col: 0,
-            scroll_row: 0,
-        };
+        let origin = self.snapshot_location();
         match candidates.len() {
             0 => {
                 // No definition — fall through to references, same as the
@@ -1053,16 +1228,20 @@ impl App {
                 self.find_references_in_diff(anchor);
             }
             1 => {
-                self.nav_push_back(origin);
-                self.nav_history_forward.clear();
+                if let Some(origin) = origin {
+                    self.nav_push_back(origin);
+                }
                 let loc = candidates.into_iter().next().expect("len==1 above");
                 let target_path = loc.path.clone().unwrap_or_else(|| c.path.clone());
                 self.nav_jump_to(target_path, loc);
             }
             _ => {
+                let Some(origin) = origin else {
+                    return;
+                };
                 let max_row_width =
                     crate::ui::nav_candidates_popup::candidates_max_width(&candidates);
-                self.nav_candidates = Some(crate::nav::NavCandidatesPopup {
+                self.nav_candidates = Some(crate::app::nav::NavCandidatesPopup {
                     anchor_col: c.anchor_col,
                     anchor_row: c.anchor_row,
                     candidates,
@@ -1070,7 +1249,10 @@ impl App {
                     scroll: 0,
                     current_path: c.path,
                     origin,
-                    opened_by_ctrl_click: matches!(anchor, crate::nav::NavAnchor::Mouse { .. }),
+                    opened_by_ctrl_click: matches!(
+                        anchor,
+                        crate::app::nav::NavAnchor::Mouse { .. }
+                    ),
                     max_row_width,
                 });
             }
@@ -1079,14 +1261,14 @@ impl App {
 
     /// `gr` inside a diff. Lists every workspace reference to the clicked
     /// identifier in the candidates popup.
-    pub fn find_references_in_diff(&mut self, anchor: crate::nav::NavAnchor) {
+    pub fn find_references_in_diff(&mut self, anchor: crate::app::nav::NavAnchor) {
         if self.nav_candidates.is_some() || self.nav_pending_lsp_jump.is_some() {
             return;
         }
         let Some(c) = self.resolve_diff_nav(anchor) else {
             return;
         };
-        let mut candidates: Vec<crate::nav::Location> = Vec::new();
+        let mut candidates: Vec<reef_core::nav::Location> = Vec::new();
         if let Some(ws) = self.nav_workspace.as_ref()
             && let Some(refs) = ws.refs_by_name.get(&c.identifier)
         {
@@ -1094,7 +1276,7 @@ impl App {
                 if r.lang != c.lang {
                     continue;
                 }
-                candidates.push(crate::nav::Location {
+                candidates.push(reef_core::nav::Location {
                     path: Some(r.path.clone()),
                     line: r.line,
                     byte_range: r.byte_range.clone(),
@@ -1107,14 +1289,11 @@ impl App {
                 .push(Toast::info(format!("No references to `{}`", c.identifier)));
             return;
         }
-        let origin = crate::nav::NavStackEntry {
-            path: c.path.clone(),
-            line: c.line,
-            byte_col: 0,
-            scroll_row: 0,
+        let Some(origin) = self.snapshot_location() else {
+            return;
         };
         let max_row_width = crate::ui::nav_candidates_popup::candidates_max_width(&candidates);
-        self.nav_candidates = Some(crate::nav::NavCandidatesPopup {
+        self.nav_candidates = Some(crate::app::nav::NavCandidatesPopup {
             anchor_col: c.anchor_col,
             anchor_row: c.anchor_row,
             candidates,
@@ -1122,7 +1301,7 @@ impl App {
             scroll: 0,
             current_path: c.path,
             origin,
-            opened_by_ctrl_click: matches!(anchor, crate::nav::NavAnchor::Mouse { .. }),
+            opened_by_ctrl_click: matches!(anchor, crate::app::nav::NavAnchor::Mouse { .. }),
             max_row_width,
         });
     }
@@ -1132,7 +1311,7 @@ impl App {
 /// `App::resolve_diff_nav`.
 struct DiffNavCursor {
     identifier: String,
-    lang: crate::nav::NavLang,
+    lang: reef_core::nav::NavLang,
     path: std::path::PathBuf,
     line: usize,
     anchor_col: u16,

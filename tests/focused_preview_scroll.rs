@@ -226,15 +226,15 @@ fn hover_wash_reaches_last_char_of_filename() {
 
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Git);
-    app.unstaged_files.push(reef::git::FileEntry {
+    app.unstaged_files.push(reef_core::git::FileEntry {
         path: name.to_string(),
-        status: reef::git::FileStatus::Modified,
+        status: reef_core::git::FileStatus::Modified,
         additions: 0,
         deletions: 0,
     });
     app.diff_content = Some(reef::app::HighlightedDiff::new(
-        reef::git::DiffContent {
-            file_path: name.to_string(),
+        reef_core::diff::DiffContent {
+            path: name.to_string(),
             hunks: Vec::new(),
         },
         None,
@@ -279,17 +279,17 @@ fn hovering_file_path_washes_chip_and_path_only() {
 
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Git);
-    app.unstaged_files.push(reef::git::FileEntry {
+    app.unstaged_files.push(reef_core::git::FileEntry {
         path: long_name.to_string(),
-        status: reef::git::FileStatus::Modified,
+        status: reef_core::git::FileStatus::Modified,
         additions: 0,
         deletions: 0,
     });
     // Seed diff_content so `focused_preview_interactive_width` can read
     // the path (matches what diff_panel draws in the header).
     app.diff_content = Some(reef::app::HighlightedDiff::new(
-        reef::git::DiffContent {
-            file_path: long_name.to_string(),
+        reef_core::diff::DiffContent {
+            path: long_name.to_string(),
             hunks: Vec::new(),
         },
         None,
@@ -344,15 +344,15 @@ fn clicking_inside_file_path_toggles_picker() {
 
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Git);
-    app.unstaged_files.push(reef::git::FileEntry {
+    app.unstaged_files.push(reef_core::git::FileEntry {
         path: long_name.to_string(),
-        status: reef::git::FileStatus::Modified,
+        status: reef_core::git::FileStatus::Modified,
         additions: 0,
         deletions: 0,
     });
     app.diff_content = Some(reef::app::HighlightedDiff::new(
-        reef::git::DiffContent {
-            file_path: long_name.to_string(),
+        reef_core::diff::DiffContent {
+            path: long_name.to_string(),
             hunks: Vec::new(),
         },
         None,
@@ -395,15 +395,15 @@ fn clicking_tag_tail_does_not_toggle_picker() {
 
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Git);
-    app.unstaged_files.push(reef::git::FileEntry {
+    app.unstaged_files.push(reef_core::git::FileEntry {
         path: "a.txt".to_string(),
-        status: reef::git::FileStatus::Modified,
+        status: reef_core::git::FileStatus::Modified,
         additions: 0,
         deletions: 0,
     });
     app.diff_content = Some(reef::app::HighlightedDiff::new(
-        reef::git::DiffContent {
-            file_path: "a.txt".to_string(),
+        reef_core::diff::DiffContent {
+            path: "a.txt".to_string(),
             hunks: Vec::new(),
         },
         None,
@@ -442,9 +442,9 @@ fn chip_click_in_git_focused_preview_toggles_picker_not_diff_drag() {
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Git);
     // Fake an unstaged entry so the picker can open.
-    app.unstaged_files.push(reef::git::FileEntry {
+    app.unstaged_files.push(reef_core::git::FileEntry {
         path: "a.txt".to_string(),
-        status: reef::git::FileStatus::Modified,
+        status: reef_core::git::FileStatus::Modified,
         additions: 0,
         deletions: 0,
     });
@@ -502,8 +502,8 @@ fn graph_focused_preview_picks_commit_file_via_picker() {
     app.set_active_tab(Tab::Graph);
     // Stub commit_detail.detail with two changed files so
     // `focused_preview_file_entries` returns a non-empty list.
-    app.commit_detail.detail = Some(reef::git::CommitDetail {
-        info: reef::git::CommitInfo {
+    app.commit_detail.detail = Some(reef_core::git::CommitDetail {
+        info: reef_core::git::CommitInfo {
             oid: "deadbeef".to_string(),
             short_oid: "dead".to_string(),
             parents: Vec::new(),
@@ -516,15 +516,15 @@ fn graph_focused_preview_picks_commit_file_via_picker() {
         committer_name: "Tester".to_string(),
         committer_time: 0,
         files: vec![
-            reef::git::FileEntry {
+            reef_core::git::FileEntry {
                 path: "src/app.rs".to_string(),
-                status: reef::git::FileStatus::Modified,
+                status: reef_core::git::FileStatus::Modified,
                 additions: 0,
                 deletions: 0,
             },
-            reef::git::FileEntry {
+            reef_core::git::FileEntry {
                 path: "src/input.rs".to_string(),
-                status: reef::git::FileStatus::Modified,
+                status: reef_core::git::FileStatus::Modified,
                 additions: 0,
                 deletions: 0,
             },
@@ -565,15 +565,15 @@ fn picker_enter_confirm_switches_diff_target() {
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Git);
     app.unstaged_files = vec![
-        reef::git::FileEntry {
+        reef_core::git::FileEntry {
             path: "a.txt".to_string(),
-            status: reef::git::FileStatus::Modified,
+            status: reef_core::git::FileStatus::Modified,
             additions: 0,
             deletions: 0,
         },
-        reef::git::FileEntry {
+        reef_core::git::FileEntry {
             path: "b.txt".to_string(),
-            status: reef::git::FileStatus::Modified,
+            status: reef_core::git::FileStatus::Modified,
             additions: 0,
             deletions: 0,
         },
@@ -608,9 +608,9 @@ fn picker_selection_wraps_at_boundaries() {
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Git);
     app.unstaged_files = (0..3)
-        .map(|i| reef::git::FileEntry {
+        .map(|i| reef_core::git::FileEntry {
             path: format!("f{i}.txt"),
-            status: reef::git::FileStatus::Modified,
+            status: reef_core::git::FileStatus::Modified,
             additions: 0,
             deletions: 0,
         })
@@ -669,9 +669,9 @@ fn focused_preview_swallows_destructive_keys_on_git_tab() {
 
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Git);
-    app.unstaged_files.push(reef::git::FileEntry {
+    app.unstaged_files.push(reef_core::git::FileEntry {
         path: "a.txt".to_string(),
-        status: reef::git::FileStatus::Modified,
+        status: reef_core::git::FileStatus::Modified,
         additions: 0,
         deletions: 0,
     });
@@ -719,15 +719,15 @@ fn picker_snaps_to_unstaged_when_viewing_unstaged_diff_of_dup_path() {
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Git);
     // Same path in both lists (committed + further edited).
-    app.staged_files.push(reef::git::FileEntry {
+    app.staged_files.push(reef_core::git::FileEntry {
         path: "a.txt".to_string(),
-        status: reef::git::FileStatus::Modified,
+        status: reef_core::git::FileStatus::Modified,
         additions: 0,
         deletions: 0,
     });
-    app.unstaged_files.push(reef::git::FileEntry {
+    app.unstaged_files.push(reef_core::git::FileEntry {
         path: "a.txt".to_string(),
-        status: reef::git::FileStatus::Modified,
+        status: reef_core::git::FileStatus::Modified,
         additions: 0,
         deletions: 0,
     });

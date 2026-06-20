@@ -5,11 +5,12 @@
 //! `enter_focused_preview_with_file`-shaped pathway against regression
 //! by exercising it through the App API rather than mocking pieces.
 
+use reef::app::nav::NavAnchor;
 use reef::app::{App, Panel, Tab};
-use reef::file_tree::{PreviewBody, PreviewContent};
-use reef::nav::{NavAnchor, NavLang, parse_file_if_supported};
 use reef::ui::selection::PreviewSelection;
 use reef::ui::theme::Theme;
+use reef_core::nav::{NavLang, parse_file_if_supported};
+use reef_core::preview::{PreviewBody, PreviewDocument as PreviewContent, TextPreview};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use test_support::CwdGuard;
@@ -31,17 +32,16 @@ fn fresh_app() -> (App, TempDir, CwdGuard) {
     (app, tmp, g)
 }
 
-fn install_rust_preview(app: &mut App, file_path: &str, src: &str) {
+fn install_rust_preview(app: &mut App, path: &str, src: &str) {
     let bytes: Arc<[u8]> = Arc::from(src.as_bytes().to_vec().into_boxed_slice());
     let parsed = parse_file_if_supported(NavLang::Rust, bytes).map(Arc::new);
     app.preview_content = Some(PreviewContent {
-        file_path: file_path.to_string(),
-        body: PreviewBody::Text {
+        path: path.to_string(),
+        body: PreviewBody::Text(TextPreview {
             lines: src.lines().map(|s| s.to_string()).collect(),
             highlighted: None,
-            markdown: None,
             parsed,
-        },
+        }),
     });
 }
 
@@ -92,9 +92,10 @@ fn intra_file_single_candidate_jumps_and_pushes_back_stack() {
         .as_ref()
         .expect("highlight set after single-candidate jump");
     assert_eq!(hl.row, 0, "jumped to the fn definition on line 0");
-    assert_eq!(app.nav_history.len(), 1, "back-stack got an entry");
+    assert_eq!(app.location_history.len(), 1, "back-stack got an entry");
     assert_eq!(
-        app.nav_history[0].scroll_row, 7,
+        app.location_history.back_items()[0].scroll.vertical,
+        7,
         "back-stack captured the pre-jump scroll"
     );
     assert!(
@@ -106,11 +107,11 @@ fn intra_file_single_candidate_jumps_and_pushes_back_stack() {
     app.nav_back();
     assert_eq!(app.preview_scroll, 7);
     assert!(
-        app.nav_history.is_empty(),
+        app.location_history.is_empty(),
         "back-stack drained after one Ctrl-o"
     );
     assert_eq!(
-        app.nav_history_forward.len(),
+        app.location_history.forward_len(),
         1,
         "forward stack got the post-jump state"
     );
@@ -145,7 +146,7 @@ fn main() { let a = A; a.run(); }
     );
     assert_eq!(popup.selected, 0, "popup defaults to row 0");
     assert!(
-        app.nav_history.is_empty(),
+        app.location_history.is_empty(),
         "back-stack NOT pushed yet — pick commits, not open"
     );
     assert!(
@@ -157,7 +158,7 @@ fn main() { let a = A; a.run(); }
     app.nav_pick_candidate();
     assert!(app.nav_candidates.is_none(), "popup closes after pick");
     assert_eq!(
-        app.nav_history.len(),
+        app.location_history.len(),
         1,
         "back-stack received origin entry after pick"
     );
@@ -183,7 +184,7 @@ fn main() { let a = A; a.run(); }
     app.nav_close_candidates();
     assert!(app.nav_candidates.is_none());
     assert!(
-        app.nav_history.is_empty(),
+        app.location_history.is_empty(),
         "closing the popup must not leak a back-stack entry"
     );
 }
@@ -195,17 +196,16 @@ fn goto_definition_on_unknown_extension_is_noop() {
     // `.txt` has no parser → parsed = None even if we install a
     // text body, so gd silently does nothing.
     app.preview_content = Some(PreviewContent {
-        file_path: "scratch.txt".to_string(),
-        body: PreviewBody::Text {
+        path: "scratch.txt".to_string(),
+        body: PreviewBody::Text(TextPreview {
             lines: vec!["fn helper() {}".to_string()],
             highlighted: None,
-            markdown: None,
             parsed: None,
-        },
+        }),
     });
     set_keyboard_cursor(&mut app, 0, 3);
     app.goto_definition_at_cursor(NavAnchor::Keyboard);
-    assert!(app.nav_history.is_empty());
+    assert!(app.location_history.is_empty());
     assert!(app.nav_candidates.is_none());
     assert!(app.preview_highlight.is_none());
 }
@@ -323,12 +323,12 @@ fn candidates_popup_scrolls_to_keep_selection_visible() {
     assert_eq!(popup.selected, 10);
     assert!(
         popup.selected >= popup.scroll
-            && popup.selected < popup.scroll + reef::nav::NavCandidatesPopup::MAX_VISIBLE_ROWS,
+            && popup.selected < popup.scroll + reef::app::nav::NavCandidatesPopup::MAX_VISIBLE_ROWS,
         "selection {} must be within window [{}, {}+{})",
         popup.selected,
         popup.scroll,
         popup.scroll,
-        reef::nav::NavCandidatesPopup::MAX_VISIBLE_ROWS
+        reef::app::nav::NavCandidatesPopup::MAX_VISIBLE_ROWS
     );
 }
 
@@ -367,20 +367,20 @@ fn nav_back_and_forward_round_trip() {
     app.preview_scroll = 5;
 
     app.goto_definition_at_cursor(NavAnchor::Keyboard);
-    assert_eq!(app.nav_history.len(), 1);
+    assert_eq!(app.location_history.len(), 1);
 
     app.nav_back();
     assert_eq!(app.preview_scroll, 5);
-    assert_eq!(app.nav_history_forward.len(), 1);
+    assert_eq!(app.location_history.forward_len(), 1);
 
     app.nav_forward();
     assert_eq!(
-        app.nav_history.len(),
+        app.location_history.len(),
         1,
         "back-stack got the symmetric push"
     );
     assert!(
-        app.nav_history_forward.is_empty(),
+        app.location_history.forward_is_empty(),
         "forward stack consumed by nav_forward"
     );
 }

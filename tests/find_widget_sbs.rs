@@ -3,12 +3,12 @@
 //! side, and run the match only against that side's content. No
 //! selection in SBS layout defaults to the right (new code) side.
 
-use reef::app::{App, DiffLayout, HighlightedDiff, Panel, Tab};
+use reef::app::{App, HighlightedDiff, Panel, Tab};
 use reef::find_widget;
 use reef::find_widget::FindTarget;
-use reef::git::{DiffContent, DiffHunk, DiffLine, LineTag};
-use reef::ui::selection::{DiffSelection, DiffSide, PreviewSelection};
+use reef::ui::selection::{DiffSelection, PreviewSelection};
 use reef::ui::theme::Theme;
+use reef_core::diff::{DiffContent, DiffHunk, DiffLayout, DiffLine, DiffSide, LineTag};
 use std::sync::Mutex;
 use tempfile::TempDir;
 use test_support::CwdGuard;
@@ -60,7 +60,7 @@ fn install_paired_diff(app: &mut App) {
     };
     app.diff_content = Some(HighlightedDiff::new(
         DiffContent {
-            file_path: "scratch.rs".to_string(),
+            path: "scratch.rs".to_string(),
             hunks: vec![hunk],
         },
         None,

@@ -1,6 +1,7 @@
 pub mod graph;
 pub mod tree;
 
+use crate::diff::{DiffContent, DiffHunk, DiffLine, LineTag};
 use git2::{DiffOptions, Repository, Sort, StatusOptions};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -107,44 +108,6 @@ mod tests {
     fn count_workdir_lines_no_workdir_is_zero() {
         assert_eq!(count_workdir_lines(None, "whatever.txt"), 0);
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct DiffContent {
-    pub file_path: String,
-    pub hunks: Vec<DiffHunk>,
-}
-
-/// One hunk of a diff. `header` is the `@@ -.. +.. @@` line plus optional
-/// section context (e.g. `@@ -1,5 +1,5 @@ fn foo`). Stored as `Arc<str>`
-/// so cloning a hunk for the SBS pairing / display cache is a refcount
-/// bump rather than a String allocation — the rendered display vector
-/// hands the same Arc through to the spans on every frame.
-#[derive(Debug, Clone)]
-pub struct DiffHunk {
-    pub header: Arc<str>,
-    pub lines: Vec<DiffLine>,
-}
-
-/// One line within a hunk. `content` is the raw text without the leading
-/// `+`/`-`/` ` marker (the marker is reconstructed from `tag` at render
-/// time). `Arc<str>` so `.clone()` is a refcount bump — the per-frame
-/// `pair_hunk_lines` and `DiffDisplay::build` paths rely on this being
-/// O(1); a `String` field would re-introduce per-line heap copies
-/// across every render.
-#[derive(Debug, Clone)]
-pub struct DiffLine {
-    pub tag: LineTag,
-    pub content: Arc<str>,
-    pub old_lineno: Option<u32>,
-    pub new_lineno: Option<u32>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LineTag {
-    Context,
-    Added,
-    Removed,
 }
 
 #[derive(Debug, Clone)]
@@ -452,7 +415,7 @@ impl GitRepo {
             .collect();
 
         Some(DiffContent {
-            file_path: path.to_string(),
+            path: path.to_string(),
             hunks: vec![DiffHunk {
                 header: Arc::from(format!("@@ -0,0 +1,{} @@ (new file)", lines.len())),
                 lines,
@@ -521,7 +484,7 @@ impl GitRepo {
         }
 
         Some(DiffContent {
-            file_path: path.to_string(),
+            path: path.to_string(),
             hunks,
         })
     }

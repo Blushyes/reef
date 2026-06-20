@@ -6,7 +6,7 @@
 //! sentinel row that resets the scope to the default and a "recent"
 //! section seeded from `GitGraphState::recent_branches`.
 
-use crate::git::{GraphScope, RefLabel};
+use reef_core::git::{GraphScope, RefLabel};
 use std::collections::HashMap;
 
 /// Soft cap for how many branches we render below the recents list.

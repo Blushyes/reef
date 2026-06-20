@@ -6,7 +6,7 @@
 //! build a fresh `RemoteBackend` and swap the running `App` for a new
 //! one via the outer `'session:` loop.
 
-use crate::hosts::HostEntry;
+use reef_core::hosts::HostEntry;
 
 /// Maximum number of recent hosts we persist in prefs. Anything beyond
 /// that becomes noise; users with more than five ssh contexts can always

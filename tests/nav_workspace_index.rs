@@ -3,7 +3,7 @@
 //!   - `gr` populates the candidates popup with references workspace-wide,
 //!   - per-language filtering keeps `foo` in Python out of `foo` in Rust.
 
-use reef::nav::{NavLang, build_workspace_index};
+use reef_core::nav::{NavLang, build_workspace_index};
 use std::fs;
 use std::sync::Mutex;
 use tempfile::TempDir;
@@ -104,7 +104,7 @@ fn vue_files_parse_without_panicking_even_with_no_queries() {
     .unwrap();
     fs::write(tmp.path().join("plain.rs"), "fn rust_marker() {}\n").unwrap();
 
-    let index = reef::nav::build_workspace_index(tmp.path().to_path_buf());
+    let index = reef_core::nav::build_workspace_index(tmp.path().to_path_buf());
     // Rust file picked up normally — proves the walker isn't crashing
     // on the Vue file mid-walk.
     assert!(index.defs_by_name.contains_key("rust_marker"));

@@ -2312,7 +2312,7 @@ dependencies = [
 
 [[package]]
 name = "reef"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "criterion",
  "crossterm",
@@ -2370,7 +2370,7 @@ dependencies = [
 
 [[package]]
 name = "reef-core"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "git2",
  "ignore",

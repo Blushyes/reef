@@ -3,7 +3,6 @@ pub mod confirm_modal;
 pub mod context_menu_panel;
 pub mod db_preview;
 pub mod diff_panel;
-pub mod file_preview_panel;
 pub mod file_tree_panel;
 pub mod find_widget_panel;
 pub mod focus;
@@ -18,6 +17,7 @@ pub mod hover;
 pub mod layout;
 pub mod mouse;
 pub mod nav_candidates_popup;
+pub mod preview;
 pub mod quick_open_panel;
 pub mod search_tab;
 pub mod selection;
@@ -165,7 +165,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 file_tree_panel::render(f, app, body_layout[0], focused);
             }
             let focused = matches!(app.active_panel, crate::app::Panel::Diff);
-            file_preview_panel::render(f, app, body_layout[editor_idx], focused);
+            preview::render(f, app, body_layout[editor_idx], focused);
         }
         Tab::Graph => {
             if has_sidebar {
@@ -181,7 +181,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 search_tab::render_sidebar(f, app, body_layout[0]);
             }
             let focused = matches!(app.active_panel, crate::app::Panel::Diff);
-            file_preview_panel::render(f, app, body_layout[editor_idx], focused);
+            preview::render(f, app, body_layout[editor_idx], focused);
         }
     }
 
@@ -781,16 +781,17 @@ fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
 /// `Off`). Pulls the per-language glyph from `LangProfile` so
 /// adding a language doesn't require touching this function.
 fn nav_lsp_badge_text(app: &App) -> String {
-    use crate::file_tree::PreviewBody;
-    use crate::nav::LspBadge;
+    use reef_core::nav::LspBadge;
+    use reef_core::preview::PreviewBody;
 
     let Some(preview) = app.preview_content.as_ref() else {
         return String::new();
     };
     let parsed = match &preview.body {
-        PreviewBody::Text {
-            parsed: Some(p), ..
-        } => p,
+        PreviewBody::Text(text) => match text.parsed.as_ref() {
+            Some(p) => p,
+            None => return String::new(),
+        },
         _ => return String::new(),
     };
     let lang = parsed.language;

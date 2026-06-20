@@ -10,7 +10,7 @@
 //! aborts within the next few files.
 //!
 //! Post-jump highlight: `accept()` stashes a `PreviewHighlight` on `App`
-//! (path + row + byte range) that `file_preview_panel` overlays once the
+//! (path + row + byte range) that `ui::preview` overlays once the
 //! async preview arrives. See `app::PreviewHighlight` + the tick handler.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -24,6 +24,7 @@ use std::time::Instant;
 use crate::app::{App, Tab};
 use crate::input::DOUBLE_CLICK_WINDOW;
 use crate::input_edit;
+use crate::keymap::{Command, InputScope, Keymap};
 use crate::ui::mouse::ClickAction;
 
 /// Hard cap on result count. VSCode uses 20k but virtualises its tree; our
@@ -339,7 +340,7 @@ pub(crate) fn current_text_selection(app: &App) -> Option<String> {
     if let (Some(sel), Some(preview)) =
         (app.preview_selection.as_ref(), app.preview_content.as_ref())
         && !sel.is_empty()
-        && matches!(&preview.body, crate::file_tree::PreviewBody::Text { .. })
+        && preview.is_text()
     {
         let rows = preview.body.display_text_rows();
         let text = crate::ui::selection::collect_selected_text_from_rows(
@@ -426,6 +427,7 @@ pub fn accept(app: &mut App) {
         return;
     }
 
+    app.push_location_before_jump();
     app.global_search.core.active = false;
     app.set_active_tab(Tab::Files);
     app.file_tree.reveal(&hit.path);
@@ -478,28 +480,36 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     //   treat it as a plain Confirm)
     // - PageUp/PageDown depend on `last_view_h` which PickerCore
     //   doesn't see
-    if matches!(key.code, KeyCode::Enter) && (alt || ctrl) {
-        app.global_search.core.active = false;
-        app.global_search.focus = SearchPanelFocus::FindInput;
-        app.set_active_tab(Tab::Search);
-        navigate_to_selected(app);
-        return;
-    }
-    if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
-        let step = app.global_search.last_view_h.max(1) as i32;
-        let signed = if matches!(key.code, KeyCode::PageUp) {
-            -step
-        } else {
-            step
-        };
-        move_selection(&mut app.global_search, signed);
-        return;
+    let mapped = Keymap::resolve(InputScope::GlobalSearch, &key);
+    match mapped {
+        Some(Command::PinGlobalSearch) => {
+            app.push_location_before_jump();
+            app.global_search.core.active = false;
+            app.global_search.focus = SearchPanelFocus::FindInput;
+            app.set_active_tab(Tab::Search);
+            navigate_to_selected(app);
+            return;
+        }
+        Some(Command::PageUp | Command::PageDown) => {
+            let step = app.global_search.last_view_h.max(1) as i32;
+            let signed = if mapped == Some(Command::PageUp) {
+                -step
+            } else {
+                step
+            };
+            move_selection(&mut app.global_search, signed);
+            return;
+        }
+        _ => {}
     }
 
     use crate::picker_core::InputOutcome;
-    let _ = ctrl; // Quit branch handles Ctrl+C; no other ctrl-gating here.
     let visible = app.global_search.results.len();
-    match app.global_search.core.dispatch_key(&key, visible) {
+    match app
+        .global_search
+        .core
+        .dispatch_key(InputScope::GlobalSearch, &key, visible)
+    {
         InputOutcome::Cancel => app.global_search.core.active = false,
         InputOutcome::Quit => {
             app.global_search.core.active = false;

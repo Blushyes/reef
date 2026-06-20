@@ -19,7 +19,7 @@
 //!   sanitise `\t` / `\n` in paths on write to keep the file parseable; those
 //!   characters in real-world paths are exotic enough to be worth the edge.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32String};
 use std::collections::{HashSet, VecDeque};
@@ -30,6 +30,7 @@ use crate::app::{App, Tab};
 use crate::backend::{Backend, WalkOpts};
 use crate::input::DOUBLE_CLICK_WINDOW;
 use crate::input_edit;
+use crate::keymap::{Command, InputScope, Keymap};
 use crate::prefs;
 use crate::ui::mouse::ClickAction;
 
@@ -149,6 +150,7 @@ pub fn accept(app: &mut App) {
     }
     save_mru_to_prefs(&app.quick_open.mru);
 
+    app.push_location_before_jump();
     app.quick_open.core.active = false;
     app.set_active_tab(Tab::Files);
     app.file_tree.reveal(&rel);
@@ -177,8 +179,6 @@ pub fn accept(app: &mut App) {
 /// so `Ctrl+P` now only means "previous candidate" — Esc is the sole
 /// keyboard close.
 pub fn handle_key(key: KeyEvent, app: &mut App) {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-
     // Space-leader close: mirrors the global open chord. Only armed while
     // `query.is_empty()` so once the user starts typing a path that might
     // legitimately contain a space (or a `p`), the chord shuts off and
@@ -220,9 +220,10 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // PageUp/PageDown depend on the rendered viewport height
     // (`last_view_h`), which PickerCore doesn't know about — handle
     // them inline before delegating the rest to the shared core.
-    if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+    let mapped = Keymap::resolve(InputScope::QuickOpen, &key);
+    if matches!(mapped, Some(Command::PageUp | Command::PageDown)) {
         let step = app.quick_open.last_view_h.max(1) as i32;
-        let signed = if matches!(key.code, KeyCode::PageUp) {
+        let signed = if mapped == Some(Command::PageUp) {
             -step
         } else {
             step
@@ -234,9 +235,12 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // Shared picker dispatch. `Edited` re-runs the fuzzy filter; the
     // other outcomes are no-ops (PickerCore already updated state).
     use crate::picker_core::InputOutcome;
-    let _ = ctrl; // Quit branch handles Ctrl+C; no other ctrl-gating here.
     let visible = app.quick_open.matches.len();
-    match app.quick_open.core.dispatch_key(&key, visible) {
+    match app
+        .quick_open
+        .core
+        .dispatch_key(InputScope::QuickOpen, &key, visible)
+    {
         InputOutcome::Cancel => app.quick_open.core.active = false,
         InputOutcome::Quit => {
             app.quick_open.core.active = false;

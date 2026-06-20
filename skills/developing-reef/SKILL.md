@@ -12,6 +12,7 @@ Use this skill as the project onboarding guide for non-test Reef changes. Reef i
 - Keep `ui::*::render` on cached state only. Do not call git, filesystem walks, diff generation, syntax highlighting, or long formatting from render.
 - Treat input handlers as intent dispatchers. They may update cheap UI state (selection, scroll, hover, active tab) and request work, but must not do blocking host work.
 - Route expensive work through the background task coordinator in `src/tasks.rs`; merge results only from `App::tick`.
+- Put UI-independent logic in `crates/reef-core`; keep ratatui/crossterm rendering and input orchestration in the root crate.
 - Prefer stale cached UI over blocking. Show old data plus loading/stale/error status instead of waiting during tab switches or hover/mouse movement.
 - Use generation tokens for async results. Late results from older requests must not overwrite newer selections or newer snapshots.
 - Keep each tab/panel independently refreshable. Adding a feature should not require another tab to render before data can update.
@@ -28,13 +29,15 @@ Read `references/runtime-architecture.md` before changing `src/app.rs`, `src/tas
 
 ## File/Module Habits
 
-- `src/app.rs` owns state orchestration: tab state, snapshot fields, async state, result merging, and command side effects.
+- `src/app/mod.rs` owns state orchestration: tab state, snapshot fields, async state, result merging, and command side effects.
+- `crates/reef-core/src/**` owns UI-independent git, diff, highlight, markdown, nav/LSP, preview loading, file-op, host parsing, and history logic.
 - `src/tasks.rs` owns background worker definitions and should stay free of UI concerns.
 - `src/ui/**` owns rendering and local panel command dispatch; keep it pure except transient hit-test registration.
+- `src/ui/preview/**` owns the TUI preview renderers; core preview models must stay free of ratatui/crossterm types.
 - `src/input.rs` owns key/mouse routing; use `App::set_active_tab` instead of assigning `active_tab` directly.
 - `src/input_edit{,_multi}.rs` and `src/picker_core.rs` own the shared text-input vocabulary. Don't hand-roll a key table; embed one of the three layers (see "Text Input Stack" below).
-- `src/file_tree.rs` owns tree structure and preview data types; updating Git decorations must not rebuild the tree unless structure changed.
-- `src/git/**` owns direct git2 operations and pure graph algorithms. Open repositories inside workers with `GitRepo::open_at`.
+- `src/file_tree.rs` owns file-tree state and navigation; preview data/loading lives in `crates/reef-core/src/preview/**`.
+- `src/keymap.rs` owns shortcut bindings by scope; handlers should dispatch commands, not duplicate key matching tables.
 
 ## Text Input Stack
 

@@ -14,7 +14,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use reef::backend::{Backend, LocalBackend, RemoteBackend};
-use reef::file_tree::{BinaryReason, PreviewBody};
+use reef_core::preview::{BinaryReason, PreviewBody};
 use test_support::{agent_bin, tempdir_repo};
 
 static BACKEND_LOCK: Mutex<()> = Mutex::new(());
@@ -36,6 +36,7 @@ fn spawn_remote(workdir: &Path) -> RemoteBackend {
 #[derive(Debug, PartialEq, Eq)]
 enum BodyShape {
     Text,
+    Markdown,
     BinaryEmpty,
     BinaryNullBytes,
     BinaryNonImage,
@@ -48,7 +49,8 @@ enum BodyShape {
 
 fn shape_of(body: &PreviewBody) -> BodyShape {
     match body {
-        PreviewBody::Text { .. } => BodyShape::Text,
+        PreviewBody::Text(_) => BodyShape::Text,
+        PreviewBody::Markdown(_) => BodyShape::Markdown,
         PreviewBody::Image(_) => BodyShape::Image,
         PreviewBody::Database(_) => BodyShape::Database,
         PreviewBody::Binary(info) => match &info.reason {
@@ -86,7 +88,7 @@ fn load_preview_parity_for_text_empty_and_nullbyte() {
         let r = remote
             .load_preview(Path::new(name), true, true)
             .unwrap_or_else(|| panic!("remote preview None for {name}"));
-        assert_eq!(l.file_path, r.file_path, "file_path for {name}");
+        assert_eq!(l.path, r.path, "file_path for {name}");
         assert_eq!(
             shape_of(&l.body),
             shape_of(&r.body),
@@ -110,12 +112,10 @@ fn load_preview_text_lines_match() {
 
     let l = local.load_preview(Path::new("a.txt"), true, true).unwrap();
     let r = remote.load_preview(Path::new("a.txt"), true, true).unwrap();
-    let (PreviewBody::Text { lines: ll, .. }, PreviewBody::Text { lines: rl, .. }) =
-        (&l.body, &r.body)
-    else {
+    let (PreviewBody::Text(lt), PreviewBody::Text(rt)) = (&l.body, &r.body) else {
         panic!("expected both Text, got {:?} / {:?}", l.body, r.body);
     };
-    assert_eq!(ll, rl, "text lines diverged");
+    assert_eq!(lt.lines, rt.lines, "text lines diverged");
 }
 
 #[test]
@@ -134,17 +134,9 @@ fn load_preview_markdown_model_matches_on_local_and_remote() {
     let r = remote
         .load_preview(Path::new("README.md"), true, true)
         .unwrap();
-    let (
-        PreviewBody::Text {
-            markdown: Some(lm), ..
-        },
-        PreviewBody::Text {
-            markdown: Some(rm), ..
-        },
-    ) = (&l.body, &r.body)
-    else {
+    let (PreviewBody::Markdown(lm), PreviewBody::Markdown(rm)) = (&l.body, &r.body) else {
         panic!(
-            "expected both Markdown Text, got {:?} / {:?}",
+            "expected both Markdown previews, got {:?} / {:?}",
             l.body, r.body
         );
     };
@@ -177,7 +169,7 @@ fn users_key() -> reef_sqlite_preview::DbObjectKey {
 
 #[test]
 fn load_preview_parity_for_sqlite_database() {
-    use reef::file_tree::PreviewBody;
+    use reef_core::preview::PreviewBody;
     let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, _repo) = tempdir_repo();
     let db_path = tmp.path().join("fixture.db");

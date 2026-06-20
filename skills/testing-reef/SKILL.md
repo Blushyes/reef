@@ -7,11 +7,13 @@ description: Conventions and gotchas for writing tests in the reef Rust workspac
 
 A project-specific test playbook. Follow this when adding **any** test. The goal is that tests are deterministic across Linux/macOS CI and every dev's laptop, and that no test becomes that one flaky thing everyone reruns.
 
-## Workspace layout (post-deplugin)
+## Workspace layout
 
-Reef is a single-process binary — there is no plugin subsystem. The repo root IS the `reef` crate; the workspace exists only to hang the test-fixture helper off it:
+Reef is a single-process binary plus shared internal crates. There is no plugin subsystem.
 
-- **Root (`reef` crate)** — `src/` (app state, UI panels, git operations), `tests/` (integration), `benches/` (criterion).
+- **Root (`reef` crate)** — `src/` (App runtime, TUI rendering, input orchestration), `tests/` (integration), `benches/` (criterion).
+- **`crates/reef-core`** — UI-independent git, diff, preview, markdown, highlight, nav/LSP, file-op, host parsing, and history logic.
+- **`crates/reef-agent` / `crates/reef-proto` / `crates/reef-sqlite-preview`** — remote agent/protocol and SQLite preview support.
 - **`crates/test-support`** — shared fixtures (`tempdir_repo`, `commit_file`, `write_file`, `HomeGuard`).
 - **`fuzz/`** — fuzz targets. Separate package, not in the workspace; run via `cargo +nightly fuzz run <target>`.
 

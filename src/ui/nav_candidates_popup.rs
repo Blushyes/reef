@@ -169,7 +169,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
 /// Format one candidate as ` L<line> <snippet>`, truncated with `…` to
 /// `MAX_ROW_TEXT_W`. Line numbers are 1-based for display so they match
 /// the preview gutter. Built only for the visible window.
-fn format_row(c: &crate::nav::Location) -> String {
+fn format_row(c: &reef_core::nav::Location) -> String {
     let s = format!(" L{:<5} {}", c.line + 1, c.snippet);
     if (UnicodeWidthStr::width(s.as_str()) as u16) <= MAX_ROW_TEXT_W {
         return s;
@@ -188,7 +188,7 @@ fn format_row(c: &crate::nav::Location) -> String {
     truncated
 }
 
-pub(crate) fn candidates_max_width(candidates: &[crate::nav::Location]) -> u16 {
+pub(crate) fn candidates_max_width(candidates: &[reef_core::nav::Location]) -> u16 {
     candidates.iter().map(row_display_width).max().unwrap_or(0) as u16
 }
 
@@ -197,7 +197,7 @@ pub(crate) fn candidates_max_width(candidates: &[crate::nav::Location]) -> u16 {
 /// the visible rows pay for actual formatting. The `{:<5}` line field
 /// pads to at least 5 columns; the total is capped at `MAX_ROW_TEXT_W`
 /// to match `format_row`'s truncation.
-fn row_display_width(c: &crate::nav::Location) -> usize {
+fn row_display_width(c: &reef_core::nav::Location) -> usize {
     // Decimal digit count of the 1-based line number; `{:<5}` pads it to
     // at least 5 columns. `c.line + 1 >= 1`, so `ilog10` never hits its
     // zero precondition.

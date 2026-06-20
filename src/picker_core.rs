@@ -21,8 +21,10 @@
 //! "current match" cursor that walks the underlying text, not a
 //! drop-down list, so it doesn't share PickerCore's selection model.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
+
+use crate::keymap::{Command, InputScope, Keymap};
 
 /// Shared state for a filter-driven picker overlay. Each consuming
 /// picker holds this as a field (e.g. `pub core: PickerCore`) and
@@ -146,30 +148,25 @@ impl PickerCore {
     /// toggles, Ctrl+P mode-switch in hosts_picker) should match those
     /// BEFORE calling `dispatch_key` and `return` early; otherwise the
     /// editor table would consume them as plain inserts.
-    pub fn dispatch_key(&mut self, key: &KeyEvent, visible_count: usize) -> InputOutcome {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    pub fn dispatch_key(
+        &mut self,
+        scope: InputScope,
+        key: &KeyEvent,
+        visible_count: usize,
+    ) -> InputOutcome {
         // Phase 1: list nav + close + commit. `Quit` requires `!shift`
         // so terminals reporting Ctrl+Shift+C as a distinct chord
         // (kitty / iTerm enhanced keyboard) don't accidentally quit
         // the app when the user wanted to copy to clipboard.
-        match key.code {
-            KeyCode::Esc => return InputOutcome::Cancel,
-            KeyCode::Char('c') if ctrl && !shift => return InputOutcome::Quit,
-            KeyCode::Enter => return InputOutcome::Confirm,
-            KeyCode::Up => {
+        match Keymap::resolve(scope, key) {
+            Some(Command::Close) => return InputOutcome::Cancel,
+            Some(Command::Quit) => return InputOutcome::Quit,
+            Some(Command::Confirm) => return InputOutcome::Confirm,
+            Some(Command::MoveUp) => {
                 self.move_selection(visible_count, -1);
                 return InputOutcome::SelectionMoved;
             }
-            KeyCode::Down => {
-                self.move_selection(visible_count, 1);
-                return InputOutcome::SelectionMoved;
-            }
-            KeyCode::Char('k' | 'p') if ctrl => {
-                self.move_selection(visible_count, -1);
-                return InputOutcome::SelectionMoved;
-            }
-            KeyCode::Char('j' | 'n') if ctrl => {
+            Some(Command::MoveDown) => {
                 self.move_selection(visible_count, 1);
                 return InputOutcome::SelectionMoved;
             }
@@ -252,8 +249,9 @@ mod tests {
     #[test]
     fn dispatch_esc_returns_cancel() {
         let mut c = PickerCore::default();
+        let key = k(KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(
-            c.dispatch_key(&k(KeyCode::Esc, KeyModifiers::NONE), 5),
+            c.dispatch_key(InputScope::QuickOpen, &key, 5),
             InputOutcome::Cancel
         );
     }
@@ -261,8 +259,9 @@ mod tests {
     #[test]
     fn dispatch_ctrl_c_returns_quit() {
         let mut c = PickerCore::default();
+        let key = k(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(
-            c.dispatch_key(&k(KeyCode::Char('c'), KeyModifiers::CONTROL), 5),
+            c.dispatch_key(InputScope::QuickOpen, &key, 5),
             InputOutcome::Quit
         );
     }
@@ -270,8 +269,9 @@ mod tests {
     #[test]
     fn dispatch_enter_returns_confirm() {
         let mut c = PickerCore::default();
+        let key = k(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(
-            c.dispatch_key(&k(KeyCode::Enter, KeyModifiers::NONE), 5),
+            c.dispatch_key(InputScope::QuickOpen, &key, 5),
             InputOutcome::Confirm
         );
     }
@@ -280,25 +280,31 @@ mod tests {
     fn dispatch_arrows_and_readline_aliases_move_selection() {
         let mut c = PickerCore::default();
         // Down
+        let down = k(KeyCode::Down, KeyModifiers::NONE);
         assert_eq!(
-            c.dispatch_key(&k(KeyCode::Down, KeyModifiers::NONE), 5),
+            c.dispatch_key(InputScope::QuickOpen, &down, 5),
             InputOutcome::SelectionMoved
         );
         assert_eq!(c.selected_idx, 1);
         // Ctrl+J
-        c.dispatch_key(&k(KeyCode::Char('j'), KeyModifiers::CONTROL), 5);
+        let ctrl_j = k(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        c.dispatch_key(InputScope::QuickOpen, &ctrl_j, 5);
         assert_eq!(c.selected_idx, 2);
         // Ctrl+N
-        c.dispatch_key(&k(KeyCode::Char('n'), KeyModifiers::CONTROL), 5);
+        let ctrl_n = k(KeyCode::Char('n'), KeyModifiers::CONTROL);
+        c.dispatch_key(InputScope::QuickOpen, &ctrl_n, 5);
         assert_eq!(c.selected_idx, 3);
         // Up
-        c.dispatch_key(&k(KeyCode::Up, KeyModifiers::NONE), 5);
+        let up = k(KeyCode::Up, KeyModifiers::NONE);
+        c.dispatch_key(InputScope::QuickOpen, &up, 5);
         assert_eq!(c.selected_idx, 2);
         // Ctrl+K
-        c.dispatch_key(&k(KeyCode::Char('k'), KeyModifiers::CONTROL), 5);
+        let ctrl_k = k(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        c.dispatch_key(InputScope::QuickOpen, &ctrl_k, 5);
         assert_eq!(c.selected_idx, 1);
         // Ctrl+P
-        c.dispatch_key(&k(KeyCode::Char('p'), KeyModifiers::CONTROL), 5);
+        let ctrl_p = k(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        c.dispatch_key(InputScope::QuickOpen, &ctrl_p, 5);
         assert_eq!(c.selected_idx, 0);
     }
 
@@ -308,7 +314,8 @@ mod tests {
             selected_idx: 4,
             ..Default::default()
         };
-        let outcome = c.dispatch_key(&k(KeyCode::Char('a'), KeyModifiers::NONE), 10);
+        let key = k(KeyCode::Char('a'), KeyModifiers::NONE);
+        let outcome = c.dispatch_key(InputScope::QuickOpen, &key, 10);
         assert_eq!(outcome, InputOutcome::Edited);
         assert_eq!(c.filter, "a");
         assert_eq!(c.cursor, 1);
@@ -324,7 +331,8 @@ mod tests {
             active: true,
             ..Default::default()
         };
-        let outcome = c.dispatch_key(&k(KeyCode::Left, KeyModifiers::NONE), 10);
+        let key = k(KeyCode::Left, KeyModifiers::NONE);
+        let outcome = c.dispatch_key(InputScope::QuickOpen, &key, 10);
         assert_eq!(outcome, InputOutcome::CursorMoved);
         assert_eq!(c.cursor, 4);
         assert_eq!(c.selected_idx, 3, "pure cursor moves preserve selection");

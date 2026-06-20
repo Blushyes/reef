@@ -1,19 +1,21 @@
 //! Graph tab's right editor — commit metadata + Changed-files list (tree or
 //! flat) + inline diff for the currently-selected file.
 
-use crate::app::{App, DiffHighlighted, DiffLayout, DiffMode, LineTokens};
-use crate::git::tree::{self as gtree, Node};
-use crate::git::{DiffContent, FileEntry, FileStatus, LineTag};
+use crate::app::{App, DiffHighlighted, DiffMode, LineTokens};
 use crate::i18n::{Msg, t};
 use crate::search::SearchTarget;
 use crate::ui::git_graph_panel;
 use crate::ui::mouse::ClickAction;
-use crate::ui::text::{clip_spans, empty_arc_str, overlay_match_highlight, spaces};
+use crate::ui::text::{clip_spans, overlay_match_highlight, spaces};
 use crate::ui::theme::Theme;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use reef_core::diff::DiffLayout;
+use reef_core::diff::{DiffContent, LineTag};
+use reef_core::git::tree::{self as gtree, Node};
+use reef_core::git::{FileEntry, FileStatus};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -572,27 +574,7 @@ struct Row {
     sbs: Option<SbsParts>,
 }
 
-#[derive(Debug, Clone)]
-struct SbsParts {
-    left_tag: LineTag,
-    left_no: Option<u32>,
-    /// Per-half text — `Arc<str>` shared with the underlying `DiffLine.content`
-    /// so the per-frame `pair_hunk_lines` rebuild costs one refcount bump per
-    /// line, not a `String::clone` heap copy. (Pre-fix, the 2-col commit-detail
-    /// path was still doing `line.content.to_string()` per line per frame even
-    /// though `DiffLine.content` is now `Arc<str>`.)
-    left_text: std::sync::Arc<str>,
-    /// Syntect-colored tokens for `left_text` — populated when syntax
-    /// highlighting is available for the file. Concatenating token texts
-    /// must yield exactly `left_text` (search byte offsets rely on this).
-    /// `None` falls back to a single plain-fg span at render time. `Arc` so
-    /// pairing / render clone is O(1) on large diffs.
-    left_tokens: Option<LineTokens>,
-    right_tag: LineTag,
-    right_no: Option<u32>,
-    right_text: std::sync::Arc<str>,
-    right_tokens: Option<LineTokens>,
-}
+type SbsParts = reef_core::diff::SbsRow<LineTokens>;
 
 impl RowSpan {
     fn plain(text: impl Into<SpanText>) -> Self {
@@ -768,7 +750,7 @@ fn build_rows(app: &App, width: u16, display_w: u16, theme: &Theme) -> Vec<Row> 
 fn append_commit_header(
     rows: &mut Vec<Row>,
     app: &App,
-    detail: &crate::git::CommitDetail,
+    detail: &reef_core::git::CommitDetail,
     max_msg: usize,
     theme: &Theme,
 ) {
@@ -1201,8 +1183,8 @@ fn append_side_by_side_diff(
                 .add_modifier(Modifier::DIM),
         )]));
 
-        let hunk_tokens = highlighted.and_then(|h| h.get(hi));
-        for parts in pair_hunk_lines(hunk, hunk_tokens) {
+        let hunk_tokens = highlighted.and_then(|h| h.get(hi).map(Vec::as_slice));
+        for parts in reef_core::diff::pair_hunk_lines(hunk, hunk_tokens) {
             rows.push(build_sbs_row(parts, theme));
         }
     }
@@ -1257,96 +1239,6 @@ fn side_style(tag: LineTag, theme: &Theme) -> (Color, Option<Color>) {
         LineTag::Removed => (theme.removed_accent, Some(theme.removed_bg)),
         LineTag::Context => (theme.fg_primary, None),
     }
-}
-
-fn pair_hunk_lines(
-    hunk: &crate::git::DiffHunk,
-    hunk_tokens: Option<&Vec<LineTokens>>,
-) -> Vec<SbsParts> {
-    use std::sync::Arc;
-    let mut rows = Vec::new();
-    // Pending removed entries carry their per-line tokens so the left half
-    // keeps its syntax highlighting when paired with a later Added line.
-    let mut pending_removed: Vec<(Option<u32>, Arc<str>, Option<LineTokens>)> = Vec::new();
-    let tokens_for =
-        |li: usize| -> Option<LineTokens> { hunk_tokens.and_then(|t| t.get(li)).cloned() };
-    let empty = empty_arc_str();
-
-    for (li, line) in hunk.lines.iter().enumerate() {
-        match line.tag {
-            LineTag::Removed => {
-                pending_removed.push((line.old_lineno, Arc::clone(&line.content), tokens_for(li)));
-            }
-            LineTag::Added => {
-                let added_tokens = tokens_for(li);
-                if let Some((old_no, old_text, old_tokens)) =
-                    (!pending_removed.is_empty()).then(|| pending_removed.remove(0))
-                {
-                    rows.push(SbsParts {
-                        left_tag: LineTag::Removed,
-                        left_no: old_no,
-                        left_text: old_text,
-                        left_tokens: old_tokens,
-                        right_tag: LineTag::Added,
-                        right_no: line.new_lineno,
-                        right_text: Arc::clone(&line.content),
-                        right_tokens: added_tokens,
-                    });
-                } else {
-                    rows.push(SbsParts {
-                        left_tag: LineTag::Context,
-                        left_no: None,
-                        left_text: Arc::clone(&empty),
-                        left_tokens: None,
-                        right_tag: LineTag::Added,
-                        right_no: line.new_lineno,
-                        right_text: Arc::clone(&line.content),
-                        right_tokens: added_tokens,
-                    });
-                }
-            }
-            LineTag::Context => {
-                for (old_no, old_text, old_tokens) in pending_removed.drain(..) {
-                    rows.push(SbsParts {
-                        left_tag: LineTag::Removed,
-                        left_no: old_no,
-                        left_text: old_text,
-                        left_tokens: old_tokens,
-                        right_tag: LineTag::Context,
-                        right_no: None,
-                        right_text: Arc::clone(&empty),
-                        right_tokens: None,
-                    });
-                }
-                let ctx_tokens = tokens_for(li);
-                rows.push(SbsParts {
-                    left_tag: LineTag::Context,
-                    left_no: line.old_lineno,
-                    left_text: Arc::clone(&line.content),
-                    left_tokens: ctx_tokens.clone(),
-                    right_tag: LineTag::Context,
-                    right_no: line.new_lineno,
-                    right_text: Arc::clone(&line.content),
-                    right_tokens: ctx_tokens,
-                });
-            }
-        }
-    }
-
-    for (old_no, old_text, old_tokens) in pending_removed.drain(..) {
-        rows.push(SbsParts {
-            left_tag: LineTag::Removed,
-            left_no: old_no,
-            left_text: old_text,
-            left_tokens: old_tokens,
-            right_tag: LineTag::Context,
-            right_no: None,
-            right_text: Arc::clone(&empty),
-            right_tokens: None,
-        });
-    }
-
-    rows
 }
 
 // ─── Utility helpers ──────────────────────────────────────────────────────────
@@ -1472,64 +1364,6 @@ mod tests {
         assert_eq!(out[1].1, "x");
         assert_eq!(out[0].0.bg, Some(Color::Yellow));
         assert_eq!(out[1].0.bg, Some(Color::Yellow));
-    }
-
-    /// SBS pairing must thread per-line tokens to the right half: when an
-    /// Added line is paired with a pending Removed line, both `left_tokens`
-    /// and `right_tokens` must survive to the `SbsParts` (otherwise the
-    /// side that lost its tokens renders as an unstyled plain-fg row).
-    #[test]
-    fn pair_hunk_lines_threads_tokens_through_pairing() {
-        use crate::git::{DiffHunk, DiffLine};
-        let hunk = DiffHunk {
-            header: "@@ -1,1 +1,1 @@".into(),
-            lines: vec![
-                DiffLine {
-                    tag: LineTag::Removed,
-                    content: "old".into(),
-                    old_lineno: Some(1),
-                    new_lineno: None,
-                },
-                DiffLine {
-                    tag: LineTag::Added,
-                    content: "new".into(),
-                    old_lineno: None,
-                    new_lineno: Some(1),
-                },
-            ],
-        };
-        let tok_removed = Arc::new(vec![(Style::default().fg(Color::Red), "old".to_string())]);
-        let tok_added = Arc::new(vec![(Style::default().fg(Color::Green), "new".to_string())]);
-        let hunk_tokens = vec![tok_removed.clone(), tok_added.clone()];
-        let parts = pair_hunk_lines(&hunk, Some(&hunk_tokens));
-        assert_eq!(parts.len(), 1);
-        let p = &parts[0];
-        // Arc identity: clones should share refcount, proving O(1) pairing.
-        assert!(Arc::ptr_eq(p.left_tokens.as_ref().unwrap(), &tok_removed));
-        assert!(Arc::ptr_eq(p.right_tokens.as_ref().unwrap(), &tok_added));
-    }
-
-    /// End-of-hunk `pending_removed` flush must carry its Arc tokens so a
-    /// hunk that ends in `-` lines (with no trailing Context or Added) still
-    /// renders the left half syntax-colored.
-    #[test]
-    fn pair_hunk_lines_end_of_hunk_flush_preserves_tokens() {
-        use crate::git::{DiffHunk, DiffLine};
-        let hunk = DiffHunk {
-            header: "@@ -1,1 +1,0 @@".into(),
-            lines: vec![DiffLine {
-                tag: LineTag::Removed,
-                content: "gone".into(),
-                old_lineno: Some(1),
-                new_lineno: None,
-            }],
-        };
-        let tok = Arc::new(vec![(Style::default().fg(Color::Red), "gone".to_string())]);
-        let hunk_tokens = vec![tok.clone()];
-        let parts = pair_hunk_lines(&hunk, Some(&hunk_tokens));
-        assert_eq!(parts.len(), 1);
-        assert!(Arc::ptr_eq(parts[0].left_tokens.as_ref().unwrap(), &tok));
-        assert!(parts[0].right_tokens.is_none());
     }
 
     #[test]

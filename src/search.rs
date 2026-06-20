@@ -12,7 +12,8 @@
 
 use crate::app::{App, Panel, SelectedFile, Tab};
 use crate::input_edit;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::keymap::{Command, InputScope, Keymap};
+use crossterm::event::KeyEvent;
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -212,21 +213,15 @@ pub fn exit_cancel(app: &mut App) {
 /// handled (always true when active — we fully own input while the prompt
 /// is up).
 pub fn handle_key_in_search_mode(key: KeyEvent, app: &mut App) {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-
     // Phase 1: prompt-specific shortcuts. Must precede `dispatch_key`,
     // which would otherwise treat Enter as Unhandled (no-op) and
     // Ctrl+C would fall through too.
-    match key.code {
-        KeyCode::Esc => {
+    match Keymap::resolve(InputScope::VimSearch, &key) {
+        Some(Command::Close) | Some(Command::Quit) => {
             exit_cancel(app);
             return;
         }
-        KeyCode::Char('c') if ctrl => {
-            exit_cancel(app);
-            return;
-        }
-        KeyCode::Enter => {
+        Some(Command::Confirm) => {
             exit_confirm(app);
             return;
         }
@@ -397,8 +392,8 @@ fn collect_rows(app: &App, target: SearchTarget) -> Vec<std::borrow::Cow<'_, str
 /// Project a slice of `DiffRowText` into the `Cow<&str>` shape `collect_rows`
 /// returns. Each row borrows directly from the underlying `Arc<str>` —
 /// zero per-row allocation, mirroring the find_widget SBS path.
-fn row_texts_to_cows(rows: &[crate::ui::selection::DiffRowText]) -> Vec<std::borrow::Cow<'_, str>> {
-    use crate::ui::selection::DiffRowText;
+fn row_texts_to_cows(rows: &[reef_core::diff::DiffRowText]) -> Vec<std::borrow::Cow<'_, str>> {
+    use reef_core::diff::DiffRowText;
     use std::borrow::Cow;
     rows.iter()
         .map(|r| match r {
@@ -409,26 +404,6 @@ fn row_texts_to_cows(rows: &[crate::ui::selection::DiffRowText]) -> Vec<std::bor
             DiffRowText::Sbs { .. } => Cow::Borrowed(""),
         })
         .collect()
-}
-
-/// Flatten a diff into searchable rows that line up with the Unified diff
-/// panel's `all_lines` layout (separator between hunks → header → body).
-/// Returns `Vec<Arc<str>>` (refcount bumps, no heap copies) since the
-/// underlying `DiffLine.content` / `DiffHunk.header` are already `Arc<str>`
-/// — the matcher only reads `&str` via deref coercion.
-pub fn unified_display_rows(diff: &crate::git::DiffContent) -> Vec<std::sync::Arc<str>> {
-    let empty = crate::ui::text::empty_arc_str();
-    let mut rows: Vec<std::sync::Arc<str>> = Vec::new();
-    for (i, hunk) in diff.hunks.iter().enumerate() {
-        if i > 0 {
-            rows.push(std::sync::Arc::clone(&empty)); // Separator row — never matches.
-        }
-        rows.push(std::sync::Arc::clone(&hunk.header));
-        for line in &hunk.lines {
-            rows.push(std::sync::Arc::clone(&line.content));
-        }
-    }
-    rows
 }
 
 // ─── Matching ─────────────────────────────────────────────────────────────────

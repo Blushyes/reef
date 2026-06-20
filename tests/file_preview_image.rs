@@ -10,8 +10,8 @@
 
 use ratatui_image::picker::Picker;
 use reef::app::App;
-use reef::file_tree::PreviewBody;
 use reef::ui::theme::Theme;
+use reef_core::preview::PreviewBody;
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};

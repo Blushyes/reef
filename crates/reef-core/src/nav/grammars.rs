@@ -2,7 +2,7 @@
 //!
 //! Adding a language: (1) add its `tree-sitter-<lang>` crate to
 //! Cargo.toml, (2) add the `NavLang` variant and its extension list
-//! here, (3) add an intra-file query module under `crate::nav::intrafile`.
+//! here, (3) add an intra-file query module under `reef_core::nav::intrafile`.
 
 use std::path::Path;
 

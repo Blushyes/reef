@@ -3,8 +3,9 @@
 
 use reef::fs_watcher;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use test_support::{commit_file, tempdir_repo, write_file};
 
@@ -15,11 +16,27 @@ fn canonical(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// Give the notify kernel watch a moment to register before the test touches
-/// files. 200ms is empirically enough on Linux inotify and macOS FSEvents
-/// without making the suite noticeably slower.
-fn kernel_warmup() {
-    thread::sleep(Duration::from_millis(200));
+/// Wait until the notify backend has actually delivered at least one event.
+/// macOS FSEvents can take longer than a fixed warmup to register a recursive
+/// watch, especially under CI-like load; repeatedly touching a harmless marker
+/// turns that registration race into a real readiness handshake.
+fn wait_until_ready(workdir: &Path, rx: &mpsc::Receiver<()>) {
+    let marker = workdir.join(".reef-watch-ready");
+    let start = Instant::now();
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        std::fs::write(&marker, attempt.to_string()).unwrap();
+        match rx.recv_timeout(Duration::from_millis(700)) {
+            Ok(()) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) if start.elapsed() < Duration::from_secs(5) => {
+                continue;
+            }
+            Err(e) => panic!("watcher did not become ready: {e:?}"),
+        }
+    }
+    thread::sleep(Duration::from_millis(500));
+    while rx.try_recv().is_ok() {}
 }
 
 #[test]
@@ -30,7 +47,7 @@ fn workdir_write_triggers_event() {
     let workdir = canonical(tmp.path());
     let rx = fs_watcher::spawn(workdir);
 
-    kernel_warmup();
+    wait_until_ready(tmp.path(), &rx);
     write_file(&raw, "new.txt", "fresh content");
 
     let got = rx.recv_timeout(Duration::from_secs(3));
@@ -49,7 +66,7 @@ fn gitignored_write_does_not_trigger() {
     let workdir = canonical(tmp.path());
     let rx = fs_watcher::spawn(workdir);
 
-    kernel_warmup();
+    wait_until_ready(tmp.path(), &rx);
     std::fs::create_dir_all(tmp.path().join("target")).unwrap();
     std::fs::write(tmp.path().join("target/build.tmp"), "junk").unwrap();
 
@@ -70,7 +87,7 @@ fn dotgit_internal_write_does_not_trigger() {
     let workdir = canonical(tmp.path());
     let rx = fs_watcher::spawn(workdir);
 
-    kernel_warmup();
+    wait_until_ready(tmp.path(), &rx);
     // Simulate a git-internal write. .git/ must be skipped outright so that
     // repeated index churn during git operations never wakes the host.
     std::fs::write(tmp.path().join(".git/custom-marker"), "x").unwrap();
@@ -89,7 +106,7 @@ fn non_git_dir_still_triggers() {
     let workdir = canonical(tmp.path());
     let rx = fs_watcher::spawn(workdir);
 
-    kernel_warmup();
+    wait_until_ready(tmp.path(), &rx);
     std::fs::write(tmp.path().join("hello.txt"), "hi").unwrap();
 
     let got = rx.recv_timeout(Duration::from_secs(3));
@@ -107,7 +124,7 @@ fn debounce_coalesces_bursts() {
     let workdir = canonical(tmp.path());
     let rx = fs_watcher::spawn(workdir);
 
-    kernel_warmup();
+    wait_until_ready(tmp.path(), &rx);
     // Fire five writes back-to-back, well inside the 300ms debounce window.
     for i in 0..5 {
         std::fs::write(tmp.path().join(format!("f{i}.txt")), "x").unwrap();

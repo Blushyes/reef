@@ -1,7 +1,8 @@
 //! End-to-end tests for `GitRepo` exercising real `git2::Repository` instances
 //! in `TempDir` workdirs. Exercises the entire public API surface.
 
-use reef::git::{FileStatus, GitRepo, LineTag, RefLabel};
+use reef_core::diff::LineTag;
+use reef_core::git::{FileStatus, GitRepo, RefLabel};
 use std::fs;
 use test_support::{CwdGuard, commit_file, tempdir_repo, write_file};
 
@@ -131,7 +132,7 @@ fn get_diff_unstaged_shows_additions() {
 
     let (_g, repo) = open_in(tmp.path());
     let diff = repo.get_diff("a.txt", false, 3).expect("diff available");
-    assert_eq!(diff.file_path, "a.txt");
+    assert_eq!(diff.path, "a.txt");
     let added: Vec<&str> = diff
         .hunks
         .iter()
@@ -184,7 +185,7 @@ fn list_commits_returns_topological_order() {
     commit_file(&raw, "a.txt", "v3", "third");
 
     let (_g, repo) = open_in(tmp.path());
-    let commits = repo.list_commits(&reef::git::GraphScope::AllRefs, 10);
+    let commits = repo.list_commits(&reef_core::git::GraphScope::AllRefs, 10);
     assert_eq!(commits.len(), 3);
     assert_eq!(commits[0].subject, "third");
     assert_eq!(commits[2].subject, "first");
@@ -219,14 +220,14 @@ fn list_commits_branch_scope_only_walks_named_ref() {
     let (_g, repo) = open_in(tmp.path());
     let default_ref = format!("refs/heads/{head_name}");
     let default_commits =
-        repo.list_commits(&reef::git::GraphScope::Branch(default_ref.clone()), 50);
+        repo.list_commits(&reef_core::git::GraphScope::Branch(default_ref.clone()), 50);
     let default_subjects: Vec<&str> = default_commits.iter().map(|c| c.subject.as_str()).collect();
     assert!(default_subjects.contains(&"A: shared root"));
     assert!(default_subjects.contains(&"B: on default"));
     assert!(!default_subjects.contains(&"C: on feature"));
 
     let feature_commits = repo.list_commits(
-        &reef::git::GraphScope::Branch("refs/heads/feature".into()),
+        &reef_core::git::GraphScope::Branch("refs/heads/feature".into()),
         50,
     );
     let feature_subjects: Vec<&str> = feature_commits.iter().map(|c| c.subject.as_str()).collect();
@@ -236,13 +237,13 @@ fn list_commits_branch_scope_only_walks_named_ref() {
 
     // Missing ref → empty Vec, no panic.
     let none = repo.list_commits(
-        &reef::git::GraphScope::Branch("refs/heads/does-not-exist".into()),
+        &reef_core::git::GraphScope::Branch("refs/heads/does-not-exist".into()),
         50,
     );
     assert!(none.is_empty());
 
     // AllRefs still surfaces both branches' tips.
-    let all = repo.list_commits(&reef::git::GraphScope::AllRefs, 50);
+    let all = repo.list_commits(&reef_core::git::GraphScope::AllRefs, 50);
     let all_subjects: Vec<&str> = all.iter().map(|c| c.subject.as_str()).collect();
     assert!(all_subjects.contains(&"B: on default"));
     assert!(all_subjects.contains(&"C: on feature"));
@@ -328,7 +329,7 @@ fn get_range_files_multi_commit_is_union() {
 
     let (_g, repo) = open_in(tmp.path());
     // list_commits is newest-first, so oldest = first commit, newest = third.
-    let commits = repo.list_commits(&reef::git::GraphScope::AllRefs, 10);
+    let commits = repo.list_commits(&reef_core::git::GraphScope::AllRefs, 10);
     let oldest = &commits[2].oid;
     let newest = &commits[0].oid;
     let files = repo.get_range_files(oldest, newest);
@@ -348,7 +349,7 @@ fn get_range_file_diff_collapses_multiple_edits() {
     let _c3 = commit_file(&raw, "a.txt", "v3\n", "third");
 
     let (_g, repo) = open_in(tmp.path());
-    let commits = repo.list_commits(&reef::git::GraphScope::AllRefs, 10);
+    let commits = repo.list_commits(&reef_core::git::GraphScope::AllRefs, 10);
     let oldest = &commits[2].oid;
     let newest = &commits[0].oid;
     let diff = repo

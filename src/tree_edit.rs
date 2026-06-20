@@ -18,6 +18,7 @@
 //! see the key first (expected), but once we're editing, tabs / clicks /
 //! normal keys all get swallowed.
 
+use reef_core::file_ops::FileNameError;
 use std::path::PathBuf;
 
 /// What the edit row is for. Drives the placeholder text, the commit
@@ -34,24 +35,6 @@ pub enum TreeEditMode {
     /// Renaming an existing entry. Renderer replaces the anchor row's
     /// name with the live buffer.
     Rename,
-}
-
-/// Why a commit was rejected, surfaced to the renderer as a red-bg
-/// banner directly under the editable row. Stays populated until the
-/// next keystroke clears it (users expect their typing to dismiss the
-/// error, matching VSCode's Explorer input behaviour).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TreeEditError {
-    /// Empty, all-whitespace, or only-dots (`.` / `..`) — can't make
-    /// a file system entry out of that.
-    InvalidName,
-    /// Contains a path separator (`/` on Unix, `\` on Windows) or a
-    /// NUL byte. These would either escape the intended parent
-    /// directory or be rejected by the OS at create time.
-    IllegalChars,
-    /// A sibling with this name already exists. Includes the name so
-    /// the error line can echo it back.
-    NameAlreadyExists(String),
 }
 
 #[derive(Debug, Default)]
@@ -91,7 +74,7 @@ pub struct TreeEditState {
 
     /// Most recent validation / commit rejection. Cleared on the next
     /// keystroke so typing auto-dismisses it.
-    pub error: Option<TreeEditError>,
+    pub error: Option<FileNameError>,
 }
 
 impl TreeEditState {
@@ -113,59 +96,6 @@ impl TreeEditState {
     pub fn clear(&mut self) {
         *self = Self::default();
     }
-}
-
-/// Trim + normalise a user-typed filename for display in the banner
-/// text and toast messages. Strips ASCII / Unicode control characters
-/// so embedded `\n` / `\t` can't break single-line rendering. Leaves
-/// the actual buffer (which users may still edit) untouched — this
-/// is only for display.
-pub fn sanitize_filename(s: &str) -> String {
-    s.trim()
-        .chars()
-        .map(|c| if c.is_control() { '?' } else { c })
-        .collect()
-}
-
-/// Validate a candidate basename BEFORE we send it to the worker.
-/// Returns `Ok(trimmed)` ready to join onto the parent dir, or the
-/// specific reason the name is rejected.
-///
-/// Collision check (name already exists) is NOT done here because it
-/// requires a syscall on the parent dir — the caller (`App::commit_tree_edit`)
-/// runs it against the live tree.
-pub fn validate_basename(raw: &str) -> Result<String, TreeEditError> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(TreeEditError::InvalidName);
-    }
-    // `.` / `..` are meaningful in a shell but can't be created as
-    // regular entries. Common slip when the user hits Enter before
-    // typing anything.
-    if trimmed == "." || trimmed == ".." {
-        return Err(TreeEditError::InvalidName);
-    }
-    // Reject path separators so users can't escape `parent_dir`. We
-    // check both `/` and `\` regardless of platform — on Unix `\` is
-    // a legal filename char, but allowing it would produce paths that
-    // look wrong on Windows copies and break git operations in subtle
-    // ways. Disallowing it matches VSCode's Explorer rename dialog.
-    if trimmed.contains('/') || trimmed.contains('\\') {
-        return Err(TreeEditError::IllegalChars);
-    }
-    // NUL is rejected by every filesystem we care about — return a
-    // clean error instead of letting the worker surface a cryptic
-    // `EILSEQ` / `ERROR_INVALID_NAME` string.
-    if trimmed.contains('\0') {
-        return Err(TreeEditError::IllegalChars);
-    }
-    // Control characters (0x01..0x1F, 0x7F) are technically legal on
-    // ext4 / APFS but produce unreadable listings. Follow VSCode and
-    // reject at the UI layer.
-    if trimmed.chars().any(|c| c.is_control()) {
-        return Err(TreeEditError::IllegalChars);
-    }
-    Ok(trimmed.to_string())
 }
 
 #[cfg(test)]
@@ -203,7 +133,7 @@ mod tests {
             buffer: "b.txt".into(),
             cursor: 5,
             anchor_idx: Some(3),
-            error: Some(TreeEditError::InvalidName),
+            error: Some(FileNameError::InvalidName),
         };
         s.clear();
         assert!(!s.active);
@@ -214,62 +144,5 @@ mod tests {
         assert_eq!(s.cursor, 0);
         assert!(s.anchor_idx.is_none());
         assert!(s.error.is_none());
-    }
-
-    #[test]
-    fn sanitize_strips_control_chars_and_trims() {
-        assert_eq!(sanitize_filename("  foo.rs  "), "foo.rs");
-        assert_eq!(sanitize_filename("a\tb\nc"), "a?b?c");
-        assert_eq!(sanitize_filename("中文.rs"), "中文.rs");
-    }
-
-    #[test]
-    fn validate_rejects_empty_and_dot_names() {
-        assert_eq!(validate_basename(""), Err(TreeEditError::InvalidName));
-        assert_eq!(validate_basename("   "), Err(TreeEditError::InvalidName));
-        assert_eq!(validate_basename("."), Err(TreeEditError::InvalidName));
-        assert_eq!(validate_basename(".."), Err(TreeEditError::InvalidName));
-    }
-
-    #[test]
-    fn validate_rejects_separators_and_nul() {
-        assert_eq!(
-            validate_basename("foo/bar"),
-            Err(TreeEditError::IllegalChars)
-        );
-        assert_eq!(
-            validate_basename("foo\\bar"),
-            Err(TreeEditError::IllegalChars)
-        );
-        assert_eq!(
-            validate_basename("foo\0bar"),
-            Err(TreeEditError::IllegalChars)
-        );
-    }
-
-    #[test]
-    fn validate_rejects_control_chars() {
-        assert_eq!(
-            validate_basename("foo\tbar"),
-            Err(TreeEditError::IllegalChars)
-        );
-        assert_eq!(
-            validate_basename("foo\nbar"),
-            Err(TreeEditError::IllegalChars)
-        );
-    }
-
-    #[test]
-    fn validate_accepts_reasonable_names() {
-        assert_eq!(validate_basename("foo.rs"), Ok("foo.rs".into()));
-        assert_eq!(validate_basename("  foo.rs  "), Ok("foo.rs".into()));
-        // Leading dot (dotfiles) is fine.
-        assert_eq!(validate_basename(".env"), Ok(".env".into()));
-        assert_eq!(validate_basename(".gitignore"), Ok(".gitignore".into()));
-        // Non-ASCII filenames are fine.
-        assert_eq!(validate_basename("中文.rs"), Ok("中文.rs".into()));
-        // Spaces in the middle are legal (they're legal on every
-        // filesystem we target; drag-drop already handles escaping).
-        assert_eq!(validate_basename("my notes.md"), Ok("my notes.md".into()));
     }
 }

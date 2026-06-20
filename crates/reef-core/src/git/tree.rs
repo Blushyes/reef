@@ -6,7 +6,7 @@
 //! in `ui/*_panel.rs` so the tree stays decoupled from output format.
 
 use super::FileEntry;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 pub enum Node {
     Dir {
@@ -26,6 +26,52 @@ pub fn build(files: &[FileEntry]) -> BTreeMap<String, Node> {
         insert(&mut root, file.clone(), &parts, 0, String::new());
     }
     root
+}
+
+pub fn sorted_entries(tree: &BTreeMap<String, Node>) -> Vec<(&str, &Node)> {
+    let mut entries: Vec<(&str, &Node)> = tree
+        .iter()
+        .map(|(name, node)| (name.as_str(), node))
+        .collect();
+    entries.sort_by(|a, b| {
+        let a_dir = matches!(a.1, Node::Dir { .. });
+        let b_dir = matches!(b.1, Node::Dir { .. });
+        match (a_dir, b_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
+        }
+    });
+    entries
+}
+
+pub fn visible_file_paths(
+    files: &[FileEntry],
+    is_staged: bool,
+    collapsed: &HashSet<String>,
+) -> Vec<String> {
+    let tree = build(files);
+    let mut paths = Vec::new();
+    collect_visible_file_paths(&tree, is_staged, collapsed, &mut paths);
+    paths
+}
+
+fn collect_visible_file_paths(
+    tree: &BTreeMap<String, Node>,
+    is_staged: bool,
+    collapsed: &HashSet<String>,
+    paths: &mut Vec<String>,
+) {
+    for (_, node) in sorted_entries(tree) {
+        match node {
+            Node::Dir { path, children } => {
+                if !collapsed.contains(&collapsed_key(is_staged, path)) {
+                    collect_visible_file_paths(children, is_staged, collapsed, paths);
+                }
+            }
+            Node::File(entry) => paths.push(entry.path.clone()),
+        }
+    }
 }
 
 fn insert(
@@ -142,5 +188,43 @@ mod tests {
     #[test]
     fn collapsed_key_empty_path() {
         assert_eq!(collapsed_key(true, ""), "s:");
+    }
+
+    #[test]
+    fn visible_file_paths_follow_tree_render_order() {
+        let files = vec![
+            entry("z.txt"),
+            entry("src/z.rs"),
+            entry("README.md"),
+            entry("src/a.rs"),
+            entry("assets/logo.png"),
+        ];
+
+        assert_eq!(
+            visible_file_paths(&files, false, &Default::default()),
+            vec![
+                "assets/logo.png",
+                "src/a.rs",
+                "src/z.rs",
+                "README.md",
+                "z.txt"
+            ]
+        );
+    }
+
+    #[test]
+    fn visible_file_paths_skip_collapsed_dirs() {
+        let files = vec![
+            entry("src/a.rs"),
+            entry("README.md"),
+            entry("src/z.rs"),
+            entry("z.txt"),
+        ];
+        let collapsed = HashSet::from([collapsed_key(false, "src")]);
+
+        assert_eq!(
+            visible_file_paths(&files, false, &collapsed),
+            vec!["README.md", "z.txt"]
+        );
     }
 }

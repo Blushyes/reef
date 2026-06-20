@@ -66,7 +66,7 @@ fn remote_staged_diff_matches_local() {
 
     assert_eq!(l.is_some(), r.is_some());
     let (l, r) = (l.unwrap(), r.unwrap());
-    assert_eq!(l.file_path, r.file_path);
+    assert_eq!(l.path, r.path);
     assert_eq!(l.hunks.len(), r.hunks.len());
     let lines_l: Vec<_> = l
         .hunks
@@ -92,7 +92,7 @@ fn remote_list_commits_matches_local() {
     let local = LocalBackend::open_at(tmp.path().to_path_buf());
     let remote = spawn_remote(tmp.path());
 
-    let scope = reef::git::GraphScope::AllRefs;
+    let scope = reef_core::git::GraphScope::AllRefs;
     let l = local.list_commits(&scope, 10).expect("local commits");
     let r = remote.list_commits(&scope, 10).expect("remote commits");
 

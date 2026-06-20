@@ -2330,6 +2330,7 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "ratatui-image",
+ "reef-core",
  "reef-proto",
  "reef-sqlite-preview",
  "regex",
@@ -2358,12 +2359,38 @@ name = "reef-agent"
 version = "0.1.0"
 dependencies = [
  "reef",
+ "reef-core",
  "reef-proto",
  "reef-sqlite-preview",
  "serde",
  "serde_json",
  "tempfile",
  "test-support",
+]
+
+[[package]]
+name = "reef-core"
+version = "0.40.0"
+dependencies = [
+ "git2",
+ "ignore",
+ "image",
+ "infer",
+ "pulldown-cmark",
+ "reef-sqlite-preview",
+ "rusqlite",
+ "serde_json",
+ "syntect",
+ "tempfile",
+ "tree-sitter",
+ "tree-sitter-go",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+ "tree-sitter-vue-updated",
+ "two-face",
+ "unicode-width",
+ "url",
 ]
 
 [[package]]

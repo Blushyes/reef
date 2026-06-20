@@ -6,12 +6,14 @@
 
 use crate::app::{CommitFileDiff, DiffHighlighted, HighlightedDiff};
 use crate::backend::Backend;
-use crate::file_tree::{PreviewContent, TreeEntry};
-use crate::git::graph::GraphRow;
-use crate::git::{CommitDetail, DiffContent, FileEntry, GraphScope, RefLabel};
+use crate::file_tree::TreeEntry;
 use crate::global_search::MatchHit;
-use crate::paste_conflict::Resolution;
 use crate::ui::highlight;
+use reef_core::diff::DiffContent;
+use reef_core::file_ops::Resolution;
+use reef_core::git::graph::GraphRow;
+use reef_core::git::{CommitDetail, FileEntry, GraphScope, RefLabel};
+use reef_core::preview::PreviewDocument as PreviewContent;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -210,7 +212,7 @@ pub enum WorkerResult {
     /// dropped via `nav_workspace_load`'s generation token.
     NavWorkspaceBuilt {
         generation: u64,
-        result: Result<crate::nav::WorkspaceIndex, String>,
+        result: Result<reef_core::nav::WorkspaceIndex, String>,
     },
     /// Phase 3 LSP refinement. `location` is `Some` when rust-analyzer
     /// returned a definition for the identifier; `None` when it
@@ -226,14 +228,14 @@ pub enum WorkerResult {
         /// must NOT repopulate the just-cleared cache (it would jump to
         /// a pre-edit line on the next `gd`).
         epoch: u64,
-        lang: crate::nav::NavLang,
+        lang: reef_core::nav::NavLang,
         identifier: String,
-        location: Option<crate::nav::LspLocation>,
+        location: Option<reef_core::nav::LspLocation>,
     },
     /// Phase 3 supervisor state change — drives the status-bar badge.
     LspStateChange {
-        lang: crate::nav::NavLang,
-        state: crate::nav::LspBadge,
+        lang: reef_core::nav::NavLang,
+        state: reef_core::nav::LspBadge,
     },
 }
 
@@ -520,10 +522,10 @@ enum LspTask {
         /// `WorkerResult::LspRefineDone` so the main thread can drop a
         /// response that raced a cache-clear. See that variant's doc.
         epoch: u64,
-        lang: crate::nav::NavLang,
+        lang: reef_core::nav::NavLang,
         identifier: String,
         workspace_root: PathBuf,
-        file_path: PathBuf,
+        path: PathBuf,
         source: Arc<[u8]>,
         line: u32,
         character: u32,
@@ -607,7 +609,7 @@ impl TaskCoordinator {
         let _ = thread::Builder::new()
             .name("reef-nav-index".into())
             .spawn(move || {
-                let index = crate::nav::build_workspace_index(root);
+                let index = reef_core::nav::build_workspace_index(root);
                 let _ = result_tx.send(WorkerResult::NavWorkspaceBuilt {
                     generation,
                     result: Ok(index),
@@ -623,10 +625,10 @@ impl TaskCoordinator {
         &self,
         generation: u64,
         epoch: u64,
-        lang: crate::nav::NavLang,
+        lang: reef_core::nav::NavLang,
         identifier: String,
         workspace_root: PathBuf,
-        file_path: PathBuf,
+        path: PathBuf,
         source: Arc<[u8]>,
         line: u32,
         character: u32,
@@ -637,7 +639,7 @@ impl TaskCoordinator {
             lang,
             identifier,
             workspace_root,
-            file_path,
+            path,
             source,
             line,
             character,
@@ -1712,7 +1714,7 @@ fn spawn_graph_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Gra
                             let commits = backend
                                 .list_commits(&scope, limit)
                                 .map_err(|e| e.to_string())?;
-                            let rows = crate::git::graph::build_graph(&commits);
+                            let rows = reef_core::git::graph::build_graph(&commits);
                             // Transient-walk-failure detector: a
                             // `Branch(X)` scope where `X` is still in
                             // ref_map but `list_commits` returned no
@@ -2433,8 +2435,9 @@ fn spawn_lsp_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<LspTa
             // picked up within ~30s with no extra plumbing).
             const SPAWN_BACKOFF: Duration = Duration::from_secs(30);
 
-            let mut clients: HashMap<crate::nav::NavLang, crate::nav::LspClient> = HashMap::new();
-            let mut failed_spawn: HashMap<crate::nav::NavLang, Instant> = HashMap::new();
+            let mut clients: HashMap<reef_core::nav::NavLang, reef_core::nav::LspClient> =
+                HashMap::new();
+            let mut failed_spawn: HashMap<reef_core::nav::NavLang, Instant> = HashMap::new();
 
             while let Ok(task) = rx.recv() {
                 let LspTask::RefineDefinition {
@@ -2443,7 +2446,7 @@ fn spawn_lsp_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<LspTa
                     lang,
                     identifier,
                     workspace_root,
-                    file_path,
+                    path,
                     source,
                     line,
                     character,
@@ -2460,7 +2463,7 @@ fn spawn_lsp_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<LspTa
                         if t.elapsed() < SPAWN_BACKOFF {
                             let _ = result_tx.send(WorkerResult::LspStateChange {
                                 lang,
-                                state: crate::nav::LspBadge::Off,
+                                state: reef_core::nav::LspBadge::Off,
                             });
                             continue;
                         }
@@ -2468,21 +2471,21 @@ fn spawn_lsp_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<LspTa
                     }
                     let _ = result_tx.send(WorkerResult::LspStateChange {
                         lang,
-                        state: crate::nav::LspBadge::Booting,
+                        state: reef_core::nav::LspBadge::Booting,
                     });
-                    match crate::nav::LspClient::spawn(lang, workspace_root.clone()) {
+                    match reef_core::nav::LspClient::spawn(lang, workspace_root.clone()) {
                         Ok(c) => {
                             slot.insert(c);
                             let _ = result_tx.send(WorkerResult::LspStateChange {
                                 lang,
-                                state: crate::nav::LspBadge::Ready,
+                                state: reef_core::nav::LspBadge::Ready,
                             });
                         }
                         Err(_) => {
                             failed_spawn.insert(lang, Instant::now());
                             let _ = result_tx.send(WorkerResult::LspStateChange {
                                 lang,
-                                state: crate::nav::LspBadge::Off,
+                                state: reef_core::nav::LspBadge::Off,
                             });
                             continue;
                         }
@@ -2491,22 +2494,21 @@ fn spawn_lsp_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<LspTa
                 let Some(client) = clients.get(&lang) else {
                     continue;
                 };
-                let location =
-                    match client.goto_definition(&file_path, &source, line, character, lang) {
-                        Ok(loc) => loc,
-                        Err(_) => {
-                            // Client crashed mid-request — drop it so
-                            // the next refine respawns (subject to
-                            // backoff).
-                            clients.remove(&lang);
-                            failed_spawn.insert(lang, Instant::now());
-                            let _ = result_tx.send(WorkerResult::LspStateChange {
-                                lang,
-                                state: crate::nav::LspBadge::Crashed,
-                            });
-                            None
-                        }
-                    };
+                let location = match client.goto_definition(&path, &source, line, character, lang) {
+                    Ok(loc) => loc,
+                    Err(_) => {
+                        // Client crashed mid-request — drop it so
+                        // the next refine respawns (subject to
+                        // backoff).
+                        clients.remove(&lang);
+                        failed_spawn.insert(lang, Instant::now());
+                        let _ = result_tx.send(WorkerResult::LspStateChange {
+                            lang,
+                            state: reef_core::nav::LspBadge::Crashed,
+                        });
+                        None
+                    }
+                };
                 let _ = result_tx.send(WorkerResult::LspRefineDone {
                     generation,
                     epoch,
@@ -3658,17 +3660,16 @@ mod preview_panic_guard_tests {
     #[test]
     fn run_preview_with_panic_guard_passes_through_some() {
         let preview = PreviewContent {
-            file_path: "x.txt".into(),
-            body: crate::file_tree::PreviewBody::Text {
+            path: "x.txt".into(),
+            body: reef_core::preview::PreviewBody::Text(reef_core::preview::TextPreview {
                 lines: vec!["hi".into()],
                 highlighted: None,
-                markdown: None,
                 parsed: None,
-            },
+            }),
         };
         let result = run_preview_with_panic_guard(Path::new("x.txt"), move || Some(preview));
         let got = result.expect("Ok").expect("Some");
-        assert_eq!(got.file_path, "x.txt");
+        assert_eq!(got.path, "x.txt");
     }
 }
 

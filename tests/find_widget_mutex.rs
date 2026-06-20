@@ -6,10 +6,10 @@
 //! the widget (caller responsibility — exercised manually for now).
 
 use reef::app::{App, Panel, Tab};
-use reef::file_tree::{PreviewBody, PreviewContent};
 use reef::find_widget;
 use reef::search::{MatchLoc, SearchState, SearchTarget};
 use reef::ui::theme::Theme;
+use reef_core::preview::{PreviewBody, PreviewDocument as PreviewContent, TextPreview};
 use std::sync::Mutex;
 use tempfile::TempDir;
 use test_support::CwdGuard;
@@ -23,13 +23,12 @@ fn fresh_app() -> (App, TempDir, CwdGuard) {
     app.active_tab = Tab::Files;
     app.active_panel = Panel::Diff;
     app.preview_content = Some(PreviewContent {
-        file_path: "scratch.txt".to_string(),
-        body: PreviewBody::Text {
+        path: "scratch.txt".to_string(),
+        body: PreviewBody::Text(TextPreview {
             lines: vec!["foo bar foo".to_string(), "bar foo".to_string()],
             highlighted: None,
-            markdown: None,
             parsed: None,
-        },
+        }),
     });
     (app, tmp, g)
 }

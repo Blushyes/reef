@@ -11,12 +11,12 @@
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use reef::app::{App, Panel, Tab};
-use reef::file_tree::{PreviewBody, PreviewContent};
 use reef::find_widget;
 use reef::ui;
 use reef::ui::mouse::ClickAction;
 use reef::ui::selection::PreviewSelection;
 use reef::ui::theme::Theme;
+use reef_core::preview::{PreviewBody, PreviewDocument as PreviewContent, TextPreview};
 use std::sync::Mutex;
 use tempfile::TempDir;
 use test_support::CwdGuard;
@@ -30,17 +30,16 @@ fn fresh_app() -> (App, TempDir, CwdGuard) {
     app.active_tab = Tab::Files;
     app.active_panel = Panel::Diff;
     app.preview_content = Some(PreviewContent {
-        file_path: "scratch.txt".to_string(),
-        body: PreviewBody::Text {
+        path: "scratch.txt".to_string(),
+        body: PreviewBody::Text(TextPreview {
             lines: vec![
                 "foo bar baz".to_string(),
                 "    bar();".to_string(),
                 "    bar();".to_string(),
             ],
             highlighted: None,
-            markdown: None,
             parsed: None,
-        },
+        }),
     });
     (app, tmp, g)
 }
@@ -138,13 +137,12 @@ fn match_case_toggle_flips_and_rematches() {
     let (mut app, _tmp, _g) = fresh_app();
     // Use a query that proves case-sensitivity matters: "Bar" vs "bar".
     app.preview_content = Some(PreviewContent {
-        file_path: "scratch.txt".to_string(),
-        body: PreviewBody::Text {
+        path: "scratch.txt".to_string(),
+        body: PreviewBody::Text(TextPreview {
             lines: vec!["Bar bar BAR".to_string()],
             highlighted: None,
-            markdown: None,
             parsed: None,
-        },
+        }),
     });
     select(&mut app, 0, 0, 3); // "Bar"
     find_widget::begin_with_selection(&mut app);
@@ -167,13 +165,12 @@ fn whole_word_toggle_flips_and_filters_matches() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp, _g) = fresh_app();
     app.preview_content = Some(PreviewContent {
-        file_path: "scratch.txt".to_string(),
-        body: PreviewBody::Text {
+        path: "scratch.txt".to_string(),
+        body: PreviewBody::Text(TextPreview {
             lines: vec!["foo food foobar foo!".to_string()],
             highlighted: None,
-            markdown: None,
             parsed: None,
-        },
+        }),
     });
     select(&mut app, 0, 0, 3);
     find_widget::begin_with_selection(&mut app);
@@ -198,13 +195,12 @@ fn regex_toggle_reinterprets_query() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp, _g) = fresh_app();
     app.preview_content = Some(PreviewContent {
-        file_path: "scratch.txt".to_string(),
-        body: PreviewBody::Text {
+        path: "scratch.txt".to_string(),
+        body: PreviewBody::Text(TextPreview {
             lines: vec!["abc 12 d345 ef".to_string()],
             highlighted: None,
-            markdown: None,
             parsed: None,
-        },
+        }),
     });
     // Seed with the literal "\d+" — without regex it matches no chars.
     find_widget::begin_with_selection(&mut app);

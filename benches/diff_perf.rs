@@ -5,8 +5,8 @@
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use reef::app::HighlightedDiff;
-use reef::git::{DiffContent, DiffHunk, DiffLine, LineTag};
 use reef::search::{MatchLoc, SearchState, SearchTarget};
+use reef_core::diff::{DiffContent, DiffHunk, DiffLine, LineTag, unified_display_rows};
 use std::sync::Arc;
 
 /// Generates a diff with `hunks` hunks of `lines_per_hunk` lines each.
@@ -49,7 +49,7 @@ fn synth_diff(hunks: usize, lines_per_hunk: usize) -> DiffContent {
         })
         .collect();
     DiffContent {
-        file_path: "src/lib.rs".to_string(),
+        path: "src/lib.rs".to_string(),
         hunks: mk_hunks,
     }
 }
@@ -65,14 +65,14 @@ fn bench_diff_display_build(c: &mut Criterion) {
     });
 }
 
-/// `search::unified_display_rows` flattens a DiffContent into
+/// `reef_core::diff::unified_display_rows` flattens a DiffContent into
 /// `Vec<Arc<str>>` (post-Arc<str> migration — used to be `Vec<String>`)
 /// for the match-finding stage. Called per keystroke in find widget.
 fn bench_unified_display_rows(c: &mut Criterion) {
     let diff = synth_diff(20, 50);
     c.bench_function("unified_display_rows/1k_lines", |b| {
         b.iter(|| {
-            let rows = reef::search::unified_display_rows(black_box(&diff));
+            let rows = unified_display_rows(black_box(&diff));
             black_box(rows);
         });
     });
@@ -113,7 +113,7 @@ fn bench_find_widget_keystroke(c: &mut Criterion) {
     let diff = synth_diff(20, 50);
     c.bench_function("find_keystroke/unified_1k_lines_smallcase", |b| {
         b.iter(|| {
-            let rows = reef::search::unified_display_rows(black_box(&diff));
+            let rows = unified_display_rows(black_box(&diff));
             let mut total = 0usize;
             for r in &rows {
                 // `&Arc<str>` derefs to `&str`.

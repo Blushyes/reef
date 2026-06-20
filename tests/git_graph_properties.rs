@@ -2,8 +2,8 @@
 //! ordered commit sequences and verifies structural guarantees on every row.
 
 use proptest::prelude::*;
-use reef::git::CommitInfo;
-use reef::git::graph::{LaneCell, build_graph};
+use reef_core::git::CommitInfo;
+use reef_core::git::graph::{LaneCell, build_graph};
 
 /// Generate a topologically-ordered commit sequence: each commit's parents
 /// reference only commits later in the vec (child-before-parent order). Up to

@@ -22,7 +22,8 @@ pub fn spawn(workdir: PathBuf) -> mpsc::Receiver<()> {
 fn run(workdir: PathBuf, out_tx: mpsc::Sender<()>) {
     // macOS tempdirs and symlinked workdirs: notify delivers canonical paths,
     // so prefix checks would fail without canonicalizing up front.
-    let workdir = std::fs::canonicalize(&workdir).unwrap_or(workdir);
+    let original_workdir = workdir;
+    let workdir = std::fs::canonicalize(&original_workdir).unwrap_or(original_workdir.clone());
     let gitdir = workdir.join(".git");
 
     let repo_gi = build_repo_gitignore(&workdir);
@@ -39,9 +40,15 @@ fn run(workdir: PathBuf, out_tx: mpsc::Sender<()>) {
             }
         };
 
-    if let Err(e) = watcher.watch(&workdir, RecursiveMode::Recursive) {
-        eprintln!("[reef] fs watcher watch({:?}) failed: {e}", workdir);
-        return;
+    let mut watch_roots = vec![original_workdir];
+    if watch_roots[0] != workdir {
+        watch_roots.push(workdir.clone());
+    }
+    for root in &watch_roots {
+        if let Err(e) = watcher.watch(root, RecursiveMode::Recursive) {
+            eprintln!("[reef] fs watcher watch({:?}) failed: {e}", root);
+            return;
+        }
     }
 
     let mut pending = false;
@@ -80,6 +87,7 @@ fn build_repo_gitignore(workdir: &Path) -> Gitignore {
 
 fn is_relevant(ev: &Event, gitdir: &Path, workdir: &Path, repo_gi: &Gitignore) -> bool {
     for path in &ev.paths {
+        let path = normalize_event_path(path);
         if path.starts_with(gitdir) {
             continue;
         }
@@ -91,7 +99,7 @@ fn is_relevant(ev: &Event, gitdir: &Path, workdir: &Path, repo_gi: &Gitignore) -
         }
         let is_dir = path.is_dir();
         if repo_gi
-            .matched_path_or_any_parents(path, is_dir)
+            .matched_path_or_any_parents(&path, is_dir)
             .is_ignore()
         {
             continue;
@@ -99,4 +107,20 @@ fn is_relevant(ev: &Event, gitdir: &Path, workdir: &Path, repo_gi: &Gitignore) -
         return true;
     }
     false
+}
+
+fn normalize_event_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    let Some(parent) = path.parent() else {
+        return path.to_path_buf();
+    };
+    let Ok(parent) = std::fs::canonicalize(parent) else {
+        return path.to_path_buf();
+    };
+    match path.file_name() {
+        Some(name) => parent.join(name),
+        None => parent,
+    }
 }

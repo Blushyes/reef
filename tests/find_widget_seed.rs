@@ -5,11 +5,11 @@
 //! user can refine the query or just navigate with `Space+G`.
 
 use reef::app::{App, Panel, Tab};
-use reef::file_tree::{PreviewBody, PreviewContent};
 use reef::find_widget;
 use reef::find_widget::FindTarget;
 use reef::ui::selection::PreviewSelection;
 use reef::ui::theme::Theme;
+use reef_core::preview::{PreviewBody, PreviewDocument as PreviewContent, TextPreview};
 use std::sync::Mutex;
 use tempfile::TempDir;
 use test_support::CwdGuard;
@@ -28,13 +28,12 @@ fn fresh_app() -> (App, TempDir, CwdGuard) {
 
 fn install_text_preview(app: &mut App, lines: &[&str]) {
     app.preview_content = Some(PreviewContent {
-        file_path: "scratch.txt".to_string(),
-        body: PreviewBody::Text {
+        path: "scratch.txt".to_string(),
+        body: PreviewBody::Text(TextPreview {
             lines: lines.iter().map(|s| s.to_string()).collect(),
             highlighted: None,
-            markdown: None,
             parsed: None,
-        },
+        }),
     });
 }
 

@@ -8,11 +8,12 @@
 //! `selection.active` refresh that makes the selection appear to "follow"
 //! the autoscroll.
 
-use reef::app::{App, DiffLayout, Tab};
-use reef::file_tree::{PreviewBody, PreviewContent};
+use reef::app::{App, Tab};
 use reef::input::tick_drag_autoscroll;
-use reef::ui::selection::{DiffHit, DiffRowText, DiffSelection, DiffSide, PreviewSelection};
+use reef::ui::selection::{DiffHit, DiffSelection, PreviewSelection};
 use reef::ui::theme::Theme;
+use reef_core::diff::{DiffLayout, DiffRowText, DiffSide};
+use reef_core::preview::{PreviewBody, PreviewDocument as PreviewContent, TextPreview};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -32,13 +33,12 @@ fn fresh_app() -> (App, TempDir) {
 
 fn text_preview(line_count: usize) -> PreviewContent {
     PreviewContent {
-        file_path: "test.txt".into(),
-        body: PreviewBody::Text {
+        path: "test.txt".into(),
+        body: PreviewBody::Text(TextPreview {
             lines: (0..line_count).map(|i| format!("line {}", i)).collect(),
             highlighted: None,
-            markdown: None,
             parsed: None,
-        },
+        }),
     }
 }
 
@@ -200,11 +200,11 @@ fn preview_non_text_body_aborts() {
     // Construct a Binary body (an image picker isn't available in this
     // test env, so use Binary which doesn't need image decoding).
     app.preview_content = Some(PreviewContent {
-        file_path: "blob.bin".into(),
-        body: PreviewBody::Binary(reef::file_tree::BinaryInfo {
+        path: "blob.bin".into(),
+        body: PreviewBody::Binary(reef_core::preview::BinaryInfo {
             bytes_on_disk: 42,
             mime: None,
-            reason: reef::file_tree::BinaryReason::NullBytes,
+            reason: reef_core::preview::BinaryReason::NullBytes,
             meta_line: "x".into(),
         }),
     });

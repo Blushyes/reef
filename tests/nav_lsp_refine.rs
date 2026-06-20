@@ -4,16 +4,31 @@
 //! `LspLocation` for a `(lang, identifier)` makes the next `gd` on the
 //! same identifier prefer the LSP answer over the tree-sitter result.
 
+use reef::app::nav::{
+    CursorPosition, LocationSnapshot, LocationSurface, NavAnchor, NavPendingJump, ScrollPosition,
+};
 use reef::app::{App, Panel, Tab};
-use reef::file_tree::{PreviewBody, PreviewContent};
-use reef::nav::{LspBadge, LspLocation, NavAnchor, NavLang, parse_file_if_supported};
 use reef::ui::selection::PreviewSelection;
 use reef::ui::theme::Theme;
+use reef_core::nav::{LspBadge, LspLocation, NavLang, parse_file_if_supported};
+use reef_core::preview::{PreviewBody, PreviewDocument as PreviewContent, TextPreview};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use test_support::CwdGuard;
 
 static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+fn file_preview_snapshot(path: &str, line: usize, byte_col: usize) -> LocationSnapshot {
+    LocationSnapshot {
+        surface: LocationSurface::FilePreview,
+        path: std::path::PathBuf::from(path),
+        cursor: CursorPosition { line, byte_col },
+        scroll: ScrollPosition {
+            vertical: 0,
+            horizontal: 0,
+        },
+    }
+}
 
 fn fresh_app() -> (App, TempDir, CwdGuard) {
     let tmp = TempDir::new().unwrap();
@@ -25,17 +40,16 @@ fn fresh_app() -> (App, TempDir, CwdGuard) {
     (app, tmp, g)
 }
 
-fn install_rust_preview(app: &mut App, file_path: &str, src: &str) {
+fn install_rust_preview(app: &mut App, path: &str, src: &str) {
     let bytes: Arc<[u8]> = Arc::from(src.as_bytes().to_vec().into_boxed_slice());
     let parsed = parse_file_if_supported(NavLang::Rust, bytes).map(Arc::new);
     app.preview_content = Some(PreviewContent {
-        file_path: file_path.to_string(),
-        body: PreviewBody::Text {
+        path: path.to_string(),
+        body: PreviewBody::Text(TextPreview {
             lines: src.lines().map(|s| s.to_string()).collect(),
             highlighted: None,
-            markdown: None,
             parsed,
-        },
+        }),
     });
 }
 
@@ -84,7 +98,7 @@ fn main() { let _ = helper(); }
     // (the fixture has 3 lines) so a cache HIT is unmistakable. The
     // cached path is workdir-relative (the production handler converts
     // before storing).
-    let key = reef::nav::refine_key(std::path::Path::new("scratch.rs"), cursor);
+    let key = reef_core::nav::refine_key(std::path::Path::new("scratch.rs"), cursor);
     app.nav_refine_cache.insert(
         (NavLang::Rust, key),
         LspLocation {
@@ -131,7 +145,7 @@ fn refine_cache_empty_falls_back_to_tree_sitter() {
 /// profile fails here.
 #[test]
 fn lang_profiles_cover_every_supported_lsp() {
-    use reef::nav::NavLang;
+    use reef_core::nav::NavLang;
     // Every language we ship today has a tree-sitter grammar AND an
     // LSP profile. Phase 4 may add languages with grammar but no LSP
     // (then this assertion is loosened to per-lang opt-in).
@@ -168,8 +182,8 @@ fn lang_profiles_cover_every_supported_lsp() {
 /// no install UI.
 #[test]
 fn settings_has_one_lsp_row_per_language() {
-    use reef::nav::NavLang;
     use reef::settings::SettingItem;
+    use reef_core::nav::NavLang;
     use std::collections::HashSet;
     let rows: Vec<NavLang> = SettingItem::ALL
         .iter()
@@ -218,13 +232,12 @@ fn vue_goto_registers_pending_jump_and_uses_cache_on_repeat() {
         "tree-sitter-vue parses SFCs even though queries are empty"
     );
     app.preview_content = Some(PreviewContent {
-        file_path: "App.vue".to_string(),
-        body: PreviewBody::Text {
+        path: "App.vue".to_string(),
+        body: PreviewBody::Text(TextPreview {
             lines: src.lines().map(|s| s.to_string()).collect(),
             highlighted: None,
-            markdown: None,
             parsed,
-        },
+        }),
     });
     // Cursor anywhere in `<script>` — the raw_text region.
     let mut sel = PreviewSelection::new((4, 6));
@@ -254,7 +267,7 @@ fn vue_goto_registers_pending_jump_and_uses_cache_on_repeat() {
     app.nav_pending_lsp_jump = None;
     app.nav_refine_cache.insert(
         (NavLang::Vue, cache_key_first.clone()),
-        reef::nav::LspLocation {
+        reef_core::nav::LspLocation {
             path: std::path::PathBuf::from("App.vue"),
             line: 4,
             character: 6,
@@ -284,15 +297,10 @@ fn lsp_state_crashed_drops_pending_jump() {
     let _g = CwdGuard::enter(tmp.path());
     let mut app = App::new(Theme::dark(), None);
 
-    app.nav_pending_lsp_jump = Some(reef::nav::NavPendingJump {
+    app.nav_pending_lsp_jump = Some(NavPendingJump {
         lang: NavLang::Vue,
         cache_key: "App.vue:1:1".to_string(),
-        origin: reef::nav::NavStackEntry {
-            path: std::path::PathBuf::from("App.vue"),
-            line: 1,
-            byte_col: 1,
-            scroll_row: 0,
-        },
+        origin: file_preview_snapshot("App.vue", 1, 1),
         generation: 42,
     });
 
@@ -314,15 +322,10 @@ fn lsp_state_change_for_other_lang_keeps_pending() {
     let _g = CwdGuard::enter(tmp.path());
     let mut app = App::new(Theme::dark(), None);
 
-    app.nav_pending_lsp_jump = Some(reef::nav::NavPendingJump {
+    app.nav_pending_lsp_jump = Some(NavPendingJump {
         lang: NavLang::Vue,
         cache_key: "App.vue:1:1".to_string(),
-        origin: reef::nav::NavStackEntry {
-            path: std::path::PathBuf::from("App.vue"),
-            line: 1,
-            byte_col: 1,
-            scroll_row: 0,
-        },
+        origin: file_preview_snapshot("App.vue", 1, 1),
         generation: 42,
     });
 

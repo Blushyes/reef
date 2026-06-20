@@ -80,7 +80,7 @@ fn range_file_diff_parity() {
 
     let l = l.expect("local diff present");
     let r = r.expect("remote diff present");
-    assert_eq!(l.file_path, r.file_path);
+    assert_eq!(l.path, r.path);
     assert_eq!(l.hunks.len(), r.hunks.len(), "hunk count mismatch");
     for (lh, rh) in l.hunks.iter().zip(r.hunks.iter()) {
         assert_eq!(lh.header, rh.header);

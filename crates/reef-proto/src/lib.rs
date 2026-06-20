@@ -655,7 +655,7 @@ pub enum FileStatusDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiffContentDto {
-    pub file_path: String,
+    pub path: String,
     pub hunks: Vec<DiffHunkDto>,
 }
 

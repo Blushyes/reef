@@ -6,7 +6,7 @@
 //! overlay: pinning the overlay via Alt/Ctrl+Enter is a state-preserving
 //! hand-off to this panel.
 //!
-//! Right panel (`file_preview_panel`) handles the preview; see `ui::mod::render`.
+//! Right panel (`ui::preview`) handles the preview; see `ui::mod::render`.
 
 use crate::app::App;
 use crate::ui::global_search_panel;

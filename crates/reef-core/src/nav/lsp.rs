@@ -180,13 +180,13 @@ impl LspClient {
     /// content.
     pub fn goto_definition(
         &self,
-        file_path: &std::path::Path,
+        path: &std::path::Path,
         source: &[u8],
         line: u32,
         character: u32,
         lang: NavLang,
     ) -> Result<Option<LspLocation>, String> {
-        let uri = file_uri(file_path);
+        let uri = file_uri(path);
         let lang_id = lsp_language_id(lang);
         let text = String::from_utf8_lossy(source).into_owned();
         // Strictly-increasing version per URI — see `doc_versions`.
@@ -456,7 +456,7 @@ fn parse_definition_response(resp: &Value) -> Option<LspLocation> {
 /// status-bar badge can pre-render `RA?` when the binary is
 /// installable). Phase 4 will layer a `~/.cache/reef/lsp/` lookup on
 /// top of this same path.
-pub(crate) fn locate_binary(name: &str) -> Option<PathBuf> {
+pub fn locate_binary(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(name);

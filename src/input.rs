@@ -11,12 +11,13 @@ use crate::clipboard;
 use crate::find_widget;
 use crate::global_search;
 use crate::i18n::{Msg, t};
+use crate::keymap::{Command, InputScope, Keymap, scope_for_app};
 use crate::quick_open;
 use crate::search;
 use crate::settings;
 use crate::ui;
 use crate::ui::selection::{
-    DiffSelection, DiffSide, PreviewSelection, col_to_byte_offset, collect_diff_selected_text,
+    DiffSelection, PreviewSelection, col_to_byte_offset, collect_diff_selected_text,
     collect_selected_text_from_rows, word_at_byte,
 };
 use crate::ui::toast::Toast;
@@ -24,6 +25,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
+use reef_core::diff::{DiffLayout, DiffSide};
 use std::time::{Duration, Instant};
 
 pub const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
@@ -128,19 +130,21 @@ pub fn leader_decision(
 // ─── Keyboard ────────────────────────────────────────────────────────────────
 
 pub fn handle_key(key: KeyEvent, app: &mut App) {
+    let scope = scope_for_app(app);
+
     // SQLite goto-page input — fully owns input while active. Sits at
     // the top of the gate stack because it's an inline prompt that
     // can be invoked from inside the Files tab without crossing any
     // other modal; the user expects "every keystroke goes into the
     // page-number buffer" while it's up.
-    if app.db_goto_input.is_some() {
+    if scope == InputScope::DbGoto {
         handle_key_db_goto(key, app);
         return;
     }
 
     // Hosts picker (Ctrl+O) — fully owns input while active, same contract
     // as the other overlays.
-    if app.hosts_picker.core.active {
+    if scope == InputScope::HostsPicker {
         handle_key_hosts_picker(key, app);
         return;
     }
@@ -148,7 +152,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // Graph branch picker (`b` on Graph tab) — same exclusive ownership
     // as the other overlays. Sits next to `hosts_picker` because it's a
     // peer overlay (filter input + commit-on-Enter + Esc-cancel).
-    if app.graph_branch_picker.core.active {
+    if scope == InputScope::GraphBranchPicker {
         handle_key_graph_branch_picker(key, app);
         return;
     }
@@ -157,27 +161,27 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // above the global-search palette because the widget is opened by
     // a Space leader chord (`Space+F`) and is the most-recently-opened
     // overlay; routing should land here before any persistent palette.
-    if app.find_widget.active {
+    if scope == InputScope::FindWidget {
         find_widget::handle_key(key, app);
         return;
     }
 
     // Global-search palette — fully owns input while active.
-    if app.global_search.core.active {
+    if scope == InputScope::GlobalSearch {
         global_search::handle_key(key, app);
         return;
     }
 
     // Quick-open palette has the next-highest priority — while active it
     // fully owns input (character append, cursor, Enter/Esc, Space-P close).
-    if app.quick_open.core.active {
+    if scope == InputScope::QuickOpen {
         quick_open::handle_key(key, app);
         return;
     }
 
     // Search mode has priority over everything else — the prompt fully owns
     // input (character append, Backspace, Enter/Esc) while active.
-    if app.search.active {
+    if scope == InputScope::VimSearch {
         search::handle_key_in_search_mode(key, app);
         return;
     }
@@ -187,7 +191,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // editable buffer. Priority-wise this sits above place-mode and
     // the context menu so a stray right-click or drop can't yank the
     // cursor out from under a half-typed filename.
-    if app.tree_edit.active {
+    if scope == InputScope::TreeEdit {
         handle_key_tree_edit(key, app);
         return;
     }
@@ -196,7 +200,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // arrow keys navigate, Enter fires, Esc closes. Any other key
     // closes the menu (VSCode behaviour — keeps the user from
     // accidentally leaving a menu lingering).
-    if app.tree_context_menu.active {
+    if scope == InputScope::TreeContextMenu {
         handle_key_tree_context_menu(key, app);
         return;
     }
@@ -204,7 +208,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // Multi-candidate goto-definition popup. Same exclusive-ownership
     // contract as the context menu — Up/Down/k/j move, Enter picks,
     // Esc/q/any-other-key dismiss without picking.
-    if app.nav_candidates.is_some() {
+    if scope == InputScope::NavCandidates {
         handle_key_nav_candidates(key, app);
         return;
     }
@@ -213,7 +217,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // paste-conflict / context-menu pattern: explicit early-return
     // before any global hotkeys so e.g. `q` can't fall through to
     // "quit" while a "discard changes?" confirm is on screen.
-    if app.confirm_modal.is_some() {
+    if scope == InputScope::ConfirmModal {
         handle_key_confirm_modal(key, app);
         return;
     }
@@ -223,7 +227,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // landing while place-mode is somehow also armed (defensive — the
     // dispatcher gates them mutually exclusive) doesn't lose the
     // conflict prompt.
-    if app.paste_conflict.is_some() {
+    if scope == InputScope::PasteConflict {
         handle_key_paste_conflict(key, app);
         return;
     }
@@ -234,15 +238,10 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // terminal-standard quit keys (bare `q` and Ctrl+C) still fire so a
     // user who feels stuck can always bail out of the whole app without
     // Esc'ing first.
-    if app.place_mode.active {
-        match key.code {
-            KeyCode::Esc => app.exit_place_mode(),
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.should_quit = true;
-            }
-            KeyCode::Char('q') if key.modifiers.is_empty() => {
-                app.should_quit = true;
-            }
+    if scope == InputScope::PlaceMode {
+        match Keymap::resolve(InputScope::PlaceMode, &key) {
+            Some(Command::Close) => app.exit_place_mode(),
+            Some(Command::Quit) => app.should_quit = true,
             _ => {}
         }
         return;
@@ -251,12 +250,10 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // Intra-tree drag in progress: Esc cancels, Ctrl+C / `q` still
     // quit. Other keys are ignored — the actual move/copy commit
     // happens on `Up(Left)`, not on a keystroke.
-    if app.tree_drag.active {
-        match key.code {
-            KeyCode::Esc => app.cancel_tree_drag(),
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.should_quit = true;
-            }
+    if scope == InputScope::TreeDrag {
+        match Keymap::resolve(InputScope::TreeDrag, &key) {
+            Some(Command::Close) => app.cancel_tree_drag(),
+            Some(Command::Quit) => app.should_quit = true,
             _ => {
                 // Live modifier tracking — user might press / release
                 // Alt mid-drag to flip move↔copy before releasing the
@@ -272,7 +269,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // above so a half-typed filename / commit message isn't yanked
     // away, and above the global keymap below so Ctrl+, can flip to
     // Esc-returns semantics inside.
-    if app.view_mode == ViewMode::Settings {
+    if scope == InputScope::Settings {
         handle_key_settings(key, app);
         return;
     }
@@ -282,7 +279,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // Esc / q exit, Ctrl+C still quits, and a handful of nav keys fall
     // through to the normal dispatcher so scroll/search continue to
     // work on the visible diff/preview.
-    if app.view_mode == ViewMode::FocusedPreview {
+    if scope == InputScope::FocusedPreview {
         if handle_key_focused_preview(key, app) {
             return;
         }
@@ -325,6 +322,14 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     } else {
         !search_list_replace_mode
     };
+
+    if in_input_mode
+        && let Some(command) = Keymap::resolve(scope, &key)
+        && dispatch_input_scope_command(command, app)
+    {
+        return;
+    }
+
     match leader_decision(
         &key,
         leader_allow_arm,
@@ -342,16 +347,16 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             // the other. `begin()` then activates the chosen one.
             app.quick_open.core.active = false;
             app.global_search.core.active = false;
-            match key.code {
-                KeyCode::Char('p') | KeyCode::Char('P') => quick_open::begin(app),
+            match Keymap::resolve_chord(InputScope::Normal, KeyCode::Char(' '), &key) {
+                Some(Command::OpenQuickOpen) => quick_open::begin(app),
                 // Space+F = VSCode-style find widget (selection-seeded,
                 // floating in the active content panel's upper-right).
                 // Space+Shift+F = global ripgrep search (VSCode
                 // Cmd+Shift+F). Case differentiation makes these distinct
                 // entry points.
-                KeyCode::Char('f') => find_widget::begin_with_selection(app),
-                KeyCode::Char('F') => global_search::begin(app),
-                KeyCode::Char('h') | KeyCode::Char('H') => {
+                Some(Command::OpenFindWidget) => find_widget::begin_with_selection(app),
+                Some(Command::OpenGlobalSearch) => global_search::begin(app),
+                Some(Command::OpenGlobalReplace) => {
                     // Open Tab::Search with the replace input pre-expanded
                     // and focused. Mirrors VSCode's Ctrl+Shift+H — the
                     // user gets straight to the replace field. Existing
@@ -365,7 +370,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
                 // content panel (file preview on Files/Search, diff on
                 // Git/Graph) from Main; exit back to Main if already
                 // focused. Esc inside the mode also exits.
-                KeyCode::Char('v') | KeyCode::Char('V') => app.toggle_focused_preview(),
+                Some(Command::ToggleFocusedPreview) => app.toggle_focused_preview(),
                 _ => {}
             }
             return;
@@ -439,33 +444,40 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             // pickers still see literal `d` keystrokes — invariant
             // 1 of references/text-input-stack.md.
             if chord_fresh {
-                let bare = no_ctrl_alt && !key.modifiers.contains(KeyModifiers::SHIFT);
                 // When the diff panel owns focus, `gd`/`gr` resolve against
                 // the diff (workspace-index, by identifier text); otherwise
                 // they run the full preview path (tree-sitter + LSP).
                 let in_diff = matches!(app.active_tab, Tab::Git | Tab::Graph)
                     && app.active_panel == Panel::Diff;
                 // `gd` — goto-definition.
-                if bare && key.code == KeyCode::Char('d') {
-                    app.g_pending_at = None;
-                    if in_diff {
-                        app.goto_definition_in_diff(crate::nav::NavAnchor::Keyboard);
-                    } else {
-                        app.goto_definition_at_cursor(crate::nav::NavAnchor::Keyboard);
+                match Keymap::resolve_chord(InputScope::Normal, KeyCode::Char('g'), &key) {
+                    Some(Command::ScrollTop) => {
+                        app.g_pending_at = None;
+                        app.scroll_active_preview_to_top();
+                        return;
                     }
-                    return;
-                }
-                // `gr` — find-references. Opens the candidates popup
-                // with every workspace reference to the symbol under
-                // the cursor.
-                if bare && key.code == KeyCode::Char('r') {
-                    app.g_pending_at = None;
-                    if in_diff {
-                        app.find_references_in_diff(crate::nav::NavAnchor::Keyboard);
-                    } else {
-                        app.find_references_at_cursor(crate::nav::NavAnchor::Keyboard);
+                    Some(Command::GotoDefinition) => {
+                        app.g_pending_at = None;
+                        if in_diff {
+                            app.goto_definition_in_diff(crate::app::nav::NavAnchor::Keyboard);
+                        } else {
+                            app.goto_definition_at_cursor(crate::app::nav::NavAnchor::Keyboard);
+                        }
+                        return;
                     }
-                    return;
+                    // `gr` — find-references. Opens the candidates popup
+                    // with every workspace reference to the symbol under
+                    // the cursor.
+                    Some(Command::FindReferences) => {
+                        app.g_pending_at = None;
+                        if in_diff {
+                            app.find_references_in_diff(crate::app::nav::NavAnchor::Keyboard);
+                        } else {
+                            app.find_references_at_cursor(crate::app::nav::NavAnchor::Keyboard);
+                        }
+                        return;
+                    }
+                    _ => {}
                 }
             }
             // Anything else (or an expired chord) breaks it.
@@ -473,116 +485,28 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         }
     }
 
-    // Alt+Left / Alt+Right — navigation back/forward stack. Bound to
-    // Alt rather than Ctrl+O/I because Ctrl+O is already the hosts-
-    // picker shortcut (vim-style Ctrl-o would conflict). Matches
-    // VSCode's primary back/forward binding. Gated above by
-    // `in_input_mode` / overlay flags — text inputs reach
-    // `input_edit`'s Alt+Left word-move first.
     if !in_input_mode
-        && key.modifiers.contains(KeyModifiers::ALT)
-        && !key.modifiers.contains(KeyModifiers::CONTROL)
-        && !key.modifiers.contains(KeyModifiers::SHIFT)
+        && let Some(command) = Keymap::resolve(InputScope::Normal, &key)
+        && dispatch_keymap_command(command, app, search_input_focused)
     {
-        match key.code {
-            KeyCode::Left => {
-                app.nav_back();
-                return;
-            }
-            KeyCode::Right => {
-                app.nav_forward();
-                return;
-            }
-            _ => {}
-        }
+        return;
     }
 
-    // Always-available global keys — even when the user is typing in a
-    // search input, these need to remain usable as the escape hatch.
-    // `Ctrl+C` quits, `Tab` / `BackTab` move between tabs and panels so the
-    // user can get out of any focus state.
-    //
-    // The `!SHIFT` guard reserves `Ctrl+Shift+C` for the file-tree
-    // copy alias (see `handle_key_files_clipboard`). Plain `Ctrl+C`
-    // still quits as before.
+    // Esc back-out, two-step. Active search input and modal Esc
+    // handlers (place mode, tree-edit, paste-conflict, …) run
+    // earlier via top-of-`handle_key` early-returns, so this
+    // block only fires for the "no specific modal owns Esc" case.
+    //   1. Clear dormant `/` highlights — but only when the
+    //      current panel owns them. If the user Tab'd to a
+    //      different panel the highlights aren't on screen, so
+    //      Esc passes through to that panel's own handler
+    //      (commit-box exit, multi-select clear, …) instead of
+    //      being silently swallowed.
+    //   2. Otherwise, return panel focus to `Panel::Files`. Both
+    //      arms use guards so Graph visual-mode exit and other
+    //      per-tab Esc semantics still fall through when neither
+    //      applies.
     match key.code {
-        KeyCode::Char('c')
-            if key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::SHIFT) =>
-        {
-            app.should_quit = true;
-            return;
-        }
-        // Ctrl+O opens the hosts picker (session switcher). Shares the
-        // overlay priority with quick-open / global-search: any key
-        // handled there returns early before reaching this match.
-        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.open_hosts_picker();
-            return;
-        }
-        // Ctrl+B toggles the left sidebar — VSCode muscle memory. Sits in
-        // the always-on block so it works regardless of which tab or panel
-        // owns focus; overlays (quick-open, global-search, hosts picker)
-        // return earlier so they're unaffected.
-        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.toggle_sidebar();
-            return;
-        }
-        // Suppressed in input mode so a literal comma in a commit
-        // message / search query isn't stolen by the chord.
-        KeyCode::Char(',') if key.modifiers.contains(KeyModifiers::CONTROL) && !in_input_mode => {
-            app.open_settings();
-            return;
-        }
-        // Ctrl+Tab: best-effort "next tab" alias. Many legacy terminals
-        // (Terminal.app) collapse Ctrl+Tab into plain Tab, in which
-        // case the bare-Tab arm below catches it and number keys
-        // remain the reliable tab-switch path.
-        KeyCode::Tab if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let tabs = Tab::ALL;
-            let cur = tabs.iter().position(|&t| t == app.active_tab).unwrap_or(0);
-            app.set_active_tab(tabs[(cur + 1) % tabs.len()]);
-            app.search.clear();
-            return;
-        }
-        // Bare Tab / BackTab cycle panels in most contexts. Exception:
-        // when a Tab::Search input row owns focus, Tab/BackTab cycle
-        // Find → Replace → List inside that panel — the per-tab
-        // handler down at `handle_key_search_*_input_mode` owns that
-        // dispatch. Without this guard the global panel-switch arm
-        // returns first and the per-input cycle never fires.
-        KeyCode::Tab if !search_input_focused => {
-            app.active_panel = next_panel(
-                app.active_panel,
-                app.graph_uses_three_col(),
-                /* reverse= */ false,
-            );
-            app.search.clear();
-            return;
-        }
-        KeyCode::BackTab if !search_input_focused => {
-            app.active_panel = next_panel(
-                app.active_panel,
-                app.graph_uses_three_col(),
-                /* reverse= */ true,
-            );
-            app.search.clear();
-            return;
-        }
-        // Esc back-out, two-step. Active search input and modal Esc
-        // handlers (place mode, tree-edit, paste-conflict, …) run
-        // earlier via top-of-`handle_key` early-returns, so this
-        // block only fires for the "no specific modal owns Esc" case.
-        //   1. Clear dormant `/` highlights — but only when the
-        //      current panel owns them. If the user Tab'd to a
-        //      different panel the highlights aren't on screen, so
-        //      Esc passes through to that panel's own handler
-        //      (commit-box exit, multi-select clear, …) instead of
-        //      being silently swallowed.
-        //   2. Otherwise, return panel focus to `Panel::Files`. Both
-        //      arms use guards so Graph visual-mode exit and other
-        //      per-tab Esc semantics still fall through when neither
-        //      applies.
         KeyCode::Esc
             if !app.search.matches.is_empty()
                 && search::resolve_target(app) == app.search.target =>
@@ -598,77 +522,116 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         _ => {}
     }
 
-    // Bare-character global shortcuts — suppressed whenever a text input
-    // is focused (Tab::Search query or Tab::Git commit box) so they don't
-    // steal literal keystrokes mid-typing. Otherwise `h` = help, `q` = quit,
-    // `/` = in-panel search, `n`/`N` = step matches, `1`-`9` = jump tab.
-    //
-    // `/` has a context-aware override: in Tab::Search list mode it focuses
-    // the search input instead of firing in-panel search. The in-panel
-    // search's `resolve_target` is None for that (tab, panel) combo anyway,
-    // so the former behaviour was a dead-end key — wiring it to mode-entry
-    // makes the keybinding earn its slot.
-    if !in_input_mode {
-        match key.code {
-            KeyCode::Char('q') => {
-                app.should_quit = true;
-                return;
-            }
-            KeyCode::Char(c) if matches!(c, '1'..='9') => {
-                let idx = (c as u8 - b'1') as usize;
-                if let Some(&tab) = Tab::ALL.get(idx) {
-                    if app.active_tab != tab {
-                        app.search.clear();
-                    }
-                    app.set_active_tab(tab);
-                }
-                return;
-            }
-            KeyCode::Char('h') => {
-                app.show_help = true;
-                return;
-            }
-            KeyCode::Char('/') => {
-                if app.active_tab == Tab::Search && app.active_panel == Panel::Files {
-                    app.global_search.focus = crate::global_search::SearchPanelFocus::FindInput;
-                } else {
-                    search::begin(app, false);
-                }
-                return;
-            }
-            KeyCode::Char('?') => {
-                search::begin(app, true);
-                return;
-            }
-            // Require NO Control modifier so Ctrl+N stays available as
-            // a per-tab "down" nav alias rather than stepping the
-            // vim-style search. Bare N (Shift+n) keeps its step-back
-            // meaning.
-            KeyCode::Char('n')
-                if app.search.can_step()
-                    && !has_pending_confirm(app)
-                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                search::step(app, false);
-                return;
-            }
-            KeyCode::Char('N')
-                if app.search.can_step()
-                    && !has_pending_confirm(app)
-                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                search::step(app, true);
-                return;
-            }
-            _ => {}
-        }
-    }
-
     match app.active_tab {
         Tab::Git => handle_key_git(key, app),
         Tab::Files => handle_key_files(key, app),
         Tab::Search => handle_key_search(key, app),
         Tab::Graph => handle_key_graph(key, app),
+    }
+}
+
+fn dispatch_input_scope_command(command: Command, app: &mut App) -> bool {
+    match command {
+        Command::Quit => {
+            app.should_quit = true;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn dispatch_keymap_command(command: Command, app: &mut App, search_input_focused: bool) -> bool {
+    match command {
+        Command::Quit => {
+            app.should_quit = true;
+            true
+        }
+        Command::OpenHelp => {
+            app.show_help = true;
+            true
+        }
+        Command::ToggleSidebar => {
+            app.toggle_sidebar();
+            true
+        }
+        Command::OpenSettings => {
+            app.open_settings();
+            true
+        }
+        Command::OpenHostsPicker => {
+            app.open_hosts_picker();
+            true
+        }
+        Command::LocationBack => {
+            app.location_back();
+            true
+        }
+        Command::LocationForward => {
+            app.location_forward();
+            true
+        }
+        Command::BeginSearchForward => {
+            if app.active_tab == Tab::Search && app.active_panel == Panel::Files {
+                app.global_search.focus = crate::global_search::SearchPanelFocus::FindInput;
+            } else {
+                search::begin(app, false);
+            }
+            true
+        }
+        Command::BeginSearchBackward => {
+            search::begin(app, true);
+            true
+        }
+        Command::NextSearchMatch => {
+            if app.search.can_step() && !has_pending_confirm(app) {
+                search::step(app, false);
+                true
+            } else {
+                false
+            }
+        }
+        Command::PrevSearchMatch => {
+            if app.search.can_step() && !has_pending_confirm(app) {
+                search::step(app, true);
+                true
+            } else {
+                false
+            }
+        }
+        Command::SwitchTab(idx) => {
+            let tab = if idx == usize::MAX {
+                let tabs = Tab::ALL;
+                let cur = tabs.iter().position(|&t| t == app.active_tab).unwrap_or(0);
+                tabs[(cur + 1) % tabs.len()]
+            } else {
+                let Some(&tab) = Tab::ALL.get(idx) else {
+                    return false;
+                };
+                tab
+            };
+            if app.active_tab != tab {
+                app.search.clear();
+            }
+            app.set_active_tab(tab);
+            true
+        }
+        Command::CyclePanelForward => {
+            if search_input_focused {
+                return false;
+            }
+            app.active_panel = next_panel(app.active_panel, app.graph_uses_three_col(), false);
+            app.search.clear();
+            true
+        }
+        Command::CyclePanelBackward => {
+            if search_input_focused {
+                return false;
+            }
+            app.active_panel = next_panel(app.active_panel, app.graph_uses_three_col(), true);
+            app.search.clear();
+            true
+        }
+        _ => false,
     }
 }
 
@@ -720,8 +683,8 @@ fn handle_key_db_goto(key: KeyEvent, app: &mut App) {
         Some(b) => b,
         None => return,
     };
-    match key.code {
-        KeyCode::Enter => {
+    match Keymap::resolve(InputScope::DbGoto, &key) {
+        Some(Command::Confirm) => {
             // Empty input on Enter → treat as Esc (cancel) rather
             // than parsing "" → 0 → page 0. Keeps the contract
             // friendlier when the user opens the prompt by accident.
@@ -739,7 +702,7 @@ fn handle_key_db_goto(key: KeyEvent, app: &mut App) {
             }
             return;
         }
-        KeyCode::Esc => {
+        Some(Command::Close) => {
             app.db_goto_input = None;
             app.db_goto_cursor = 0;
             return;
@@ -850,22 +813,22 @@ fn handle_key_focused_preview(key: KeyEvent, app: &mut App) -> bool {
     }
 
     // Explicit handling for FocusedPreview-specific actions.
-    match key.code {
-        KeyCode::Esc => {
+    match Keymap::resolve(InputScope::FocusedPreview, &key) {
+        Some(Command::Close) => {
             app.close_focused_preview();
             return true;
         }
         // Bare q quits reef (same convention as Settings / place mode
         // takeovers). Ctrl+C is the universal quit and is intentionally
         // handled here too so the user can bail without first Esc'ing.
-        KeyCode::Char('q') if !ctrl => {
+        Some(Command::Quit) => {
             app.should_quit = true;
             return true;
         }
-        KeyCode::Char('c') if ctrl => {
-            app.should_quit = true;
-            return true;
-        }
+        _ => {}
+    }
+
+    match key.code {
         // `o` opens the floating file picker — scoped to focused preview
         // only (not a global binding), and only where the picker is
         // actually rendered (Git tab + Graph 3-col). Mirror the
@@ -980,25 +943,16 @@ fn handle_key_settings(key: KeyEvent, app: &mut App) {
         return;
     }
 
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    match key.code {
-        KeyCode::Esc => app.close_settings(),
-        // Match the other modal-takeover panels (place mode, paste
-        // conflict): bare q / Ctrl+C always exit reef so a confused
-        // user can bail without first popping the modal.
-        KeyCode::Char('q') if !ctrl => app.should_quit = true,
-        KeyCode::Char('c') if ctrl => app.should_quit = true,
-        KeyCode::Up | KeyCode::Char('k') if !ctrl => app.settings.move_selection(-1),
-        KeyCode::Down | KeyCode::Char('j') if !ctrl => app.settings.move_selection(1),
-        KeyCode::Char('p') if ctrl => app.settings.move_selection(-1),
-        KeyCode::Char('n') if ctrl => app.settings.move_selection(1),
-        // The list is too short for a real "page" concept; PageUp /
-        // PageDown collapse to first / last to match user expectation.
-        KeyCode::PageUp | KeyCode::Home => app.settings.select(0),
-        KeyCode::PageDown | KeyCode::End => app
+    match Keymap::resolve(InputScope::Settings, &key) {
+        Some(Command::Close) => app.close_settings(),
+        Some(Command::Quit) => app.should_quit = true,
+        Some(Command::MoveUp) => app.settings.move_selection(-1),
+        Some(Command::MoveDown) => app.settings.move_selection(1),
+        Some(Command::ScrollTop) => app.settings.select(0),
+        Some(Command::ScrollBottom) => app
             .settings
             .select(crate::settings::SettingItem::ALL.len().saturating_sub(1)),
-        KeyCode::Enter | KeyCode::Char(' ') => {
+        Some(Command::Confirm) => {
             let item = app.settings.selected();
             if matches!(item, crate::settings::SettingItem::EditorCommand) {
                 settings::begin_edit_editor_command(&mut app.settings);
@@ -1011,14 +965,20 @@ fn handle_key_settings(key: KeyEvent, app: &mut App) {
 }
 
 fn handle_key_settings_editor(key: KeyEvent, app: &mut App) {
-    match key.code {
-        KeyCode::Esc => settings::cancel_editor_command(&mut app.settings),
-        KeyCode::Enter => settings::commit_editor_command(&mut app.settings),
-        _ => {
-            if let Some(edit) = app.settings.editor_edit.as_mut() {
-                let _ = crate::input_edit::dispatch_key(&key, &mut edit.buffer, &mut edit.cursor);
-            }
+    match Keymap::resolve(InputScope::Settings, &key) {
+        Some(Command::Close) => {
+            settings::cancel_editor_command(&mut app.settings);
+            return;
         }
+        Some(Command::Confirm) => {
+            settings::commit_editor_command(&mut app.settings);
+            return;
+        }
+        _ => {}
+    }
+
+    if let Some(edit) = app.settings.editor_edit.as_mut() {
+        let _ = crate::input_edit::dispatch_key(&key, &mut edit.buffer, &mut edit.cursor);
     }
 }
 
@@ -1243,54 +1203,51 @@ fn handle_key_search_list_mode(key: KeyEvent, app: &mut App, ctrl: bool) {
 /// to kick the search-rerun debounce.
 fn handle_key_search_find_input(key: KeyEvent, app: &mut App, ctrl: bool, alt: bool) {
     // Pass 1: app-level actions.
-    match key.code {
-        KeyCode::Esc => {
+    match Keymap::resolve(InputScope::SearchInput, &key) {
+        Some(Command::Close) => {
             app.global_search.focus = crate::global_search::SearchPanelFocus::List;
             return;
         }
+        Some(Command::Confirm) if app.global_search.replace_open && (ctrl || alt) => {
+            app.commit_replace_in_files();
+            return;
+        }
+        Some(Command::Quit) => {
+            app.should_quit = true;
+            return;
+        }
+        Some(Command::Confirm) => {
+            global_search::accept(app);
+            return;
+        }
+        Some(Command::MoveUp) => {
+            global_search::move_selection_by(app, -1);
+            return;
+        }
+        Some(Command::MoveDown) => {
+            global_search::move_selection_by(app, 1);
+            return;
+        }
+        Some(Command::PageUp) => {
+            let step = app.global_search.last_view_h.max(1) as i32;
+            global_search::move_selection_by(app, -step);
+            return;
+        }
+        Some(Command::PageDown) => {
+            let step = app.global_search.last_view_h.max(1) as i32;
+            global_search::move_selection_by(app, step);
+            return;
+        }
+        _ => {}
+    }
+
+    match key.code {
         KeyCode::Tab if key.modifiers.is_empty() => {
             app.global_search.cycle_focus_forward();
             return;
         }
         KeyCode::BackTab => {
             app.global_search.cycle_focus_backward();
-            return;
-        }
-        // Ctrl/Alt+Enter commits the replace batch (when open).
-        KeyCode::Enter if app.global_search.replace_open && (ctrl || alt) => {
-            app.commit_replace_in_files();
-            return;
-        }
-        // Plain Enter accepts the selected hit.
-        KeyCode::Enter => {
-            global_search::accept(app);
-            return;
-        }
-        // List navigation (works alongside typing).
-        KeyCode::Up => {
-            global_search::move_selection_by(app, -1);
-            return;
-        }
-        KeyCode::Down => {
-            global_search::move_selection_by(app, 1);
-            return;
-        }
-        KeyCode::Char('p') | KeyCode::Char('k') if ctrl => {
-            global_search::move_selection_by(app, -1);
-            return;
-        }
-        KeyCode::Char('n') | KeyCode::Char('j') if ctrl => {
-            global_search::move_selection_by(app, 1);
-            return;
-        }
-        KeyCode::PageUp => {
-            let step = app.global_search.last_view_h.max(1) as i32;
-            global_search::move_selection_by(app, -step);
-            return;
-        }
-        KeyCode::PageDown => {
-            let step = app.global_search.last_view_h.max(1) as i32;
-            global_search::move_selection_by(app, step);
             return;
         }
         _ => {}
@@ -1321,43 +1278,47 @@ fn handle_key_search_find_input(key: KeyEvent, app: &mut App, ctrl: bool, alt: b
 /// typing the replacement); `Esc` returns to list mode.
 fn handle_key_search_replace_input(key: KeyEvent, app: &mut App, _ctrl: bool, _alt: bool) {
     // Pass 1: app-level actions.
-    match key.code {
-        KeyCode::Esc => {
+    match Keymap::resolve(InputScope::SearchInput, &key) {
+        Some(Command::Close) => {
             app.global_search.focus = crate::global_search::SearchPanelFocus::List;
             return;
         }
+        Some(Command::Confirm) => {
+            app.commit_replace_in_files();
+            return;
+        }
+        Some(Command::Quit) => {
+            app.should_quit = true;
+            return;
+        }
+        Some(Command::MoveUp) => {
+            global_search::move_selection_by(app, -1);
+            return;
+        }
+        Some(Command::MoveDown) => {
+            global_search::move_selection_by(app, 1);
+            return;
+        }
+        Some(Command::PageUp) => {
+            let step = app.global_search.last_view_h.max(1) as i32;
+            global_search::move_selection_by(app, -step);
+            return;
+        }
+        Some(Command::PageDown) => {
+            let step = app.global_search.last_view_h.max(1) as i32;
+            global_search::move_selection_by(app, step);
+            return;
+        }
+        _ => {}
+    }
+
+    match key.code {
         KeyCode::Tab if key.modifiers.is_empty() => {
             app.global_search.cycle_focus_forward();
             return;
         }
         KeyCode::BackTab => {
             app.global_search.cycle_focus_backward();
-            return;
-        }
-        // Plain Enter, Ctrl+Enter, and Alt+Enter all commit. Plain
-        // Enter is OK here because there's no "accept the selected
-        // result" action competing for the key inside the replace
-        // input — the user is committing the replace, full stop.
-        KeyCode::Enter => {
-            app.commit_replace_in_files();
-            return;
-        }
-        KeyCode::Up => {
-            global_search::move_selection_by(app, -1);
-            return;
-        }
-        KeyCode::Down => {
-            global_search::move_selection_by(app, 1);
-            return;
-        }
-        KeyCode::PageUp => {
-            let step = app.global_search.last_view_h.max(1) as i32;
-            global_search::move_selection_by(app, -step);
-            return;
-        }
-        KeyCode::PageDown => {
-            let step = app.global_search.last_view_h.max(1) as i32;
-            global_search::move_selection_by(app, step);
             return;
         }
         _ => {}
@@ -1597,13 +1558,17 @@ fn handle_key_git_commit(key: KeyEvent, app: &mut App, ctrl: bool, alt: bool) ->
     // Ctrl-letter swallow guard below doesn't catch it — landing on
     // the outer Git handler's `Char('e') | Enter` arm that opens
     // `$EDITOR` on the selected file.
-    match key.code {
-        KeyCode::Esc => {
+    match Keymap::resolve(InputScope::CommitEditor, &key) {
+        Some(Command::Close) => {
             app.git_status.commit_editing = false;
             return true;
         }
-        KeyCode::Enter if ctrl => {
+        Some(Command::Confirm) => {
             app.run_commit();
+            return true;
+        }
+        Some(Command::Quit) => {
+            app.should_quit = true;
             return true;
         }
         _ => {}
@@ -2059,16 +2024,12 @@ fn handle_key_tree_edit(key: KeyEvent, app: &mut App) {
     // modifier press (the commit-box right next door treats
     // Shift+Enter as soft-newline; consistent muscle-memory says
     // Shift+Enter is non-destructive).
-    match key.code {
-        KeyCode::Esc => {
+    match Keymap::resolve(InputScope::TreeEdit, &key) {
+        Some(Command::Close) | Some(Command::Quit) => {
             app.cancel_tree_edit();
             return;
         }
-        KeyCode::Char('c') if ctrl => {
-            app.cancel_tree_edit();
-            return;
-        }
-        KeyCode::Enter if !ctrl && !alt && !shift => {
+        Some(Command::Confirm) if !ctrl && !alt && !shift => {
             app.commit_tree_edit();
             return;
         }
@@ -2093,14 +2054,11 @@ fn handle_key_tree_edit(key: KeyEvent, app: &mut App) {
 
 /// Keyboard navigation for the right-click context menu popup.
 fn handle_key_tree_context_menu(key: KeyEvent, app: &mut App) {
-    match key.code {
-        KeyCode::Esc => app.close_tree_context_menu(),
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.close_tree_context_menu();
-        }
-        KeyCode::Up | KeyCode::Char('k') => app.tree_context_menu.navigate(-1),
-        KeyCode::Down | KeyCode::Char('j') => app.tree_context_menu.navigate(1),
-        KeyCode::Enter => {
+    match Keymap::resolve(InputScope::TreeContextMenu, &key) {
+        Some(Command::Close) | Some(Command::Quit) => app.close_tree_context_menu(),
+        Some(Command::MoveUp) => app.tree_context_menu.navigate(-1),
+        Some(Command::MoveDown) => app.tree_context_menu.navigate(1),
+        Some(Command::Confirm) => {
             if let Some(item) = app.tree_context_menu.current() {
                 app.dispatch_context_menu_item(item);
             }
@@ -2116,14 +2074,14 @@ fn handle_key_tree_context_menu(key: KeyEvent, app: &mut App) {
 /// Enter picks, Esc / `q` / Ctrl+C / any other key dismisses without
 /// jumping.
 fn handle_key_nav_candidates(key: KeyEvent, app: &mut App) {
-    match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => app.nav_close_candidates(),
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+    match Keymap::resolve(InputScope::NavCandidates, &key) {
+        Some(Command::Close) => app.nav_close_candidates(),
+        Some(Command::Quit) => {
             app.nav_close_candidates();
         }
-        KeyCode::Up | KeyCode::Char('k') => app.nav_candidates_move(-1),
-        KeyCode::Down | KeyCode::Char('j') => app.nav_candidates_move(1),
-        KeyCode::Enter => app.nav_pick_candidate(),
+        Some(Command::MoveUp) => app.nav_candidates_move(-1),
+        Some(Command::MoveDown) => app.nav_candidates_move(1),
+        Some(Command::Confirm) => app.nav_pick_candidate(),
         _ => app.nav_close_candidates(),
     }
 }
@@ -2141,18 +2099,22 @@ fn handle_key_nav_candidates(key: KeyEvent, app: &mut App) {
 fn handle_key_hosts_picker(key: KeyEvent, app: &mut App) {
     use crate::hosts_picker::InputMode;
     use crate::picker_core::InputOutcome;
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
     match app.hosts_picker.input_mode {
         InputMode::Search => {
             // Picker-specific shortcut that has to precede PickerCore:
             // Ctrl+P would otherwise be eaten as list-up.
-            if ctrl && matches!(key.code, KeyCode::Char('p')) {
+            if Keymap::resolve(InputScope::HostsPicker, &key) == Some(Command::TogglePickerPathMode)
+            {
                 app.hosts_picker.enter_path_mode();
                 return;
             }
             let visible = app.hosts_picker.visible_rows().len();
-            match app.hosts_picker.core.dispatch_key(&key, visible) {
+            match app
+                .hosts_picker
+                .core
+                .dispatch_key(InputScope::HostsPicker, &key, visible)
+            {
                 InputOutcome::Cancel => app.close_hosts_picker(),
                 InputOutcome::Quit => {
                     app.close_hosts_picker();
@@ -2163,10 +2125,8 @@ fn handle_key_hosts_picker(key: KeyEvent, app: &mut App) {
             }
         }
         InputMode::Path => {
-            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-            let alt = key.modifiers.contains(KeyModifiers::ALT);
-            match key.code {
-                KeyCode::Esc => {
+            match Keymap::resolve(InputScope::HostsPicker, &key) {
+                Some(Command::Close) => {
                     // Drop back to filter view rather than closing
                     // outright — gives the user a way out of the path
                     // buffer without losing the picker state.
@@ -2179,13 +2139,13 @@ fn handle_key_hosts_picker(key: KeyEvent, app: &mut App) {
                 // exits back to filter mode. Without this, the only
                 // way out is Esc, which is a UX asymmetry every
                 // tester trips on at least once.
-                KeyCode::Char('p') if ctrl => {
+                Some(Command::TogglePickerPathMode) => {
                     app.hosts_picker.input_mode = InputMode::Search;
                     app.hosts_picker.path_buffer.clear();
                     app.hosts_picker.path_cursor = 0;
                     return;
                 }
-                KeyCode::Char('c') if ctrl => {
+                Some(Command::Quit) => {
                     app.close_hosts_picker();
                     app.should_quit = true;
                     return;
@@ -2194,7 +2154,7 @@ fn handle_key_hosts_picker(key: KeyEvent, app: &mut App) {
                 // otherwise commit a half-typed target on a stray
                 // modifier press (users muscle-memory Shift+Enter as
                 // "newline" even in single-line buffers).
-                KeyCode::Enter if !ctrl && !alt && !shift => {
+                Some(Command::Confirm) => {
                     app.confirm_hosts_picker();
                     return;
                 }
@@ -2222,7 +2182,11 @@ fn handle_key_hosts_picker(key: KeyEvent, app: &mut App) {
 fn handle_key_graph_branch_picker(key: KeyEvent, app: &mut App) {
     use crate::picker_core::InputOutcome;
     let visible = app.graph_branch_picker.visible_rows().len();
-    match app.graph_branch_picker.core.dispatch_key(&key, visible) {
+    match app
+        .graph_branch_picker
+        .core
+        .dispatch_key(InputScope::GraphBranchPicker, &key, visible)
+    {
         InputOutcome::Cancel => app.close_graph_branch_picker(),
         InputOutcome::Quit => {
             app.close_graph_branch_picker();
@@ -2294,7 +2258,7 @@ fn handle_key_confirm_modal(key: KeyEvent, app: &mut App) {
 /// - `C` / `Esc` → Cancel the entire batch
 /// - other keys: ignored (don't accidentally close the prompt)
 fn handle_key_paste_conflict(key: KeyEvent, app: &mut App) {
-    use crate::paste_conflict::Resolution;
+    use reef_core::file_ops::Resolution;
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
@@ -2701,7 +2665,7 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
         && let Some(rect) = app.last_preview_rect
         && point_in_rect(rect, mouse.column, mouse.row)
     {
-        app.goto_definition_at_cursor(crate::nav::NavAnchor::Mouse {
+        app.goto_definition_at_cursor(crate::app::nav::NavAnchor::Mouse {
             col: mouse.column,
             row: mouse.row,
         });
@@ -2720,7 +2684,7 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
         && let Some(rect) = app.last_diff_rect
         && point_in_rect(rect, mouse.column, mouse.row)
     {
-        app.goto_definition_in_diff(crate::nav::NavAnchor::Mouse {
+        app.goto_definition_in_diff(crate::app::nav::NavAnchor::Mouse {
             col: mouse.column,
             row: mouse.row,
         });
@@ -2946,10 +2910,10 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
                 && let Some(cursor) = mouse_to_file_coord(app, mouse.column, mouse.row, origin)
             {
                 let id_range = app.preview_content.as_ref().and_then(|p| match &p.body {
-                    crate::file_tree::PreviewBody::Text {
-                        parsed: Some(parse),
-                        ..
-                    } => crate::nav::identifier_range_at(parse, cursor),
+                    reef_core::preview::PreviewBody::Text(text) => text
+                        .parsed
+                        .as_ref()
+                        .and_then(|parse| reef_core::nav::identifier_range_at(parse, cursor)),
                     _ => None,
                 });
                 app.ctrl_hover_target = id_range;
@@ -3089,7 +3053,7 @@ fn handle_preview_selection(mouse: &MouseEvent, app: &mut App) -> bool {
                 if let Some(preview) = app.preview_content.as_ref() {
                     // Only text bodies have selectable lines — image/binary
                     // previews have no `lines` vector.
-                    if matches!(&preview.body, crate::file_tree::PreviewBody::Text { .. }) {
+                    if preview.is_text() {
                         let text = collect_preview_selected_text(preview, &sel_snapshot);
                         if !text.is_empty() {
                             match clipboard::copy_to_clipboard(&text) {
@@ -3241,15 +3205,15 @@ fn handle_diff_selection(mouse: &MouseEvent, app: &mut App) -> bool {
 /// In Unified layout there's nothing to clamp and `col` passes through.
 fn clamp_col_to_side(hit: &crate::ui::selection::DiffHit, col: u16, side: DiffSide) -> u16 {
     match (hit.layout, side) {
-        (crate::app::DiffLayout::Unified, _) => col,
-        (crate::app::DiffLayout::SideBySide, DiffSide::Unified) => col,
-        (crate::app::DiffLayout::SideBySide, DiffSide::SbsLeft) => {
+        (DiffLayout::Unified, _) => col,
+        (DiffLayout::SideBySide, DiffSide::Unified) => col,
+        (DiffLayout::SideBySide, DiffSide::SbsLeft) => {
             // Right edge of the left half is just before `right_start_x`
             // (which is the divider column). `saturating_sub(1)` keeps us
             // on the left half's last content column.
             col.min(hit.right_start_x.saturating_sub(1))
         }
-        (crate::app::DiffLayout::SideBySide, DiffSide::SbsRight) => col.max(hit.right_start_x),
+        (DiffLayout::SideBySide, DiffSide::SbsRight) => col.max(hit.right_start_x),
     }
 }
 
@@ -3260,17 +3224,14 @@ fn point_in_rect(rect: Rect, col: u16, row: u16) -> bool {
 fn preview_display_line(app: &App, row: usize) -> Option<&str> {
     let preview = app.preview_content.as_ref()?;
     match &preview.body {
-        crate::file_tree::PreviewBody::Text {
-            markdown: Some(markdown),
-            ..
-        } => markdown.text_for_row(row),
-        crate::file_tree::PreviewBody::Text { lines, .. } => lines.get(row).map(String::as_str),
+        reef_core::preview::PreviewBody::Markdown(markdown) => markdown.text_for_row(row),
+        reef_core::preview::PreviewBody::Text(text) => text.lines.get(row).map(String::as_str),
         _ => None,
     }
 }
 
 fn collect_preview_selected_text(
-    preview: &crate::file_tree::PreviewContent,
+    preview: &reef_core::preview::PreviewDocument,
     sel: &PreviewSelection,
 ) -> String {
     let rows = preview.body.display_text_rows();
@@ -3293,7 +3254,7 @@ pub(crate) fn mouse_to_file_coord(
 ) -> Option<(usize, usize)> {
     let preview = app.preview_content.as_ref()?;
     let lines = match &preview.body {
-        crate::file_tree::PreviewBody::Text { lines, .. } => lines,
+        reef_core::preview::PreviewBody::Text(text) => &text.lines,
         // Image / binary cards don't have per-line content, so
         // drag-select is a no-op over them.
         _ => return None,
@@ -3316,10 +3277,7 @@ pub(crate) fn mouse_to_file_coord(
 fn mouse_to_preview_coord(app: &App, col: u16, row: u16) -> Option<(usize, usize)> {
     let preview = app.preview_content.as_ref()?;
     match &preview.body {
-        crate::file_tree::PreviewBody::Text {
-            markdown: Some(markdown),
-            ..
-        } => {
+        reef_core::preview::PreviewBody::Markdown(markdown) => {
             if markdown.text_rows.is_empty() {
                 return None;
             }
@@ -3330,7 +3288,7 @@ fn mouse_to_preview_coord(app: &App, col: u16, row: u16) -> Option<(usize, usize
             let byte_offset = col_to_byte_offset(&markdown.text_rows[line_idx], visible_col);
             Some((line_idx, byte_offset))
         }
-        crate::file_tree::PreviewBody::Text { .. } => {
+        reef_core::preview::PreviewBody::Text(_) => {
             let origin = app.last_preview_content_origin?;
             mouse_to_file_coord(app, col, row, origin)
         }
@@ -3341,10 +3299,10 @@ fn mouse_to_preview_coord(app: &App, col: u16, row: u16) -> Option<(usize, usize
 fn preview_content_top(app: &App) -> Option<u16> {
     let preview = app.preview_content.as_ref()?;
     match &preview.body {
-        crate::file_tree::PreviewBody::Text {
-            markdown: Some(_), ..
-        } => app.last_markdown_content_origin.map(|(_, y)| y),
-        crate::file_tree::PreviewBody::Text { .. } => {
+        reef_core::preview::PreviewBody::Markdown(_) => {
+            app.last_markdown_content_origin.map(|(_, y)| y)
+        }
+        reef_core::preview::PreviewBody::Text(_) => {
             app.last_preview_content_origin.map(|(_, y, _)| y)
         }
         _ => None,
@@ -3453,11 +3411,8 @@ fn tick_preview_drag_autoscroll(app: &mut App) {
         return;
     };
     let line_count = match &preview.body {
-        crate::file_tree::PreviewBody::Text {
-            markdown: Some(markdown),
-            ..
-        } => markdown.text_rows.len(),
-        crate::file_tree::PreviewBody::Text { lines, .. } => lines.len(),
+        reef_core::preview::PreviewBody::Markdown(markdown) => markdown.text_rows.len(),
+        reef_core::preview::PreviewBody::Text(text) => text.lines.len(),
         _ => return,
     };
     let max_scroll = line_count.saturating_sub(view_h as usize);
@@ -3727,10 +3682,8 @@ fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: 
         match app.active_tab {
             Tab::Files | Tab::Search => apply_scroll_delta(&mut app.preview_h_scroll, delta),
             Tab::Git => match app.diff_layout {
-                crate::app::DiffLayout::Unified => {
-                    apply_scroll_delta(&mut app.diff_h_scroll, delta)
-                }
-                crate::app::DiffLayout::SideBySide => {
+                DiffLayout::Unified => apply_scroll_delta(&mut app.diff_h_scroll, delta),
+                DiffLayout::SideBySide => {
                     if sbs_cursor_on_left(0, total_width, column) {
                         apply_scroll_delta(&mut app.sbs_left_h_scroll, delta)
                     } else {
@@ -3741,10 +3694,10 @@ fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: 
             Tab::Graph => {
                 if app.graph_uses_three_col() {
                     match app.commit_detail.diff_layout {
-                        crate::app::DiffLayout::Unified => {
+                        DiffLayout::Unified => {
                             apply_scroll_delta(&mut app.commit_detail.file_diff_h_scroll, delta)
                         }
-                        crate::app::DiffLayout::SideBySide => {
+                        DiffLayout::SideBySide => {
                             if sbs_cursor_on_left(0, total_width, column) {
                                 apply_scroll_delta(
                                     &mut app.commit_detail.file_diff_sbs_left_h_scroll,
@@ -3763,10 +3716,10 @@ fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: 
                     // and tracks pan via `diff_h_scroll` (SBS uses the same
                     // sbs_left/right_h_scroll fields the keyboard handler does).
                     match app.commit_detail.diff_layout {
-                        crate::app::DiffLayout::Unified => {
+                        DiffLayout::Unified => {
                             apply_scroll_delta(&mut app.commit_detail.diff_h_scroll, delta)
                         }
-                        crate::app::DiffLayout::SideBySide => {
+                        DiffLayout::SideBySide => {
                             if sbs_cursor_on_left(0, total_width, column) {
                                 apply_scroll_delta(&mut app.commit_detail.sbs_left_h_scroll, delta)
                             } else {
@@ -3791,11 +3744,11 @@ fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: 
         (Tab::Files, false) => Some(&mut app.preview_h_scroll),
         (Tab::Git, false) => match app.diff_layout {
             // Unified: one h_scroll applies to the whole content column.
-            crate::app::DiffLayout::Unified => Some(&mut app.diff_h_scroll),
+            DiffLayout::Unified => Some(&mut app.diff_h_scroll),
             // SBS: each half scrolls independently (old vs new version
             // line widths often diverge — rename, large rewrite). Route
             // to whichever side the cursor sits over.
-            crate::app::DiffLayout::SideBySide => {
+            DiffLayout::SideBySide => {
                 let panel_w = total_width.saturating_sub(split_x);
                 if sbs_cursor_on_left(split_x, panel_w, column) {
                     Some(&mut app.sbs_left_h_scroll)
@@ -3812,14 +3765,14 @@ fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: 
             let diff_start = graph_diff_column_start(app, total_width).unwrap_or(total_width);
             let in_diff_column = diff_start < total_width && column >= diff_start;
             match app.commit_detail.diff_layout {
-                crate::app::DiffLayout::Unified => {
+                DiffLayout::Unified => {
                     if in_diff_column {
                         Some(&mut app.commit_detail.file_diff_h_scroll)
                     } else {
                         Some(&mut app.commit_detail.diff_h_scroll)
                     }
                 }
-                crate::app::DiffLayout::SideBySide => {
+                DiffLayout::SideBySide => {
                     let (panel_start, panel_w, left_h, right_h) = if in_diff_column {
                         let panel_w = total_width.saturating_sub(diff_start);
                         (

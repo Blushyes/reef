@@ -950,8 +950,8 @@ pub fn tree_edit_placeholder(mode: crate::tree_edit::TreeEditMode) -> &'static s
 /// Error line rendered directly under the editable row when commit is
 /// rejected. Uses the specific variant so the user knows whether to
 /// change the name or delete the conflicting file first.
-pub fn tree_edit_error(err: &crate::tree_edit::TreeEditError) -> String {
-    use crate::tree_edit::TreeEditError as E;
+pub fn tree_edit_error(err: &reef_core::file_ops::FileNameError) -> String {
+    use reef_core::file_ops::FileNameError as E;
     match (lang(), err) {
         (Lang::Zh, E::InvalidName) => "名字不能为空或是 `.` / `..`".to_string(),
         (Lang::En, E::InvalidName) => "Name cannot be empty or `.` / `..`".to_string(),

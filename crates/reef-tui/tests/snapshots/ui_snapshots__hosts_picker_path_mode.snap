@@ -1,11 +1,11 @@
 ---
-source: tests/ui_snapshots.rs
-assertion_line: 417
+source: crates/reef-tui/tests/ui_snapshots.rs
+assertion_line: 393
 expression: output
 ---
  reef  [TMPDIR]  ⎇ (detached)
  📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph        ⊟  1:Files 2:Search 3:Git 4:Graph
- +   📁  Connect to · [user@]host[:path] ─────────────────────────────────┐
+ +   +┌ Connect to · [user@]host[:path] ─────────────────────────────────┐
  (empt│ ➜ root@47.101.167.85:/tmp/work                                   │
       │ ──────────────────────────────────────────────────────────────── │
       │  hongxuan  root@47.101.167.85                                    │
@@ -22,4 +22,4 @@ expression: output
       │   Enter connect · Esc back to filter                             │
       └──────────────────────────────────────────────────────────────────┘
                        │
- 🔗  SSH        ⚙  q:quit Tab:switch s:stage u:unstage r:refresh h:help  [Files]
+ SSH           ⚙  q:quit Tab:switch s:stage u:unstage r:refresh h:help  [Files]

@@ -83,7 +83,6 @@ pub enum ClickAction {
     /// Click on one of the Files-tab tree toolbar buttons.
     FileTreeToolbarNewFile,
     FileTreeToolbarNewFolder,
-    FileTreeToolbarRefresh,
     FileTreeToolbarCollapse,
     /// Pick from an open right-click context menu. Dispatched when
     /// the user left-clicks a menu row; keyboard picks go through

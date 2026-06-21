@@ -1167,12 +1167,6 @@ pub fn tree_toolbar_new_folder() -> &'static str {
         Lang::En => "New Folder",
     }
 }
-pub fn tree_toolbar_refresh() -> &'static str {
-    match lang() {
-        Lang::Zh => "刷新",
-        Lang::En => "Refresh",
-    }
-}
 pub fn tree_toolbar_collapse_all() -> &'static str {
     match lang() {
         Lang::Zh => "全部折叠",

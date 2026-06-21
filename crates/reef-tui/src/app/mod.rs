@@ -5254,10 +5254,6 @@ impl App {
                     anchor,
                 );
             }
-            ClickAction::FileTreeToolbarRefresh => {
-                self.refresh_file_tree();
-                self.refresh_status();
-            }
             ClickAction::FileTreeToolbarCollapse => {
                 self.collapse_all_tree_entries();
             }

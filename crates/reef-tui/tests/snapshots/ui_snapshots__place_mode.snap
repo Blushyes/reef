@@ -1,5 +1,6 @@
 ---
-source: tests/ui_snapshots.rs
+source: crates/reef-tui/tests/ui_snapshots.rs
+assertion_line: 161
 expression: output
 ---
  reef  [TMPDIR]  ⎇ master

@@ -704,7 +704,7 @@ fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // Mouse-only hosts-picker entry — Ctrl+O fallback. Sits at the very
     // leftmost cell of the status bar so it stays reachable even when
     // the notification text is empty.
-    let hosts_btn = " 🔗 SSH ";
+    let hosts_btn = " SSH ";
     let hosts_btn_w = UnicodeWidthStr::width(hosts_btn) as u16;
 
     // Mouse-only settings entry — Ctrl+, fallback for terminals that

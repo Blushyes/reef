@@ -208,16 +208,14 @@ fn render_normal(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     }
 }
 
-/// Render the 4-button Files-tab toolbar. Icons sit at fixed cell
+/// Render the Files-tab toolbar. Icons sit at fixed cell
 /// offsets from the panel's left edge; each button registers its
 /// ClickAction with the hit registry so the main mouse pipeline
 /// dispatches through the normal handle_action path.
 ///
-/// Layout: `[+ File] [+ Folder]  [↻]  [⊟]` — icons with abbreviated
+/// Layout: `[+ File] [+ Folder]  [⊟]` — icons with abbreviated
 /// labels; the labels get dropped first when the panel is narrow so
-/// only icons show on cramped widths. The right-side pair (refresh /
-/// collapse) sit flush-left-of-border so the visual weight stays
-/// balanced.
+/// only icons show on cramped widths.
 fn render_toolbar(f: &mut Frame, app: &mut App, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -242,11 +240,10 @@ fn render_toolbar(f: &mut Frame, app: &mut App, area: Rect) {
         format!(" + {} ", crate::i18n::tree_toolbar_new_file())
     };
     let btn_new_folder = if compact {
-        " 📁 ".to_string()
+        " + ".to_string()
     } else {
-        format!(" 📁 {} ", crate::i18n::tree_toolbar_new_folder())
+        format!(" + {} ", crate::i18n::tree_toolbar_new_folder())
     };
-    let btn_refresh = " ↻ ".to_string();
     let btn_collapse = " ⊟ ".to_string();
 
     let style_btn = Style::default()
@@ -255,10 +252,9 @@ fn render_toolbar(f: &mut Frame, app: &mut App, area: Rect) {
         .add_modifier(Modifier::BOLD);
     let style_sep = Style::default().fg(th.chrome_muted_fg).bg(th.chrome_bg);
 
-    let buttons: [(String, ClickAction); 4] = [
+    let buttons: [(String, ClickAction); 3] = [
         (btn_new_file, ClickAction::FileTreeToolbarNewFile),
         (btn_new_folder, ClickAction::FileTreeToolbarNewFolder),
-        (btn_refresh, ClickAction::FileTreeToolbarRefresh),
         (btn_collapse, ClickAction::FileTreeToolbarCollapse),
     ];
 

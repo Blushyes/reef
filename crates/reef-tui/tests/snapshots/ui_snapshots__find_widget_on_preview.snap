@@ -1,11 +1,11 @@
 ---
-source: tests/ui_snapshots.rs
-assertion_line: 733
+source: crates/reef-tui/tests/ui_snapshots.rs
+assertion_line: 737
 expression: output
 ---
  reef  [TMPDIR]  ⎇ master
  📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph                            ⊟  1:Files 2:Search 3:Git 4:Graph
- + New File   📁  New Folder  │ scra
+ + New File   + New Folder   │ scra
    scratch.txt               │ ────  bar                          Aa  ab  .*     1/2     ↑  ↓  ×
                              │
                              │     2     bar();
@@ -26,4 +26,4 @@ expression: output
                              │
                              │
                              │
- 🔗  SSH                          ⚙  q:quit Tab:switch s:stage u:unstage r:refresh h:help  [Preview]
+ SSH                             ⚙  q:quit Tab:switch s:stage u:unstage r:refresh h:help  [Preview]

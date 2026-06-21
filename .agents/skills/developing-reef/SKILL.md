@@ -1,6 +1,6 @@
 ---
 name: developing-reef
-description: REQUIRED before any non-test code change in Reef. Load this skill before modifying Reef runtime architecture, `App` state, tabs/panels, rendering code, input dispatch (`src/input.rs`, any picker overlay, the commit textarea, any new text-input field), background work, git/file-tree/diff/graph loading, performance-sensitive paths, or when the user asks about "how Reef is structured", "render blocking", "heavy tasks", "new tab", "new feature architecture", "input handling", "text input", "picker", "PickerCore", "input_edit", or "project conventions". Do NOT start editing Reef source without loading this skill first — the architecture has non-obvious invariants (render-pure, async generation tokens, three-layer text-input stack) whose violation has been re-introduced and re-fixed across multiple PRs. Pair with `testing-reef` whenever adding or changing tests.
+description: REQUIRED before any non-test code change in Reef. Load this skill before modifying Reef runtime architecture, `App` state, tabs/panels, rendering code, input dispatch (`crates/reef-tui/src/input.rs`, any picker overlay, the commit textarea, any new text-input field), background work, git/file-tree/diff/graph loading, performance-sensitive paths, or when the user asks about "how Reef is structured", "render blocking", "heavy tasks", "new tab", "new feature architecture", "input handling", "text input", "picker", "PickerCore", "input_edit", or "project conventions". Do NOT start editing Reef source without loading this skill first — the architecture has non-obvious invariants (render-pure, async generation tokens, three-layer text-input stack) whose violation has been re-introduced and re-fixed across multiple PRs. Pair with `testing-reef` whenever adding or changing tests.
 ---
 
 # Developing Reef
@@ -11,8 +11,8 @@ Use this skill as the project onboarding guide for non-test Reef changes. Reef i
 
 - Keep `ui::*::render` on cached state only. Do not call git, filesystem walks, diff generation, syntax highlighting, or long formatting from render.
 - Treat input handlers as intent dispatchers. They may update cheap UI state (selection, scroll, hover, active tab) and request work, but must not do blocking host work.
-- Route expensive work through the background task coordinator in `src/tasks.rs`; merge results only from `App::tick`.
-- Put UI-independent logic in `crates/reef-core`; keep ratatui/crossterm rendering and input orchestration in the root crate.
+- Route expensive work through the background task coordinator in `crates/reef-tui/src/tasks.rs`; merge results only from `App::tick`.
+- Put UI-independent logic in `crates/reef-core`; keep ratatui/crossterm rendering and input orchestration in `crates/reef-tui`.
 - Prefer stale cached UI over blocking. Show old data plus loading/stale/error status instead of waiting during tab switches or hover/mouse movement.
 - Use generation tokens for async results. Late results from older requests must not overwrite newer selections or newer snapshots.
 - Keep each tab/panel independently refreshable. Adding a feature should not require another tab to render before data can update.
@@ -25,19 +25,19 @@ Use this skill as the project onboarding guide for non-test Reef changes. Reef i
 4. `App::tick` drains results, accepts only matching generations, updates snapshots/state, and schedules follow-up work when needed.
 5. Render reads the latest state and status flags. It must never be required for progress beyond drawing.
 
-Read `references/runtime-architecture.md` before changing `src/app.rs`, `src/tasks.rs`, `src/input.rs`, or any tab/panel render path.
+Read `references/runtime-architecture.md` before changing `crates/reef-tui/src/app/mod.rs`, `crates/reef-tui/src/tasks.rs`, `crates/reef-tui/src/input.rs`, or any tab/panel render path.
 
 ## File/Module Habits
 
-- `src/app/mod.rs` owns state orchestration: tab state, snapshot fields, async state, result merging, and command side effects.
+- `crates/reef-tui/src/app/mod.rs` owns state orchestration: tab state, snapshot fields, async state, result merging, and command side effects.
 - `crates/reef-core/src/**` owns UI-independent git, diff, highlight, markdown, nav/LSP, preview loading, file-op, host parsing, and history logic.
-- `src/tasks.rs` owns background worker definitions and should stay free of UI concerns.
-- `src/ui/**` owns rendering and local panel command dispatch; keep it pure except transient hit-test registration.
-- `src/ui/preview/**` owns the TUI preview renderers; core preview models must stay free of ratatui/crossterm types.
-- `src/input.rs` owns key/mouse routing; use `App::set_active_tab` instead of assigning `active_tab` directly.
-- `src/input_edit{,_multi}.rs` and `src/picker_core.rs` own the shared text-input vocabulary. Don't hand-roll a key table; embed one of the three layers (see "Text Input Stack" below).
-- `src/file_tree.rs` owns file-tree state and navigation; preview data/loading lives in `crates/reef-core/src/preview/**`.
-- `src/keymap.rs` owns shortcut bindings by scope; handlers should dispatch commands, not duplicate key matching tables.
+- `crates/reef-tui/src/tasks.rs` owns background worker definitions and should stay free of UI concerns.
+- `crates/reef-tui/src/ui/**` owns rendering and local panel command dispatch; keep it pure except transient hit-test registration.
+- `crates/reef-tui/src/ui/preview/**` owns the TUI preview renderers; core preview models must stay free of ratatui/crossterm types.
+- `crates/reef-tui/src/input.rs` owns key/mouse routing; use `App::set_active_tab` instead of assigning `active_tab` directly.
+- `crates/reef-tui/src/input_edit{,_multi}.rs` and `crates/reef-tui/src/picker_core.rs` own the shared text-input vocabulary. Don't hand-roll a key table; embed one of the three layers (see "Text Input Stack" below).
+- `crates/reef-tui/src/file_tree.rs` owns file-tree state and navigation; preview data/loading lives in `crates/reef-core/src/preview/**`.
+- `crates/reef-tui/src/keymap.rs` owns shortcut bindings by scope; handlers should dispatch commands, not duplicate key matching tables.
 
 ## Text Input Stack
 
@@ -86,7 +86,7 @@ cargo test --workspace --doc
 
 Failure modes that keep catching people:
 
-- **`cargo test --lib` is not enough.** It skips integration tests (`tests/*.rs`), snapshot tests (`tests/ui_snapshots.rs`), and doctests. CI runs `--workspace --all-features` — so must you.
+- **`cargo test --lib` is not enough.** It skips integration tests (`crates/reef-tui/tests/*.rs`), snapshot tests (`crates/reef-tui/tests/ui_snapshots.rs`), and doctests. CI runs `--workspace --all-features` — so must you.
 - **Clippy without `--workspace` misses `test-support`.** The scope flag is load-bearing; drop it and a broken lint in a helper crate sails through locally then trips CI.
 - **`cargo fmt` edits in place; `--check` only verifies.** Run the first to fix, the second to gate. Omit the first and every stylebot nit becomes a second commit on your PR.
 

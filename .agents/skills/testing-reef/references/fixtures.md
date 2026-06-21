@@ -1,6 +1,6 @@
 # `test-support` fixture reference
 
-All shared test helpers live in `crates/test-support/src/lib.rs`. Every consumer has `test-support = { path = "../test-support" }` as a dev-dependency, so `use test_support::...` works from any `tests/*.rs` or `benches/*.rs`.
+All shared test helpers live in `crates/test-support/src/lib.rs`. Every consumer has `test-support = { path = "../test-support" }` as a dev-dependency, so `use test_support::...` works from any `crates/reef-tui/tests/*.rs` or `crates/reef-tui/benches/*.rs`.
 
 Don't reach into `git2` directly from tests or copy these helpers around — extend the crate when you need something new. One canonical source means every test gets the same fix when we find a better way.
 
@@ -72,8 +72,8 @@ fn fake_commit(oid: &str, parents: &[&str]) -> CommitInfo {
 Existing examples:
 
 - `crates/reef-core/src/git/graph.rs` — unit tests inside the module itself
-- `tests/git_graph_properties.rs` — the proptest version, which generates topologically-ordered commit vectors from a random shape
-- `benches/graph.rs` — the bench version with a deterministic fork/merge pattern
+- `crates/reef-tui/tests/git_graph_properties.rs` — the proptest version, which generates topologically-ordered commit vectors from a random shape
+- `crates/reef-tui/benches/graph.rs` — the bench version with a deterministic fork/merge pattern
 
 Topological order (child before parent) is the caller's responsibility — `build_graph` assumes it.
 

@@ -101,10 +101,16 @@ fn make_absolute(path: PathBuf) -> PathBuf {
     if path.is_absolute() {
         path
     } else {
-        env::current_dir()
-            .expect("current dir set by cargo")
-            .join(path)
+        workspace_root().join(path)
     }
+}
+
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("reef-io lives under crates/")
+        .to_path_buf()
 }
 
 fn agent_binary_name(target: &str) -> &'static str {

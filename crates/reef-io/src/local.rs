@@ -4,7 +4,7 @@
 //!
 //! Every git operation re-opens `git2::Repository::discover(workdir)` rather
 //! than caching a handle — matches what the background workers in
-//! `src/tasks.rs` already do and keeps `LocalBackend` `Send + Sync` without
+//! `crates/reef-tui/src/tasks.rs` already do and keeps `LocalBackend` `Send + Sync` without
 //! any `Mutex` dance around `Repository` (which is non-Send).
 
 use std::borrow::Cow;

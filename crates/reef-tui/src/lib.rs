@@ -1,6 +1,6 @@
 //! Library crate for reef — exposes modules as public API so that
 //! integration tests under `tests/` can exercise them. The `reef` binary
-//! (src/main.rs) is a thin wrapper that consumes this library.
+//! (`src/main.rs`) is a thin wrapper that consumes this library.
 
 pub mod app;
 pub mod clipboard;

@@ -3,7 +3,7 @@
 //! selection) when the user drags past the viewport vertically.
 //!
 //! The pure helpers (step / distance / interval) have their own unit
-//! tests in `src/input.rs`. These tests cover the orchestration: gate
+//! tests in `crates/reef-tui/src/input.rs`. These tests cover the orchestration: gate
 //! conditions, scroll-field routing, clamp-at-bounds, throttle, and the
 //! `selection.active` refresh that makes the selection appear to "follow"
 //! the autoscroll.

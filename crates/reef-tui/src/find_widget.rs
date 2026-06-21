@@ -13,9 +13,10 @@ use crate::app::App;
 use crate::input;
 use crate::input_edit;
 use crate::keymap::{Command, InputScope, Keymap};
-use crate::search::{MatchLoc, Snapshot, center_scroll, find_all, restore_snapshot, take_snapshot};
+use crate::search::{MatchLoc, Snapshot, center_scroll, restore_snapshot, take_snapshot};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use reef_core::diff::{DiffLayout, DiffRowText, DiffSide};
+use reef_core::search::{SearchOptions, build_row_index, ranges_on_row};
 use std::ops::Range;
 use std::time::Instant;
 
@@ -88,10 +89,7 @@ impl FindWidgetState {
     pub fn set_matches(&mut self, matches: Vec<MatchLoc>) {
         self.matches = matches;
         self.current = None;
-        self.row_index.clear();
-        for (i, m) in self.matches.iter().enumerate() {
-            self.row_index.entry(m.row).or_default().push(i);
-        }
+        self.row_index = build_row_index(&self.matches);
     }
 
     /// Empty `matches` + reset associated fields (index, current,
@@ -116,19 +114,7 @@ impl FindWidgetState {
         if self.target != Some(target) || self.matches.is_empty() {
             return (Vec::new(), None);
         }
-        let Some(idxs) = self.row_index.get(&row) else {
-            return (Vec::new(), None);
-        };
-        let mut all = Vec::with_capacity(idxs.len());
-        let mut cur = None;
-        for &i in idxs {
-            let m = &self.matches[i];
-            if Some(i) == self.current {
-                cur = Some(m.byte_range.clone());
-            }
-            all.push(m.byte_range.clone());
-        }
-        (all, cur)
+        ranges_on_row(&self.matches, &self.row_index, self.current, row)
     }
 
     pub fn clear(&mut self) {
@@ -527,7 +513,7 @@ pub fn recompute(app: &mut App) {
         return;
     }
 
-    let opts = MatchOptions {
+    let opts = SearchOptions {
         case_sensitive: app.find_widget.match_case,
         whole_word: app.find_widget.whole_word,
         regex: app.find_widget.regex,
@@ -537,7 +523,7 @@ pub fn recompute(app: &mut App) {
     let mut matches: Vec<MatchLoc> = Vec::new();
     let mut regex_error: Option<String> = None;
     for (idx, text) in rows.iter().enumerate() {
-        match find_all_with(text, &query, &opts) {
+        match reef_core::search::find_all_with_options(text, &query, &opts) {
             Ok(rs) => {
                 for r in rs {
                     matches.push(MatchLoc {
@@ -574,82 +560,14 @@ fn pick_current(app: &App, target: FindTarget) -> Option<usize> {
         .or(Some(0))
 }
 
-// ─── Matching engine ─────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct MatchOptions {
-    pub case_sensitive: bool,
-    pub whole_word: bool,
-    pub regex: bool,
-}
-
-/// All byte-range matches of `needle` in `haystack` honouring the three
-/// VSCode-style toggles. The `regex` toggle uses the standard `regex` crate;
-/// the literal-substring path reuses `search::find_all` and post-filters
-/// whole-word boundaries so CJK haystacks behave predictably.
-pub(crate) fn find_all_with(
-    haystack: &str,
-    needle: &str,
-    opts: &MatchOptions,
-) -> Result<Vec<Range<usize>>, regex::Error> {
-    if needle.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    if opts.regex {
-        let pattern = if opts.whole_word {
-            format!(r"\b(?:{}){}", needle, r"\b")
-        } else {
-            needle.to_string()
-        };
-        let re = regex::RegexBuilder::new(&pattern)
-            .case_insensitive(!opts.case_sensitive)
-            .multi_line(false)
-            .build()?;
-        let mut out = Vec::new();
-        for m in re.find_iter(haystack) {
-            // Zero-width matches (e.g. `(?:)`) can't anchor highlight ranges,
-            // and infinite-looping on them is pointless — skip silently.
-            if m.start() < m.end() {
-                out.push(m.start()..m.end());
-            }
-        }
-        return Ok(out);
-    }
-
-    let case_insensitive = !opts.case_sensitive;
-    let raw = find_all(haystack, needle, case_insensitive);
-    if !opts.whole_word {
-        return Ok(raw);
-    }
-    Ok(raw
-        .into_iter()
-        .filter(|r| is_word_boundary(haystack, r))
-        .collect())
-}
-
-fn is_word_boundary(text: &str, range: &Range<usize>) -> bool {
-    let before_ok = range.start == 0
-        || !text[..range.start]
-            .chars()
-            .next_back()
-            .is_some_and(input_edit::is_word_char);
-    let after_ok = range.end >= text.len()
-        || !text[range.end..]
-            .chars()
-            .next()
-            .is_some_and(input_edit::is_word_char);
-    before_ok && after_ok
-}
-
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use reef_core::search::{SearchOptions, find_all_with_options};
 
-    fn opts(case_sensitive: bool, whole_word: bool, regex: bool) -> MatchOptions {
-        MatchOptions {
+    fn opts(case_sensitive: bool, whole_word: bool, regex: bool) -> SearchOptions {
+        SearchOptions {
             case_sensitive,
             whole_word,
             regex,
@@ -657,61 +575,18 @@ mod tests {
     }
 
     #[test]
-    fn literal_case_insensitive_by_default() {
-        let r = find_all_with("Foo FOO foo", "foo", &opts(false, false, false)).unwrap();
-        assert_eq!(r, vec![0..3, 4..7, 8..11]);
-    }
-
-    #[test]
-    fn literal_case_sensitive_when_toggled() {
-        let r = find_all_with("Foo FOO foo", "foo", &opts(true, false, false)).unwrap();
-        assert_eq!(r, vec![8..11]);
-    }
-
-    #[test]
-    fn whole_word_rejects_substring_match() {
-        // "food" should not match "foo" with whole_word.
-        let r = find_all_with("food foo foo!", "foo", &opts(false, true, false)).unwrap();
-        assert_eq!(r, vec![5..8, 9..12]);
-    }
-
-    #[test]
-    fn whole_word_at_string_boundaries_passes() {
-        let r = find_all_with("foo", "foo", &opts(false, true, false)).unwrap();
-        assert_eq!(r, vec![0..3]);
-    }
-
-    #[test]
-    fn regex_basic() {
-        let r = find_all_with("a1 b22 c333", r"\d+", &opts(false, false, true)).unwrap();
-        assert_eq!(r, vec![1..2, 4..6, 8..11]);
-    }
-
-    #[test]
-    fn regex_invalid_returns_err() {
-        let r = find_all_with("anything", "(unclosed", &opts(false, false, true));
-        assert!(r.is_err());
-    }
-
-    #[test]
-    fn regex_with_whole_word_anchors_boundaries() {
-        let r = find_all_with("foo food foo!", r"foo", &opts(false, true, true)).unwrap();
-        assert_eq!(r, vec![0..3, 9..12]);
-    }
-
-    #[test]
     fn regex_case_sensitivity_obeys_toggle() {
-        let r_i = find_all_with("Foo foo FOO", r"foo", &opts(false, false, true)).unwrap();
-        let r_s = find_all_with("Foo foo FOO", r"foo", &opts(true, false, true)).unwrap();
+        let r_i = find_all_with_options("Foo foo FOO", r"foo", &opts(false, false, true)).unwrap();
+        let r_s = find_all_with_options("Foo foo FOO", r"foo", &opts(true, false, true)).unwrap();
         assert_eq!(r_i, vec![0..3, 4..7, 8..11]);
         assert_eq!(r_s, vec![4..7]);
     }
 
     #[test]
     fn empty_needle_returns_no_matches() {
-        let r = find_all_with("anything", "", &opts(false, false, false)).unwrap();
+        let r = find_all_with_options("anything", "", &opts(false, false, false)).unwrap();
         assert!(r.is_empty());
-        let r = find_all_with("anything", "", &opts(false, false, true)).unwrap();
+        let r = find_all_with_options("anything", "", &opts(false, false, true)).unwrap();
         assert!(r.is_empty());
     }
 }

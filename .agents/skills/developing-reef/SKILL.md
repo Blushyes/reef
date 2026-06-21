@@ -36,7 +36,7 @@ Read `references/runtime-architecture.md` before changing `crates/reef-tui/src/a
 - `crates/reef-tui/src/ui/preview/**` owns the TUI preview renderers; core preview models must stay free of ratatui/crossterm types.
 - `crates/reef-tui/src/input.rs` owns key/mouse routing; use `App::set_active_tab` instead of assigning `active_tab` directly.
 - `crates/reef-tui/src/input_edit{,_multi}.rs` and `crates/reef-tui/src/picker_core.rs` own the shared text-input vocabulary. Don't hand-roll a key table; embed one of the three layers (see "Text Input Stack" below).
-- `crates/reef-tui/src/file_tree.rs` owns file-tree state and navigation; preview data/loading lives in `crates/reef-core/src/preview/**`.
+- `crates/reef-core/src/file_tree.rs` owns file-tree state/navigation; `crates/reef-tui/src/file_tree.rs` only wraps it with IO rebuilds. Preview data/loading lives in `crates/reef-core/src/preview/**`.
 - `crates/reef-tui/src/keymap.rs` owns shortcut bindings by scope; handlers should dispatch commands, not duplicate key matching tables.
 
 ## Text Input Stack

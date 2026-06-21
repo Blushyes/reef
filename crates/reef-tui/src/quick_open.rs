@@ -20,9 +20,7 @@
 //!   characters in real-world paths are exotic enough to be worth the edge.
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
-use nucleo_matcher::{Config, Matcher, Utf32String};
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -32,29 +30,17 @@ use crate::input_edit;
 use crate::keymap::{Command, InputScope, Keymap};
 use crate::prefs;
 use crate::ui::mouse::ClickAction;
+use reef_core::quick_open::{MRU_MAX, MRU_PREF_KEY};
 use reef_io::{Backend, WalkOpts};
-
-const MRU_MAX: usize = 50;
-const MRU_PREF_KEY: &str = "quickopen.mru";
-const MRU_SEP: char = '\t';
 
 /// One file that can be matched. `display` is the workdir-relative path as it
 /// appears in the UI; `utf32` is the same string pre-encoded to the form
 /// nucleo consumes, so filter() doesn't re-encode every keystroke.
-pub struct Candidate {
-    pub rel_path: PathBuf,
-    pub display: String,
-    utf32: Utf32String,
-}
+pub type Candidate = reef_core::quick_open::QuickOpenCandidate;
 
 /// A single filtered hit. `indices` are character positions in
 /// `index[idx].display` that matched — fed to the renderer for highlighting.
-#[derive(Clone)]
-pub struct MatchEntry {
-    pub idx: usize,
-    pub score: u32,
-    pub indices: Vec<u32>,
-}
+pub type MatchEntry = reef_core::quick_open::QuickOpenMatch;
 
 pub struct QuickOpenState {
     /// Shared overlay scaffolding (`active`, `query` → `core.filter`,
@@ -142,12 +128,7 @@ pub fn accept(app: &mut App) {
     };
     let rel = cand.rel_path.clone();
 
-    // MRU: move-to-front with dedup, cap at MRU_MAX.
-    app.quick_open.mru.retain(|p| p != &rel);
-    app.quick_open.mru.push_front(rel.clone());
-    while app.quick_open.mru.len() > MRU_MAX {
-        app.quick_open.mru.pop_back();
-    }
+    reef_core::quick_open::bump_mru(&mut app.quick_open.mru, rel.clone(), MRU_MAX);
     save_mru_to_prefs(&app.quick_open.mru);
 
     app.push_location_before_jump();
@@ -358,58 +339,8 @@ pub fn handle_mouse(mouse: MouseEvent, app: &mut App) {
 /// `query` is non-empty we delegate to nucleo and sort by score desc, with
 /// shorter paths as a tiebreaker (keeps basename hits above deep-path hits).
 pub fn filter(state: &mut QuickOpenState) {
-    state.matches.clear();
-
-    if state.core.filter.is_empty() {
-        let mut seen: HashSet<usize> = HashSet::new();
-        for path in &state.mru {
-            if let Some(idx) = state.index.iter().position(|c| &c.rel_path == path) {
-                state.matches.push(MatchEntry {
-                    idx,
-                    score: 0,
-                    indices: Vec::new(),
-                });
-                seen.insert(idx);
-            }
-        }
-        for idx in 0..state.index.len() {
-            if !seen.contains(&idx) {
-                state.matches.push(MatchEntry {
-                    idx,
-                    score: 0,
-                    indices: Vec::new(),
-                });
-            }
-        }
-    } else {
-        let mut matcher = Matcher::new(Config::DEFAULT);
-        let pattern = Pattern::parse(
-            &state.core.filter,
-            CaseMatching::Smart,
-            Normalization::Smart,
-        );
-        for (idx, cand) in state.index.iter().enumerate() {
-            let mut indices: Vec<u32> = Vec::new();
-            if let Some(score) = pattern.indices(cand.utf32.slice(..), &mut matcher, &mut indices) {
-                state.matches.push(MatchEntry {
-                    idx,
-                    score,
-                    indices,
-                });
-            }
-        }
-        // Primary: score desc. Tiebreak: shorter path (basename hits beat
-        // deep-path hits with the same score). Secondary tiebreak:
-        // lexicographic so the order is stable.
-        state.matches.sort_by(|a, b| {
-            b.score.cmp(&a.score).then_with(|| {
-                let la = state.index[a.idx].display.len();
-                let lb = state.index[b.idx].display.len();
-                la.cmp(&lb)
-                    .then_with(|| state.index[a.idx].display.cmp(&state.index[b.idx].display))
-            })
-        });
-    }
+    state.matches =
+        reef_core::quick_open::filter_candidates(&state.index, &state.core.filter, &state.mru);
 
     // Query change resets the viewport so the top match is visible.
     state.core.selected_idx = 0;
@@ -436,19 +367,7 @@ fn rebuild_index_via_backend(backend: &dyn Backend) -> Vec<Candidate> {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
-    let mut out: Vec<Candidate> = Vec::with_capacity(resp.paths.len());
-    for display in resp.paths {
-        if display.is_empty() {
-            continue;
-        }
-        let utf32 = Utf32String::from(display.as_str());
-        out.push(Candidate {
-            rel_path: PathBuf::from(&display),
-            display,
-            utf32,
-        });
-    }
-    out
+    reef_core::quick_open::build_candidates(resp.paths)
 }
 
 /// Legacy direct-walk path kept only for the `rebuild_index_respects_gitignore`
@@ -472,15 +391,7 @@ fn rebuild_index(root: &std::path::Path) -> Vec<Candidate> {
             continue;
         };
         let display = rel.to_string_lossy().to_string();
-        if display.is_empty() {
-            continue;
-        }
-        let utf32 = Utf32String::from(display.as_str());
-        out.push(Candidate {
-            rel_path: rel.to_path_buf(),
-            display,
-            utf32,
-        });
+        out.extend(reef_core::quick_open::build_candidates([display]));
     }
     out.sort_by(|a, b| a.display.cmp(&b.display));
     out
@@ -492,24 +403,11 @@ fn load_mru_from_prefs() -> VecDeque<PathBuf> {
     let Some(raw) = prefs::get(MRU_PREF_KEY) else {
         return VecDeque::new();
     };
-    raw.split(MRU_SEP)
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .collect()
+    reef_core::quick_open::decode_mru(&raw)
 }
 
 fn save_mru_to_prefs(mru: &VecDeque<PathBuf>) {
-    // The prefs file uses `key=value\n` lines split via `split_once('=')` and
-    // per-line trim, so values mustn't contain `\n`, and we use `\t` as our
-    // in-value separator. Either character in a real path is pathological,
-    // but we replace them defensively so one weird path can't corrupt the
-    // whole prefs file.
-    let joined: String = mru
-        .iter()
-        .map(|p| p.to_string_lossy().replace(['\t', '\n'], " "))
-        .collect::<Vec<_>>()
-        .join(&MRU_SEP.to_string());
-    prefs::set(MRU_PREF_KEY, &joined);
+    prefs::set(MRU_PREF_KEY, &reef_core::quick_open::encode_mru(mru));
 }
 
 // ─── Input helpers ───────────────────────────────────────────────────────────
@@ -536,14 +434,7 @@ mod tests {
     use super::*;
 
     fn mk_state(paths: &[&str]) -> QuickOpenState {
-        let index = paths
-            .iter()
-            .map(|p| Candidate {
-                rel_path: PathBuf::from(p),
-                display: p.to_string(),
-                utf32: Utf32String::from(*p),
-            })
-            .collect();
+        let index = reef_core::quick_open::build_candidates(paths.iter().map(|p| p.to_string()));
         QuickOpenState {
             index,
             index_stale: false,

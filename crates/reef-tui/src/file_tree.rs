@@ -1,117 +1,74 @@
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-pub use reef_io::TreeEntry;
+pub use reef_core::file_tree::{FileTreeState, TreeEntry};
 
-/// Manages the file tree state.
 pub struct FileTree {
     pub root: PathBuf,
-    pub entries: Vec<TreeEntry>,
-    pub selected: usize,
-    expanded: HashSet<PathBuf>,
-    git_statuses: HashMap<String, char>,
+    pub state: FileTreeState,
 }
 
 impl FileTree {
     pub fn new(workdir: &Path) -> Self {
         let mut tree = Self {
             root: workdir.to_path_buf(),
-            entries: Vec::new(),
-            selected: 0,
-            expanded: HashSet::new(),
-            git_statuses: HashMap::new(),
+            state: FileTreeState::default(),
         };
         tree.rebuild();
         tree
     }
 
     pub fn rebuild(&mut self) {
-        self.entries =
-            reef_io::local::build_entries(&self.root, &self.expanded, &self.git_statuses);
-        if !self.entries.is_empty() {
-            self.selected = self.selected.min(self.entries.len() - 1);
-        } else {
-            self.selected = 0;
-        }
+        let entries = reef_io::local::build_entries(
+            &self.root,
+            self.state.expanded(),
+            self.state.git_statuses(),
+        );
+        let selected = self.state.selected;
+        self.state.replace_entries(entries, selected);
     }
 
     pub fn toggle_expand(&mut self, index: usize) {
-        if let Some(entry) = self.entries.get(index)
-            && entry.is_dir
-        {
-            let path = entry.path.clone();
-            if self.expanded.contains(&path) {
-                self.expanded.remove(&path);
-            } else {
-                self.expanded.insert(path);
-            }
-        }
+        self.state.toggle_expand(index);
     }
 
     pub fn collapse_all(&mut self) {
-        self.expanded.clear();
-        self.selected = 0;
+        self.state.collapse_all();
     }
 
     pub fn navigate(&mut self, delta: i32) {
-        if self.entries.is_empty() {
-            return;
-        }
-        let last = self.entries.len() - 1;
-        if self.selected > last {
-            self.selected = if delta > 0 { 0 } else { last };
-            return;
-        }
-        if delta > 0 {
-            self.selected = (self.selected + delta as usize).min(last);
-        } else {
-            self.selected = self.selected.saturating_sub((-delta) as usize);
-        }
+        self.state.navigate(delta);
     }
 
     pub fn clear_selection(&mut self) {
-        self.selected = self.entries.len();
+        self.state.clear_selection();
     }
 
     pub fn selected_cleared(&self) -> bool {
-        self.selected >= self.entries.len()
+        self.state.selected_cleared()
     }
 
     pub fn selected_entry(&self) -> Option<&TreeEntry> {
-        self.entries.get(self.selected)
+        self.state.selected_entry()
     }
 
     pub fn selected_path(&self) -> Option<PathBuf> {
-        self.selected_entry().map(|entry| entry.path.clone())
+        self.state.selected_path()
     }
 
     pub fn expanded_paths(&self) -> Vec<PathBuf> {
-        self.expanded.iter().cloned().collect()
+        self.state.expanded_paths()
     }
 
-    pub fn git_statuses(&self) -> HashMap<String, char> {
-        self.git_statuses.clone()
+    pub fn git_statuses(&self) -> std::collections::HashMap<String, char> {
+        self.state.git_statuses_map()
     }
 
     pub fn replace_entries(&mut self, entries: Vec<TreeEntry>, selected_idx: usize) {
-        self.entries = entries;
-        if self.entries.is_empty() {
-            self.selected = 0;
-        } else {
-            self.selected = selected_idx.min(self.entries.len() - 1);
-        }
+        self.state.replace_entries(entries, selected_idx);
     }
 
     pub fn reveal(&mut self, rel: &Path) {
-        for ancestor in rel.ancestors().skip(1) {
-            if ancestor.as_os_str().is_empty() {
-                break;
-            }
-            self.expanded.insert(ancestor.to_path_buf());
-        }
-        if let Some(idx) = self.entries.iter().position(|entry| entry.path == rel) {
-            self.selected = idx;
-        }
+        self.state.reveal(rel);
     }
 
     pub fn refresh_git_statuses(
@@ -119,169 +76,20 @@ impl FileTree {
         staged: &[reef_core::git::FileEntry],
         unstaged: &[reef_core::git::FileEntry],
     ) {
-        self.git_statuses.clear();
-        for file in staged {
-            self.git_statuses.insert(
-                file.path.clone(),
-                file.status.label().chars().next().unwrap_or(' '),
-            );
-        }
-        for file in unstaged {
-            let ch = file.status.label().chars().next().unwrap_or(' ');
-            self.git_statuses.entry(file.path.clone()).or_insert(ch);
-        }
-
-        let paths: Vec<String> = self.git_statuses.keys().cloned().collect();
-        for path in paths {
-            let p = Path::new(&path);
-            for ancestor in p.ancestors().skip(1) {
-                let ancestor = ancestor.to_string_lossy().to_string();
-                if ancestor.is_empty() {
-                    break;
-                }
-                self.git_statuses.entry(ancestor).or_insert('●');
-            }
-        }
-        self.apply_git_statuses_to_entries();
-    }
-
-    fn apply_git_statuses_to_entries(&mut self) {
-        for entry in &mut self.entries {
-            let rel = entry.path.to_string_lossy().to_string();
-            entry.git_status = self.git_statuses.get(&rel).copied();
-        }
+        self.state.refresh_git_statuses(staged, unstaged);
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use reef_core::git::{FileEntry, FileStatus};
+impl std::ops::Deref for FileTree {
+    type Target = FileTreeState;
 
-    fn make_entry(path: &str, status: FileStatus) -> FileEntry {
-        FileEntry {
-            path: path.to_string(),
-            status,
-            additions: 0,
-            deletions: 0,
-        }
+    fn deref(&self) -> &Self::Target {
+        &self.state
     }
+}
 
-    fn make_tree_with_entries(entries: Vec<TreeEntry>) -> FileTree {
-        FileTree {
-            root: PathBuf::from("/nonexistent"),
-            entries,
-            selected: 0,
-            expanded: HashSet::new(),
-            git_statuses: HashMap::new(),
-        }
-    }
-
-    fn dummy_entry(name: &str) -> TreeEntry {
-        TreeEntry {
-            path: PathBuf::from(name),
-            name: name.to_string(),
-            depth: 0,
-            is_dir: false,
-            is_expanded: false,
-            git_status: None,
-        }
-    }
-
-    #[test]
-    fn navigate_forward() {
-        let mut tree =
-            make_tree_with_entries(vec![dummy_entry("a"), dummy_entry("b"), dummy_entry("c")]);
-        tree.navigate(1);
-        assert_eq!(tree.selected, 1);
-    }
-
-    #[test]
-    fn navigate_backward_at_zero_stays_zero() {
-        let mut tree = make_tree_with_entries(vec![dummy_entry("a"), dummy_entry("b")]);
-        tree.navigate(-1);
-        assert_eq!(tree.selected, 0);
-    }
-
-    #[test]
-    fn navigate_clamps_at_end() {
-        let mut tree =
-            make_tree_with_entries(vec![dummy_entry("a"), dummy_entry("b"), dummy_entry("c")]);
-        tree.navigate(9999);
-        assert_eq!(tree.selected, 2);
-    }
-
-    #[test]
-    fn navigate_no_op_on_empty() {
-        let mut tree = make_tree_with_entries(vec![]);
-        tree.navigate(1);
-        assert_eq!(tree.selected, 0);
-    }
-
-    #[test]
-    fn selected_entry_empty_returns_none() {
-        let tree = make_tree_with_entries(vec![]);
-        assert!(tree.selected_entry().is_none());
-    }
-
-    #[test]
-    fn selected_entry_returns_correct_entry() {
-        let mut tree = make_tree_with_entries(vec![
-            dummy_entry("file0.rs"),
-            dummy_entry("file1.rs"),
-            dummy_entry("file2.rs"),
-        ]);
-        tree.selected = 2;
-        assert_eq!(tree.selected_entry().unwrap().name, "file2.rs");
-    }
-
-    #[test]
-    fn refresh_git_statuses_clears_previous() {
-        let mut tree = make_tree_with_entries(vec![]);
-        tree.git_statuses.insert("old.rs".to_string(), 'X');
-        tree.refresh_git_statuses(&[], &[]);
-        assert!(tree.git_statuses.is_empty());
-    }
-
-    #[test]
-    fn refresh_git_statuses_inserts_staged_files() {
-        let mut tree = make_tree_with_entries(vec![]);
-        let staged = vec![make_entry("src/main.rs", FileStatus::Modified)];
-        tree.refresh_git_statuses(&staged, &[]);
-        assert_eq!(tree.git_statuses.get("src/main.rs").copied(), Some('M'));
-    }
-
-    #[test]
-    fn refresh_git_statuses_propagates_to_parent_dir() {
-        let mut tree = make_tree_with_entries(vec![]);
-        let staged = vec![make_entry("src/main.rs", FileStatus::Added)];
-        tree.refresh_git_statuses(&staged, &[]);
-        assert!(tree.git_statuses.contains_key("src"));
-    }
-
-    #[test]
-    fn refresh_git_statuses_unstaged_does_not_overwrite_staged() {
-        let mut tree = make_tree_with_entries(vec![]);
-        let staged = vec![make_entry("a.rs", FileStatus::Added)];
-        let unstaged = vec![make_entry("a.rs", FileStatus::Modified)];
-        tree.refresh_git_statuses(&staged, &unstaged);
-        assert_eq!(tree.git_statuses.get("a.rs").copied(), Some('A'));
-    }
-
-    #[test]
-    fn refresh_git_statuses_updates_visible_entries_without_rebuild() {
-        let mut src = dummy_entry("src");
-        src.is_dir = true;
-        let mut file = dummy_entry("main.rs");
-        file.path = PathBuf::from("src/main.rs");
-        file.depth = 1;
-        let mut tree = make_tree_with_entries(vec![src, file]);
-
-        let staged = vec![make_entry("src/main.rs", FileStatus::Modified)];
-        tree.refresh_git_statuses(&staged, &[]);
-
-        assert_eq!(tree.entries.len(), 2);
-        assert_eq!(tree.entries[0].git_status, Some('●'));
-        assert_eq!(tree.entries[1].git_status, Some('M'));
+impl std::ops::DerefMut for FileTree {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
     }
 }

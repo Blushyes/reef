@@ -672,20 +672,7 @@ pub fn navigate_to_selected(app: &mut App) {
 /// Preserves the invariant that the returned string is valid UTF-8 even if
 /// the input had a fragment at the limit.
 pub fn truncate_line(text: &str) -> String {
-    let mut chars_seen = 0usize;
-    let mut byte_end = 0usize;
-    for (bi, c) in text.char_indices() {
-        if chars_seen >= MAX_LINE_CHARS {
-            break;
-        }
-        byte_end = bi + c.len_utf8();
-        chars_seen += 1;
-    }
-    if byte_end >= text.len() {
-        text.to_string()
-    } else {
-        text[..byte_end].to_string()
-    }
+    reef_core::search::truncate_line(text, MAX_LINE_CHARS)
 }
 
 /// Clip a byte range to a maximum end offset. If the range falls entirely
@@ -693,11 +680,7 @@ pub fn truncate_line(text: &str) -> String {
 /// match is off-screen (we still surface the hit — just without the
 /// highlight).
 pub fn clip_range(range: Range<usize>, max_end: usize) -> Option<Range<usize>> {
-    if range.start >= max_end {
-        return None;
-    }
-    let end = range.end.min(max_end);
-    Some(range.start..end)
+    reef_core::search::clip_range(range, max_end)
 }
 
 #[cfg(test)]

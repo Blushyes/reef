@@ -1,6 +1,6 @@
 # Reef Text-Input & Picker Stack
 
-Use this reference when touching `src/input.rs` text-input handlers, any
+Use this reference when touching `crates/reef-tui/src/input.rs` text-input handlers, any
 picker overlay (`hosts_picker`, `quick_open`, `global_search`,
 `graph_branch_picker`), the commit textarea, the SQLite goto-page input,
 or any new TUI input field. Reef has a deliberate three-layer
@@ -138,7 +138,7 @@ template — especially the `Char(_)` + (ctrl || alt) swallow guard on
 the Unhandled path.
 
 For paste: route through the appropriate `handle_paste` branch in
-`src/input.rs`. Don't depend on `Char('\r')` / `Char('\n')` events;
+`crates/reef-tui/src/input.rs`. Don't depend on `Char('\r')` / `Char('\n')` events;
 many terminals deliver bracketed-paste payloads instead, and
 non-bracketed terminals deliver discrete key events that the
 defensive `Char('\r') → CursorOnly` arm in `dispatch_key_multi`
@@ -206,9 +206,9 @@ unification work. Don't repeat the bugs:
 | Need | Look at |
 |---|---|
 | L0 single-line | `src/find_widget.rs` (handle_key) — cleanest two-phase pattern |
-| L0 filtered | `src/input.rs::handle_key_db_goto` — digit-only predicate |
-| L1 multi-line | `src/input.rs::handle_key_git_commit` — Ctrl/Alt+Char swallow guard included |
-| L2 picker | `src/input.rs::handle_key_graph_branch_picker` — minimal InputOutcome translation; or `src/input.rs::handle_key_hosts_picker` for the double-buffer (filter + path mode) variant |
+| L0 filtered | `crates/reef-tui/src/input.rs::handle_key_db_goto` — digit-only predicate |
+| L1 multi-line | `crates/reef-tui/src/input.rs::handle_key_git_commit` — Ctrl/Alt+Char swallow guard included |
+| L2 picker | `crates/reef-tui/src/input.rs::handle_key_graph_branch_picker` — minimal InputOutcome translation; or `crates/reef-tui/src/input.rs::handle_key_hosts_picker` for the double-buffer (filter + path mode) variant |
 
 Tests live in `src/{input_edit,input_edit_multi,picker_core,
 graph_branch_picker}::tests` plus integration coverage under

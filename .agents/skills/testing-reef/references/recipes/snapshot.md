@@ -126,7 +126,7 @@ This accepts the new output as the new baseline. **Always** review the diff befo
 
 ```bash
 cargo insta review
-# or just: git diff tests/snapshots/
+# or just: git diff crates/reef-tui/tests/snapshots/
 ```
 
 Commit the updated `.snap` file. **Never** commit `.snap.new` files — those are pending snapshots that weren't accepted. The `.gitignore` already excludes them.

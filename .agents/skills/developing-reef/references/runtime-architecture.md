@@ -70,7 +70,7 @@ Before coding, decide these names and locations:
 - UI state field in `App` or a tab state struct.
 - Snapshot/result data type.
 - `AsyncState` field.
-- Worker request and result variant in `src/tasks.rs`.
+- Worker request and result variant in `crates/reef-tui/src/tasks.rs`.
 - `App` request method.
 - `App::apply_worker_result` merge branch.
 - `App::kick_active_tab_work` stale/throttle branch if it refreshes automatically.

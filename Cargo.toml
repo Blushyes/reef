@@ -1,75 +1,18 @@
-[package]
-name = "reef"
-version = "0.41.0"
-edition = "2024"
-publish = false
-
-[lints]
-workspace = true
-
-[[bin]]
-name = "reef"
-path = "src/main.rs"
-
-[dependencies]
-crossterm     = "0.29.0"
-git2          = { version = "0.21.0", default-features = false }
-reef-core    = { path = "crates/reef-core" }
-reef-io      = { path = "crates/reef-io" }
-ratatui       = "0.30.0"
-similar       = "3.1.0"
-unicode-width = "0.2.2"
-ignore        = "0.4"
-nucleo-matcher = "0.3"
-grep-regex    = "0.1.14"
-grep-matcher  = "0.1.8"
-serde         = { workspace = true }
-serde_json    = { workspace = true }
-url           = "2"
-terminal-colorsaurus = "1.0.3"
-# Used by legacy unit-test helpers; runtime trash goes through reef-io.
-trash         = "5"
-# Image preview protocol rendering in the TUI. Decoding lives in reef-core.
-ratatui-image = { version = "10.0.6", default-features = false, features = ["crossterm"] }
-image         = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
-reef-sqlite-preview = { path = "crates/reef-sqlite-preview" }
-# Used by unit tests in this crate.
-tempfile     = "3"
-# Regex matching for the VSCode-style Find widget's `.*` toggle. Stays
-# disabled by default — only used when `find_widget.regex == true` —
-# but the crate is unavoidable once the toggle exists since literal
-# substring matching can't express word boundaries / alternation.
-regex        = "1"
-
-[dev-dependencies]
-insta        = { version = "1", features = ["filters"] }
-criterion    = { version = "0.5", features = ["html_reports"] }
-proptest     = "1"
-test-support = { path = "crates/test-support" }
-# Used only to seed `.db` fixtures in integration tests for the SQLite
-# preview parity. Same `bundled` flag as `reef-sqlite-preview` so the
-# vendored SQLite C source is shared (no duplicate compile).
-rusqlite     = { version = "0.32", default-features = false, features = ["bundled"] }
-reef-proto   = { path = "crates/reef-proto" }
-
-[[bench]]
-name = "highlight"
-harness = false
-
-[[bench]]
-name = "graph"
-harness = false
-
-[[bench]]
-name = "diff_perf"
-harness = false
-
 # ─── Workspace ─────────────────────────────────────────────────────────────
-# Root is the `reef` crate itself; `crates/test-support` is a dev-only helper
-# lib used by this crate's integration tests. `fuzz/` is excluded and runs as
-# its own workspace (see fuzz/Cargo.toml).
+# Root is a workspace container. The `reef` package lives in
+# `crates/reef-tui`; `fuzz/` is excluded and runs as its own workspace (see
+# fuzz/Cargo.toml).
 [workspace]
-members = ["crates/test-support", "crates/reef-proto", "crates/reef-agent", "crates/reef-sqlite-preview", "crates/reef-core", "crates/reef-io"]
+members = [
+    "crates/test-support",
+    "crates/reef-proto",
+    "crates/reef-agent",
+    "crates/reef-sqlite-preview",
+    "crates/reef-core",
+    "crates/reef-io",
+    "crates/reef-tui",
+]
+default-members = ["crates/reef-tui"]
 resolver = "2"
 
 [workspace.dependencies]

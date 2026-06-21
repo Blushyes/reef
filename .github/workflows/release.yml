@@ -63,9 +63,8 @@ jobs:
         if: matrix.use_cross
         run: cargo install cross --locked --git https://github.com/cross-rs/cross
 
-      # The agent is built before reef itself so reef's `build.rs` can
-      # embed the freshly-built `reef-agent` binary as the upload fallback
-      # blob (see `src/agent_deploy/upload.rs`).
+      # The agent is built before reef itself so reef-io's build script can
+      # embed the freshly-built `reef-agent` binary as the upload fallback.
       - name: Build reef-agent (cargo)
         if: '!matrix.use_cross'
         run: cargo build --release --locked --target ${{ matrix.target }} -p reef-agent

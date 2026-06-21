@@ -11,7 +11,7 @@ Reef releases are driven by **git tags matching `v*`**. Pushing such a tag is th
 
 `.github/workflows/release.yml`:
 
-1. **Build matrix** — for each target, builds **`reef-agent` first, then `reef`** (`cargo build --release --locked -p <crate>`). reef-agent goes first because reef's `build.rs` embeds the freshly-built agent as the upload-fallback blob (see `src/agent_deploy/upload.rs`). Targets:
+1. **Build matrix** — for each target, builds **`reef-agent` first, then `reef`** (`cargo build --release --locked -p <crate>`). reef-agent goes first because `reef-io`'s build script embeds the freshly-built agent as the upload-fallback blob. Targets:
    - `aarch64-apple-darwin`, `x86_64-apple-darwin`
    - `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` (via `cross`)
    - `x86_64-pc-windows-msvc`
@@ -69,13 +69,13 @@ If every commit is `fix(...)` → patch. One or more `feat(...)` → minor. When
 PREV=v0.4.0       # last tag — sanity-check with `git describe --tags --abbrev=0`
 NEW=v0.5.0        # this release
 
-# 1. Bump Cargo.toml. `cargo build` re-runs to sync Cargo.lock's reef entry.
-sed -i '' 's/^version = ".*"/version = "'"${NEW#v}"'"/' Cargo.toml   # macOS BSD sed
+# 1. Bump Cargo.toml files. `cargo build` re-runs to sync Cargo.lock entries.
+sed -i '' 's/^version = ".*"/version = "'"${NEW#v}"'"/' crates/reef-tui/Cargo.toml crates/reef-io/Cargo.toml   # macOS BSD sed
 cargo build
-git diff --stat Cargo.toml Cargo.lock              # both files, trivial diff
+git diff --stat crates/reef-tui/Cargo.toml crates/reef-io/Cargo.toml Cargo.lock
 
 # 2. Release commit — on main, pre-tag.
-git add Cargo.toml Cargo.lock
+git add crates/reef-tui/Cargo.toml crates/reef-io/Cargo.toml Cargo.lock
 git commit -m "chore: release ${NEW}"
 git push origin main
 
@@ -160,15 +160,15 @@ Expected assets on the Release (**10 total**):
 - `reef-agent-linux-arm64.tar.gz`, `reef-agent-linux-x64.tar.gz`
 - `reef-agent-win32-x64.zip`
 
-If any are missing, the matrix job for that target failed — open `gh run view <run_id>`, check which job, re-run just the failed jobs with `gh run rerun <run_id> --failed`. A partial build does **not** block the npm publish jobs that already ran successfully, so your npm package may be live without the missing platform. Decide: rerun (good if the failure was transient) or cut a patch release (if the failure is real). Note: because reef's `build.rs` embeds `reef-agent`, a reef-agent build failure cascades into the reef build for that target — the two binaries for a given platform fail or succeed together.
+If any are missing, the matrix job for that target failed — open `gh run view <run_id>`, check which job, re-run just the failed jobs with `gh run rerun <run_id> --failed`. A partial build does **not** block the npm publish jobs that already ran successfully, so your npm package may be live without the missing platform. Decide: rerun (good if the failure was transient) or cut a patch release (if the failure is real). Note: because `reef-io` embeds `reef-agent`, a reef-agent build failure cascades into the reef build for that target — the two binaries for a given platform fail or succeed together.
 
 ## Pitfalls we've paid for
 
 ### Cargo.toml drift
 
-Before v0.5.0, Cargo.toml sat at `version = "0.1.0"` across seven tags from v0.1.0 → v0.4.0. Every release commit **must** bump Cargo.toml + Cargo.lock together. If you see `version = "0.x.y"` where x.y is older than the latest tag on main, the previous release skipped the bump — fix it in your release commit.
+Before v0.5.0, Cargo.toml sat at `version = "0.1.0"` across seven tags from v0.1.0 → v0.4.0. Every release commit **must** bump `crates/reef-tui/Cargo.toml`, `crates/reef-io/Cargo.toml`, and Cargo.lock together. If you see `version = "0.x.y"` where x.y is older than the latest tag on main, the previous release skipped the bump — fix it in your release commit.
 
-Consider adding a CI check later: on tag push, assert `Cargo.toml` version equals `${GITHUB_REF_NAME#v}` before the publish jobs.
+Consider adding a CI check later: on tag push, assert the `crates/reef-tui/Cargo.toml` and `crates/reef-io/Cargo.toml` versions equal `${GITHUB_REF_NAME#v}` before the publish jobs.
 
 ### Shell escaping in `--notes`
 

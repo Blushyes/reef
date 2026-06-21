@@ -1,6 +1,6 @@
 # Integration test recipe
 
-For tests that use real `git2::Repository` or real filesystem. Live under `tests/<name>_integration.rs`.
+For tests that use real `git2::Repository` or real filesystem. Live under `crates/reef-tui/tests/<name>_integration.rs`.
 
 ## Basic skeleton
 

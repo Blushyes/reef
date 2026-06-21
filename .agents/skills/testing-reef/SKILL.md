@@ -11,7 +11,7 @@ A project-specific test playbook. Follow this when adding **any** test. The goal
 
 Reef is a single-process binary plus shared internal crates. There is no plugin subsystem.
 
-- **Root (`reef` crate)** — `src/` (App runtime, TUI rendering, input orchestration), `tests/` (integration), `benches/` (criterion).
+- **`crates/reef-tui` (`reef` crate)** — `src/` (App runtime, TUI rendering, input orchestration), `tests/` (integration), `benches/` (criterion).
 - **`crates/reef-core`** — UI-independent git, diff, preview, markdown, highlight, nav/LSP, file-op, host parsing, and history logic.
 - **`crates/reef-agent` / `crates/reef-proto` / `crates/reef-sqlite-preview`** — remote agent/protocol and SQLite preview support.
 - **`crates/test-support`** — shared fixtures (`tempdir_repo`, `commit_file`, `write_file`, `HomeGuard`).
@@ -22,10 +22,10 @@ Reef is a single-process binary plus shared internal crates. There is no plugin 
 | Scenario | Test type | Where it goes |
 |----------|-----------|---------------|
 | Pure function, no I/O | Unit test | `#[cfg(test)] mod tests` inline at bottom of the source file |
-| Uses `git2::Repository`, real fs | Integration test | `tests/<name>_integration.rs` |
-| Algorithmic invariant over random inputs | Property test | `tests/<name>_properties.rs` (uses `proptest`) |
-| Full UI rendered to terminal buffer | Snapshot | `tests/<name>_snapshots.rs` (uses `insta` + `ratatui::TestBackend`) |
-| Hot-path performance | Benchmark | `benches/<name>.rs` (uses `criterion`) |
+| Uses `git2::Repository`, real fs | Integration test | `crates/reef-tui/tests/<name>_integration.rs` |
+| Algorithmic invariant over random inputs | Property test | `crates/reef-tui/tests/<name>_properties.rs` (uses `proptest`) |
+| Full UI rendered to terminal buffer | Snapshot | `crates/reef-tui/tests/<name>_snapshots.rs` (uses `insta` + `ratatui::TestBackend`) |
+| Hot-path performance | Benchmark | `crates/reef-tui/benches/<name>.rs` (uses `criterion`) |
 | Parser / deserializer robustness | Fuzz target | `fuzz/fuzz_targets/<name>.rs` |
 
 If you're unsure, default to unit test first; promote to integration only when real I/O is required for the test to be meaningful.
@@ -125,7 +125,7 @@ fn my_test() {
 
 In practice `ui_snapshots.rs` uses a single `CWD_LOCK` for both cwd and HOME because every HOME swap in this codebase is paired with a cwd swap. If you add a test that touches only HOME, a separate `HOME_LOCK` is fine; don't over-share.
 
-See existing examples: `tests/ui_snapshots.rs`, `tests/git_repo_integration.rs`.
+See existing examples: `crates/reef-tui/tests/ui_snapshots.rs`, `crates/reef-tui/tests/git_repo_integration.rs`.
 
 ### 4. Canonicalize tempdir paths on macOS before handing them to watchers
 
@@ -156,7 +156,7 @@ fn my_snapshot() {
 }
 ```
 
-The `insta` dep must be `{ features = ["filters"] }` (already configured in `reef/Cargo.toml`).
+The `insta` dep must be `{ features = ["filters"] }` (already configured in `crates/reef-tui/Cargo.toml`).
 
 Full recipe: **`references/recipes/snapshot.md`**.
 

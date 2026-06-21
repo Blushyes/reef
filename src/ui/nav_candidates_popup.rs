@@ -7,8 +7,6 @@
 //! keyboard focus, fixed-order list of rows, Up/Down/Enter/Esc plus
 //! mouse. Same panel-wide fallthrough close zone keeps stray clicks
 //! from leaking through to the preview underneath.
-//!
-//! Plan: `/Users/pan/.claude/plans/1-2-prancy-whisper.md` — Phase 1.
 
 use crate::app::App;
 use crate::ui::mouse::ClickAction;

@@ -15,69 +15,31 @@ path = "src/main.rs"
 crossterm     = "0.29.0"
 git2          = { version = "0.21.0", default-features = false }
 reef-core    = { path = "crates/reef-core" }
+reef-io      = { path = "crates/reef-io" }
 ratatui       = "0.30.0"
 similar       = "3.1.0"
 unicode-width = "0.2.2"
-syntect       = { version = "5.2", default-features = false, features = ["default-fancy"] }
-two-face      = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
-notify        = "6"
 ignore        = "0.4"
 nucleo-matcher = "0.3"
-grep-searcher = "0.1.16"
 grep-regex    = "0.1.14"
 grep-matcher  = "0.1.8"
 serde         = { workspace = true }
 serde_json    = { workspace = true }
 url           = "2"
 terminal-colorsaurus = "1.0.3"
-reef-proto    = { path = "crates/reef-proto" }
-# Cross-platform "Move to Trash" for the file-tree delete action.
-# macOS: NSWorkspace recycleURLs; Linux: XDG freedesktop spec; Windows:
-# SHFileOperationW. Safer default than `std::fs::remove_*` — hard delete
-# stays behind Shift+Delete.
+# Used by legacy unit-test helpers; runtime trash goes through reef-io.
 trash         = "5"
-# Image preview in the file-preview panel. `ratatui-image` drives Kitty /
-# iTerm2 / Halfblocks protocols; `image` decodes pixels off the render
-# path; `infer` sniffs MIME from magic bytes so `.png`-extension-on-a-jpg
-# still routes correctly. Sixel/chafa features are deliberately disabled
-# — those would pull C system libs (libsixel / libchafa) we want to avoid.
+# Image preview protocol rendering in the TUI. Decoding lives in reef-core.
 ratatui-image = { version = "10.0.6", default-features = false, features = ["crossterm"] }
 image         = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
-infer         = { version = "0.16", default-features = false }
-# SQLite read-only preview (Files tab — `.db` / `.sqlite[3]` cards). Lives in
-# its own workspace crate so `reef-agent` can pull the same reader without
-# pulling in ratatui / syntect / git2. `bundled` feature compiles the SQLite
-# C source in-tree — same rationale as `image`'s feature pruning above:
-# avoid system-libsqlite linkage so cross-builds and the npm-shipped binary
-# stay self-contained.
 reef-sqlite-preview = { path = "crates/reef-sqlite-preview" }
-# Atomic file writes (global find-and-replace path). Same crate the agent
-# uses; promoting from dev-dep to runtime so `LocalBackend::write_file`
-# can do the same temp+rename dance the agent does.
+# Used by unit tests in this crate.
 tempfile     = "3"
 # Regex matching for the VSCode-style Find widget's `.*` toggle. Stays
 # disabled by default — only used when `find_widget.regex == true` —
 # but the crate is unavoidable once the toggle exists since literal
 # substring matching can't express word boundaries / alternation.
 regex        = "1"
-# Markdown preview parsing. HTML rendering helpers are disabled; reef builds
-# a terminal-native preview model instead.
-pulldown-cmark = { version = "0.13.4", default-features = false }
-# Code navigation (goto-definition / find-references). `tree-sitter` is the
-# always-on engine — grammars are statically linked C source so the binary
-# stays self-contained and works offline. Phase 2 layers stack-graphs on top
-# for cross-file resolution (Python / TypeScript). Phase 3 layers rust-
-# analyzer (and other LSPs) lazily for local-only refinement; SSH mode keeps
-# only the tree-sitter tier.
-tree-sitter            = "0.26"
-tree-sitter-rust       = "0.24"
-tree-sitter-typescript = "0.23"
-tree-sitter-python     = "0.25"
-tree-sitter-go         = "0.25"
-# Vue grammar — `tree-sitter-vue` 0.0.3 (upstream) is dormant and
-# pre-dates the `LanguageFn` constant pattern; `tree-sitter-vue-updated`
-# is the community fork tracking modern tree-sitter releases.
-tree-sitter-vue        = { package = "tree-sitter-vue-updated", version = "0.1" }
 
 [dev-dependencies]
 insta        = { version = "1", features = ["filters"] }
@@ -88,6 +50,7 @@ test-support = { path = "crates/test-support" }
 # preview parity. Same `bundled` flag as `reef-sqlite-preview` so the
 # vendored SQLite C source is shared (no duplicate compile).
 rusqlite     = { version = "0.32", default-features = false, features = ["bundled"] }
+reef-proto   = { path = "crates/reef-proto" }
 
 [[bench]]
 name = "highlight"
@@ -106,7 +69,7 @@ harness = false
 # lib used by this crate's integration tests. `fuzz/` is excluded and runs as
 # its own workspace (see fuzz/Cargo.toml).
 [workspace]
-members = ["crates/test-support", "crates/reef-proto", "crates/reef-agent", "crates/reef-sqlite-preview", "crates/reef-core"]
+members = ["crates/test-support", "crates/reef-proto", "crates/reef-agent", "crates/reef-sqlite-preview", "crates/reef-core", "crates/reef-io"]
 resolver = "2"
 
 [workspace.dependencies]

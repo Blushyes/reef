@@ -9,7 +9,7 @@
 
 use std::sync::Mutex;
 
-use reef::backend::{Backend, LocalBackend, RemoteBackend};
+use reef_io::{Backend, LocalBackend, RemoteBackend};
 use test_support::{agent_bin, commit_file, tempdir_repo, write_file};
 
 static BACKEND_LOCK: Mutex<()> = Mutex::new(());

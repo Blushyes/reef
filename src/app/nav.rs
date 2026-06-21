@@ -102,9 +102,8 @@ impl NavCandidatesPopup {
 }
 
 // ─── Code navigation (gd / Ctrl+click / Ctrl-o-Ctrl-i) ────────────────
-// Phase 1: intra-file only. Tree-sitter parse is already attached to
-// `PreviewBody::Text.parsed` by the preview worker; these methods are
-// the request side. See `/Users/pan/.claude/plans/1-2-prancy-whisper.md`.
+// Tree-sitter parse is attached to `PreviewBody::Text.parsed` by the
+// preview worker; these methods are the request side.
 impl App {
     /// Soft cap on the back/forward stacks. Prevents unbounded growth
     /// in long sessions; oldest entry is dropped on overflow.

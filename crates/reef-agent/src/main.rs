@@ -1,7 +1,7 @@
 //! reef-agent — the remote daemon spawned by `reef --agent-exec`.
 //!
 //! Speaks the length-prefixed JSON-RPC protocol from `reef-proto` over
-//! stdin/stdout. Internally it's a thin dispatcher over `reef::backend::
+//! stdin/stdout. Internally it's a thin dispatcher over `reef_io::
 //! LocalBackend` — every Phase 0 operation we gave the trait has a one-to-
 //! one RPC counterpart here.
 //!
@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicI8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use reef::backend::{Backend, LocalBackend};
+use reef_io::{Backend, LocalBackend};
 use reef_proto::{
     CommitDetailDto, CommitInfoDto, ContentSearchCompletedDto, DiffContentDto, DiffHunkDto,
     DiffLineDto, DirEntryDto, Envelope, ErrorCode, FileEntryDto, FileStatusDto, Frame,
@@ -424,7 +424,7 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
 
         // ── M3 Track 2: walk + search ───────────────────────────────────
         Request::WalkRepoPaths { opts } => {
-            let domain = reef::backend::WalkOpts {
+            let domain = reef_io::WalkOpts {
                 include_hidden: opts.include_hidden,
                 respect_gitignore: opts.respect_gitignore,
                 max_files: opts.max_files,
@@ -500,7 +500,7 @@ fn dispatch_search_content(
     request: reef_proto::ContentSearchRequestDto,
     stdout: Arc<Mutex<BufWriter<Stdout>>>,
 ) -> Option<Response> {
-    let domain = reef::backend::ContentSearchRequest {
+    let domain = reef_io::ContentSearchRequest {
         pattern: request.pattern,
         fixed_strings: request.fixed_strings,
         case_sensitive: request.case_sensitive,
@@ -514,7 +514,7 @@ fn dispatch_search_content(
     // `ControlFlow::Break` to short-circuit the walker so we don't
     // keep doing work for nobody.
     let mut broken = false;
-    let mut sink = |hits: Vec<reef::backend::ContentMatchHit>| -> ControlFlow<()> {
+    let mut sink = |hits: Vec<reef_io::ContentMatchHit>| -> ControlFlow<()> {
         let dto_hits: Vec<MatchHitDto> = hits
             .into_iter()
             .map(|h| MatchHitDto {
@@ -568,7 +568,7 @@ fn dispatch_search_content(
     }
 }
 
-fn backend_err(e: reef::backend::BackendError) -> (ErrorCode, String) {
+fn backend_err(e: reef_io::BackendError) -> (ErrorCode, String) {
     (e.wire_code(), e.to_string())
 }
 
@@ -583,7 +583,7 @@ fn read_file_response(
     rel: &str,
     max_bytes: u64,
 ) -> Result<serde_json::Value, (ErrorCode, String)> {
-    use reef::backend::BackendError;
+    use reef_io::BackendError;
     let missing = || {
         serde_json::to_value(ReadFileResponse {
             is_file: false,
@@ -592,7 +592,7 @@ fn read_file_response(
         })
         .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}")))
     };
-    let abs = match reef::backend::local::canonical_child_within(workdir, Path::new(rel)) {
+    let abs = match reef_io::local::canonical_child_within(workdir, Path::new(rel)) {
         Ok(p) => p,
         Err(BackendError::NotFound) => return missing(),
         Err(e) => return Err(backend_err(e)),
@@ -644,7 +644,7 @@ fn has_gio() -> bool {
 /// `Ok(true)` when the trash tool succeeded, `Ok(false)` when we fell
 /// back to permanent delete.
 fn agent_trash_delete(workdir: &Path, rel_paths: &[PathBuf]) -> Result<bool, (ErrorCode, String)> {
-    use reef::backend::local::resolve_rel_within;
+    use reef_io::local::resolve_rel_within;
     // Validate workdir-relative up front so a bad path aborts before any
     // side-effect.
     let abs_paths: Vec<PathBuf> = rel_paths
@@ -793,8 +793,8 @@ fn load_db_initial_handler(
     rel: &str,
     page_size: u32,
 ) -> Result<serde_json::Value, (ErrorCode, String)> {
-    use reef::backend::BackendError;
-    use reef::backend::local::canonical_child_within;
+    use reef_io::BackendError;
+    use reef_io::local::canonical_child_within;
     let none_value = || {
         serde_json::to_value(None::<reef_proto::DatabaseInfoDto>)
             .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}")))
@@ -829,8 +829,8 @@ fn load_db_page_handler(
     offset: u64,
     limit: u32,
 ) -> Result<serde_json::Value, (ErrorCode, String)> {
-    use reef::backend::BackendError;
-    use reef::backend::local::canonical_child_within;
+    use reef_io::BackendError;
+    use reef_io::local::canonical_child_within;
     let abs = match canonical_child_within(workdir, Path::new(rel)) {
         Ok(p) => p,
         Err(BackendError::NotFound) => return Err((ErrorCode::NotFound, "file not found".into())),
@@ -907,8 +907,8 @@ fn load_db_initial_v2_handler(
     rel: &str,
     page_size: u32,
 ) -> Result<serde_json::Value, (ErrorCode, String)> {
-    use reef::backend::BackendError;
-    use reef::backend::local::canonical_child_within;
+    use reef_io::BackendError;
+    use reef_io::local::canonical_child_within;
     let none_value = || {
         serde_json::to_value(None::<reef_proto::DatabaseInfoV2Dto>)
             .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}")))
@@ -945,8 +945,8 @@ fn load_db_page_v2_handler(
     offset: u64,
     limit: u32,
 ) -> Result<serde_json::Value, (ErrorCode, String)> {
-    use reef::backend::BackendError;
-    use reef::backend::local::canonical_child_within;
+    use reef_io::BackendError;
+    use reef_io::local::canonical_child_within;
     let abs = match canonical_child_within(workdir, Path::new(rel)) {
         Ok(p) => p,
         Err(BackendError::NotFound) => return Err((ErrorCode::NotFound, "file not found".into())),
@@ -976,8 +976,8 @@ fn load_db_object_detail_handler(
     kind: reef_proto::DbObjectKindDto,
     name: &str,
 ) -> Result<serde_json::Value, (ErrorCode, String)> {
-    use reef::backend::BackendError;
-    use reef::backend::local::canonical_child_within;
+    use reef_io::BackendError;
+    use reef_io::local::canonical_child_within;
     let abs = match canonical_child_within(workdir, Path::new(rel)) {
         Ok(p) => p,
         Err(BackendError::NotFound) => return Err((ErrorCode::NotFound, "file not found".into())),

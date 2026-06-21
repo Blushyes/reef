@@ -3,15 +3,9 @@
 //! per file and stays bundled into the binary (no runtime download, no
 //! external language server) so SSH mode and offline use both work.
 //!
-//! Phase 2 will layer cross-file `stack-graphs` queries on top of the
-//! same `FileParse` cache. Phase 3 will optionally spawn rust-analyzer
-//! to *refine* tree-sitter answers silently into a cache — it never
-//! moves the user's cursor itself; the next `gd` at the same position
-//! consults the cache first. SSH mode bypasses the LSP tier entirely
-//! (see `Backend::is_remote`).
-//!
-//! The plan file `/Users/pan/.claude/plans/1-2-prancy-whisper.md`
-//! documents the full three-phase rollout.
+//! LSP refinement can update a cache, but it never moves the user's
+//! cursor itself; the next `gd` at the same position consults cached
+//! answers first. SSH mode bypasses the LSP tier entirely.
 
 use std::ops::Range;
 use std::sync::Arc;

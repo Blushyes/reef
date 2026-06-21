@@ -5,9 +5,9 @@
 //! The worker runs in a background thread so each test polls `try_recv`
 //! with a timeout rather than busy-waiting.
 
-use reef::backend::{Backend, LocalBackend};
 use reef::global_search::{MAX_RESULTS, MatchHit};
 use reef::tasks::{TaskCoordinator, WorkerResult};
+use reef_io::{Backend, LocalBackend};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;

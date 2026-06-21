@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use reef::backend::{Backend, LocalBackend, RemoteBackend};
+use reef_io::{Backend, LocalBackend, RemoteBackend};
 use tempfile::TempDir;
 use test_support::agent_bin;
 

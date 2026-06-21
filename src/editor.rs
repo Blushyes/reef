@@ -22,7 +22,7 @@ use std::io;
 use std::path::Path;
 use std::process::Command;
 
-use crate::backend::EditorLaunchSpec;
+use reef_io::EditorLaunchSpec;
 
 /// Parse an `$EDITOR`-style string into (program, extra_args).
 ///
@@ -30,10 +30,7 @@ use crate::backend::EditorLaunchSpec;
 /// passed before the file path on the final command line, so
 /// `"code -w"` → `code -w <file>`.
 pub fn parse_editor_command(s: &str) -> Option<(String, Vec<String>)> {
-    let mut parts = s.split_whitespace();
-    let prog = parts.next()?.to_string();
-    let args = parts.map(|s| s.to_string()).collect();
-    Some((prog, args))
+    reef_io::parse_editor_command(s)
 }
 
 /// Priority: `editor.command` pref → `$VISUAL` → `$EDITOR` → `vi`. The
@@ -45,19 +42,11 @@ pub(crate) fn resolve_editor() -> Option<(String, Vec<String>)> {
             return Some(cmd);
         }
     }
-    for var in ["VISUAL", "EDITOR"] {
-        if let Ok(s) = std::env::var(var) {
-            if let Some(cmd) = parse_editor_command(&s) {
-                return Some(cmd);
-            }
-        }
-    }
-    // POSIX guarantees `vi`; on Windows we refuse to guess.
-    if cfg!(unix) {
-        Some(("vi".to_string(), Vec::new()))
-    } else {
-        None
-    }
+    reef_io::default_editor_command()
+}
+
+pub fn install_editor_resolver() {
+    reef_io::set_editor_resolver(resolve_editor);
 }
 
 /// Suspend the TUI, run the user's editor on `path`, then restore the TUI.

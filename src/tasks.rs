@@ -5,8 +5,6 @@
 //! these workers and merged back into `App` from `tick()`.
 
 use crate::app::{CommitFileDiff, DiffHighlighted, HighlightedDiff};
-use crate::backend::Backend;
-use crate::file_tree::TreeEntry;
 use crate::global_search::MatchHit;
 use crate::ui::highlight;
 use reef_core::diff::DiffContent;
@@ -14,6 +12,8 @@ use reef_core::file_ops::Resolution;
 use reef_core::git::graph::GraphRow;
 use reef_core::git::{CommitDetail, FileEntry, GraphScope, RefLabel};
 use reef_core::preview::PreviewDocument as PreviewContent;
+use reef_io::Backend;
+use reef_io::TreeEntry;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -2543,7 +2543,7 @@ fn run_global_search_via_backend(
     if query.is_empty() {
         return false;
     }
-    let request = crate::backend::ContentSearchRequest {
+    let request = reef_io::ContentSearchRequest {
         pattern: query.to_string(),
         fixed_strings: true,
         case_sensitive: None,
@@ -2551,7 +2551,7 @@ fn run_global_search_via_backend(
         max_line_chars: crate::global_search::MAX_LINE_CHARS as u32,
     };
 
-    let mut on_chunk = |hits: Vec<crate::backend::ContentMatchHit>| -> std::ops::ControlFlow<()> {
+    let mut on_chunk = |hits: Vec<reef_io::ContentMatchHit>| -> std::ops::ControlFlow<()> {
         if cancel.load(Ordering::Relaxed) {
             return std::ops::ControlFlow::Break(());
         }
@@ -2664,7 +2664,7 @@ fn run_replace_in_files(
     }
     // Same builder the search worker used (smart-case, fixed-strings)
     // so the worker rewrites exactly the matches the UI streamed in.
-    let matcher = match crate::backend::local::build_smart_case_matcher(
+    let matcher = match reef_io::local::build_smart_case_matcher(
         query, /* fixed_strings */ true, /* case_sensitive */ None,
     ) {
         Ok(m) => m,
@@ -2749,14 +2749,14 @@ fn replace_one_file(
     match backend.file_size(path) {
         Ok(sz) if sz > MAX_REPLACE_FILE_SIZE => return FileReplaceOutcome::TooLarge,
         Ok(_) => {}
-        Err(crate::backend::BackendError::PathEscape(_)) => {
+        Err(reef_io::BackendError::PathEscape(_)) => {
             return FileReplaceOutcome::SymlinkEscape;
         }
         Err(e) => return FileReplaceOutcome::Err(format!("stat: {e}")),
     }
     let original = match backend.read_file(path, MAX_REPLACE_FILE_SIZE) {
         Ok(bytes) => bytes,
-        Err(crate::backend::BackendError::PathEscape(_)) => {
+        Err(reef_io::BackendError::PathEscape(_)) => {
             return FileReplaceOutcome::SymlinkEscape;
         }
         Err(e) => return FileReplaceOutcome::Err(format!("read: {e}")),
@@ -2864,7 +2864,7 @@ fn replace_one_file(
 #[cfg(test)]
 mod copy_tests {
     use super::*;
-    use crate::backend::LocalBackend;
+    use reef_io::LocalBackend;
     use std::fs;
     use tempfile::TempDir;
 
@@ -3128,8 +3128,8 @@ mod fs_mutation_tests {
 
     // ── paste_batch (Cut/Copy + Paste) end-to-end ──────────────────
 
-    fn make_local(tmp: &TempDir) -> crate::backend::LocalBackend {
-        crate::backend::LocalBackend::open_at(tmp.path().to_path_buf())
+    fn make_local(tmp: &TempDir) -> reef_io::LocalBackend {
+        reef_io::LocalBackend::open_at(tmp.path().to_path_buf())
     }
 
     fn item(rel: &str, is_dir: bool, r: Resolution) -> PasteItem {
@@ -3357,7 +3357,7 @@ mod replace_tests {
     //! rewrite → atomic write). Uses a plain `mpsc` to capture progress
     //! / done frames the way the App's `tick` would.
     use super::*;
-    use crate::backend::LocalBackend;
+    use reef_io::LocalBackend;
     use std::fs;
     use std::sync::Arc;
     use tempfile::TempDir;

@@ -9,14 +9,14 @@ use crossterm::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use reef::agent_deploy::{self, InstallPath, SshSession};
 use reef::app::{App, ViewMode};
-use reef::backend::{Backend, LocalBackend, RemoteBackend};
 use reef::i18n;
 use reef::images;
 use reef::ui::theme::Theme;
 use reef::ui::toast::Toast;
 use reef::{editor, input, ui};
+use reef_io::agent_deploy::{self, InstallPath, SshSession};
+use reef_io::{Backend, LocalBackend, RemoteBackend};
 use std::io;
 use std::panic;
 use std::path::PathBuf;
@@ -211,6 +211,7 @@ fn split_ssh_target(target: &str) -> (String, String) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    editor::install_editor_resolver();
     let parsed = parse_args()?;
 
     // Set up panic hook to restore terminal

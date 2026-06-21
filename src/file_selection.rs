@@ -18,7 +18,7 @@
 //! scope by definition — Explorer-style selection is visual, not
 //! semantic.
 
-use crate::file_tree::TreeEntry;
+use reef_io::TreeEntry;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 

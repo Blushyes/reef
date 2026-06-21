@@ -13,8 +13,8 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use reef::backend::{Backend, LocalBackend, RemoteBackend};
 use reef_core::preview::{BinaryReason, PreviewBody};
+use reef_io::{Backend, LocalBackend, RemoteBackend};
 use test_support::{agent_bin, tempdir_repo};
 
 static BACKEND_LOCK: Mutex<()> = Mutex::new(());

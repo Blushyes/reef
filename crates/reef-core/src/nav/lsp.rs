@@ -1,12 +1,8 @@
-//! Phase 3 LSP client. Modeled on `src/backend/remote.rs` — long-lived
-//! child subprocess, dedicated reader thread, request/response pending
-//! map keyed by JSON-RPC IDs.
+//! LSP client: long-lived child subprocess, dedicated reader thread,
+//! request/response pending map keyed by JSON-RPC IDs.
 //!
-//! **Scope of v1:** PATH-detected `rust-analyzer` only. Auto-download
-//! is deferred (architecture supports it — see `try_locate_binary`
-//! comment). The full Phase 3 plan in
-//! `/Users/pan/.claude/plans/1-2-prancy-whisper.md` covers download +
-//! sha256 + xattr stripping; those are tracked as Phase 4 polish.
+//! **Scope of v1:** PATH-detected language servers only. Auto-download is
+//! deferred; this file keeps the minimal protocol core.
 //!
 //! **SSH:** Never starts in remote mode. The nav worker gates on
 //! `Backend::is_remote()` before dispatching `LspRefine` tasks.

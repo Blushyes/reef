@@ -20,7 +20,7 @@
 use std::process::Command;
 use std::sync::Mutex;
 
-use reef::agent_deploy::{
+use reef_io::agent_deploy::{
     self, AgentLocation, DeployError, InstallPath, SshSession,
     script::{self, InstallState},
 };
@@ -126,7 +126,7 @@ fn ensure_agent_download_failed_upload_fallback() {
         eprintln!("skip: ssh localhost not reachable without a password");
         return;
     }
-    if !reef::agent_deploy::embedded::EMBEDDED_AGENT_PRESENT {
+    if !reef_io::agent_deploy::embedded::EMBEDDED_AGENT_PRESENT {
         eprintln!("skip: no embedded agent bytes in this build (pre-build reef-agent and rerun)");
         return;
     }

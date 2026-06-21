@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::sync::Mutex;
 
-use reef::backend::{Backend, BackendError, LocalBackend, RemoteBackend};
+use reef_io::{Backend, BackendError, LocalBackend, RemoteBackend};
 use tempfile::TempDir;
 use test_support::{HOME_LOCK, HomeGuard, agent_bin};
 
@@ -26,6 +26,7 @@ fn spawn_remote(workdir: &Path) -> RemoteBackend {
 
 #[test]
 fn local_editor_spec_uses_editor_env() {
+    reef::editor::install_editor_resolver();
     // `resolve_editor` now reads the `editor.command` pref before
     // $VISUAL / $EDITOR (so the in-app Settings page can override the
     // shell environment). Redirect $HOME to an empty tempdir so the
@@ -76,6 +77,7 @@ fn remote_spawn_variant_refuses_editor_spec() {
 
 #[test]
 fn local_editor_spec_rejects_path_escape() {
+    reef::editor::install_editor_resolver();
     // Same HOME isolation rationale as `local_editor_spec_uses_editor_env`
     // — without it the dev's real `editor.command` pref leaks in. The
     // PathEscape check happens before editor resolution though, so this

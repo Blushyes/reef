@@ -27,12 +27,12 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::app::{App, Tab};
-use crate::backend::{Backend, WalkOpts};
 use crate::input::DOUBLE_CLICK_WINDOW;
 use crate::input_edit;
 use crate::keymap::{Command, InputScope, Keymap};
 use crate::prefs;
 use crate::ui::mouse::ClickAction;
+use reef_io::{Backend, WalkOpts};
 
 const MRU_MAX: usize = 50;
 const MRU_PREF_KEY: &str = "quickopen.mru";

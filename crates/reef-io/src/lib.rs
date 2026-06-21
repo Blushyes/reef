@@ -1,13 +1,9 @@
 //! Backend abstraction for reef.
 //!
 //! Reef today runs entirely against the local filesystem + `git2` + a local
-//! `notify` watcher + local `$EDITOR`. The `Backend` trait is the seam we
-//! introduce so the same UI can be driven against a remote agent (see
-//! `src/backend/remote.rs`) over an SSH stdio JSON-RPC pipe.
-//!
-//! Phase 0 of the remote-backend work is additive only: `LocalBackend` wraps
-//! the existing `GitRepo` / `fs_watcher::spawn` / `editor::launch`
-//! implementations and forwards to them unchanged. No behaviour changes.
+//! `notify` watcher + local `$EDITOR`. The `Backend` trait lets the same UI
+//! run against either local disk or a remote agent over an SSH stdio JSON-RPC
+//! pipe.
 //!
 //! # Threading model
 //! Every `Backend` impl is `Send + Sync` so it can live behind
@@ -20,20 +16,74 @@ use std::ffi::OsString;
 use std::io;
 use std::ops::{ControlFlow, Range};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Mutex, OnceLock, mpsc};
 
-use crate::file_tree::TreeEntry;
 use reef_core::diff::DiffContent;
 use reef_core::git::graph::GraphRow;
 use reef_core::git::{CommitDetail, CommitInfo, FileEntry, GraphScope, RefLabel};
 use reef_core::preview::PreviewDocument as PreviewContent;
 use std::collections::{HashMap, HashSet};
 
+pub mod agent_deploy;
+pub mod fs_watcher;
 pub mod local;
 pub mod remote;
 
 pub use local::LocalBackend;
 pub use remote::RemoteBackend;
+
+/// A visible entry in the flattened file tree.
+#[derive(Debug, Clone)]
+pub struct TreeEntry {
+    pub path: PathBuf,
+    pub name: String,
+    pub depth: usize,
+    pub is_dir: bool,
+    pub is_expanded: bool,
+    pub git_status: Option<char>,
+}
+
+pub type EditorResolver = fn() -> Option<(String, Vec<String>)>;
+
+static EDITOR_RESOLVER: OnceLock<Mutex<EditorResolver>> = OnceLock::new();
+
+pub fn set_editor_resolver(resolver: EditorResolver) {
+    let slot = EDITOR_RESOLVER.get_or_init(|| Mutex::new(default_editor_command));
+    if let Ok(mut guard) = slot.lock() {
+        *guard = resolver;
+    }
+}
+
+pub fn parse_editor_command(s: &str) -> Option<(String, Vec<String>)> {
+    let mut parts = s.split_whitespace();
+    let prog = parts.next()?.to_string();
+    let args = parts.map(|s| s.to_string()).collect();
+    Some((prog, args))
+}
+
+pub fn resolve_editor_command() -> Option<(String, Vec<String>)> {
+    let resolver = EDITOR_RESOLVER
+        .get_or_init(|| Mutex::new(default_editor_command))
+        .lock()
+        .map(|guard| *guard)
+        .unwrap_or(default_editor_command);
+    resolver()
+}
+
+pub fn default_editor_command() -> Option<(String, Vec<String>)> {
+    for var in ["VISUAL", "EDITOR"] {
+        if let Ok(s) = std::env::var(var)
+            && let Some(cmd) = parse_editor_command(&s)
+        {
+            return Some(cmd);
+        }
+    }
+    if cfg!(unix) {
+        Some(("vi".to_string(), Vec::new()))
+    } else {
+        None
+    }
+}
 
 /// Errors returned by `Backend` operations. Kept deliberately simple — we
 /// fold git2/IO errors into strings at the boundary because the UI only

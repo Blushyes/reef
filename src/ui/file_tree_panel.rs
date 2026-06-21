@@ -310,7 +310,7 @@ fn render_toolbar(f: &mut Frame, app: &mut App, area: Rect) {
 fn render_entry_row(
     f: &mut Frame,
     app: &mut App,
-    entry: &crate::file_tree::TreeEntry,
+    entry: &reef_io::TreeEntry,
     global_idx: usize,
     x: u16,
     y: u16,

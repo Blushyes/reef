@@ -27,7 +27,7 @@ use super::{
     Backend, BackendError, ContentMatchHit, ContentSearchCompleted, ContentSearchRequest,
     EditorLaunchSpec, SearchChunkSink, StatusSnapshot, TrashOutcome, WalkOpts, WalkResponse,
 };
-use crate::file_tree::TreeEntry;
+use crate::TreeEntry;
 use reef_core::diff::DiffContent;
 use reef_core::git::{CommitDetail, CommitInfo, FileEntry, GraphScope, RefLabel};
 use reef_core::preview::PreviewDocument as PreviewContent;

@@ -1,4 +1,3 @@
-use crate::backend::{Backend, LocalBackend};
 use crate::file_tree::FileTree;
 use crate::tasks::{AsyncState, TaskCoordinator, WorkerResult};
 use crate::ui::confirm_modal::ConfirmModal;
@@ -11,6 +10,7 @@ use reef_core::git::graph::GraphRow;
 use reef_core::git::tree as git_tree;
 use reef_core::git::{CommitDetail, CommitInfo, FileEntry, GitRepo, GraphScope, RefLabel};
 use reef_core::preview::{PreviewBody, PreviewDocument as PreviewContent};
+use reef_io::{Backend, LocalBackend};
 use std::collections::{HashMap, HashSet};
 use std::path::Component;
 use std::path::{Path, PathBuf};
@@ -6152,11 +6152,11 @@ mod tests {
         App, GRAPH_RECENT_BRANCHES_MAX, GitGraphState, PREF_GRAPH_SCOPE, PREF_GRAPH_SCOPE_RECENT,
         folder_contains, load_graph_scope_pref, persist_graph_scope,
     };
-    use crate::backend::LocalBackend;
     use crate::tasks::{GraphPayload, WorkerResult};
     use crate::ui::theme::Theme;
     use reef_core::git::{FileEntry, FileStatus, GraphScope};
     use reef_core::preview::{PreviewBody, PreviewDocument as PreviewContent};
+    use reef_io::LocalBackend;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use test_support::{HOME_LOCK, HomeGuard, commit_file, tempdir_repo};

@@ -1,16 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-/// A visible entry in the flattened file tree.
-#[derive(Debug, Clone)]
-pub struct TreeEntry {
-    pub path: PathBuf,
-    pub name: String,
-    pub depth: usize,
-    pub is_dir: bool,
-    pub is_expanded: bool,
-    pub git_status: Option<char>,
-}
+pub use reef_io::TreeEntry;
 
 /// Manages the file tree state.
 pub struct FileTree {
@@ -35,7 +26,8 @@ impl FileTree {
     }
 
     pub fn rebuild(&mut self) {
-        self.entries = build_entries(&self.root, &self.expanded, &self.git_statuses);
+        self.entries =
+            reef_io::local::build_entries(&self.root, &self.expanded, &self.git_statuses);
         if !self.entries.is_empty() {
             self.selected = self.selected.min(self.entries.len() - 1);
         } else {
@@ -157,70 +149,6 @@ impl FileTree {
         for entry in &mut self.entries {
             let rel = entry.path.to_string_lossy().to_string();
             entry.git_status = self.git_statuses.get(&rel).copied();
-        }
-    }
-}
-
-pub fn build_entries(
-    root: &Path,
-    expanded: &HashSet<PathBuf>,
-    git_statuses: &HashMap<String, char>,
-) -> Vec<TreeEntry> {
-    let mut entries = Vec::new();
-    walk_dir(root, root, expanded, git_statuses, &mut entries, 0);
-    entries
-}
-
-fn walk_dir(
-    root: &Path,
-    dir: &Path,
-    expanded: &HashSet<PathBuf>,
-    git_statuses: &HashMap<String, char>,
-    out: &mut Vec<TreeEntry>,
-    depth: usize,
-) {
-    let mut children: Vec<(String, PathBuf, bool)> = Vec::new();
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name == ".git" {
-            continue;
-        }
-        let path = entry.path();
-        let is_dir = path.is_dir();
-        children.push((name, path, is_dir));
-    }
-
-    children.sort_by(|a, b| match (a.2, b.2) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
-    });
-
-    for (name, full_path, is_dir) in children {
-        let rel = full_path
-            .strip_prefix(root)
-            .unwrap_or(&full_path)
-            .to_path_buf();
-        let rel_str = rel.to_string_lossy().to_string();
-        let is_expanded = is_dir && expanded.contains(&rel);
-        let git_status = git_statuses.get(&rel_str).copied();
-
-        out.push(TreeEntry {
-            path: rel.clone(),
-            name,
-            depth,
-            is_dir,
-            is_expanded,
-            git_status,
-        });
-
-        if is_dir && is_expanded {
-            walk_dir(root, &full_path, expanded, git_statuses, out, depth + 1);
         }
     }
 }

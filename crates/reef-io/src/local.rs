@@ -16,7 +16,7 @@ use super::{
     Backend, BackendError, ContentMatchHit, ContentSearchCompleted, ContentSearchRequest,
     EditorLaunchSpec, SearchChunkSink, StatusSnapshot, TrashOutcome, WalkOpts, WalkResponse,
 };
-use crate::file_tree::{self, TreeEntry};
+use crate::{TreeEntry, resolve_editor_command};
 use reef_core::diff::DiffContent;
 use reef_core::git::{CommitDetail, CommitInfo, FileEntry, GitRepo, GraphScope, RefLabel};
 use reef_core::preview::PreviewDocument as PreviewContent;
@@ -315,11 +315,7 @@ impl Backend for LocalBackend {
         expanded: &HashSet<PathBuf>,
         git_statuses: &HashMap<String, char>,
     ) -> Result<Vec<TreeEntry>, String> {
-        Ok(file_tree::build_entries(
-            &self.workdir,
-            expanded,
-            git_statuses,
-        ))
+        Ok(build_entries(&self.workdir, expanded, git_statuses))
     }
 
     fn load_preview(
@@ -591,7 +587,7 @@ impl Backend for LocalBackend {
         } else {
             self.resolve_rel(rel_path)?
         };
-        let (program, extra_args) = crate::editor::resolve_editor()
+        let (program, extra_args) = resolve_editor_command()
             .ok_or_else(|| BackendError::Io("no editor set (VISUAL / EDITOR)".to_string()))?;
         let mut args: Vec<OsString> = extra_args.into_iter().map(OsString::from).collect();
         args.push(abs.into_os_string());
@@ -710,6 +706,70 @@ impl Backend for LocalBackend {
         on_chunk: &mut SearchChunkSink<'_>,
     ) -> Result<ContentSearchCompleted, BackendError> {
         Ok(search_content_local(&self.workdir, request, on_chunk))
+    }
+}
+
+pub fn build_entries(
+    root: &Path,
+    expanded: &HashSet<PathBuf>,
+    git_statuses: &HashMap<String, char>,
+) -> Vec<TreeEntry> {
+    let mut entries = Vec::new();
+    walk_dir(root, root, expanded, git_statuses, &mut entries, 0);
+    entries
+}
+
+fn walk_dir(
+    root: &Path,
+    dir: &Path,
+    expanded: &HashSet<PathBuf>,
+    git_statuses: &HashMap<String, char>,
+    out: &mut Vec<TreeEntry>,
+    depth: usize,
+) {
+    let mut children: Vec<(String, PathBuf, bool)> = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == ".git" {
+            continue;
+        }
+        let path = entry.path();
+        let is_dir = path.is_dir();
+        children.push((name, path, is_dir));
+    }
+
+    children.sort_by(|a, b| match (a.2, b.2) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
+    });
+
+    for (name, full_path, is_dir) in children {
+        let rel = full_path
+            .strip_prefix(root)
+            .unwrap_or(&full_path)
+            .to_path_buf();
+        let rel_str = rel.to_string_lossy().to_string();
+        let is_expanded = is_dir && expanded.contains(&rel);
+        let git_status = git_statuses.get(&rel_str).copied();
+
+        out.push(TreeEntry {
+            path: rel.clone(),
+            name,
+            depth,
+            is_dir,
+            is_expanded,
+            git_status,
+        });
+
+        if is_dir && is_expanded {
+            walk_dir(root, &full_path, expanded, git_statuses, out, depth + 1);
+        }
     }
 }
 

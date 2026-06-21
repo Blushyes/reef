@@ -16,7 +16,7 @@ use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::Mutex;
 
-use reef::backend::{
+use reef_io::{
     Backend, ContentMatchHit, ContentSearchRequest, LocalBackend, RemoteBackend, WalkOpts,
 };
 use tempfile::TempDir;

@@ -2319,18 +2319,15 @@ dependencies = [
  "git2",
  "grep-matcher",
  "grep-regex",
- "grep-searcher",
  "ignore",
  "image",
- "infer",
  "insta",
- "notify",
  "nucleo-matcher",
  "proptest",
- "pulldown-cmark",
  "ratatui",
  "ratatui-image",
  "reef-core",
+ "reef-io",
  "reef-proto",
  "reef-sqlite-preview",
  "regex",
@@ -2338,18 +2335,10 @@ dependencies = [
  "serde",
  "serde_json",
  "similar 3.1.0",
- "syntect",
  "tempfile",
  "terminal-colorsaurus",
  "test-support",
  "trash",
- "tree-sitter",
- "tree-sitter-go",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-typescript",
- "tree-sitter-vue-updated",
- "two-face",
  "unicode-width",
  "url",
 ]
@@ -2358,8 +2347,8 @@ dependencies = [
 name = "reef-agent"
 version = "0.1.0"
 dependencies = [
- "reef",
  "reef-core",
+ "reef-io",
  "reef-proto",
  "reef-sqlite-preview",
  "serde",
@@ -2391,6 +2380,25 @@ dependencies = [
  "two-face",
  "unicode-width",
  "url",
+]
+
+[[package]]
+name = "reef-io"
+version = "0.41.0"
+dependencies = [
+ "git2",
+ "grep-matcher",
+ "grep-regex",
+ "grep-searcher",
+ "ignore",
+ "notify",
+ "reef-core",
+ "reef-proto",
+ "reef-sqlite-preview",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "trash",
 ]
 
 [[package]]

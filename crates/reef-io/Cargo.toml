@@ -1,0 +1,23 @@
+[package]
+name = "reef-io"
+version = "0.41.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+git2 = { version = "0.21.0", default-features = false }
+grep-matcher = "0.1.8"
+grep-regex = "0.1.14"
+grep-searcher = "0.1.16"
+ignore = "0.4"
+notify = "6"
+reef-core = { path = "../reef-core" }
+reef-proto = { path = "../reef-proto" }
+reef-sqlite-preview = { path = "../reef-sqlite-preview" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3"
+trash = "5"

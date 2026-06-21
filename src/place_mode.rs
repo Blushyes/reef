@@ -16,7 +16,7 @@
 //! drive rendering and input gating. Everything expensive (the recursive
 //! copy itself, name-conflict resolution) runs on the files worker.
 
-use crate::file_tree::TreeEntry;
+use reef_io::TreeEntry;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 

@@ -13,7 +13,7 @@ use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::sync::Mutex;
 
-use reef::backend::{Backend, BackendError, LocalBackend, RemoteBackend};
+use reef_io::{Backend, BackendError, LocalBackend, RemoteBackend};
 use tempfile::TempDir;
 use test_support::agent_bin;
 

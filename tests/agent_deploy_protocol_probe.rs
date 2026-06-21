@@ -11,7 +11,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 
-use reef::agent_deploy::script::{InstallState, generate_install_script, parse_script_output};
+use reef_io::agent_deploy::script::{InstallState, generate_install_script, parse_script_output};
 use tempfile::TempDir;
 
 const EXPECTED: &str = "3";

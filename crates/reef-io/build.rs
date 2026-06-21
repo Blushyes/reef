@@ -5,7 +5,7 @@
 //! and `include_bytes!` it into the main `reef` binary. When the agent is
 //! later pushed to a host that has no external network (or the GitHub
 //! release download fails) we fall back to streaming this embedded copy
-//! over ssh via `cat >`. See `src/agent_deploy/upload.rs`.
+//! over ssh via `cat >`. See the agent deploy upload module in this crate.
 //!
 //! The embed is best-effort by default:
 //!   - On a `cargo build -p reef` where `target/{profile}/reef-agent`

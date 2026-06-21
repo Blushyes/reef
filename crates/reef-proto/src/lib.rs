@@ -16,7 +16,7 @@
 //! bit-for-bit equivalents but **live in this crate**, because the
 //! reef-proto crate can't depend on reef (cyclic) and we want the agent to
 //! be able to consume the protocol types without pulling in git2, syntect,
-//! ratatui and friends. `src/backend/remote.rs` holds the `From<Dto>` impls
+//! ratatui and friends. `crates/reef-io/src/remote.rs` holds the `From<Dto>` impls
 //! that translate the protocol types back into their domain twins.
 
 use serde::{Deserialize, Serialize};
@@ -913,7 +913,7 @@ pub enum SqliteValueDto {
 // ── v9: multi-schema preview DTOs ──────────────────────────────────────────
 //
 // Mirrors the V2 type set in `reef-sqlite-preview` 1:1. The `From<Domain>`
-// impls live alongside the V1 ones in `src/backend/remote.rs`.
+// impls live alongside the V1 ones in `crates/reef-io/src/remote.rs`.
 
 /// Kind tag used in [`LoadDbPageV2`] / [`LoadDbObjectDetail`] payloads
 /// and inside [`DbObjectDto`]. Mirror of

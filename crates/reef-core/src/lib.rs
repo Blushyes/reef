@@ -1,10 +1,14 @@
 pub mod diff;
 pub mod file_ops;
+pub mod file_tree;
 pub mod git;
 pub mod highlight;
 pub mod history;
 pub mod hosts;
 pub mod markdown;
 pub mod nav;
+pub mod prefs;
 pub mod preview;
+pub mod quick_open;
+pub mod search;
 pub mod text;

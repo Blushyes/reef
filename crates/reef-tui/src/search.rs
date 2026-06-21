@@ -14,6 +14,7 @@ use crate::app::{App, Panel, SelectedFile, Tab};
 use crate::input_edit;
 use crate::keymap::{Command, InputScope, Keymap};
 use crossterm::event::KeyEvent;
+use reef_core::search::{SearchMatch, build_row_index, ranges_on_row};
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -33,11 +34,7 @@ pub enum SearchTarget {
     GraphDiff,
 }
 
-#[derive(Debug, Clone)]
-pub struct MatchLoc {
-    pub row: usize,
-    pub byte_range: Range<usize>,
-}
+pub type MatchLoc = SearchMatch;
 
 /// Pre-search scroll / selection state, restored on Esc.
 #[derive(Debug, Clone, Default)]
@@ -120,10 +117,7 @@ impl SearchState {
     pub fn set_matches(&mut self, matches: Vec<MatchLoc>) {
         self.matches = matches;
         self.current = None;
-        self.row_index.clear();
-        for (i, m) in self.matches.iter().enumerate() {
-            self.row_index.entry(m.row).or_default().push(i);
-        }
+        self.row_index = build_row_index(&self.matches);
     }
 
     /// Empty `matches` + clear the index. Cheaper than building a fresh
@@ -145,19 +139,7 @@ impl SearchState {
         if self.target != Some(target) || self.matches.is_empty() {
             return (Vec::new(), None);
         }
-        let Some(idxs) = self.row_index.get(&row) else {
-            return (Vec::new(), None);
-        };
-        let mut all = Vec::with_capacity(idxs.len());
-        let mut cur = None;
-        for &i in idxs {
-            let m = &self.matches[i];
-            if Some(i) == self.current {
-                cur = Some(m.byte_range.clone());
-            }
-            all.push(m.byte_range.clone());
-        }
-        (all, cur)
+        ranges_on_row(&self.matches, &self.row_index, self.current, row)
     }
 
     /// Reset search entirely (used on tab / panel switch).
@@ -408,37 +390,6 @@ fn row_texts_to_cows(rows: &[reef_core::diff::DiffRowText]) -> Vec<std::borrow::
 
 // ─── Matching ─────────────────────────────────────────────────────────────────
 
-pub(crate) fn smart_case(query: &str) -> bool {
-    query.chars().all(|c| !c.is_uppercase())
-}
-
-/// All byte-range matches of `needle` in `haystack`, non-overlapping, with
-/// smart-case folding. Needle must be non-empty.
-pub fn find_all(haystack: &str, needle: &str, case_insensitive: bool) -> Vec<Range<usize>> {
-    if needle.is_empty() {
-        return Vec::new();
-    }
-    let mut results = Vec::new();
-    if case_insensitive {
-        let h = haystack.to_ascii_lowercase();
-        let n = needle.to_ascii_lowercase();
-        let mut start = 0usize;
-        while let Some(pos) = h[start..].find(&n) {
-            let abs = start + pos;
-            results.push(abs..abs + needle.len());
-            start = abs + needle.len().max(1);
-        }
-    } else {
-        let mut start = 0usize;
-        while let Some(pos) = haystack[start..].find(needle) {
-            let abs = start + pos;
-            results.push(abs..abs + needle.len());
-            start = abs + needle.len().max(1);
-        }
-    }
-    results
-}
-
 /// Recompute `matches` for the current query, update `current` to the nearest
 /// match relative to the cursor baseline (snapshot), and jump. Called on each
 /// keystroke.
@@ -459,10 +410,10 @@ fn recompute_and_jump(app: &mut App, from_step: bool) {
     }
 
     let rows = collect_rows(app, target);
-    let case_insensitive = smart_case(&query);
+    let case_insensitive = reef_core::search::smart_case_insensitive(&query);
     let mut matches = Vec::new();
     for (idx, text) in rows.iter().enumerate() {
-        for r in find_all(text, &query, case_insensitive) {
+        for r in reef_core::search::find_literal_all(text, &query, case_insensitive) {
             matches.push(MatchLoc {
                 row: idx,
                 byte_range: r,
@@ -645,49 +596,6 @@ pub(crate) fn center_scroll(row: usize, view_h: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn find_all_basic() {
-        let r = find_all("foobar foo baz", "foo", true);
-        assert_eq!(r, vec![0..3, 7..10]);
-    }
-
-    #[test]
-    fn find_all_smart_case_insensitive() {
-        let r = find_all("Foo FOO foo", "foo", true);
-        assert_eq!(r, vec![0..3, 4..7, 8..11]);
-    }
-
-    #[test]
-    fn find_all_smart_case_sensitive_when_upper() {
-        // Capital letter in query → case-sensitive.
-        let r = find_all("Foo FOO foo", "Foo", false);
-        assert_eq!(r, vec![0..3]);
-    }
-
-    #[test]
-    fn find_all_empty_needle() {
-        assert!(find_all("abc", "", true).is_empty());
-    }
-
-    #[test]
-    fn find_all_no_match() {
-        assert!(find_all("abc", "xyz", true).is_empty());
-    }
-
-    #[test]
-    fn find_all_overlapping_advances_by_needle_len() {
-        // "aaaa" searching "aa" → [0..2, 2..4], non-overlapping.
-        let r = find_all("aaaa", "aa", true);
-        assert_eq!(r, vec![0..2, 2..4]);
-    }
-
-    #[test]
-    fn smart_case_all_lowercase_is_insensitive() {
-        assert!(smart_case("foo"));
-        assert!(!smart_case("Foo"));
-        assert!(!smart_case("FOO"));
-    }
 
     #[test]
     fn center_scroll_centers_when_possible() {

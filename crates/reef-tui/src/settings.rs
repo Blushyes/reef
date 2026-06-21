@@ -7,6 +7,7 @@
 use crate::app::{App, DiffMode};
 use reef_core::diff::DiffLayout;
 use reef_core::nav::NavLang;
+use reef_core::prefs::{EDITOR_COMMAND, ThemePref, UI_THEME};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingSection {
@@ -116,51 +117,12 @@ impl SettingItem {
     }
 }
 
-/// Theme preference — distinct from `ui::theme::Theme` (the resolved
-/// palette) because `Auto` isn't a palette, it's a "probe at startup"
-/// instruction. The render path needs the pref string for display; the
-/// cycle path needs the next state. Keeping it as one enum centralises
-/// both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ThemePref {
-    #[default]
-    Auto,
-    Dark,
-    Light,
-}
-
-impl ThemePref {
-    fn pref_str(self) -> &'static str {
-        match self {
-            ThemePref::Auto => "auto",
-            ThemePref::Dark => "dark",
-            ThemePref::Light => "light",
-        }
-    }
-
-    fn from_pref_str(s: &str) -> Self {
-        match s {
-            "dark" => ThemePref::Dark,
-            "light" => ThemePref::Light,
-            _ => ThemePref::Auto,
-        }
-    }
-
-    fn next(self) -> Self {
-        match self {
-            ThemePref::Auto => ThemePref::Dark,
-            ThemePref::Dark => ThemePref::Light,
-            ThemePref::Light => ThemePref::Auto,
-        }
-    }
-
-    fn label_msg(self) -> crate::i18n::Msg {
-        use crate::i18n::Msg;
-        match self {
-            ThemePref::Auto => Msg::SettingsValueThemeAuto,
-            ThemePref::Dark => Msg::SettingsValueThemeDark,
-            ThemePref::Light => Msg::SettingsValueThemeLight,
-        }
+fn theme_label_msg(pref: ThemePref) -> crate::i18n::Msg {
+    use crate::i18n::Msg;
+    match pref {
+        ThemePref::Auto => Msg::SettingsValueThemeAuto,
+        ThemePref::Dark => Msg::SettingsValueThemeDark,
+        ThemePref::Light => Msg::SettingsValueThemeLight,
     }
 }
 
@@ -205,11 +167,11 @@ impl SettingsState {
 /// not free, so we only call this on transitions: opening the page, and
 /// after each mutation that could have changed a cached value.
 pub fn refresh_pref_cache(state: &mut SettingsState) {
-    state.theme_pref = crate::prefs::get("ui.theme")
+    state.theme_pref = crate::prefs::get(UI_THEME)
         .as_deref()
         .map(ThemePref::from_pref_str)
         .unwrap_or_default();
-    state.editor_command = crate::prefs::get("editor.command").unwrap_or_default();
+    state.editor_command = crate::prefs::get(EDITOR_COMMAND).unwrap_or_default();
 }
 
 #[derive(Debug, Clone)]
@@ -247,7 +209,7 @@ pub enum LspRowState {
 pub(crate) fn current_value(item: SettingItem, app: &App) -> ItemValue {
     use crate::i18n::t;
     match item {
-        SettingItem::Theme => ItemValue::Choice(t(app.settings.theme_pref.label_msg())),
+        SettingItem::Theme => ItemValue::Choice(t(theme_label_msg(app.settings.theme_pref))),
         SettingItem::EditorCommand => ItemValue::Text(app.settings.editor_command.clone()),
         SettingItem::DiffLayout => ItemValue::Choice(diff_layout_label(app.diff_layout)),
         SettingItem::DiffMode => ItemValue::Choice(diff_mode_label(app.diff_mode)),
@@ -304,7 +266,7 @@ pub fn cycle(app: &mut App, item: SettingItem) {
 
 fn cycle_theme(app: &mut App) {
     let next = app.settings.theme_pref.next();
-    crate::prefs::set("ui.theme", next.pref_str());
+    crate::prefs::set(UI_THEME, next.pref_str());
     match next {
         ThemePref::Dark => app.theme = crate::ui::theme::Theme::dark(),
         ThemePref::Light => app.theme = crate::ui::theme::Theme::light(),
@@ -336,7 +298,7 @@ pub(crate) fn commit_editor_command(state: &mut SettingsState) {
     if let Some(edit) = state.editor_edit.take() {
         let trimmed = edit.buffer.replace(['\n', '\r', '\t'], " ");
         let trimmed = trimmed.trim();
-        crate::prefs::set("editor.command", trimmed);
+        crate::prefs::set(EDITOR_COMMAND, trimmed);
         state.editor_command = trimmed.to_string();
     }
 }

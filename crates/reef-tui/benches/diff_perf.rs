@@ -109,7 +109,7 @@ fn bench_ranges_on_row(c: &mut Criterion) {
 /// `to_string()` storm dominated; post-fix the Arc-clone path is the
 /// hot work.
 fn bench_find_widget_keystroke(c: &mut Criterion) {
-    use reef::search::find_all;
+    use reef_core::search::find_literal_all;
     let diff = synth_diff(20, 50);
     c.bench_function("find_keystroke/unified_1k_lines_smallcase", |b| {
         b.iter(|| {
@@ -117,7 +117,7 @@ fn bench_find_widget_keystroke(c: &mut Criterion) {
             let mut total = 0usize;
             for r in &rows {
                 // `&Arc<str>` derefs to `&str`.
-                total += find_all(r, black_box("compute"), true).len();
+                total += find_literal_all(r, black_box("compute"), true).len();
             }
             black_box(total);
         });

@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, mpsc};
 
 use reef_core::diff::DiffContent;
+pub use reef_core::file_tree::TreeEntry;
 use reef_core::git::graph::GraphRow;
 use reef_core::git::{CommitDetail, CommitInfo, FileEntry, GraphScope, RefLabel};
 use reef_core::preview::PreviewDocument as PreviewContent;
@@ -31,17 +32,6 @@ pub mod remote;
 
 pub use local::LocalBackend;
 pub use remote::RemoteBackend;
-
-/// A visible entry in the flattened file tree.
-#[derive(Debug, Clone)]
-pub struct TreeEntry {
-    pub path: PathBuf,
-    pub name: String,
-    pub depth: usize,
-    pub is_dir: bool,
-    pub is_expanded: bool,
-    pub git_status: Option<char>,
-}
 
 pub type EditorResolver = fn() -> Option<(String, Vec<String>)>;
 

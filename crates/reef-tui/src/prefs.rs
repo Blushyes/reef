@@ -42,33 +42,20 @@ fn legacy_git_prefs_path() -> Option<PathBuf> {
 }
 
 pub fn read_all() -> BTreeMap<String, String> {
-    let mut map = BTreeMap::new();
     let Some(path) = prefs_path() else {
-        return map;
+        return BTreeMap::new();
     };
     let Ok(content) = std::fs::read_to_string(&path) else {
-        return map;
+        return BTreeMap::new();
     };
-    for line in content.lines() {
-        if let Some((k, v)) = line.split_once('=') {
-            map.insert(k.trim().to_string(), v.trim().to_string());
-        }
-    }
-    map
+    reef_core::prefs::parse_flat(&content)
 }
 
 fn write_all(map: &BTreeMap<String, String>) {
     let Some(path) = prefs_path() else {
         return;
     };
-    let mut content = String::new();
-    for (k, v) in map {
-        content.push_str(k);
-        content.push('=');
-        content.push_str(v);
-        content.push('\n');
-    }
-    let _ = std::fs::write(path, content);
+    let _ = std::fs::write(path, reef_core::prefs::serialize_flat(map));
 }
 
 pub fn get(key: &str) -> Option<String> {
@@ -78,7 +65,7 @@ pub fn get(key: &str) -> Option<String> {
 /// Read a bool pref: `true` iff the stored value is the literal string
 /// `"true"`. Any other value (including missing) yields `false`.
 pub fn get_bool(key: &str) -> bool {
-    get(key).map(|v| v == "true").unwrap_or(false)
+    reef_core::prefs::bool_value(&read_all(), key)
 }
 
 pub fn set(key: &str, value: &str) {
@@ -91,7 +78,7 @@ pub fn set(key: &str, value: &str) {
 /// round-trips. Callers should prefer this over building the literal
 /// string at every flip site.
 pub fn set_bool(key: &str, value: bool) {
-    set(key, if value { "true" } else { "false" });
+    set(key, reef_core::prefs::bool_str(value));
 }
 
 /// Fold unprefixed legacy keys into the new prefixed namespace and delete the
@@ -100,41 +87,18 @@ pub fn set_bool(key: &str, value: bool) {
 /// actually changed, so a first boot in a clean HOME doesn't touch the fs.
 pub fn migrate_legacy_prefs() {
     let original = read_all();
-    let mut map = original.clone();
-    let mut changed = false;
-
-    if let Some(v) = map.remove("layout") {
-        map.entry("diff.layout".into()).or_insert(v);
-        changed = true;
+    let legacy = legacy_git_prefs_path();
+    let legacy_content = legacy
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok());
+    let migration = reef_core::prefs::migrate_legacy(original.clone(), legacy_content.as_deref());
+    if migration.delete_legacy_git_prefs
+        && let Some(path) = legacy
+    {
+        let _ = std::fs::remove_file(path);
     }
-    if let Some(v) = map.remove("mode") {
-        map.entry("diff.mode".into()).or_insert(v);
-        changed = true;
-    }
-
-    if let Some(legacy) = legacy_git_prefs_path() {
-        if let Ok(content) = std::fs::read_to_string(&legacy) {
-            for line in content.lines() {
-                if let Some((k, v)) = line.split_once('=') {
-                    let k = k.trim();
-                    let v = v.trim();
-                    let new_key = match k {
-                        "tree_mode" => "status.tree_mode",
-                        "commit_diff_layout" => "commit.diff_layout",
-                        "commit_diff_mode" => "commit.diff_mode",
-                        "commit_files_tree_mode" => "commit.files_tree_mode",
-                        _ => continue,
-                    };
-                    map.entry(new_key.into()).or_insert_with(|| v.to_string());
-                }
-            }
-            let _ = std::fs::remove_file(&legacy);
-            changed = true;
-        }
-    }
-
-    if changed {
-        write_all(&map);
+    if migration.changed && migration.map != original {
+        write_all(&migration.map);
     }
 }
 

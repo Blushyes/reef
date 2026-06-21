@@ -62,6 +62,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // from steering mouse selection toward a hidden region.
     app.last_diff_rect = None;
     app.last_diff_hit = None;
+    app.last_commit_detail_rect = None;
+    app.last_commit_detail_hit = None;
 
     // Settings page is a full-screen takeover — render it instead of
     // the normal title/tab/body/status frame. The four-tab body still

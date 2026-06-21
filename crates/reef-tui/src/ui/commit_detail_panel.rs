@@ -6,7 +6,8 @@ use crate::i18n::{Msg, t};
 use crate::search::SearchTarget;
 use crate::ui::git_graph_panel;
 use crate::ui::mouse::ClickAction;
-use crate::ui::text::{clip_spans, overlay_match_highlight, spaces};
+use crate::ui::selection::{CommitDetailHit, CommitDetailHitRow};
+use crate::ui::text::{clip_spans, overlay_match_highlight, overlay_selection_highlight, spaces};
 use crate::ui::theme::Theme;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -89,6 +90,26 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
     let h_unified = app.commit_detail.diff_h_scroll;
     let sbs_left_h = app.commit_detail.sbs_left_h_scroll;
     let sbs_right_h = app.commit_detail.sbs_right_h_scroll;
+    let selection = app.commit_detail_selection;
+    let selection_h = if is_sbs { 0 } else { h_unified };
+
+    app.last_commit_detail_rect = Some(area);
+    app.last_commit_detail_hit = Some(CommitDetailHit {
+        content_x: area.x,
+        content_y: area.y,
+        h_scroll: selection_h,
+        rows: rows
+            .iter()
+            .enumerate()
+            .skip(scroll)
+            .take(area.height as usize)
+            .map(|(row_idx, row)| CommitDetailHitRow {
+                row_idx,
+                text: row.plain_text(),
+                selectable: row.is_text_selectable(),
+            })
+            .collect(),
+    });
 
     for (i, row) in rows
         .iter()
@@ -144,7 +165,18 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
         } else {
             overlay_match_highlight(base, &ranges, cur, theme.search_match, theme.search_current)
         };
-        let final_tokens: Vec<(Style, std::borrow::Cow<'_, str>)> = overlaid
+        let selected = if row.is_text_selectable() {
+            let row_text = row.plain_text();
+            match selection.and_then(|sel| sel.line_byte_range(row_idx, &row_text)) {
+                Some(range) if range.start < range.end => {
+                    overlay_selection_highlight(overlaid, range)
+                }
+                _ => overlaid,
+            }
+        } else {
+            overlaid
+        };
+        let final_tokens: Vec<(Style, std::borrow::Cow<'_, str>)> = selected
             .into_iter()
             .map(|(style, text)| {
                 (
@@ -468,6 +500,7 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
         }
         "git.toggleCommitDir" => {
             if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                app.clear_commit_detail_selection();
                 if !app.commit_detail.files_collapsed.remove(path) {
                     app.commit_detail.files_collapsed.insert(path.to_string());
                 }
@@ -624,6 +657,19 @@ impl Row {
     fn with_sbs(mut self, parts: SbsParts) -> Self {
         self.sbs = Some(parts);
         self
+    }
+    fn plain_text(&self) -> String {
+        let total: usize = self.spans.iter().map(|s| s.text.len()).sum();
+        let mut out = String::with_capacity(total);
+        for span in &self.spans {
+            out.push_str(span.text.as_str());
+        }
+        out
+    }
+    fn is_text_selectable(&self) -> bool {
+        self.sbs.is_none()
+            && self.row_click.is_none()
+            && self.spans.iter().all(|span| span.click.is_none())
     }
 }
 

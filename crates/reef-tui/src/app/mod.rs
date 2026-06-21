@@ -726,6 +726,10 @@ pub struct App {
     /// 连击计数器:diff 面板的 Down(Left) 序列,和 `preview_click_state`
     /// 语义一致,但分开存以防两个 tab 之间的点击串扰。
     pub diff_click_state: Option<(Instant, u16, u16, u8)>,
+    pub commit_detail_selection: Option<crate::ui::selection::PreviewSelection>,
+    pub last_commit_detail_rect: Option<ratatui::layout::Rect>,
+    pub last_commit_detail_hit: Option<crate::ui::selection::CommitDetailHit>,
+    pub commit_detail_click_state: Option<(Instant, u16, u16, u8)>,
     /// 拖拽选中过程中,上一次观察到的鼠标 `(column, row)`。终端在鼠标
     /// 不动时不会再发 Drag 事件,所以 VSCode 风格的"鼠标移出视口后
     /// 自动滚动"必须每帧重放最后已知位置——`tick_drag_autoscroll`
@@ -1289,6 +1293,10 @@ impl App {
             last_diff_rect: None,
             last_diff_hit: None,
             diff_click_state: None,
+            commit_detail_selection: None,
+            last_commit_detail_rect: None,
+            last_commit_detail_hit: None,
+            commit_detail_click_state: None,
             last_drag_mouse: None,
             preview_autoscroll_at: None,
             diff_autoscroll_at: None,
@@ -1462,6 +1470,11 @@ impl App {
     pub fn clear_diff_selection(&mut self) {
         self.diff_selection = None;
         self.diff_click_state = None;
+    }
+
+    pub fn clear_commit_detail_selection(&mut self) {
+        self.commit_detail_selection = None;
+        self.commit_detail_click_state = None;
     }
 
     /// Drop `Panel::Commit` back to a two-column-compatible panel when the
@@ -3280,6 +3293,7 @@ impl App {
             DiffLayout::Unified => DiffLayout::SideBySide,
             DiffLayout::SideBySide => DiffLayout::Unified,
         };
+        self.clear_commit_detail_selection();
         crate::prefs::set(
             "commit.diff_layout",
             self.commit_detail.diff_layout.pref_str(),
@@ -3291,6 +3305,7 @@ impl App {
             DiffMode::Compact => DiffMode::FullFile,
             DiffMode::FullFile => DiffMode::Compact,
         };
+        self.clear_commit_detail_selection();
         crate::prefs::set("commit.diff_mode", self.commit_detail.diff_mode.pref_str());
         // The compact↔full-file flip changes the context-lines argument the
         // worker uses, so the cached diff is now wrong shape — refetch.
@@ -3299,6 +3314,7 @@ impl App {
 
     pub fn toggle_commit_files_tree_mode(&mut self) {
         self.commit_detail.files_tree_mode = !self.commit_detail.files_tree_mode;
+        self.clear_commit_detail_selection();
         crate::prefs::set_bool("commit.files_tree_mode", self.commit_detail.files_tree_mode);
     }
 
@@ -3574,6 +3590,7 @@ impl App {
     /// and any previously-selected file diff whenever the target changes.
     pub fn load_commit_detail(&mut self) {
         self.commit_detail.file_diff = None;
+        self.clear_commit_detail_selection();
         // Different commit → different content; reset all three h_scrolls so
         // the panel starts at the left edge. Keeps the scrollbar out of
         // "offset that only made sense for the prior commit" states.
@@ -3600,6 +3617,7 @@ impl App {
     /// worker. No-ops when the selection is actually a single row.
     pub fn load_commit_range_detail(&mut self) {
         self.commit_detail.file_diff = None;
+        self.clear_commit_detail_selection();
         self.commit_detail.diff_h_scroll = 0;
         self.commit_detail.sbs_left_h_scroll = 0;
         self.commit_detail.sbs_right_h_scroll = 0;
@@ -3695,6 +3713,7 @@ impl App {
             .map(|d| d.path.as_str() != path)
             .unwrap_or(true);
         if is_new_file {
+            self.clear_commit_detail_selection();
             self.commit_detail.diff_h_scroll = 0;
             self.commit_detail.sbs_left_h_scroll = 0;
             self.commit_detail.sbs_right_h_scroll = 0;
@@ -5061,6 +5080,7 @@ impl App {
         // appears on return and the click-count resets cleanly.
         self.preview_selection = None;
         self.preview_click_state = None;
+        self.clear_commit_detail_selection();
         // FocusedPreview file picker is also tab-scoped (entries come
         // from the active tab's diff list). Switching tabs while the
         // picker is open would carry the popup state to a tab whose

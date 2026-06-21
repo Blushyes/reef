@@ -92,7 +92,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
         app.hit_registry.register_row(
             area.x,
             y,
-            click_x_w,
+            click_x_w.min(area.width),
             ClickAction::GitCommand {
                 command: "git.selectCommit".into(),
                 args: serde_json::json!({ "oid": row.commit.oid }),

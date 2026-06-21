@@ -17,8 +17,8 @@ use crate::search;
 use crate::settings;
 use crate::ui;
 use crate::ui::selection::{
-    DiffSelection, PreviewSelection, col_to_byte_offset, collect_diff_selected_text,
-    collect_selected_text_from_rows, word_at_byte,
+    DiffSelection, PreviewSelection, col_to_byte_offset, collect_commit_detail_selected_text,
+    collect_diff_selected_text, collect_selected_text_from_rows, word_at_byte,
 };
 use crate::ui::toast::Toast;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -2708,6 +2708,9 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
     if handle_diff_selection(&mouse, app) {
         return;
     }
+    if handle_commit_detail_selection(&mouse, app) {
+        return;
+    }
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
@@ -3191,6 +3194,110 @@ fn handle_diff_selection(mouse: &MouseEvent, app: &mut App) -> bool {
                             Ok(()) => app.toasts.push(Toast::info(t(Msg::ClipboardCopied))),
                             Err(_) => app.toasts.push(Toast::error(t(Msg::ClipboardCopyFailed))),
                         }
+                    }
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn handle_commit_detail_selection(mouse: &MouseEvent, app: &mut App) -> bool {
+    let Some(rect) = app.last_commit_detail_rect else {
+        return false;
+    };
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if !point_in_rect(rect, mouse.column, mouse.row) {
+                return false;
+            }
+            let Some(hit) = app.last_commit_detail_hit.as_ref() else {
+                return false;
+            };
+            let Some((row_idx, byte_offset)) = hit.selectable_coord_for(mouse.column, mouse.row)
+            else {
+                return false;
+            };
+            let Some(row_text) = hit.text_for_row(row_idx) else {
+                return false;
+            };
+            let row_text = row_text.to_string();
+
+            if app.graph_uses_three_col() {
+                app.active_panel = Panel::Commit;
+            } else {
+                app.active_panel = Panel::Diff;
+            }
+
+            let now = Instant::now();
+            let click_count = if let Some((t, c, r, n)) = app.commit_detail_click_state {
+                if c == mouse.column
+                    && r == mouse.row
+                    && now.duration_since(t) < DOUBLE_CLICK_WINDOW
+                {
+                    (n + 1).min(3)
+                } else {
+                    1
+                }
+            } else {
+                1
+            };
+            app.commit_detail_click_state = Some((now, mouse.column, mouse.row, click_count));
+
+            let sel = match click_count {
+                2 => {
+                    let word = word_at_byte(&row_text, byte_offset);
+                    PreviewSelection {
+                        anchor: (row_idx, word.start),
+                        active: (row_idx, word.end),
+                        dragging: true,
+                    }
+                }
+                3 => PreviewSelection {
+                    anchor: (row_idx, 0),
+                    active: (row_idx, row_text.len()),
+                    dragging: true,
+                },
+                _ => PreviewSelection::new((row_idx, byte_offset)),
+            };
+            app.commit_detail_selection = Some(sel);
+            true
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let dragging = app
+                .commit_detail_selection
+                .is_some_and(|selection| selection.dragging);
+            if !dragging {
+                return false;
+            }
+            let Some(hit) = app.last_commit_detail_hit.as_ref() else {
+                return true;
+            };
+            if let Some(pos) = hit.selectable_coord_for_clamped(mouse.column, mouse.row)
+                && let Some(selection) = app.commit_detail_selection.as_mut()
+            {
+                selection.active = pos;
+            }
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let Some(selection) = app.commit_detail_selection.as_mut() else {
+                return false;
+            };
+            if !selection.dragging {
+                return false;
+            }
+            selection.dragging = false;
+            let snap = *selection;
+            if !snap.is_empty()
+                && let Some(hit) = app.last_commit_detail_hit.as_ref()
+            {
+                let text = collect_commit_detail_selected_text(hit, &snap);
+                if !text.is_empty() {
+                    match clipboard::copy_to_clipboard(&text) {
+                        Ok(()) => app.toasts.push(Toast::info(t(Msg::ClipboardCopied))),
+                        Err(_) => app.toasts.push(Toast::error(t(Msg::ClipboardCopyFailed))),
                     }
                 }
             }

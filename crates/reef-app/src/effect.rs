@@ -1,10 +1,3 @@
-//! Cross-panel toast/notification queue.
-//!
-//! Any panel can push a toast here and the top-level `ui::render_status_bar`
-//! shows the most recent one. Used for things that must stay visible when
-//! the user switches tabs (push success/failure being the current primary
-//! consumer).
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToastLevel {
     Info,
@@ -39,4 +32,18 @@ impl Toast {
             message: message.into(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub enum AppEffect {
+    Quit,
+    CopyToClipboard {
+        text: String,
+        success: Option<Toast>,
+        failure: Toast,
+    },
+    OpenUrl(String),
+    OpenInEditor(std::path::PathBuf),
+    Toast(Toast),
+    SwitchSession(crate::features::hosts_picker::SshTarget),
 }

@@ -1,11 +1,10 @@
 //! Quick-open palette overlay (bound to Space-P; see `crate::quick_open`).
 //!
-//! Rendered on top of the normal UI when `app.quick_open.core.active` is true.
+//! Rendered on top of the normal UI when the quick-open overlay is active.
 //! Three regions inside the popup: a single-row input line, a list of
 //! matches, and a right-aligned counter footer. The only state this panel
-//! writes back to `App` is `quick_open.last_view_h` (used by PageUp/PageDown
-//! step sizing) and `quick_open.scroll` (kept in sync with `selected`); the
-//! matching itself lives in `crate::quick_open`.
+//! writes back to `App` is the TUI list height cache (used by PageUp/PageDown
+//! step sizing); the matching itself lives in `reef-app`.
 //!
 //! Highlight strategy: nucleo reports `indices` as character positions in
 //! the full display path. We render the path as "basename + dir" — basename
@@ -22,10 +21,10 @@ use ratatui::widgets::{Block, Borders, Clear, Padding};
 use std::collections::HashSet;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::App;
-use crate::quick_open::{Candidate, MatchEntry};
+use crate::TuiApp as App;
 use crate::ui::mouse::ClickAction;
 use crate::ui::theme::Theme;
+use reef_app::QuickOpenRowSnapshot;
 
 pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     let th = app.theme;
@@ -39,11 +38,12 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     // Stash bounds so `quick_open::handle_mouse` can decide "inside popup
     // vs. click-away dismiss". Overwritten every frame so it stays in sync
     // with terminal resizes.
-    app.quick_open.core.last_popup_area = Some(area);
+    app.quick_open_popup_area = Some(area);
 
     f.render_widget(Clear, area);
 
-    let recent = app.quick_open.core.filter.is_empty() && !app.quick_open.mru.is_empty();
+    let snapshot = app.engine.snapshot().quick_open;
+    let recent = snapshot.recent;
     let title = if recent {
         " Quick Open · recent "
     } else {
@@ -82,7 +82,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     };
     let footer_y = inner.y + inner.height.saturating_sub(1);
 
-    app.quick_open.last_view_h = list_h;
+    app.layout.quick_open_last_view_h = list_h;
 
     // ── Input row ──────────────────────────────────────────────────────
     let prompt_spans = vec![
@@ -90,10 +90,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
             "> ",
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            app.quick_open.core.filter.clone(),
-            Style::default().fg(th.fg_primary),
-        ),
+        Span::styled(snapshot.query.clone(), Style::default().fg(th.fg_primary)),
     ];
     f.render_widget(
         Line::from(prompt_spans),
@@ -101,8 +98,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     );
     // Blinking cursor — same trick `render_search_prompt` uses. Using
     // UnicodeWidthStr so cursor lands between CJK/wide chars correctly.
-    let cursor_w =
-        UnicodeWidthStr::width(&app.quick_open.core.filter[..app.quick_open.core.cursor]) as u16;
+    let cursor_w = UnicodeWidthStr::width(&snapshot.query[..snapshot.cursor]) as u16;
     let cursor_x = inner.x + 2 + cursor_w.min(inner.width.saturating_sub(3));
     f.set_cursor_position((cursor_x, input_y));
 
@@ -116,8 +112,8 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     );
 
     // ── List ───────────────────────────────────────────────────────────
-    if app.quick_open.matches.is_empty() {
-        let msg = if app.quick_open.core.filter.is_empty() {
+    if snapshot.match_count == 0 {
+        let msg = if snapshot.query.is_empty() {
             "Type to search files…"
         } else {
             "No matching files"
@@ -132,28 +128,22 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
             Rect::new(inner.x, list_y, inner.width, 1),
         );
     } else {
-        // Keep the selection in view. Same pattern as file_tree_panel — only
-        // adjust scroll when selection moved outside the window, so the user
-        // can scroll independently (Future: wire mouse wheel on popup).
-        let sel = app.quick_open.core.selected_idx;
-        if sel < app.quick_open.scroll {
-            app.quick_open.scroll = sel;
-        } else if list_h > 0 && sel >= app.quick_open.scroll + list_h as usize {
-            app.quick_open.scroll = sel + 1 - list_h as usize;
-        }
-        let scroll = app.quick_open.scroll;
+        let scroll = visible_scroll(
+            snapshot.scroll,
+            snapshot.selected_idx,
+            list_h as usize,
+            snapshot.match_count,
+        );
+        let sel = snapshot.selected_idx;
 
-        for row in 0..list_h as usize {
-            let match_idx = scroll + row;
-            let Some(m) = app.quick_open.matches.get(match_idx) else {
-                break;
-            };
-            let Some(cand) = app.quick_open.index.get(m.idx) else {
-                continue;
-            };
+        for (row, (match_idx, item)) in app
+            .engine
+            .quick_open_rows(scroll, list_h as usize)
+            .enumerate()
+        {
             let is_sel = match_idx == sel;
             let y = list_y + row as u16;
-            let line = build_row_line(cand, m, is_sel, inner.width, &th);
+            let line = build_row_line(&item, is_sel, inner.width, &th);
             f.render_widget(line, Rect::new(inner.x, y, inner.width, 1));
             // Register the row as a click zone. Registered after the
             // underlying panels drew theirs, so `hit_test` (which scans
@@ -169,12 +159,12 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
 
     // ── Footer (N/M counter) ───────────────────────────────────────────
     if has_footer {
-        let cur = if app.quick_open.matches.is_empty() {
+        let cur = if snapshot.match_count == 0 {
             0
         } else {
-            app.quick_open.core.selected_idx + 1
+            snapshot.selected_idx + 1
         };
-        let text = format!("{} / {}", cur, app.quick_open.matches.len());
+        let text = format!("{} / {}", cur, snapshot.match_count);
         let w = UnicodeWidthStr::width(text.as_str()) as u16;
         let fx = inner.x + inner.width.saturating_sub(w);
         f.render_widget(
@@ -184,13 +174,26 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     }
 }
 
+fn visible_scroll(scroll: usize, selected: usize, visible_rows: usize, total_rows: usize) -> usize {
+    if visible_rows == 0 || total_rows == 0 {
+        return 0;
+    }
+    let max_scroll = total_rows.saturating_sub(visible_rows);
+    let mut next = scroll.min(max_scroll);
+    if selected < next {
+        next = selected;
+    } else if selected >= next + visible_rows {
+        next = selected + 1 - visible_rows;
+    }
+    next.min(max_scroll)
+}
+
 /// Render one result row. Layout:
 /// `<bg> basename   dir/ <fill> `
 /// — basename bold, dir dim, matched chars in `indices` in accent color.
 /// The whole row gets `selection_bg` when selected.
 fn build_row_line(
-    cand: &Candidate,
-    m: &MatchEntry,
+    row: &QuickOpenRowSnapshot,
     is_sel: bool,
     width: u16,
     th: &Theme,
@@ -201,7 +204,7 @@ fn build_row_line(
         Color::Reset
     };
 
-    let display = &cand.display;
+    let display = &row.display;
     // Byte offset where basename starts; also acts as "dir byte length".
     let basename_start_byte = display.rfind('/').map(|i| i + 1).unwrap_or(0);
     let basename = &display[basename_start_byte..];
@@ -210,7 +213,7 @@ fn build_row_line(
     // full display so we need a char boundary, not the byte one.
     let basename_start_char = display[..basename_start_byte].chars().count();
 
-    let basename_hl: HashSet<usize> = m
+    let basename_hl: HashSet<usize> = row
         .indices
         .iter()
         .filter_map(|&i| {
@@ -222,7 +225,7 @@ fn build_row_line(
             }
         })
         .collect();
-    let dir_hl: HashSet<usize> = m
+    let dir_hl: HashSet<usize> = row
         .indices
         .iter()
         .filter_map(|&i| {

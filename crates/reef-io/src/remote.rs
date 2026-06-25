@@ -1,12 +1,10 @@
 //! Remote backend — speaks length-prefixed JSON-RPC (see `reef-proto`) to a
 //! `reef-agent` subprocess (typically `ssh host reef-agent --stdio …`).
 //!
-//! Phase 3 of the SSH feature: this file ships the M1 "loopback" story —
-//! enough to spawn the agent locally, issue synchronous RPC calls from the
-//! main thread and receive debounced fs-change notifications. `launch_editor`
-//! is explicitly left `Unimplemented` for M1 (Phase 6 adds SSH -t transparent
-//! forwarding). Everything else matches the `Backend` contract byte-for-byte
-//! with `LocalBackend`.
+//! It can spawn the agent, issue synchronous RPC calls, and receive debounced
+//! fs-change notifications. `launch_editor` is explicitly `Unimplemented`;
+//! callers that need an editor use `editor_launch_spec`. Everything else
+//! matches the `Backend` contract byte-for-byte with `LocalBackend`.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader, BufWriter, Write};
@@ -564,11 +562,10 @@ impl Backend for RemoteBackend {
             None
         };
 
-        // SSH mode: tree-sitter still runs locally — file bytes have
+        // SSH mode: tree-sitter still runs locally because file bytes have
         // already crossed the SSH boundary into `raw`. The result is
-        // intra-file `gd` parity with local mode. Cross-file
-        // (Phase 2 stack-graphs) is local-only; LSP (Phase 3) is also
-        // local-only — both gate on `Backend::is_remote()`.
+        // intra-file `gd` parity with local mode. Cross-file workspace index
+        // and LSP remain local-only and gate on `Backend::is_remote()`.
         let parsed = if within_cap {
             let path_buf = std::path::PathBuf::from(&rel_str);
             reef_core::nav::NavLang::from_path(&path_buf).and_then(|lang| {
@@ -588,6 +585,19 @@ impl Backend for RemoteBackend {
                 parsed,
             }),
         })
+    }
+
+    fn list_dir(&self, rel_path: &Path) -> Result<Vec<crate::DirEntry>, BackendError> {
+        let entries: Vec<DirEntryDto> = self.request(Request::ReadDir {
+            path: normalize_remote_path(rel_path),
+        })?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| crate::DirEntry {
+                name: entry.name,
+                is_dir: entry.is_dir,
+            })
+            .collect())
     }
 
     fn read_file(&self, rel_path: &Path, max_bytes: u64) -> Result<Vec<u8>, BackendError> {
@@ -810,7 +820,7 @@ impl Backend for RemoteBackend {
 
     fn launch_editor(&self, _rel_path: &Path) -> Result<(), BackendError> {
         Err(BackendError::Unimplemented(
-            "remote editor launch (ssh -t forwarding) is not part of M1".into(),
+            "remote editor launch is not supported".into(),
         ))
     }
 

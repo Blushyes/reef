@@ -2,6 +2,7 @@
 name = "reef-io"
 version = "0.41.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 publish = false
 
 [lints]
@@ -21,3 +22,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = "3"
 trash = "5"
+
+[dev-dependencies]
+rusqlite = { version = "0.32", default-features = false, features = ["bundled"] }
+test-support = { path = "../test-support" }

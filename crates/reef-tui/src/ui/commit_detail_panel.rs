@@ -1,9 +1,8 @@
 //! Graph tab's right editor — commit metadata + Changed-files list (tree or
 //! flat) + inline diff for the currently-selected file.
 
-use crate::app::{App, DiffHighlighted, DiffMode, LineTokens};
+use crate::TuiApp as App;
 use crate::i18n::{Msg, t};
-use crate::search::SearchTarget;
 use crate::ui::git_graph_panel;
 use crate::ui::mouse::ClickAction;
 use crate::ui::selection::{CommitDetailHit, CommitDetailHitRow};
@@ -13,6 +12,8 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use reef_app::{AppCommand, SearchTarget};
+use reef_app::{DiffHighlighted, DiffMode, LineTokens};
 use reef_core::diff::DiffLayout;
 use reef_core::diff::{DiffContent, LineTag};
 use reef_core::git::tree::{self as gtree, Node};
@@ -28,18 +29,21 @@ const SBS_GUTTER_WIDTH: usize = 7;
 
 pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
     let theme = app.theme;
-    app.last_commit_detail_view_h = area.height;
+    app.layout.last_commit_detail_view_h = area.height;
 
     // Layout split — Unified uses a single h_scroll across all rows and builds
     // rows at virtual_w (= viewport + h_scroll) so pad/content extends past
     // the viewport for clip_spans to reveal. SBS uses two independent
     // h_scrolls (left & right halves) applied per-half at render time; rows
     // build at virtual_w = area.width (non-SBS rows don't h-scroll in SBS mode).
-    let is_sbs = matches!(app.commit_detail.diff_layout, DiffLayout::SideBySide);
+    let is_sbs = matches!(
+        app.engine.commit_detail().diff_layout,
+        DiffLayout::SideBySide
+    );
     let h_unified = if is_sbs {
         0
     } else {
-        app.commit_detail.diff_h_scroll
+        app.engine.commit_detail().diff_h_scroll
     };
     let virtual_w = (area.width as usize)
         .saturating_add(h_unified)
@@ -48,19 +52,17 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
     let total = rows.len();
 
     let max_scroll = total.saturating_sub(area.height as usize);
-    if app.commit_detail.scroll > max_scroll {
-        app.commit_detail.scroll = max_scroll;
-    }
-    let scroll = app.commit_detail.scroll;
+    app.engine
+        .dispatch(AppCommand::ClampCommitDetailVerticalScroll(max_scroll));
+    let scroll = app.engine.commit_detail().scroll;
     let visible = rows.iter().skip(scroll).take(area.height as usize);
 
     // Clamp the relevant h_scrolls to the widest content in view.
     if !is_sbs {
         let max_visible_w: usize = visible.clone().map(|r| r.content_width).max().unwrap_or(0);
         let max_h = max_visible_w.saturating_sub(area.width as usize);
-        if app.commit_detail.diff_h_scroll > max_h {
-            app.commit_detail.diff_h_scroll = max_h;
-        }
+        app.engine
+            .dispatch(AppCommand::ClampCommitDetailDiffHorizontalScroll(max_h));
     } else {
         // SBS: clamp each half against the widest corresponding side in view.
         let half_w = (area.width.saturating_sub(1) / 2) as usize;
@@ -79,17 +81,16 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
                 });
         let max_left_h = max_left_tw.saturating_sub(left_body_w);
         let max_right_h = max_right_tw.saturating_sub(right_body_w);
-        if app.commit_detail.sbs_left_h_scroll > max_left_h {
-            app.commit_detail.sbs_left_h_scroll = max_left_h;
-        }
-        if app.commit_detail.sbs_right_h_scroll > max_right_h {
-            app.commit_detail.sbs_right_h_scroll = max_right_h;
-        }
+        app.engine
+            .dispatch(AppCommand::ClampCommitDetailSbsHorizontalScrolls {
+                left: max_left_h,
+                right: max_right_h,
+            });
     }
 
-    let h_unified = app.commit_detail.diff_h_scroll;
-    let sbs_left_h = app.commit_detail.sbs_left_h_scroll;
-    let sbs_right_h = app.commit_detail.sbs_right_h_scroll;
+    let h_unified = app.engine.commit_detail().diff_h_scroll;
+    let sbs_left_h = app.engine.commit_detail().sbs_left_h_scroll;
+    let sbs_right_h = app.engine.commit_detail().sbs_right_h_scroll;
     let selection = app.commit_detail_selection;
     let selection_h = if is_sbs { 0 } else { h_unified };
 
@@ -127,7 +128,8 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
             // them into left-body-local and right-body-local ranges and
             // apply overlay per half before clipping.
             let (ranges, cur) = app
-                .search
+                .engine
+                .search()
                 .ranges_on_row(SearchTarget::CommitDetail, row_idx);
             render_sbs_row_live(
                 f,
@@ -152,7 +154,8 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
         let h = if is_sbs { 0 } else { h_unified };
 
         let (ranges, cur) = app
-            .search
+            .engine
+            .search()
             .ranges_on_row(SearchTarget::CommitDetail, row_idx);
 
         let base: Vec<(Style, std::borrow::Cow<'_, str>)> = row
@@ -304,10 +307,10 @@ fn render_sbs_row_live(
     let left_base_tokens: Vec<(Style, std::borrow::Cow<'_, str>)> = match &sbs.left_tokens {
         Some(toks) if !toks.is_empty() => toks
             .iter()
-            .map(|(s, t)| {
+            .map(|token| {
                 (
-                    style_with_bg(*s, left_bg),
-                    std::borrow::Cow::Borrowed(t.as_str()),
+                    style_with_bg(crate::ui::highlight::to_ratatui_style(token.style), left_bg),
+                    std::borrow::Cow::Borrowed(token.text.as_str()),
                 )
             })
             .collect(),
@@ -342,10 +345,13 @@ fn render_sbs_row_live(
     let right_base_tokens: Vec<(Style, std::borrow::Cow<'_, str>)> = match &sbs.right_tokens {
         Some(toks) if !toks.is_empty() => toks
             .iter()
-            .map(|(s, t)| {
+            .map(|token| {
                 (
-                    style_with_bg(*s, right_bg),
-                    std::borrow::Cow::Borrowed(t.as_str()),
+                    style_with_bg(
+                        crate::ui::highlight::to_ratatui_style(token.style),
+                        right_bg,
+                    ),
+                    std::borrow::Cow::Borrowed(token.text.as_str()),
                 )
             })
             .collect(),
@@ -483,16 +489,13 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             // arg on range rows is just the "newest" marker; we deliberately
             // don't compare it against `selected_commit` because that would
             // spuriously flip us into single-select.
-            if !app.git_graph.is_range() {
+            if !app.engine.git_graph().is_range() {
                 if oid.is_empty() {
                     return true;
                 }
-                if app.git_graph.selected_commit.as_deref() != Some(oid) {
-                    if let Some(idx) = app.git_graph.find_row_by_oid(oid) {
-                        app.git_graph.selected_idx = idx;
-                    }
-                    app.git_graph.selected_commit = Some(oid.to_string());
-                    app.load_commit_detail();
+                if app.engine.git_graph().selected_commit.as_deref() != Some(oid) {
+                    app.engine
+                        .dispatch(reef_app::AppCommand::FocusGraphCommit(oid.to_string()));
                 }
             }
             app.load_commit_file_diff(path);
@@ -501,9 +504,10 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
         "git.toggleCommitDir" => {
             if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
                 app.clear_commit_detail_selection();
-                if !app.commit_detail.files_collapsed.remove(path) {
-                    app.commit_detail.files_collapsed.insert(path.to_string());
-                }
+                app.engine
+                    .dispatch(reef_app::AppCommand::ToggleCommitFilesDirCollapsed(
+                        path.to_string(),
+                    ));
             }
             true
         }
@@ -516,12 +520,8 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
 }
 
 pub fn scroll(app: &mut App, delta: i32) {
-    let s = &mut app.commit_detail.scroll;
-    *s = if delta < 0 {
-        s.saturating_sub(delta.unsigned_abs() as usize)
-    } else {
-        s.saturating_add(delta as usize)
-    };
+    app.engine
+        .dispatch(reef_app::AppCommand::ScrollCommitDetailVertical(delta));
 }
 
 // ─── Row model ────────────────────────────────────────────────────────────────
@@ -699,7 +699,7 @@ fn from_ratatui_span(span: Span<'static>) -> RowSpan {
 /// past max_h, producing visible jitter at the right edge.
 fn build_rows(app: &App, width: u16, display_w: u16, theme: &Theme) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
-    let cd = &app.commit_detail;
+    let cd = &app.engine.commit_detail();
     let max_msg = (width as usize).saturating_sub(4);
     let max_path = (width as usize).saturating_sub(6);
 
@@ -826,7 +826,7 @@ fn append_commit_header(
         ),
     ]));
 
-    if let Some(labels) = app.git_graph.ref_map.get(&info.oid) {
+    if let Some(labels) = app.engine.git_graph().ref_map.get(&info.oid) {
         let mut spans: Vec<RowSpan> = vec![RowSpan::styled(
             t(Msg::RefsLabel),
             Style::default().fg(theme.fg_secondary),
@@ -869,7 +869,7 @@ fn append_commit_header(
 /// is the wrong semantic for this list.
 fn append_range_header(
     rows: &mut Vec<Row>,
-    range: &crate::app::RangeDetail,
+    range: &reef_app::RangeDetail,
     max_msg: usize,
     theme: &Theme,
 ) {
@@ -1198,7 +1198,12 @@ fn content_tokens_for_line<'a>(
     match line_tokens {
         Some(toks) if !toks.is_empty() => toks
             .iter()
-            .map(|(s, t)| (apply_bg(*s, bg), std::borrow::Cow::Borrowed(t.as_str())))
+            .map(|token| {
+                (
+                    apply_bg(crate::ui::highlight::to_ratatui_style(token.style), bg),
+                    std::borrow::Cow::Borrowed(token.text.as_str()),
+                )
+            })
             .collect(),
         _ => {
             let style = apply_bg(Style::default().fg(fallback_fg), bg);
@@ -1396,11 +1401,17 @@ mod tests {
 
     #[test]
     fn content_tokens_applies_bg_to_highlighted_tokens() {
-        let syntax_a = Style::default().fg(Color::Blue);
-        let syntax_b = Style::default().fg(Color::Green);
+        let syntax_a = reef_core::text::TextStyle {
+            fg: Some(reef_core::text::Rgb { r: 0, g: 0, b: 255 }),
+            ..reef_core::text::TextStyle::default()
+        };
+        let syntax_b = reef_core::text::TextStyle {
+            fg: Some(reef_core::text::Rgb { r: 0, g: 128, b: 0 }),
+            ..reef_core::text::TextStyle::default()
+        };
         let line_tokens: LineTokens = Arc::new(vec![
-            (syntax_a, "let ".to_string()),
-            (syntax_b, "x".to_string()),
+            reef_core::text::StyledToken::new(syntax_a, "let "),
+            reef_core::text::StyledToken::new(syntax_b, "x"),
         ]);
         let out =
             content_tokens_for_line("let x", Some(&line_tokens), Color::Red, Some(Color::Yellow));

@@ -9,22 +9,10 @@ pub struct FileTree {
 
 impl FileTree {
     pub fn new(workdir: &Path) -> Self {
-        let mut tree = Self {
+        Self {
             root: workdir.to_path_buf(),
             state: FileTreeState::default(),
-        };
-        tree.rebuild();
-        tree
-    }
-
-    pub fn rebuild(&mut self) {
-        let entries = reef_io::local::build_entries(
-            &self.root,
-            self.state.expanded(),
-            self.state.git_statuses(),
-        );
-        let selected = self.state.selected;
-        self.state.replace_entries(entries, selected);
+        }
     }
 
     pub fn toggle_expand(&mut self, index: usize) {

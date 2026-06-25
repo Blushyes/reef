@@ -1,6 +1,6 @@
 //! Internal file clipboard for the Files tab — VS Code-style Cut / Copy /
-//! Paste. This is *not* the OSC 52 system clipboard (`crate::clipboard`),
-//! which is used only for `Copy Path` / `Copy Relative Path`. The internal
+//! Paste. This is *not* the host/system clipboard used for `Copy Path` /
+//! `Copy Relative Path`. The internal
 //! clipboard tracks paths the user has marked for an upcoming `Paste`,
 //! plus whether the operation is move (Cut) or duplicate (Copy).
 //!

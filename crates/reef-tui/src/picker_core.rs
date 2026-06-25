@@ -22,37 +22,20 @@
 //! drop-down list, so it doesn't share PickerCore's selection model.
 
 use crossterm::event::KeyEvent;
-use ratatui::layout::Rect;
+use reef_app::PickerInput;
+#[cfg(test)]
+use reef_app::PickerInputOutcome;
+#[cfg(test)]
+use reef_app::PickerState;
 
 use crate::keymap::{Command, InputScope, Keymap};
-
-/// Shared state for a filter-driven picker overlay. Each consuming
-/// picker holds this as a field (e.g. `pub core: PickerCore`) and
-/// keeps its domain-specific data (`all_hosts`, `recent`,
-/// `space_leader_at`, …) alongside.
-#[derive(Debug, Default)]
-pub struct PickerCore {
-    pub active: bool,
-    /// Text in the filter input. Edited via `dispatch_key` / paste.
-    pub filter: String,
-    /// Byte offset into `filter` (UTF-8 char boundary). Maintained
-    /// alongside `filter` by [`crate::input_edit`].
-    pub cursor: usize,
-    /// Index into `visible_rows()` of the row currently highlighted.
-    /// Always reset to 0 on filter edit so the next match lands at the
-    /// top — matches the UX convention every reef picker uses.
-    pub selected_idx: usize,
-    /// Cached popup rect for mouse hit-testing. Set by the panel
-    /// renderer each frame, read by the click/scroll handler.
-    pub last_popup_area: Option<Rect>,
-}
 
 /// Outcome of dispatching a key event to [`PickerCore::dispatch_key`].
 /// Callers translate these into picker-specific actions:
 ///
 /// ```text
 /// Cancel         → close()                   (Esc — close picker only)
-/// Quit           → close() + should_quit     (Ctrl+C — close + app quit)
+/// Quit           → close() + quit effect     (Ctrl+C — close + app quit)
 /// Confirm        → look up the row at `selected_idx`, act on it
 /// Edited         → recompute the candidate list against `filter`
 /// Rejected       → a printable char was recognised but a future
@@ -70,127 +53,41 @@ pub struct PickerCore {
 ///                  swallowed rather than bubbled up to global hotkeys.
 /// ```
 ///
-/// `Cancel` and `Quit` are split so callers can wire `should_quit`
+/// `Cancel` and `Quit` are split so callers can wire the quit effect
 /// in one place — letting them collapse to a single outcome forces
 /// every site to re-derive Ctrl+C by re-matching `key.code`, which
 /// is the kind of duplication that drifts the first time a new
 /// caller forgets to copy the branch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InputOutcome {
-    Cancel,
-    Quit,
-    Confirm,
-    Edited,
-    Rejected,
-    SelectionMoved,
-    CursorMoved,
-    Unhandled,
+#[cfg(test)]
+type InputOutcome = PickerInputOutcome;
+
+/// Standard picker key dispatch. Two-phase:
+///   1. List navigation + close + commit (Esc/Ctrl+C, Enter,
+///      Up/Down/Ctrl+J/K/N/P).
+///   2. Filter editing via [`crate::input_edit::dispatch_key`].
+#[cfg(test)]
+pub fn dispatch_key(
+    state: &mut PickerState,
+    scope: InputScope,
+    key: &KeyEvent,
+    visible_count: usize,
+) -> InputOutcome {
+    reef_app::apply_picker_input(state, input_for_key(scope, key), visible_count)
 }
 
-impl PickerCore {
-    /// Open the overlay, resetting filter / cursor / selection.
-    /// Domain-specific data (cached candidates, recents, etc.) should
-    /// be set by the caller *before* calling this — `open()` is the
-    /// last step that flips `active` to true.
-    pub fn open(&mut self) {
-        self.filter.clear();
-        self.cursor = 0;
-        self.selected_idx = 0;
-        // Also clear the stale popup rect. quick_open and global_search
-        // toggle `core.active = false` directly on close (intentional —
-        // they preserve `filter` for Esc-peek-and-return UX), so they
-        // never go through `close()`. Without invalidating
-        // `last_popup_area` at open time, the first frame after a
-        // terminal resize + reopen sees a stale rect; the mouse
-        // hit-test against `last_popup_area` would misclassify the
-        // first click as outside-the-popup and dismiss the freshly-
-        // opened overlay.
-        self.last_popup_area = None;
-        self.active = true;
+pub fn input_for_key(scope: InputScope, key: &KeyEvent) -> PickerInput {
+    match Keymap::resolve(scope, key) {
+        Some(Command::Close) => return PickerInput::Cancel,
+        Some(Command::Quit) => return PickerInput::Quit,
+        Some(Command::Confirm) => return PickerInput::Confirm,
+        Some(Command::MoveUp) => return PickerInput::MoveSelection(-1),
+        Some(Command::MoveDown) => return PickerInput::MoveSelection(1),
+        _ => {}
     }
 
-    /// Close the overlay and wipe transient state (filter, cursor,
-    /// selection, mouse rect). Caller is responsible for any picker-
-    /// specific cleanup (e.g. clearing `path_buffer` in hosts_picker).
-    pub fn close(&mut self) {
-        self.active = false;
-        self.filter.clear();
-        self.cursor = 0;
-        self.selected_idx = 0;
-        self.last_popup_area = None;
-    }
-
-    /// Clamp `selected_idx` against the current visible row count and
-    /// move it by `delta` (negative = up). Used by the standard
-    /// key/scroll handlers and by callers that need to drive selection
-    /// from outside the key path (mouse wheel, PageUp/PageDown with a
-    /// view_h step).
-    pub fn move_selection(&mut self, visible_count: usize, delta: i32) {
-        if visible_count == 0 {
-            self.selected_idx = 0;
-            return;
-        }
-        let last = visible_count as i32 - 1;
-        let next = (self.selected_idx as i32 + delta).clamp(0, last);
-        self.selected_idx = next as usize;
-    }
-
-    /// Standard picker key dispatch. Two-phase:
-    ///   1. List navigation + close + commit (Esc/Ctrl+C, Enter,
-    ///      Up/Down/Ctrl+J/K/N/P).
-    ///   2. Filter editing via [`crate::input_edit::dispatch_key`].
-    ///
-    /// `visible_count` is the row count caller's `visible_rows()` would
-    /// produce *right now*; needed for selection clamping. Pass 0 when
-    /// the picker has no rows yet (the cursor will just snap to 0).
-    ///
-    /// Callers that own extra shortcuts (leader chords, Alt-modifier
-    /// toggles, Ctrl+P mode-switch in hosts_picker) should match those
-    /// BEFORE calling `dispatch_key` and `return` early; otherwise the
-    /// editor table would consume them as plain inserts.
-    pub fn dispatch_key(
-        &mut self,
-        scope: InputScope,
-        key: &KeyEvent,
-        visible_count: usize,
-    ) -> InputOutcome {
-        // Phase 1: list nav + close + commit. `Quit` requires `!shift`
-        // so terminals reporting Ctrl+Shift+C as a distinct chord
-        // (kitty / iTerm enhanced keyboard) don't accidentally quit
-        // the app when the user wanted to copy to clipboard.
-        match Keymap::resolve(scope, key) {
-            Some(Command::Close) => return InputOutcome::Cancel,
-            Some(Command::Quit) => return InputOutcome::Quit,
-            Some(Command::Confirm) => return InputOutcome::Confirm,
-            Some(Command::MoveUp) => {
-                self.move_selection(visible_count, -1);
-                return InputOutcome::SelectionMoved;
-            }
-            Some(Command::MoveDown) => {
-                self.move_selection(visible_count, 1);
-                return InputOutcome::SelectionMoved;
-            }
-            _ => {}
-        }
-
-        // Phase 2: shared editor table. Reset selection on any genuine
-        // edit so the filtered list always opens at row 0.
-        let outcome = crate::input_edit::dispatch_key(key, &mut self.filter, &mut self.cursor);
-        match outcome {
-            crate::input_edit::Outcome::Edited => {
-                self.selected_idx = 0;
-                InputOutcome::Edited
-            }
-            crate::input_edit::Outcome::CursorOnly => InputOutcome::CursorMoved,
-            // PickerCore uses the non-filtered dispatcher so Rejected
-            // can't fire today. Surface it as a distinct outcome
-            // anyway so a future swap to `dispatch_key_filtered`
-            // forces every caller (each currently has a `Rejected =>`
-            // arm) to make an explicit choice instead of folding
-            // rejection into CursorMoved.
-            crate::input_edit::Outcome::Rejected => InputOutcome::Rejected,
-            crate::input_edit::Outcome::Unhandled => InputOutcome::Unhandled,
-        }
+    match crate::input_edit::op_for_key(key) {
+        Some(op) => PickerInput::Edit(op),
+        None => PickerInput::Unhandled,
     }
 }
 
@@ -205,11 +102,11 @@ mod tests {
 
     #[test]
     fn open_resets_filter_and_selection() {
-        let mut c = PickerCore {
+        let mut c = PickerState {
             filter: "stale".into(),
             cursor: 5,
             selected_idx: 3,
-            ..Default::default()
+            ..PickerState::default()
         };
         c.open();
         assert!(c.active);
@@ -220,24 +117,22 @@ mod tests {
 
     #[test]
     fn close_clears_state() {
-        let mut c = PickerCore {
+        let mut c = PickerState {
             active: true,
             filter: "x".into(),
             cursor: 1,
             selected_idx: 2,
-            last_popup_area: Some(Rect::new(0, 0, 1, 1)),
         };
         c.close();
         assert!(!c.active);
         assert!(c.filter.is_empty());
         assert_eq!(c.cursor, 0);
         assert_eq!(c.selected_idx, 0);
-        assert!(c.last_popup_area.is_none());
     }
 
     #[test]
     fn move_selection_clamps() {
-        let mut c = PickerCore::default();
+        let mut c = PickerState::default();
         c.move_selection(5, 10);
         assert_eq!(c.selected_idx, 4);
         c.move_selection(5, -99);
@@ -248,74 +143,74 @@ mod tests {
 
     #[test]
     fn dispatch_esc_returns_cancel() {
-        let mut c = PickerCore::default();
+        let mut c = PickerState::default();
         let key = k(KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(
-            c.dispatch_key(InputScope::QuickOpen, &key, 5),
+            dispatch_key(&mut c, InputScope::QuickOpen, &key, 5),
             InputOutcome::Cancel
         );
     }
 
     #[test]
     fn dispatch_ctrl_c_returns_quit() {
-        let mut c = PickerCore::default();
+        let mut c = PickerState::default();
         let key = k(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(
-            c.dispatch_key(InputScope::QuickOpen, &key, 5),
+            dispatch_key(&mut c, InputScope::QuickOpen, &key, 5),
             InputOutcome::Quit
         );
     }
 
     #[test]
     fn dispatch_enter_returns_confirm() {
-        let mut c = PickerCore::default();
+        let mut c = PickerState::default();
         let key = k(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(
-            c.dispatch_key(InputScope::QuickOpen, &key, 5),
+            dispatch_key(&mut c, InputScope::QuickOpen, &key, 5),
             InputOutcome::Confirm
         );
     }
 
     #[test]
     fn dispatch_arrows_and_readline_aliases_move_selection() {
-        let mut c = PickerCore::default();
+        let mut c = PickerState::default();
         // Down
         let down = k(KeyCode::Down, KeyModifiers::NONE);
         assert_eq!(
-            c.dispatch_key(InputScope::QuickOpen, &down, 5),
+            dispatch_key(&mut c, InputScope::QuickOpen, &down, 5),
             InputOutcome::SelectionMoved
         );
         assert_eq!(c.selected_idx, 1);
         // Ctrl+J
         let ctrl_j = k(KeyCode::Char('j'), KeyModifiers::CONTROL);
-        c.dispatch_key(InputScope::QuickOpen, &ctrl_j, 5);
+        dispatch_key(&mut c, InputScope::QuickOpen, &ctrl_j, 5);
         assert_eq!(c.selected_idx, 2);
         // Ctrl+N
         let ctrl_n = k(KeyCode::Char('n'), KeyModifiers::CONTROL);
-        c.dispatch_key(InputScope::QuickOpen, &ctrl_n, 5);
+        dispatch_key(&mut c, InputScope::QuickOpen, &ctrl_n, 5);
         assert_eq!(c.selected_idx, 3);
         // Up
         let up = k(KeyCode::Up, KeyModifiers::NONE);
-        c.dispatch_key(InputScope::QuickOpen, &up, 5);
+        dispatch_key(&mut c, InputScope::QuickOpen, &up, 5);
         assert_eq!(c.selected_idx, 2);
         // Ctrl+K
         let ctrl_k = k(KeyCode::Char('k'), KeyModifiers::CONTROL);
-        c.dispatch_key(InputScope::QuickOpen, &ctrl_k, 5);
+        dispatch_key(&mut c, InputScope::QuickOpen, &ctrl_k, 5);
         assert_eq!(c.selected_idx, 1);
         // Ctrl+P
         let ctrl_p = k(KeyCode::Char('p'), KeyModifiers::CONTROL);
-        c.dispatch_key(InputScope::QuickOpen, &ctrl_p, 5);
+        dispatch_key(&mut c, InputScope::QuickOpen, &ctrl_p, 5);
         assert_eq!(c.selected_idx, 0);
     }
 
     #[test]
     fn dispatch_char_inserts_into_filter_and_resets_selection() {
-        let mut c = PickerCore {
+        let mut c = PickerState {
             selected_idx: 4,
             ..Default::default()
         };
         let key = k(KeyCode::Char('a'), KeyModifiers::NONE);
-        let outcome = c.dispatch_key(InputScope::QuickOpen, &key, 10);
+        let outcome = dispatch_key(&mut c, InputScope::QuickOpen, &key, 10);
         assert_eq!(outcome, InputOutcome::Edited);
         assert_eq!(c.filter, "a");
         assert_eq!(c.cursor, 1);
@@ -324,15 +219,14 @@ mod tests {
 
     #[test]
     fn dispatch_cursor_motion_does_not_reset_selection() {
-        let mut c = PickerCore {
+        let mut c = PickerState {
+            active: true,
             filter: "hello".into(),
             cursor: 5,
             selected_idx: 3,
-            active: true,
-            ..Default::default()
         };
         let key = k(KeyCode::Left, KeyModifiers::NONE);
-        let outcome = c.dispatch_key(InputScope::QuickOpen, &key, 10);
+        let outcome = dispatch_key(&mut c, InputScope::QuickOpen, &key, 10);
         assert_eq!(outcome, InputOutcome::CursorMoved);
         assert_eq!(c.cursor, 4);
         assert_eq!(c.selected_idx, 3, "pure cursor moves preserve selection");

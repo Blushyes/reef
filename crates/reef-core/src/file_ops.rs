@@ -87,6 +87,7 @@ pub struct PasteConflictPrompt {
     dest_dir: PathBuf,
     pending: VecDeque<ConflictItem>,
     decisions: Vec<(PathBuf, Resolution)>,
+    used_names: HashSet<String>,
     cancelled: bool,
 }
 
@@ -96,12 +97,14 @@ impl PasteConflictPrompt {
         dest_dir: PathBuf,
         auto_decisions: Vec<(PathBuf, Resolution)>,
         pending: Vec<ConflictItem>,
+        used_names: HashSet<String>,
     ) -> Self {
         Self {
             op,
             dest_dir,
             pending: pending.into(),
             decisions: auto_decisions,
+            used_names,
             cancelled: false,
         }
     }
@@ -126,6 +129,12 @@ impl PasteConflictPrompt {
         self.cancelled || self.pending.is_empty()
     }
 
+    pub fn keep_both_name_for_current(&self) -> Option<String> {
+        let item = self.current()?;
+        let basename = item.source.file_name().and_then(|s| s.to_str())?;
+        Some(next_copy_name(basename, &self.used_names))
+    }
+
     pub fn was_cancelled(&self) -> bool {
         self.cancelled
     }
@@ -136,6 +145,9 @@ impl PasteConflictPrompt {
                 self.cancelled = true;
                 self.pending.clear();
                 return;
+            }
+            if let Resolution::KeepBoth(name) = &r {
+                self.used_names.insert(name.clone());
             }
             self.decisions.push((item.source, r));
         }
@@ -152,6 +164,27 @@ impl PasteConflictPrompt {
     pub fn into_decisions(self) -> Vec<(PathBuf, Resolution)> {
         self.decisions
     }
+}
+
+pub fn used_names_after_auto_decisions(
+    existing: &HashSet<String>,
+    auto_decisions: &[(PathBuf, Resolution)],
+) -> HashSet<String> {
+    let mut used = existing.clone();
+    for (source, resolution) in auto_decisions {
+        match resolution {
+            Resolution::KeepBoth(name) => {
+                used.insert(name.clone());
+            }
+            Resolution::Replace => {
+                if let Some(name) = source.file_name().and_then(|name| name.to_str()) {
+                    used.insert(name.to_string());
+                }
+            }
+            Resolution::Skip | Resolution::Cancel => {}
+        }
+    }
+    used
 }
 
 fn split_stem_ext(name: &str) -> (&str, &str) {
@@ -255,23 +288,29 @@ mod tests {
         }
     }
 
-    #[test]
-    fn prompt_with_no_conflicts_is_done_immediately() {
-        let p = PasteConflictPrompt::new(
+    fn prompt(
+        auto_decisions: Vec<(PathBuf, Resolution)>,
+        pending: Vec<ConflictItem>,
+    ) -> PasteConflictPrompt {
+        PasteConflictPrompt::new(
             ClipMode::Copy,
             PathBuf::from("dst"),
-            vec![(PathBuf::from("a"), Resolution::Replace)],
-            vec![],
-        );
+            auto_decisions,
+            pending,
+            s(&[]),
+        )
+    }
+
+    #[test]
+    fn prompt_with_no_conflicts_is_done_immediately() {
+        let p = prompt(vec![(PathBuf::from("a"), Resolution::Replace)], vec![]);
         assert!(p.is_done());
         assert_eq!(p.into_decisions().len(), 1);
     }
 
     #[test]
     fn prompt_walks_pending_one_at_a_time() {
-        let mut p = PasteConflictPrompt::new(
-            ClipMode::Copy,
-            PathBuf::from("dst"),
+        let mut p = prompt(
             vec![],
             vec![confl("src/a", "dst/a"), confl("src/b", "dst/b")],
         );
@@ -291,9 +330,7 @@ mod tests {
 
     #[test]
     fn prompt_apply_to_all_drains_remainder() {
-        let mut p = PasteConflictPrompt::new(
-            ClipMode::Copy,
-            PathBuf::from("dst"),
+        let mut p = prompt(
             vec![],
             vec![
                 confl("src/a", "dst/a"),
@@ -310,9 +347,7 @@ mod tests {
 
     #[test]
     fn prompt_cancel_clears_pending_and_flags_cancelled() {
-        let mut p = PasteConflictPrompt::new(
-            ClipMode::Copy,
-            PathBuf::from("dst"),
+        let mut p = prompt(
             vec![(PathBuf::from("seed"), Resolution::Replace)],
             vec![confl("src/a", "dst/a"), confl("src/b", "dst/b")],
         );

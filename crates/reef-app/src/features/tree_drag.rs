@@ -1,10 +1,10 @@
 //! Intra-tree mouse-drag state machine.
 //!
-//! Distinct from `place_mode`, which handles **OS → terminal** drag-in
-//! (operating system delivers paths as a bracketed-paste payload, no
-//! drag-over signal). This module handles **tree-row → tree-row**
-//! drag, where crossterm reports the full `Down → Drag → Up` sequence
-//! so we can render hover affordances live.
+//! Distinct from `place_mode`, which handles **host → tree** placement
+//! after the input adapter has received dropped paths. This module handles
+//! **tree-row → tree-row** drag, where the host reports a full
+//! press/drag/release sequence so a renderer can show live hover
+//! affordances.
 //!
 //! State transitions:
 //! 1. `Down(Left)` on a tree row → `arm(...)`. Press is recorded but
@@ -26,15 +26,21 @@
 //! themselves, files into their parent) applies to both flows, so we
 //! reuse the pure helper rather than re-implementing it.
 
-use crate::place_mode::HOVER_EXPAND_DELAY;
-use crossterm::event::KeyModifiers;
+use crate::features::place_mode::HOVER_EXPAND_DELAY;
 use std::path::PathBuf;
 use std::time::Instant;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InputModifiers {
+    pub alt: bool,
+    pub ctrl: bool,
+    pub shift: bool,
+}
 
 /// Mouse cells the cursor must travel from the press point before a
 /// click promotes to a drag. Two cells is the smallest value that
 /// reliably distinguishes a deliberate drag from a touchpad-jitter
-/// click on terminals where mouse coordinates round to integer cells.
+/// click on hosts where pointer coordinates round to integer cells.
 pub const DRAG_START_THRESHOLD: u16 = 2;
 
 /// Cheap snapshot taken at `Down(Left)`. Held in `TreeDragState.press`
@@ -47,17 +53,17 @@ pub struct DragPress {
     /// caller when deciding source paths if no multi-selection is
     /// active.
     pub press_idx: usize,
-    pub mods_at_press: KeyModifiers,
+    pub mods_at_press: InputModifiers,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct TreeDragState {
     /// Armed by `Down(Left)`, cleared on `Up`/`cancel` or promoted by
     /// `start`. `None` while idle.
     pub press: Option<DragPress>,
     /// `true` between `start()` and `cancel()`. While active the
-    /// renderer overlays a hover-target highlight and `handle_mouse`
-    /// short-circuits other interpretations of `Drag`/`Up`.
+    /// renderer overlays a hover-target highlight and the input adapter
+    /// short-circuits other interpretations of drag/release.
     pub active: bool,
     /// Workdir-relative paths the drag is carrying. Snapshotted by
     /// `start` from `App::effective_action_paths()`.
@@ -71,27 +77,12 @@ pub struct TreeDragState {
     pub hover_since: Option<Instant>,
     /// Modifiers as of the most recent mouse event during the drag.
     /// `Up(Left)` consults this for move-vs-copy.
-    pub modifiers: KeyModifiers,
-}
-
-impl Default for TreeDragState {
-    fn default() -> Self {
-        // `KeyModifiers` has no `Default` (crossterm 0.29) — fall back
-        // to `NONE` so the idle state has no implied modifier.
-        Self {
-            press: None,
-            active: false,
-            sources: Vec::new(),
-            hover_idx: None,
-            hover_since: None,
-            modifiers: KeyModifiers::NONE,
-        }
-    }
+    pub modifiers: InputModifiers,
 }
 
 impl TreeDragState {
     /// Record a press without activating drag yet.
-    pub fn arm(&mut self, col: u16, row: u16, press_idx: usize, mods: KeyModifiers) {
+    pub fn arm(&mut self, col: u16, row: u16, press_idx: usize, mods: InputModifiers) {
         self.press = Some(DragPress {
             start_col: col,
             start_row: row,
@@ -112,7 +103,7 @@ impl TreeDragState {
     /// Promote the press to an active drag. `sources` is the workdir-
     /// relative path list the drag is carrying — snapshotted now to
     /// freeze it against later selection mutations.
-    pub fn start(&mut self, sources: Vec<PathBuf>, mods: KeyModifiers) {
+    pub fn start(&mut self, sources: Vec<PathBuf>, mods: InputModifiers) {
         self.active = true;
         self.sources = sources;
         self.modifiers = mods;
@@ -129,7 +120,7 @@ impl TreeDragState {
         }
     }
 
-    pub fn update_modifiers(&mut self, mods: KeyModifiers) {
+    pub fn update_modifiers(&mut self, mods: InputModifiers) {
         self.modifiers = mods;
     }
 
@@ -150,7 +141,7 @@ impl TreeDragState {
     /// Modifier reading for the move-vs-copy decision at drop. VS
     /// Code's convention: bare drag = move, Alt(Option) drag = copy.
     pub fn is_copy_op(&self) -> bool {
-        self.modifiers.contains(KeyModifiers::ALT)
+        self.modifiers.alt
     }
 
     /// Reset to idle. Called on `Up(Left)` after dispatch, on `Esc`,
@@ -175,7 +166,7 @@ mod tests {
     #[test]
     fn arm_records_press_without_activating() {
         let mut s = TreeDragState::default();
-        s.arm(10, 5, 3, KeyModifiers::NONE);
+        s.arm(10, 5, 3, InputModifiers::default());
         assert!(!s.active);
         assert!(s.press.is_some());
         let p = s.press.unwrap();
@@ -187,7 +178,7 @@ mod tests {
     #[test]
     fn should_start_drag_requires_threshold() {
         let mut s = TreeDragState::default();
-        s.arm(10, 5, 0, KeyModifiers::NONE);
+        s.arm(10, 5, 0, InputModifiers::default());
         // Same point: no drag.
         assert!(!s.should_start_drag(10, 5));
         // One cell off: still under threshold (THRESHOLD = 2).
@@ -209,9 +200,15 @@ mod tests {
     #[test]
     fn start_activates_and_snapshots_sources() {
         let mut s = TreeDragState::default();
-        s.arm(0, 0, 0, KeyModifiers::NONE);
+        s.arm(0, 0, 0, InputModifiers::default());
         let srcs = vec![PathBuf::from("a.rs"), PathBuf::from("b.rs")];
-        s.start(srcs.clone(), KeyModifiers::ALT);
+        s.start(
+            srcs.clone(),
+            InputModifiers {
+                alt: true,
+                ..InputModifiers::default()
+            },
+        );
         assert!(s.active);
         assert_eq!(s.sources, srcs);
         assert!(s.is_copy_op());
@@ -244,19 +241,31 @@ mod tests {
     #[test]
     fn modifier_updates_drive_copy_decision() {
         let mut s = TreeDragState::default();
-        s.start(vec![], KeyModifiers::NONE);
+        s.start(vec![], InputModifiers::default());
         assert!(!s.is_copy_op());
-        s.update_modifiers(KeyModifiers::ALT);
+        s.update_modifiers(InputModifiers {
+            alt: true,
+            ..InputModifiers::default()
+        });
         assert!(s.is_copy_op());
-        s.update_modifiers(KeyModifiers::SHIFT);
+        s.update_modifiers(InputModifiers {
+            shift: true,
+            ..InputModifiers::default()
+        });
         assert!(!s.is_copy_op());
     }
 
     #[test]
     fn cancel_resets_everything() {
         let mut s = TreeDragState::default();
-        s.arm(0, 0, 0, KeyModifiers::NONE);
-        s.start(vec![PathBuf::from("a")], KeyModifiers::ALT);
+        s.arm(0, 0, 0, InputModifiers::default());
+        s.start(
+            vec![PathBuf::from("a")],
+            InputModifiers {
+                alt: true,
+                ..InputModifiers::default()
+            },
+        );
         s.update_hover(Some(3));
         s.cancel();
         assert!(!s.active);

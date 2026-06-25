@@ -8,9 +8,10 @@
 //! to swallow yet).
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use reef::app::{App, Panel, Tab};
+use reef::TuiApp as App;
 use reef::input;
 use reef::ui::theme::Theme;
+use reef_app::{AppPanel as Panel, AppTab as Tab};
 use std::sync::Mutex;
 use tempfile::TempDir;
 use test_support::CwdGuard;
@@ -35,7 +36,7 @@ fn bare_space_arms_leader_in_normal_context() {
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new(Theme::dark(), None);
-    app.active_panel = Panel::Diff;
+    app.engine.state.active_panel = Panel::Diff;
     assert!(app.space_leader_at.is_none());
     input::handle_key(space_key(), &mut app);
     assert!(
@@ -54,8 +55,8 @@ fn bare_space_arms_leader_on_files_tree_panel() {
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new(Theme::dark(), None);
-    assert_eq!(app.active_tab, Tab::Files);
-    assert_eq!(app.active_panel, Panel::Files);
+    assert_eq!(app.engine.state.active_tab, Tab::Files);
+    assert_eq!(app.engine.state.active_panel, Panel::Files);
 
     input::handle_key(space_key(), &mut app);
 
@@ -64,7 +65,7 @@ fn bare_space_arms_leader_on_files_tree_panel() {
         "Space on Files+Files should arm the leader (multi-select moved to `s`)",
     );
     assert!(
-        app.file_selection.is_empty(),
+        app.engine.state.file_selection.is_empty(),
         "Space must not touch the multi-selection set anymore",
     );
 }
@@ -80,16 +81,16 @@ fn s_toggles_selection_on_files_tree_panel() {
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new(Theme::dark(), None);
-    assert_eq!(app.active_tab, Tab::Files);
-    assert_eq!(app.active_panel, Panel::Files);
-    assert!(app.file_selection.is_empty());
+    assert_eq!(app.engine.state.active_tab, Tab::Files);
+    assert_eq!(app.engine.state.active_panel, Panel::Files);
+    assert!(app.engine.state.file_selection.is_empty());
 
     input::handle_key(s_key(), &mut app);
 
     assert!(app.space_leader_at.is_none(), "`s` must not arm the leader",);
-    if app.file_tree.selected_path().is_some() {
+    if app.engine.state.file_tree.selected_path().is_some() {
         assert_eq!(
-            app.file_selection.len(),
+            app.engine.state.file_selection.len(),
             1,
             "`s` should have toggled the cursor into the selection",
         );
@@ -108,9 +109,9 @@ fn space_does_not_arm_while_typing_in_commit_box() {
 
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Git);
-    app.active_panel = Panel::Files;
-    app.git_status.commit_editing = true;
-    app.git_status.commit_message = "fix:".to_string();
+    app.engine.state.active_panel = Panel::Files;
+    app.engine.state.git_status.commit_editing = true;
+    app.engine.state.git_status.commit_message = "fix:".to_string();
 
     input::handle_key(space_key(), &mut app);
     assert!(
@@ -131,9 +132,9 @@ fn space_arms_when_commit_box_empty() {
 
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Git);
-    app.active_panel = Panel::Files;
-    app.git_status.commit_editing = true;
-    app.git_status.commit_message.clear();
+    app.engine.state.active_panel = Panel::Files;
+    app.engine.state.git_status.commit_editing = true;
+    app.engine.state.git_status.commit_message.clear();
 
     input::handle_key(space_key(), &mut app);
     assert!(
@@ -152,9 +153,9 @@ fn space_does_not_arm_while_typing_in_search_query() {
 
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Search);
-    app.active_panel = Panel::Files;
-    app.global_search.focus = reef::global_search::SearchPanelFocus::FindInput;
-    app.global_search.core.filter = "foo".to_string();
+    app.engine.state.active_panel = Panel::Files;
+    app.engine.state.global_search.focus = reef_app::SearchPanelFocus::FindInput;
+    app.engine.state.global_search.core.filter = "foo".to_string();
 
     input::handle_key(space_key(), &mut app);
     assert!(
@@ -176,21 +177,21 @@ fn tab_in_search_input_cycles_focus_instead_of_switching_panel() {
 
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Search);
-    app.active_panel = Panel::Files;
-    app.global_search.replace_open = true;
-    app.global_search.focus = reef::global_search::SearchPanelFocus::FindInput;
-    let panel_before = app.active_panel;
+    app.engine.state.active_panel = Panel::Files;
+    app.engine.state.global_search.replace_open = true;
+    app.engine.state.global_search.focus = reef_app::SearchPanelFocus::FindInput;
+    let panel_before = app.engine.state.active_panel;
 
     let tab_key = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
     input::handle_key(tab_key, &mut app);
 
     assert_eq!(
-        app.active_panel, panel_before,
+        app.engine.state.active_panel, panel_before,
         "Tab in search FindInput must NOT switch panel"
     );
     assert_eq!(
-        app.global_search.focus,
-        reef::global_search::SearchPanelFocus::ReplaceInput,
+        app.engine.state.global_search.focus,
+        reef_app::SearchPanelFocus::ReplaceInput,
         "Tab in search FindInput should cycle focus to ReplaceInput"
     );
 }

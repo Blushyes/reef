@@ -10,8 +10,9 @@ For asserting on rendered terminal output. Uses `ratatui::backend::TestBackend` 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
-use reef::app::App;
+use reef::TuiApp as App;
 use reef::ui;
+use reef::ui::theme::Theme;
 use std::sync::Mutex;
 use test_support::{commit_file, tempdir_repo, write_file};
 
@@ -32,7 +33,7 @@ impl Drop for CwdGuard {
     fn drop(&mut self) { let _ = std::env::set_current_dir(&self.original); }
 }
 
-/// Redirect `$HOME` to the given path so `App::new()` reads a blank
+/// Redirect `$HOME` to the given path so `TuiApp::new()` reads a blank
 /// `~/.config/reef/prefs` instead of the developer's real one.
 /// The caller must hold `CWD_LOCK` (or an equivalent HOME_LOCK).
 struct HomeGuard { original: Option<std::ffi::OsString> }
@@ -93,8 +94,8 @@ fn snapshot_<scenario>() {
     let _home = HomeGuard::enter(tmp.path());        // <-- NEVER skip this
     let _cwd  = CwdGuard::enter(tmp.path());
 
-    let mut app = App::new();
-    app.active_tab = reef::app::Tab::Git;       // optional: set UI state
+    let mut app = App::new(Theme::dark(), None);
+    app.set_active_tab(reef_app::AppTab::Git);  // optional: drive state through commands/adapter
     app.refresh_status();
 
     let output = render_app(&mut app, 80, 20);
@@ -104,9 +105,9 @@ fn snapshot_<scenario>() {
 
 ## Why `HomeGuard` is non-negotiable
 
-See `references/pitfalls.md` → "App::new() reads the developer's real ~/.config/reef/prefs". Summary: `App::new()` calls `load_bool_pref("status.tree_mode", ...)` and similar for commit-detail toggles. Without HOME isolation, your snapshot captures the dev's saved view-mode and CI gets a different one.
+See `references/pitfalls.md` → "TuiApp::new() reads the developer's real ~/.config/reef/prefs". Summary: `TuiApp::new()` loads `status.tree_mode` and similar commit-detail toggles before building `reef-app` state. Without HOME isolation, your snapshot captures the dev's saved view-mode and CI gets a different one.
 
-`App::new()` also runs `prefs::migrate_legacy_prefs()`. The migrator is intentionally a no-op when there's nothing to migrate, so pointing HOME at a clean tempdir doesn't leave a spurious `.config/reef/prefs` file that would show up as untracked in `git status` and pollute the snapshot.
+`TuiApp::new()` also runs `prefs::migrate_legacy_prefs()`. The migrator is intentionally a no-op when there's nothing to migrate, so pointing HOME at a clean tempdir doesn't leave a spurious `.config/reef/prefs` file that would show up as untracked in `git status` and pollute the snapshot.
 
 ## Picking buffer dimensions
 

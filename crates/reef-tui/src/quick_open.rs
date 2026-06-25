@@ -9,11 +9,9 @@
 //! Enter — so Esc cleanly drops back to exactly what was on screen.
 //!
 //! Index & MRU:
-//! - Index is (re)built lazily on `begin()` when `index_stale` is set. A fresh
-//!   `ignore::WalkBuilder` walk pulls every non-`.git` file under the workdir,
-//!   respecting every ignore layer (`.gitignore`, `.git/info/exclude`,
-//!   global), then caches the UTF-32 encoding nucleo needs so typing stays
-//!   hot on large repos.
+//! - Index is (re)built lazily when the palette opens. `reef-app` schedules
+//!   the backend walk on a worker, then caches the UTF-32 encoding nucleo
+//!   needs so typing stays hot on large repos.
 //! - MRU is an ordered dedup of recently accepted paths, capped at 50 and
 //!   persisted via the same flat-kv prefs file the rest of the app uses. We
 //!   sanitise `\t` / `\n` in paths on write to keep the file parseable; those
@@ -24,71 +22,22 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::app::{App, Tab};
+use crate::TuiApp as App;
 use crate::input::DOUBLE_CLICK_WINDOW;
-use crate::input_edit;
 use crate::keymap::{Command, InputScope, Keymap};
 use crate::prefs;
 use crate::ui::mouse::ClickAction;
+use reef_app::AppCommand;
+use reef_app::QuickOpenState;
 use reef_core::quick_open::{MRU_MAX, MRU_PREF_KEY};
-use reef_io::{Backend, WalkOpts};
 
-/// One file that can be matched. `display` is the workdir-relative path as it
-/// appears in the UI; `utf32` is the same string pre-encoded to the form
-/// nucleo consumes, so filter() doesn't re-encode every keystroke.
-pub type Candidate = reef_core::quick_open::QuickOpenCandidate;
-
-/// A single filtered hit. `indices` are character positions in
-/// `index[idx].display` that matched — fed to the renderer for highlighting.
-pub type MatchEntry = reef_core::quick_open::QuickOpenMatch;
-
-pub struct QuickOpenState {
-    /// Shared overlay scaffolding (`active`, `query` → `core.filter`,
-    /// `cursor`, `selected` → `core.selected_idx`, `last_popup_area`).
-    /// Edits route through `PickerCore::dispatch_key`.
-    pub core: crate::picker_core::PickerCore,
-    pub scroll: usize,
-    pub index: Vec<Candidate>,
-    /// fs-watcher flips this on; `begin()` rebuilds and clears it. Avoids
-    /// re-walking the tree on every unrelated fs event.
-    pub index_stale: bool,
-    pub matches: Vec<MatchEntry>,
-    pub mru: VecDeque<PathBuf>,
-    /// Last-rendered list viewport height in rows; used by PageUp/PageDown
-    /// to pick a step size. Mirrors `last_preview_view_h` etc. in `App`.
-    pub last_view_h: u16,
-    /// Timestamp of the most recent bare-Space keystroke inside the palette.
-    /// Drives the in-palette half of the Space-P chord so the user can
-    /// toggle the palette closed without reaching for Esc. Only armed when
-    /// `core.filter.is_empty()` so Space becomes a literal char once the
-    /// user is actually searching for something with a space in it.
-    pub space_leader_at: Option<Instant>,
-}
-
-impl Default for QuickOpenState {
-    fn default() -> Self {
-        Self {
-            core: crate::picker_core::PickerCore::default(),
-            scroll: 0,
-            index: Vec::new(),
-            index_stale: true,
-            matches: Vec::new(),
-            mru: VecDeque::new(),
-            last_view_h: 0,
-            space_leader_at: None,
-        }
-    }
-}
-
-impl QuickOpenState {
-    /// Build state from persisted prefs (loads the MRU). Index stays empty
-    /// and stale — it'll be walked on the first `begin()` call so startup
-    /// time isn't spent on an index the user may never open.
-    pub fn from_prefs() -> Self {
-        Self {
-            mru: load_mru_from_prefs(),
-            ..Self::default()
-        }
+/// Build state from persisted prefs (loads the MRU). Index stays empty
+/// and stale — it'll be walked on the first `begin()` call so startup
+/// time isn't spent on an index the user may never open.
+pub fn from_prefs() -> QuickOpenState {
+    QuickOpenState {
+        mru: load_mru_from_prefs(),
+        ..QuickOpenState::default()
     }
 }
 
@@ -98,45 +47,21 @@ impl QuickOpenState {
 /// saw changes since the last build). Preserves `query` across close/reopen
 /// so the user can Esc to peek at something and come back.
 pub fn begin(app: &mut App) {
-    if app.quick_open.index_stale || app.quick_open.index.is_empty() {
-        app.quick_open.index = rebuild_index_via_backend(app.backend.as_ref());
-        app.quick_open.index_stale = false;
-    }
-    app.quick_open.core.active = true;
-    app.quick_open.core.selected_idx = 0;
-    app.quick_open.scroll = 0;
-    // Position cursor at end so the first keystroke continues (not splits)
-    // the existing query.
-    app.quick_open.core.cursor = app.quick_open.core.filter.len();
-    // Start with a clean leader slot — a stale timestamp from a previous
-    // session would make the first Space-after-open surprisingly close the
-    // palette.
-    app.quick_open.space_leader_at = None;
-    filter(&mut app.quick_open);
+    app.quick_open_leader_at = None;
+    app.engine.dispatch(AppCommand::OpenQuickOpen);
 }
 
 /// Commit the current selection: update MRU, close the palette, and jump
 /// the Files tab to the chosen file with a fresh preview loaded.
 pub fn accept(app: &mut App) {
-    let Some(m) = app.quick_open.matches.get(app.quick_open.core.selected_idx) else {
-        app.quick_open.core.active = false;
+    if !app.engine.quick_open_has_selection() {
+        app.engine.dispatch(AppCommand::CloseQuickOpen);
         return;
-    };
-    let Some(cand) = app.quick_open.index.get(m.idx) else {
-        app.quick_open.core.active = false;
-        return;
-    };
-    let rel = cand.rel_path.clone();
-
-    reef_core::quick_open::bump_mru(&mut app.quick_open.mru, rel.clone(), MRU_MAX);
-    save_mru_to_prefs(&app.quick_open.mru);
-
+    }
     app.push_location_before_jump();
-    app.quick_open.core.active = false;
-    app.set_active_tab(Tab::Files);
-    app.file_tree.reveal(&rel);
-    app.refresh_file_tree_with_target(Some(rel.clone()));
-    app.load_preview_for_path(rel);
+    app.engine
+        .dispatch(AppCommand::AcceptQuickOpenSelection { mru_cap: MRU_MAX });
+    app.drain_engine_runtime_events();
 }
 
 /// Dispatch one key while the palette is active. The caller (input.rs)
@@ -166,13 +91,13 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // characters go straight into the query.
     match crate::input::leader_decision(
         &key,
-        /* allow_arm */ app.quick_open.core.filter.is_empty(),
-        app.quick_open.space_leader_at,
+        /* allow_arm */ app.engine.quick_open_query_is_empty(),
+        app.quick_open_leader_at,
         Instant::now(),
         crate::input::LEADER_TIMEOUT,
     ) {
         crate::input::LeaderVerdict::Arm => {
-            app.quick_open.space_leader_at = Some(Instant::now());
+            app.quick_open_leader_at = Some(Instant::now());
             return;
         }
         crate::input::LeaderVerdict::Fire => {
@@ -184,15 +109,15 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             // happened to be empty; we don't want to swallow it. Treat
             // those as Consume so the literal char still appends to the
             // query below.
-            app.quick_open.space_leader_at = None;
+            app.quick_open_leader_at = None;
             if matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P')) {
-                app.quick_open.core.active = false;
+                app.engine.dispatch(AppCommand::CloseQuickOpen);
                 return;
             }
             // Fall through — non-P chord lands in the char-append arm.
         }
         crate::input::LeaderVerdict::Consume => {
-            app.quick_open.space_leader_at = None;
+            app.quick_open_leader_at = None;
             // Fall through — the current key still runs below.
         }
         crate::input::LeaderVerdict::None => {}
@@ -203,40 +128,25 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // them inline before delegating the rest to the shared core.
     let mapped = Keymap::resolve(InputScope::QuickOpen, &key);
     if matches!(mapped, Some(Command::PageUp | Command::PageDown)) {
-        let step = app.quick_open.last_view_h.max(1) as i32;
+        let step = app.layout.quick_open_last_view_h.max(1) as i32;
         let signed = if mapped == Some(Command::PageUp) {
             -step
         } else {
             step
         };
-        move_selection(&mut app.quick_open, signed);
+        app.engine.dispatch(AppCommand::MoveQuickOpenSelection {
+            delta: signed,
+            visible_rows: app.layout.quick_open_last_view_h as usize,
+        });
         return;
     }
 
-    // Shared picker dispatch. `Edited` re-runs the fuzzy filter; the
-    // other outcomes are no-ops (PickerCore already updated state).
-    use crate::picker_core::InputOutcome;
-    let visible = app.quick_open.matches.len();
-    match app
-        .quick_open
-        .core
-        .dispatch_key(InputScope::QuickOpen, &key, visible)
-    {
-        InputOutcome::Cancel => app.quick_open.core.active = false,
-        InputOutcome::Quit => {
-            app.quick_open.core.active = false;
-            app.should_quit = true;
-        }
-        InputOutcome::Confirm => accept(app),
-        InputOutcome::Edited => filter(&mut app.quick_open),
-        // Rejected unreachable today (PickerCore uses non-filtered
-        // dispatch_key); the arm is here so a future swap forces
-        // an explicit choice.
-        InputOutcome::Rejected
-        | InputOutcome::SelectionMoved
-        | InputOutcome::CursorMoved
-        | InputOutcome::Unhandled => {}
-    }
+    let input = crate::picker_core::input_for_key(InputScope::QuickOpen, &key);
+    app.engine.dispatch(AppCommand::ApplyQuickOpenPickerInput {
+        input,
+        visible_rows: app.layout.quick_open_last_view_h as usize,
+    });
+    app.drain_engine_runtime_events();
 }
 
 /// Bracketed-paste arrival while the palette is active. Stripping newlines
@@ -248,12 +158,8 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
 /// Called from `input::handle_paste` after the drop-path parser has already
 /// ruled out the payload as a file drop.
 pub fn handle_paste(s: &str, app: &mut App) {
-    input_edit::paste_single_line(
-        s,
-        &mut app.quick_open.core.filter,
-        &mut app.quick_open.core.cursor,
-    );
-    filter(&mut app.quick_open);
+    app.engine
+        .dispatch(AppCommand::PasteQuickOpen(s.to_string()));
 }
 
 /// Dispatch one mouse event while the palette is active. The caller
@@ -267,7 +173,7 @@ pub fn handle_paste(s: &str, app: &mut App) {
 /// - Scroll wheel inside popup → move selection (3 rows per tick)
 /// - Everything else (drag, right-click, move) → ignored
 pub fn handle_mouse(mouse: MouseEvent, app: &mut App) {
-    let popup = match app.quick_open.core.last_popup_area {
+    let popup = match app.quick_open_popup_area {
         Some(r) => r,
         // No popup rendered yet — swallow the event without side-effects so
         // a spurious click during the first tick can't dismiss the palette.
@@ -281,10 +187,10 @@ pub fn handle_mouse(mouse: MouseEvent, app: &mut App) {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if !inside {
-                // Click-away dismisses the palette, just like clicking
-                // outside a dropdown in a GUI. Keeps the pre-palette state
-                // intact (filter doesn't touch scroll/selection elsewhere).
-                app.quick_open.core.active = false;
+                // Click-away dismisses the palette while keeping the
+                // pre-palette state intact.
+                app.quick_open_leader_at = None;
+                app.engine.dispatch(AppCommand::CloseQuickOpen);
                 app.last_click = None;
                 return;
             }
@@ -306,7 +212,10 @@ pub fn handle_mouse(mouse: MouseEvent, app: &mut App) {
             if let Some(ClickAction::QuickOpenSelect(idx)) =
                 app.hit_registry.hit_test(mouse.column, mouse.row)
             {
-                app.quick_open.core.selected_idx = idx;
+                app.engine.dispatch(AppCommand::SelectQuickOpenMatch {
+                    idx,
+                    visible_rows: app.layout.quick_open_last_view_h as usize,
+                });
                 if is_double {
                     accept(app);
                     app.last_click = None;
@@ -322,10 +231,16 @@ pub fn handle_mouse(mouse: MouseEvent, app: &mut App) {
             };
         }
         MouseEventKind::ScrollUp if inside => {
-            move_selection(&mut app.quick_open, -3);
+            app.engine.dispatch(AppCommand::MoveQuickOpenSelection {
+                delta: -3,
+                visible_rows: app.layout.quick_open_last_view_h as usize,
+            });
         }
         MouseEventKind::ScrollDown if inside => {
-            move_selection(&mut app.quick_open, 3);
+            app.engine.dispatch(AppCommand::MoveQuickOpenSelection {
+                delta: 3,
+                visible_rows: app.layout.quick_open_last_view_h as usize,
+            });
         }
         _ => {}
     }
@@ -339,62 +254,14 @@ pub fn handle_mouse(mouse: MouseEvent, app: &mut App) {
 /// `query` is non-empty we delegate to nucleo and sort by score desc, with
 /// shorter paths as a tiebreaker (keeps basename hits above deep-path hits).
 pub fn filter(state: &mut QuickOpenState) {
-    state.matches =
-        reef_core::quick_open::filter_candidates(&state.index, &state.core.filter, &state.mru);
-
-    // Query change resets the viewport so the top match is visible.
-    state.core.selected_idx = 0;
-    state.scroll = 0;
+    reef_app::filter_quick_open(state);
 }
 
 /// Mark the index as stale. Called from `App::tick` when fs-watcher fires —
 /// cheaper than re-walking the tree on every event, and if the user never
 /// opens the palette we never pay the walk cost at all.
 pub fn mark_stale(state: &mut QuickOpenState) {
-    state.index_stale = true;
-}
-
-// ─── Index construction ──────────────────────────────────────────────────────
-
-/// Ask the backend to walk the workdir and build the palette candidate
-/// list. For `LocalBackend` this is `ignore::WalkBuilder` over the cwd
-/// (identical to the pre-M3 behaviour). For `RemoteBackend` this ships a
-/// `WalkRepoPaths` RPC so the agent walks its own workdir and the reef
-/// client never touches the remote filesystem directly.
-fn rebuild_index_via_backend(backend: &dyn Backend) -> Vec<Candidate> {
-    let opts = WalkOpts::default();
-    let resp = match backend.walk_repo_paths(&opts) {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-    reef_core::quick_open::build_candidates(resp.paths)
-}
-
-/// Legacy direct-walk path kept only for the `rebuild_index_respects_gitignore`
-/// regression test — production code routes through
-/// `rebuild_index_via_backend`.
-#[cfg(test)]
-fn rebuild_index(root: &std::path::Path) -> Vec<Candidate> {
-    use ignore::WalkBuilder;
-    let mut out: Vec<Candidate> = Vec::new();
-    let walker = WalkBuilder::new(root)
-        .hidden(false)
-        .filter_entry(|dent| dent.file_name() != ".git")
-        .build();
-    for result in walker {
-        let Ok(entry) = result else { continue };
-        let is_file = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false);
-        if !is_file {
-            continue;
-        }
-        let Ok(rel) = entry.path().strip_prefix(root) else {
-            continue;
-        };
-        let display = rel.to_string_lossy().to_string();
-        out.extend(reef_core::quick_open::build_candidates([display]));
-    }
-    out.sort_by(|a, b| a.display.cmp(&b.display));
-    out
+    reef_app::mark_quick_open_stale(state);
 }
 
 // ─── MRU persistence ─────────────────────────────────────────────────────────
@@ -406,25 +273,15 @@ fn load_mru_from_prefs() -> VecDeque<PathBuf> {
     reef_core::quick_open::decode_mru(&raw)
 }
 
-fn save_mru_to_prefs(mru: &VecDeque<PathBuf>) {
-    prefs::set(MRU_PREF_KEY, &reef_core::quick_open::encode_mru(mru));
-}
-
 // ─── Input helpers ───────────────────────────────────────────────────────────
 //
 // Text-editing primitives (insert/backspace/delete_word_backward/clear/
 // move_cursor) live in `crate::input_edit` and are shared with
 // `crate::global_search`.
 
+#[cfg(test)]
 fn move_selection(state: &mut QuickOpenState, delta: i32) {
-    if state.matches.is_empty() {
-        state.core.selected_idx = 0;
-        return;
-    }
-    let last = state.matches.len() - 1;
-    let cur = state.core.selected_idx as i32;
-    let next = (cur + delta).clamp(0, last as i32) as usize;
-    state.core.selected_idx = next;
+    reef_app::move_quick_open_selection(state, delta);
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -507,37 +364,5 @@ mod tests {
         assert_eq!(s.core.selected_idx, 2);
         move_selection(&mut s, -99);
         assert_eq!(s.core.selected_idx, 0);
-    }
-
-    #[test]
-    fn rebuild_index_respects_gitignore_and_prunes_dotgit() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-        // Seed files: a tracked source file, a dotfile (should surface), a
-        // gitignored build artefact (should be excluded), and a fake .git
-        // entry (must never appear).
-        std::fs::write(root.join("src.rs"), "fn main() {}").unwrap();
-        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
-        std::fs::create_dir(root.join("target")).unwrap();
-        std::fs::write(root.join("target/build.o"), "binary").unwrap();
-        std::fs::create_dir(root.join(".git")).unwrap();
-        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main").unwrap();
-
-        let index = rebuild_index(root);
-        let displays: Vec<&str> = index.iter().map(|c| c.display.as_str()).collect();
-
-        assert!(displays.contains(&"src.rs"), "tracked source must appear");
-        assert!(
-            displays.contains(&".gitignore"),
-            "dotfiles must appear — hidden(false)"
-        );
-        assert!(
-            !displays.iter().any(|d| d.starts_with("target/")),
-            "gitignored target/ must be excluded"
-        );
-        assert!(
-            !displays.iter().any(|d| d.starts_with(".git/")),
-            ".git/ must never appear in the palette"
-        );
     }
 }

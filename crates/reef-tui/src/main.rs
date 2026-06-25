@@ -9,14 +9,14 @@ use crossterm::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use reef::app::{App, ViewMode};
+use reef::TuiApp as App;
 use reef::i18n;
 use reef::images;
 use reef::ui::theme::Theme;
-use reef::ui::toast::Toast;
 use reef::{editor, input, ui};
+use reef_app::{AppEffect, Toast, ViewMode};
 use reef_io::agent_deploy::{self, InstallPath, SshSession};
-use reef_io::{Backend, LocalBackend, RemoteBackend};
+use reef_io::{Backend, LocalBackend, RemoteBackend, ResolvedLocalTarget};
 use std::io;
 use std::panic;
 use std::path::PathBuf;
@@ -115,87 +115,6 @@ struct AppArgs {
     path: Option<String>,
 }
 
-/// Expand a leading `~/` (or bare `~`) against `$HOME`. Any other form is
-/// returned verbatim — absolute, relative, `./`, etc. are all handled by
-/// the subsequent canonicalize step.
-fn expand_tilde(raw: &str) -> Result<PathBuf, String> {
-    if raw == "~" {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| "cannot expand `~`: $HOME not set".to_string())
-    } else if let Some(rest) = raw.strip_prefix("~/") {
-        let home = std::env::var_os("HOME")
-            .ok_or_else(|| "cannot expand `~`: $HOME not set".to_string())?;
-        let mut p = PathBuf::from(home);
-        p.push(rest);
-        Ok(p)
-    } else {
-        Ok(PathBuf::from(raw))
-    }
-}
-
-/// Resolve a user-supplied local path: expand `~/`, make absolute,
-/// verify it exists. `Dir` opens normally; `File` opens the smallest
-/// containing context (repo root if any, file's parent otherwise) and
-/// remembers the workdir-relative path so the caller can drop straight
-/// into FocusedPreview against it (the `reef <file>` quick-look path).
-enum ResolvedPath {
-    Dir(PathBuf),
-    /// File quick-look. `workdir` is set so the Files tab + Git
-    /// tab see the enclosing repo (when present); `rel` is the
-    /// path relative to `workdir`.
-    File {
-        workdir: PathBuf,
-        rel: PathBuf,
-    },
-}
-
-fn resolve_local_path(raw: &str) -> Result<ResolvedPath, String> {
-    let expanded = expand_tilde(raw)?;
-    let canonical =
-        std::fs::canonicalize(&expanded).map_err(|e| format!("cannot open `{raw}`: {e}"))?;
-    if canonical.is_dir() {
-        return Ok(ResolvedPath::Dir(canonical));
-    }
-    if canonical.is_file() {
-        let parent = canonical
-            .parent()
-            .map(|p| p.to_path_buf())
-            .ok_or_else(|| format!("`{raw}` has no parent directory"))?;
-        // Prefer the enclosing repo root as the workdir so the file
-        // tree + Git tab show the right scope. `Repository::discover`
-        // walks upward looking for `.git`; if none is found we fall
-        // back to the file's immediate parent (loose-file viewing).
-        let workdir = match git2::Repository::discover(&parent) {
-            Ok(repo) => repo
-                .workdir()
-                .map(|p| p.to_path_buf())
-                // Bare repos have no workdir — useless for file
-                // viewing, fall back to the file's parent.
-                .unwrap_or(parent.clone()),
-            Err(_) => parent.clone(),
-        };
-        // `canonical` is absolute; `workdir` is also absolute. Their
-        // shared prefix should always be `workdir` because workdir is
-        // either an ancestor (repo case) or the immediate parent
-        // (loose case). strip_prefix returning Err here means the
-        // discover walked past `canonical`'s ancestor chain, which
-        // canonicalize ensures can't happen for honest filesystems —
-        // fall back to just the file name in the defensive arm.
-        let rel = canonical
-            .strip_prefix(&workdir)
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|_| {
-                canonical
-                    .file_name()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from(raw))
-            });
-        return Ok(ResolvedPath::File { workdir, rel });
-    }
-    Err(format!("`{raw}` is neither a file nor a directory"))
-}
-
 /// Split a `[user@]host[:path]` target. Returns `(host_with_user, path)`;
 /// `path` defaults to `"."` so the agent opens the remote `$HOME`.
 ///
@@ -264,15 +183,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else if let Some(raw) = parsed.path.as_deref() {
         // Switch the process cwd so spawned subprocesses ($EDITOR, git hooks)
         // inherit the same workdir — matches reef-agent's --workdir path.
-        match resolve_local_path(raw)? {
-            ResolvedPath::Dir(workdir) => {
+        match reef_io::resolve_local_target(raw)? {
+            ResolvedLocalTarget::Dir(workdir) => {
                 std::env::set_current_dir(&workdir)?;
                 Arc::new(LocalBackend::open_at(workdir))
             }
-            ResolvedPath::File { workdir, rel } => {
+            ResolvedLocalTarget::File { workdir, rel } => {
                 // Quick-look path: anchor at the enclosing repo root
-                // (or the file's parent when no repo is found, per
-                // resolve_local_path's discover logic). `rel` is the
+                // (or the file's parent when no repo is found). `rel` is the
                 // path relative to that workdir — Files tab tree + Git
                 // tab status both anchor on workdir so the user sees
                 // the file in its repo context, not just a subdir.
@@ -313,9 +231,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend_term = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend_term)?;
 
-    // Outer session loop: the Ctrl+O hosts picker can flip
-    // `should_quit_session` + `pending_ssh_target` to ask for a fresh
-    // backend. Each iteration owns one `App` + one backend; the terminal
+    // Outer session loop: the Ctrl+O hosts picker emits a switch-session
+    // effect to ask for a fresh backend. Each iteration owns one `App` + one backend; the terminal
     // setup/teardown lives outside so the new session inherits the
     // existing alt-screen/mouse-capture state instead of flashing.
     //
@@ -329,7 +246,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // it for its preview-protocol lifecycle.
         let mut app = App::new_with_backend(theme, Arc::clone(&backend), image_picker.clone());
         if let Some(msg) = pending_connect_error.take() {
-            app.toasts.push(Toast::error(msg));
+            app.push_toast(Toast::error(msg));
             // Re-open the picker so the user has a visible recovery path
             // — they came here trying to connect to *something*.
             app.open_hosts_picker();
@@ -341,6 +258,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(file) = pending_preview_file.take() {
             app.enter_focused_preview_with_file(file);
         }
+        let mut session_swap_target = None;
 
         // Main loop
         loop {
@@ -353,10 +271,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Snapshot selection before processing events
-            let sel_before = app
-                .selected_file
-                .as_ref()
-                .map(|s| (s.path.clone(), s.is_staged));
+            let sel_before = app.engine.selected_file_identity();
 
             // Drain ALL pending events so rapid key repeats coalesce — only one
             // render + diff-load runs per frame, regardless of how many events fired.
@@ -376,11 +291,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // the full-screen Settings page own every key unconditionally —
                         // 'any key' must not dismiss help while one of them is up — so
                         // route to handle_key first and let it delegate to the page.
-                        if app.quick_open.core.active
-                            || app.global_search.core.active
-                            || app.hosts_picker.core.active
-                            || app.view_mode == ViewMode::Settings
-                            || app.view_mode == ViewMode::FocusedPreview
+                        let snapshot = app.engine.snapshot();
+                        if snapshot.overlays.quick_open
+                            || snapshot.overlays.global_search
+                            || snapshot.overlays.hosts_picker
+                            || snapshot.view_mode == ViewMode::Settings
+                            || snapshot.view_mode == ViewMode::FocusedPreview
                         {
                             // Full-screen takeovers + overlays own every key,
                             // including the would-be "dismiss help" path:
@@ -388,8 +304,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // after `h` would close help instead of reaching
                             // handle_key_focused_preview's nav fallthrough.
                             input::handle_key(key, &mut app);
-                        } else if app.show_help {
-                            app.show_help = false;
+                        } else if snapshot.show_help {
+                            app.close_help();
                         } else {
                             input::handle_key(key, &mut app);
                         }
@@ -410,52 +326,78 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // After draining, sync selection state
-            let sel_after = app
-                .selected_file
-                .as_ref()
-                .map(|s| (s.path.clone(), s.is_staged));
+            let sel_after = app.engine.selected_file_identity();
             if sel_after != sel_before {
                 app.load_diff();
             }
 
-            // Handle an edit request *after* event drain so the terminal is
-            // idle. Suspends the TUI, runs `$EDITOR` (or `ssh -t host
-            // $EDITOR rel` for remote), resumes.
-            if let Some(path) = app.pending_edit.take() {
-                // Convert an absolute path (input.rs synthesises
-                // `file_tree.root.join(entry.path)`) back to a workdir-
-                // relative form so the backend's remote variant can ship the
-                // path across the ssh boundary verbatim. LocalBackend accepts
-                // either shape.
-                let workdir = app.backend.workdir_path();
-                let rel_for_spec = path
-                    .strip_prefix(&workdir)
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|_| path.clone());
-                match app.backend.editor_launch_spec(&rel_for_spec) {
-                    Ok(spec) => {
-                        if let Err(e) = editor::launch_spec(&mut terminal, &spec) {
-                            app.toasts
-                                .push(Toast::error(i18n::edit_open_failed(&e.to_string())));
+            let mut should_quit = false;
+            for effect in app.engine.drain_effects() {
+                match effect {
+                    AppEffect::Quit => {
+                        should_quit = true;
+                    }
+                    AppEffect::OpenInEditor(path) => {
+                        // Convert an absolute path (input.rs synthesises
+                        // `file_tree.root.join(entry.path)`) back to a workdir-
+                        // relative form so the backend's remote variant can ship the
+                        // path across the ssh boundary verbatim. LocalBackend accepts
+                        // either shape.
+                        let workdir = app.engine.workdir_path();
+                        let rel_for_spec = path
+                            .strip_prefix(&workdir)
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_else(|_| path.clone());
+                        match app.engine.editor_launch_spec(&rel_for_spec) {
+                            Ok(spec) => {
+                                if let Err(e) = editor::launch_spec(&mut terminal, &spec) {
+                                    app.push_toast(Toast::error(i18n::edit_open_failed(
+                                        &e.to_string(),
+                                    )));
+                                }
+                            }
+                            Err(e) => {
+                                app.push_toast(Toast::error(i18n::edit_open_failed(
+                                    &e.to_string(),
+                                )));
+                            }
+                        }
+                        // Pick up on-disk changes immediately rather than waiting for
+                        // the fs-watcher debounce. `reload_preview_now` bypasses the
+                        // scrubbing debounce so the new file contents land on the
+                        // first frame after the editor exits, not 80 ms later.
+                        app.refresh_file_tree();
+                        app.reload_preview_now();
+                    }
+                    AppEffect::SwitchSession(target) => {
+                        session_swap_target = Some(target);
+                    }
+                    AppEffect::Toast(toast) => app.push_toast(toast),
+                    AppEffect::CopyToClipboard {
+                        text,
+                        success,
+                        failure,
+                    } => {
+                        if let Err(e) = reef::clipboard::copy_to_clipboard(&text) {
+                            app.push_toast(Toast::error(format!("{}: {e}", failure.message)));
+                        } else if let Some(toast) = success {
+                            app.push_toast(toast);
                         }
                     }
-                    Err(e) => {
-                        app.toasts
-                            .push(Toast::error(i18n::edit_open_failed(&e.to_string())));
+                    AppEffect::OpenUrl(url) => {
+                        if let Err(e) = App::open_external_url(&url) {
+                            app.push_toast(Toast::error(format!("Open link failed: {e}")));
+                        } else {
+                            app.push_toast(Toast::info(format!("Opened {url}")));
+                        }
                     }
                 }
-                // Pick up on-disk changes immediately rather than waiting for
-                // the fs-watcher debounce. `reload_preview_now` bypasses the
-                // scrubbing debounce so the new file contents land on the
-                // first frame after the editor exits, not 80 ms later.
-                app.refresh_file_tree();
-                app.reload_preview_now();
             }
 
-            if app.should_quit {
+            if should_quit {
                 break 'session;
             }
-            if app.should_quit_session {
+            if session_swap_target.is_some() {
                 break; // inner loop only — outer 'session handles the swap
             }
         }
@@ -465,7 +407,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // it if anything went wrong), then restart the inner loop with a
         // fresh App. Errors here return to the picker state by falling
         // through to a `continue 'session` with the old backend retained.
-        if let Some(target) = app.pending_ssh_target.take() {
+        if let Some(target) = session_swap_target.take() {
             let target_arg = target.to_arg();
             match build_ssh_backend(&target_arg) {
                 Ok(new_backend) => {

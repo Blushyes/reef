@@ -20,6 +20,13 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  architecture:
+    name: architecture
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/check-architecture.sh
+
   clippy:
     name: clippy
     runs-on: ubuntu-latest

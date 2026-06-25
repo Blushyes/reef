@@ -44,6 +44,7 @@ fn seed_tree(root: &Path) {
     std::fs::write(root.join("src/lib.rs"), "fn foo() { bar() }\nfn baz() {}").unwrap();
     std::fs::write(root.join("src/other.rs"), "fn other() { foo() }").unwrap();
     std::fs::write(root.join("README.md"), "Use foo() for the thing\n").unwrap();
+    std::fs::write(root.join(".env"), "hidden=true\n").unwrap();
     std::fs::create_dir(root.join("ignored")).unwrap();
     std::fs::write(root.join("ignored/secret.rs"), "fn secret() { foo() }").unwrap();
 }
@@ -65,9 +66,15 @@ fn walk_repo_paths_parity() {
     assert_eq!(l_resp.paths, r_resp.paths);
     assert_eq!(l_resp.truncated, r_resp.truncated);
     assert!(l_resp.paths.iter().any(|p| p == "src/lib.rs"));
+    assert!(
+        l_resp.paths.iter().any(|p| p == ".env"),
+        "default walk should include dotfiles"
+    );
     // Gitignore honoured on both sides.
     assert!(!l_resp.paths.iter().any(|p| p.starts_with("ignored/")));
     assert!(!r_resp.paths.iter().any(|p| p.starts_with("ignored/")));
+    assert!(!l_resp.paths.iter().any(|p| p.starts_with(".git/")));
+    assert!(!r_resp.paths.iter().any(|p| p.starts_with(".git/")));
 }
 
 /// Helper: drive `search_content` to completion, accumulating every

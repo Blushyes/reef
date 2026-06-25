@@ -1,10 +1,8 @@
 //! Local vs Remote parity — `revert_path` (a.k.a. discard).
 //!
-//! This is the M4 Track A-0.1 regression guard: pre-M4 `RemoteBackend`
-//! silently no-op'd folder/section discard because `app.rs::apply_discard_target`
-//! went through the `self.repo` field (always `None` on remote). After
-//! the switch to `backend.revert_path`, both backends must flip the same
-//! file from "modified" back to clean / from staged back to HEAD.
+//! Regression guard for folder/section discard: local and remote
+//! backends must both route through `Backend::revert_path` and flip
+//! the same file from "modified" back to clean / from staged back to HEAD.
 
 use std::path::Path;
 use std::sync::Mutex;

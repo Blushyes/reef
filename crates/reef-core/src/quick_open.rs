@@ -14,6 +14,15 @@ pub struct QuickOpenCandidate {
     utf32: Utf32String,
 }
 
+impl std::fmt::Debug for QuickOpenCandidate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuickOpenCandidate")
+            .field("rel_path", &self.rel_path)
+            .field("display", &self.display)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QuickOpenMatch {
     pub idx: usize,

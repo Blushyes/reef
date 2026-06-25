@@ -1,22 +1,18 @@
 //! Right-click context menu for the Files tab file tree.
 //!
 //! Mirrors VSCode's Explorer context menu — the items that make sense
-//! in a terminal file manager. Not included (by design):
+//! in a compact file manager. Not included (by design):
 //!
-//! - Open in Integrated Terminal — reef doesn't embed a terminal.
+//! - Open in Integrated Terminal — Reef does not embed a shell panel.
 //! - Compare / Select for Compare — separate feature.
 //!
 //! Clipboard items (Cut / Copy / Paste / Duplicate / Copy Path /
 //! Copy Relative Path) are wired through `App::file_clipboard` and
-//! `crate::clipboard` (OSC 52). `Paste` reports `is_enabled = false`
-//! when the clipboard is empty — render greys it out, dispatch
-//! short-circuits.
+//! host clipboard effects. `Paste` reports `is_enabled = false` when
+//! the clipboard is empty — render greys it out, dispatch short-circuits.
 //!
-//! The menu is a cheap UI state + a renderer that overlays on top of
-//! the tree. Clicks inside dispatch a `ClickAction::TreeContextMenuItem`;
-//! clicks outside dispatch `ClickAction::TreeContextMenuClose` (registered
-//! panel-wide beneath the menu, same way place-mode's root drop zone
-//! falls through to cancel).
+//! The menu is cheap overlay state. Input adapters decide whether a click
+//! picks an item or closes the menu.
 
 /// A single action offered by the right-click menu. Most items carry
 /// enough context on themselves that the dispatch side doesn't need
@@ -49,14 +45,13 @@ pub enum ContextMenuItem {
     /// confirmation (status bar prompt).
     Delete,
     /// "Copy Path" — write the absolute path of the anchor entry to
-    /// the system clipboard (OSC 52). Multi-select copies all paths
-    /// joined by newlines.
+    /// the system clipboard. Multi-select copies all paths joined by
+    /// newlines.
     CopyPath,
     /// "Copy Relative Path" — same as `CopyPath` but workdir-relative.
     CopyRelativePath,
     /// "Reveal in Finder / File Explorer" — shells out to the platform
-    /// file manager. macOS only for now; other OSes get a toast
-    /// pointing at the follow-up.
+    /// file manager. Unsupported hosts report a toast instead.
     RevealInFinder,
 }
 
@@ -110,10 +105,10 @@ pub struct ContextMenuState {
     /// the menu on unrelated input).
     pub active: bool,
 
-    /// Anchor in terminal cells — top-left of the menu popup. Set by
-    /// `App::open_tree_context_menu` from the mouse event; the
-    /// renderer clamps to the screen bounds so the menu never draws
-    /// outside the viewport even if the click landed near the edge.
+    /// Anchor in renderer cells — top-left of the menu popup. Set by
+    /// `App::open_tree_context_menu` from the pointer event; the renderer
+    /// clamps to the screen bounds so the menu never draws outside the
+    /// viewport even if the click landed near the edge.
     pub anchor: (u16, u16),
 
     /// Which file-tree entry (if any) triggered this menu. Used by

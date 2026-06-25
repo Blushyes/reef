@@ -2,15 +2,15 @@
 
 Every entry here represents time paid. Read before writing a test that touches the relevant area.
 
-## `App::new()` reads the developer's real `~/.config/reef/prefs`
+## `TuiApp::new()` reads the developer's real `~/.config/reef/prefs`
 
 **Symptom**: Snapshot test passes for the author but fails for someone else (or on CI). The diff shows the Git sidebar's view-mode toggle flipping between "视图: 列表" and "视图: 树形", or the commit-file view switching tree/flat, with no obvious source.
 
-**Root cause**: `App::new()` runs `load_bool_pref("status.tree_mode", ...)` and the equivalents for `commit.diff_layout`, `commit.diff_mode`, `commit.files_tree_mode`. Without test-level isolation, these reads hit the tester's real home directory — which has been used as a real Reef user and has non-default prefs persisted.
+**Root cause**: `TuiApp::new()` loads `status.tree_mode` and the equivalents for `commit.diff_layout`, `commit.diff_mode`, `commit.files_tree_mode` before constructing `reef-app` state. Without test-level isolation, these reads hit the tester's real home directory — which has been used as a real Reef user and has non-default prefs persisted.
 
-**Fix**: Redirect `$HOME` to the test's tempdir before calling `App::new()`, serialised behind a lock that also covers cwd mutation (see SKILL.md critical pattern #1 for the `HomeGuard` template). `prefs::migrate_legacy_prefs()` is a no-op when the tempdir has no prefs file, so it won't create a spurious `.config/reef/prefs` that shows up as an untracked file in the snapshot's `git status`.
+**Fix**: Redirect `$HOME` to the test's tempdir before calling `TuiApp::new()`, serialised behind a lock that also covers cwd mutation (see SKILL.md critical pattern #1 for the `HomeGuard` template). `prefs::migrate_legacy_prefs()` is a no-op when the tempdir has no prefs file, so it won't create a spurious `.config/reef/prefs` that shows up as an untracked file in the snapshot's `git status`.
 
-**Don't fix by**: Sprinkling `prefs::set(...)` at the top of each test to force known values. You'd have to know every key `App::new()` reads, and the list will grow.
+**Don't fix by**: Sprinkling `prefs::set(...)` at the top of each test to force known values. You'd have to know every key `TuiApp::new()` reads, and the list will grow.
 
 ## macOS tempdir symlink vs. `notify` canonicalization
 

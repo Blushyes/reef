@@ -24,18 +24,17 @@ pub mod selection;
 pub mod settings_panel;
 pub mod text;
 pub mod theme;
-pub mod toast;
 
-use crate::app::{App, Tab, ViewMode};
 use crate::i18n::{Msg, t};
+use crate::tui_app::{TuiApp as App, tab_label};
 use crate::ui::mouse::ClickAction;
-use crate::ui::toast::ToastLevel;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Text;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
+use reef_app::{AppTab as Tab, ToastLevel, ViewMode};
 use unicode_width::UnicodeWidthStr;
 
 /// Tab-bar sidebar-toggle button glyphs. `⊟` (squared minus) renders
@@ -47,6 +46,7 @@ pub const SIDEBAR_TOGGLE_GLYPH_HIDDEN: &str = "⊞";
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let size = f.area();
+    let snapshot = app.engine.snapshot();
     app.hit_registry.clear();
     // Clear the preview hit cache each frame; the preview panel's own
     // `render` will repopulate it when the active tab renders the preview.
@@ -69,7 +69,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // the normal title/tab/body/status frame. The four-tab body still
     // gets its async work scheduled in the background; we just don't
     // draw it.
-    if app.view_mode == ViewMode::Settings {
+    if snapshot.view_mode == ViewMode::Settings {
         settings_panel::render(f, app, size);
         return;
     }
@@ -79,7 +79,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // frame to the active tab's content panel. Implementation lives in
     // `focused_preview_panel`; we still draw a 1-row bottom hint so
     // the Esc affordance is always visible.
-    if app.view_mode == ViewMode::FocusedPreview {
+    if snapshot.view_mode == ViewMode::FocusedPreview {
         focused_preview_panel::render(f, app, size);
         return;
     }
@@ -94,14 +94,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
         ])
         .split(size);
 
-    render_title_bar(f, app, main_layout[0]);
-    render_tab_bar(f, app, main_layout[1]);
+    render_title_bar(f, app, main_layout[0], &snapshot);
+    render_tab_bar(f, app, main_layout[1], &snapshot);
 
     // Cache body width before layout math so `graph_uses_three_col` and
     // `normalize_active_panel` can see the current frame's geometry. The
     // title/tab/status bars are fixed-width siblings, so the body width
     // equals the frame width here.
-    app.last_total_width = main_layout[2].width;
+    app.layout.last_total_width = main_layout[2].width;
     app.normalize_active_panel();
 
     // Body: left (+ optional commit column for Graph 3-col) + right.
@@ -150,9 +150,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // sidebar slot is absent so the editor slides left by one.
     let editor_idx = if has_sidebar { 1 } else { 0 };
 
-    match app.active_tab {
+    match app.engine.active_tab() {
         Tab::Git => {
-            if !app.backend.has_repo() {
+            if !snapshot.has_repo {
                 render_no_repo(f, app, body_layout[0]);
             } else {
                 if has_sidebar {
@@ -163,10 +163,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
         }
         Tab::Files => {
             if has_sidebar {
-                let focused = matches!(app.active_panel, crate::app::Panel::Files);
+                let focused = matches!(app.engine.active_panel(), reef_app::AppPanel::Files);
                 file_tree_panel::render(f, app, body_layout[0], focused);
             }
-            let focused = matches!(app.active_panel, crate::app::Panel::Diff);
+            let focused = matches!(app.engine.active_panel(), reef_app::AppPanel::Diff);
             preview::render(f, app, body_layout[editor_idx], focused);
         }
         Tab::Graph => {
@@ -182,7 +182,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
             if has_sidebar {
                 search_tab::render_sidebar(f, app, body_layout[0]);
             }
-            let focused = matches!(app.active_panel, crate::app::Panel::Diff);
+            let focused = matches!(app.engine.active_panel(), reef_app::AppPanel::Diff);
             preview::render(f, app, body_layout[editor_idx], focused);
         }
     }
@@ -217,14 +217,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
         );
     }
 
-    render_status_bar(f, app, main_layout[3]);
+    render_status_bar(f, app, main_layout[3], &snapshot);
 
     // VSCode-style find widget overlays its host panel after status bar
     // so its borders and hit zones sit above any panel chrome. Skips
     // itself when not active.
     find_widget_panel::render(f, app);
 
-    if app.show_help {
+    if snapshot.show_help {
         render_help(f, app, size);
     }
 
@@ -234,16 +234,16 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // Global-search after quick-open: if both flags were somehow true the
     // later render wins on overlap, and having global-search on top matches
     // its priority in input dispatch.
-    if app.quick_open.core.active {
+    if snapshot.overlays.quick_open {
         quick_open_panel::render(f, app, size);
     }
-    if app.global_search.core.active {
+    if snapshot.overlays.global_search {
         global_search_panel::render(f, app, size);
     }
-    if app.hosts_picker.core.active {
+    if snapshot.overlays.hosts_picker {
         hosts_picker_panel::render(f, app, size);
     }
-    if app.graph_branch_picker.core.active {
+    if snapshot.overlays.graph_branch_picker {
         graph_branch_picker_panel::render(f, app, size);
     }
     // Context menu overlay renders last so it sits above the help
@@ -254,20 +254,20 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // opens. Once shown, the menu should stay visible even if the
     // user tab-switches (unlikely — input is gated) so the render
     // check only looks at `tree_context_menu.active`.
-    if app.tree_context_menu.active {
+    if snapshot.overlays.tree_context_menu {
         context_menu_panel::render(f, app, size);
     }
     // Navigation candidates popup — same priority bucket as the
     // context menu (overlays everything except the modal). Mutually
     // exclusive with `tree_context_menu` by design: a `gd` while a
     // context menu is open is suppressed in `goto_definition_at_cursor`.
-    if app.nav_candidates.is_some() {
+    if snapshot.overlays.nav_candidates {
         nav_candidates_popup::render(f, app, size);
     }
     // ConfirmModal sits on top of everything — including context menu —
     // because once the user has committed to a destructive choice, the
     // confirm must be the only thing eligible to receive input.
-    if app.confirm_modal.is_some() {
+    if snapshot.overlays.confirm.is_some() {
         confirm_modal::render(f, app, size);
     }
 }
@@ -311,7 +311,7 @@ fn render_git_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
         inner.width.saturating_sub(1),
         inner.height,
     );
-    let focused = matches!(app.active_panel, crate::app::Panel::Files);
+    let focused = matches!(app.engine.active_panel(), reef_app::AppPanel::Files);
     git_status_panel::render(f, app, padded, focused);
 }
 
@@ -334,7 +334,7 @@ fn render_graph_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
         inner.width.saturating_sub(1),
         inner.height,
     );
-    let focused = matches!(app.active_panel, crate::app::Panel::Files);
+    let focused = matches!(app.engine.active_panel(), reef_app::AppPanel::Files);
     git_graph_panel::render(f, app, padded, focused);
 }
 
@@ -351,9 +351,9 @@ fn render_graph_editor(f: &mut Frame, app: &mut App, area: Rect) {
     );
     let focused = if app.graph_uses_three_col() {
         // In 3-col mode Panel::Commit owns the middle column.
-        matches!(app.active_panel, crate::app::Panel::Commit)
+        matches!(app.engine.active_panel(), reef_app::AppPanel::Commit)
     } else {
-        matches!(app.active_panel, crate::app::Panel::Diff)
+        matches!(app.engine.active_panel(), reef_app::AppPanel::Diff)
     };
     commit_detail_panel::render(f, app, inner, focused);
 }
@@ -361,7 +361,7 @@ fn render_graph_editor(f: &mut Frame, app: &mut App, area: Rect) {
 /// Graph tab's right column (3-col mode only) — the diff viewport for
 /// the file selected inside the middle column. Delegates to the shared
 /// `diff_panel::render_diff` so Git-tab Diff and this column share
-/// rendering, search integration, and (after Stage 3) mouse selection.
+/// rendering, search integration, and mouse selection.
 fn render_graph_diff_column(f: &mut Frame, app: &mut App, area: Rect) {
     use ratatui::widgets::{Block, Padding};
     let block = Block::default().padding(Padding::new(1, 1, 0, 0));
@@ -372,23 +372,7 @@ fn render_graph_diff_column(f: &mut Frame, app: &mut App, area: Rect) {
     // one of them renders Diff at a time.
     app.last_diff_rect = Some(inner);
 
-    // RAII guard around take/restore — mirrors `diff_panel::render`'s
-    // pattern so a panic inside `render_diff` doesn't strand the loaded
-    // commit-file diff in `None` (would render the loading banner
-    // forever even after the load is long since complete).
-    struct FileDiffGuard<'a> {
-        slot: &'a mut Option<crate::app::CommitFileDiff>,
-        held: Option<crate::app::CommitFileDiff>,
-    }
-    impl<'a> Drop for FileDiffGuard<'a> {
-        fn drop(&mut self) {
-            if let Some(d) = self.held.take() {
-                *self.slot = Some(d);
-            }
-        }
-    }
-
-    let Some(taken) = app.commit_detail.file_diff.take() else {
+    let Some(file_diff) = app.engine.commit_detail().file_diff.as_ref() else {
         // In 3-col mode this only fires when `commit_file_diff_load.loading`
         // is still true. Show a quiet "loading…" banner so the column is
         // never blank between the click and the async result landing.
@@ -402,40 +386,50 @@ fn render_graph_diff_column(f: &mut Frame, app: &mut App, area: Rect) {
         }
         return;
     };
-    let guard = FileDiffGuard {
-        slot: &mut app.commit_detail.file_diff,
-        held: Some(taken),
-    };
-    let d = guard.held.as_ref().expect("just took it");
     let selection = app.diff_selection;
     let ctrl_hover = app.diff_ctrl_hover.clone();
+    let layout = app.engine.commit_detail().diff_layout;
+    let mode = app.engine.commit_detail().diff_mode;
+    let theme = app.theme;
+    let search = app.engine.search();
+    let find_widget = app.engine.find_widget();
+    let mut last_diff_view_h = app.layout.last_diff_view_h;
+    let (mut scroll, mut h_scroll, mut sbs_left_h_scroll, mut sbs_right_h_scroll) =
+        app.engine.commit_file_diff_scroll_state();
     diff_panel::render_diff(
         f,
         inner,
-        &d.diff,
-        &d.display,
-        app.commit_detail.diff_layout,
-        app.commit_detail.diff_mode,
-        app.theme,
-        &app.search,
-        crate::search::SearchTarget::GraphDiff,
-        &app.find_widget,
-        crate::find_widget::FindTarget::GraphDiffUnified,
+        &file_diff.diff,
+        &file_diff.display,
+        layout,
+        mode,
+        theme,
+        search,
+        reef_app::SearchTarget::GraphDiff,
+        find_widget,
+        reef_app::FindTarget::GraphDiffUnified,
         selection.as_ref(),
         ctrl_hover.as_ref(),
         &mut diff_panel::DiffView {
-            scroll: &mut app.commit_detail.file_diff_scroll,
-            h_scroll: &mut app.commit_detail.file_diff_h_scroll,
-            sbs_left_h_scroll: &mut app.commit_detail.file_diff_sbs_left_h_scroll,
-            sbs_right_h_scroll: &mut app.commit_detail.file_diff_sbs_right_h_scroll,
-            last_view_h: &mut app.last_diff_view_h,
+            scroll: &mut scroll,
+            h_scroll: &mut h_scroll,
+            sbs_left_h_scroll: &mut sbs_left_h_scroll,
+            sbs_right_h_scroll: &mut sbs_right_h_scroll,
+            last_view_h: &mut last_diff_view_h,
         },
         &mut app.last_diff_hit,
     );
-    drop(guard);
+    app.engine
+        .dispatch(reef_app::AppCommand::SetCommitFileDiffScrollState {
+            scroll,
+            h_scroll,
+            sbs_left_h_scroll,
+            sbs_right_h_scroll,
+        });
+    app.layout.last_diff_view_h = last_diff_view_h;
 }
 
-fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
+fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect, snapshot: &reef_app::AppSnapshot) {
     let th = app.theme;
     let bg = th.chrome_bg;
     let tabs = Tab::ALL;
@@ -444,8 +438,8 @@ fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let mut x = area.x;
 
     for (i, tab) in tabs.iter().enumerate() {
-        let label = tab.label();
-        let is_active = app.active_tab == *tab;
+        let label = tab_label(*tab);
+        let is_active = snapshot.active_tab == *tab;
         let style = if is_active {
             Style::default()
                 .fg(th.chrome_active_fg)
@@ -480,7 +474,7 @@ fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // tight to the glyph's columns so clicks on the surrounding hint
     // don't accidentally toggle.
     let keys_hint = t(Msg::TabBarHint);
-    let button_text = if app.sidebar_visible {
+    let button_text = if snapshot.sidebar_visible {
         " ⊟ "
     } else {
         " ⊞ "
@@ -510,14 +504,14 @@ fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Line::from(spans), area);
 }
 
-fn render_title_bar(f: &mut Frame, app: &App, area: Rect) {
+fn render_title_bar(f: &mut Frame, app: &App, area: Rect, snapshot: &reef_app::AppSnapshot) {
     let th = app.theme;
-    let repo_name = if app.backend.has_repo() {
-        app.workdir_name.as_str()
+    let repo_name = if snapshot.has_repo {
+        snapshot.workdir_name.as_str()
     } else {
         "—"
     };
-    let branch = app.branch_name.as_str();
+    let branch = snapshot.branch_name.as_str();
 
     let title = Line::from(vec![
         Span::styled(
@@ -555,12 +549,12 @@ fn render_title_bar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(title, area);
 }
 
-fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
+fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect, snapshot: &reef_app::AppSnapshot) {
     let th = app.theme;
 
     // Search prompt has the highest priority — while active it fully owns the
     // status row so the user can see what they're typing.
-    if app.search.active {
+    if app.engine.search().active {
         render_search_prompt(f, app, area);
         return;
     }
@@ -568,7 +562,7 @@ fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // Post-search "n/N hint" indicator: when a search session is dormant but
     // still has matches, show a compact counter so the user remembers they
     // can keep stepping.
-    if !app.search.active && !app.search.matches.is_empty() {
+    if !app.engine.search().active && !app.engine.search().matches.is_empty() {
         render_search_dormant(f, app, area);
         return;
     }
@@ -578,8 +572,8 @@ fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // to commit or cancel. When a copy is actively running the hint
     // swaps to a copying indicator so the status bar proves the worker
     // is still alive on big transfers.
-    if app.place_mode.active {
-        let copying = app.file_copy_load.loading;
+    if app.engine.place_mode_active() {
+        let copying = app.engine.file_copy_loading();
         let (badge_text, hint_text) = if copying {
             (" 📋 COPYING ", crate::i18n::place_mode_copying_banner())
         } else {
@@ -609,7 +603,7 @@ fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // Paste-conflict prompt: status bar becomes a yellow ⚠ prompt
     // walking the user through Replace / Skip / Keep both / Cancel.
     // Key routing lives in `input::handle_key_paste_conflict`.
-    if let Some(prompt) = app.paste_conflict.as_ref()
+    if let Some(prompt) = app.engine.paste_conflict_prompt()
         && let Some(item) = prompt.current()
     {
         let name = item
@@ -648,8 +642,8 @@ fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // just pressed V but hasn't moved yet) — so the user always knows why
     // arrows/clicks behave differently. Takes priority over the generic
     // status line so the exit hint (`Esc`) is always visible.
-    if app.active_tab == crate::app::Tab::Graph && app.git_graph.in_visual_mode() {
-        let (lo, hi) = app.git_graph.selected_range();
+    if snapshot.active_tab == reef_app::AppTab::Graph && snapshot.graph.visual_mode {
+        let (lo, hi) = snapshot.graph.selection_range;
         let count = hi - lo + 1;
         let hint = Line::from(vec![
             Span::styled(
@@ -673,7 +667,7 @@ fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     // Show the most recent toast (push success/failure etc.) inline.
-    let (notif, notif_color) = match app.toasts.last() {
+    let (notif, notif_color) = match snapshot.toast.as_ref() {
         Some(t) => (
             format!("  {} ", t.message),
             match t.level {
@@ -692,7 +686,10 @@ fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // Always rendered in `accent` since it is by definition the focused
     // panel — the visual cue is the chip's presence and color, not its
     // change of state. Drops automatically when the row is too narrow.
-    let chip = format!(" [{}] ", panel_chip_text(app.active_tab, app.active_panel));
+    let chip = format!(
+        " [{}] ",
+        panel_chip_text(app.engine.active_tab(), app.engine.active_panel())
+    );
     let chip_style = Style::default()
         .fg(th.accent)
         .bg(th.chrome_bg)
@@ -715,9 +712,8 @@ fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let settings_btn = " ⚙ ";
     let settings_btn_w = UnicodeWidthStr::width(settings_btn) as u16;
 
-    // Phase 3 LSP badge. Compact glyph per-language; absent when no
-    // supervisor exists for the current preview's language. Sits
-    // between the activity area and the panel chip per plan.
+    // Compact LSP badge per language; absent when no supervisor exists for
+    // the current preview's language.
     let lsp_badge = nav_lsp_badge_text(app);
     let lsp_badge_w = UnicodeWidthStr::width(lsp_badge.as_str()) as u16;
 
@@ -786,7 +782,7 @@ fn nav_lsp_badge_text(app: &App) -> String {
     use reef_core::nav::LspBadge;
     use reef_core::preview::PreviewBody;
 
-    let Some(preview) = app.preview_content.as_ref() else {
+    let Some(preview) = app.engine.preview_content_ref() else {
         return String::new();
     };
     let parsed = match &preview.body {
@@ -804,7 +800,7 @@ fn nav_lsp_badge_text(app: &App) -> String {
         return String::new();
     }
     let glyph = profile.badge_glyph;
-    let state = app.lsp_states.get(&lang).cloned().unwrap_or(LspBadge::Off);
+    let state = app.engine.lsp_badge(lang);
     match state {
         LspBadge::Off => {
             // Promote `Off` to `Available` when the binary is on PATH
@@ -813,7 +809,7 @@ fn nav_lsp_badge_text(app: &App) -> String {
             // first `gd`. Reads the cached PATH-probe (`lsp_installed`,
             // refreshed off the render path) instead of walking PATH
             // every frame.
-            let installed = app.lsp_installed.get(&lang).copied().unwrap_or(false);
+            let installed = app.engine.is_lsp_installed(lang);
             if installed {
                 format!(" {glyph}○ ")
             } else {
@@ -832,8 +828,8 @@ fn nav_lsp_badge_text(app: &App) -> String {
 /// "Files" in the Files/Git tabs but "Search" in the Search tab where
 /// the left column is the query input). Pulled out as a pure fn (no
 /// `&App` parameter) so the mapping is unit-testable.
-fn panel_chip_text(tab: crate::app::Tab, panel: crate::app::Panel) -> &'static str {
-    use crate::app::{Panel, Tab};
+fn panel_chip_text(tab: reef_app::AppTab, panel: reef_app::AppPanel) -> &'static str {
+    use reef_app::{AppPanel as Panel, AppTab as Tab};
     match (tab, panel) {
         (Tab::Files, Panel::Files) => t(Msg::PanelFiles),
         (Tab::Files, Panel::Diff | Panel::Commit) => t(Msg::PanelPreview),
@@ -849,14 +845,15 @@ fn panel_chip_text(tab: crate::app::Tab, panel: crate::app::Panel) -> &'static s
 
 pub(crate) fn render_search_prompt(f: &mut Frame, app: &App, area: Rect) {
     let th = app.theme;
-    let prefix = if app.search.backwards { '?' } else { '/' };
-    let query = app.search.query.as_str();
+    let search = app.engine.search();
+    let prefix = if search.backwards { '?' } else { '/' };
+    let query = search.query.as_str();
 
     // Build the right-side counter / status text.
     let right = match (
-        app.search.matches.len(),
-        app.search.current,
-        app.search.wrap_msg,
+        search.matches.len(),
+        search.current,
+        search.wrap_msg,
         query.is_empty(),
     ) {
         (0, _, _, true) => String::new(),
@@ -899,23 +896,20 @@ pub(crate) fn render_search_prompt(f: &mut Frame, app: &App, area: Rect) {
     // see where new chars will land without a static `█` glyph.
     let prefix_w = 1u16; // '/' and '?' are always narrow.
     let cursor_w =
-        UnicodeWidthStr::width(&app.search.query[..app.search.cursor.min(app.search.query.len())])
-            as u16;
+        UnicodeWidthStr::width(&search.query[..search.cursor.min(search.query.len())]) as u16;
     let cursor_x = area.x + (prefix_w + cursor_w).min(area.width.saturating_sub(1));
     f.set_cursor_position((cursor_x, area.y));
 }
 
 pub(crate) fn render_search_dormant(f: &mut Frame, app: &App, area: Rect) {
     let th = app.theme;
-    let prefix = if app.search.backwards { '?' } else { '/' };
-    let counter = match app.search.current {
-        Some(i) => crate::i18n::search_dormant_with_counter(
-            prefix,
-            &app.search.query,
-            i,
-            app.search.matches.len(),
-        ),
-        None => format!(" {}{} ", prefix, app.search.query),
+    let search = app.engine.search();
+    let prefix = if search.backwards { '?' } else { '/' };
+    let counter = match search.current {
+        Some(i) => {
+            crate::i18n::search_dormant_with_counter(prefix, &search.query, i, search.matches.len())
+        }
+        None => format!(" {}{} ", prefix, search.query),
     };
     let counter_w = UnicodeWidthStr::width(counter.as_str()) as u16;
     let fill = Line::from(Span::styled(
@@ -1019,7 +1013,7 @@ fn render_help(f: &mut Frame, app: &App, screen: Rect) {
 #[cfg(test)]
 mod panel_chip_tests {
     use super::*;
-    use crate::app::{Panel, Tab};
+    use reef_app::{AppPanel as Panel, AppTab as Tab};
 
     // Files tab → file tree on the left, preview on the right.
     #[test]

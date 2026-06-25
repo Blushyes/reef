@@ -7,9 +7,10 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use reef::app::{App, Tab, ViewMode};
+use reef::TuiApp as App;
 use reef::input;
 use reef::ui::theme::Theme;
+use reef_app::{AppTab as Tab, FocusedPreviewFileSource, ViewMode};
 use std::sync::Mutex;
 use tempfile::TempDir;
 use test_support::CwdGuard;
@@ -32,26 +33,26 @@ fn files_tab_focused_preview_scrolls_preview_vertically() {
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new(Theme::dark(), None);
-    assert_eq!(app.active_tab, Tab::Files);
+    assert_eq!(app.engine.state.active_tab, Tab::Files);
     app.enter_focused_preview();
-    assert_eq!(app.view_mode, ViewMode::FocusedPreview);
+    assert_eq!(app.engine.state.view_mode, ViewMode::FocusedPreview);
 
-    let before = app.preview_scroll;
+    let before = app.engine.state.preview_scroll;
     input::handle_key(key(KeyCode::Down), &mut app);
     assert_eq!(
-        app.preview_scroll,
+        app.engine.state.preview_scroll,
         before + 1,
         "↓ in Files focused preview should pan preview_scroll"
     );
     input::handle_key(key(KeyCode::Down), &mut app);
     input::handle_key(key(KeyCode::Down), &mut app);
-    assert_eq!(app.preview_scroll, before + 3);
+    assert_eq!(app.engine.state.preview_scroll, before + 3);
     input::handle_key(key(KeyCode::Up), &mut app);
-    assert_eq!(app.preview_scroll, before + 2);
+    assert_eq!(app.engine.state.preview_scroll, before + 2);
 
     // PageDown step is +20 in handle_key_files.
     input::handle_key(key(KeyCode::PageDown), &mut app);
-    assert_eq!(app.preview_scroll, before + 22);
+    assert_eq!(app.engine.state.preview_scroll, before + 22);
 }
 
 #[test]
@@ -64,18 +65,18 @@ fn files_tab_focused_preview_scrolls_preview_horizontally() {
     let mut app = App::new(Theme::dark(), None);
     app.enter_focused_preview();
 
-    let before = app.preview_h_scroll;
+    let before = app.engine.state.preview_h_scroll;
     input::handle_key(key(KeyCode::Right), &mut app);
     assert_eq!(
-        app.preview_h_scroll,
+        app.engine.state.preview_h_scroll,
         before + 1,
         "→ should pan preview_h_scroll horizontally"
     );
     input::handle_key(key_with(KeyCode::Right, KeyModifiers::SHIFT), &mut app);
     // Shift+→ steps by 10 in handle_key_files.
-    assert_eq!(app.preview_h_scroll, before + 11);
+    assert_eq!(app.engine.state.preview_h_scroll, before + 11);
     input::handle_key(key(KeyCode::Left), &mut app);
-    assert_eq!(app.preview_h_scroll, before + 10);
+    assert_eq!(app.engine.state.preview_h_scroll, before + 10);
 }
 
 #[test]
@@ -87,24 +88,24 @@ fn git_tab_focused_preview_scrolls_diff_vertically_and_horizontally() {
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Git);
     app.enter_focused_preview();
-    assert_eq!(app.view_mode, ViewMode::FocusedPreview);
+    assert_eq!(app.engine.state.view_mode, ViewMode::FocusedPreview);
 
-    let vert_before = app.diff_scroll;
+    let vert_before = app.engine.state.diff_scroll;
     input::handle_key(key(KeyCode::Down), &mut app);
-    assert_eq!(app.diff_scroll, vert_before + 1);
+    assert_eq!(app.engine.state.diff_scroll, vert_before + 1);
     input::handle_key(key(KeyCode::PageDown), &mut app);
     // PageDown step in handle_key_git is +20.
-    assert_eq!(app.diff_scroll, vert_before + 21);
+    assert_eq!(app.engine.state.diff_scroll, vert_before + 21);
     input::handle_key(key(KeyCode::Up), &mut app);
-    assert_eq!(app.diff_scroll, vert_before + 20);
+    assert_eq!(app.engine.state.diff_scroll, vert_before + 20);
 
-    let h_before = app.diff_h_scroll;
+    let h_before = app.engine.state.diff_h_scroll;
     input::handle_key(key(KeyCode::Right), &mut app);
-    assert_eq!(app.diff_h_scroll, h_before + 1);
+    assert_eq!(app.engine.state.diff_h_scroll, h_before + 1);
     input::handle_key(key_with(KeyCode::Right, KeyModifiers::SHIFT), &mut app);
-    assert_eq!(app.diff_h_scroll, h_before + 11);
+    assert_eq!(app.engine.state.diff_h_scroll, h_before + 11);
     input::handle_key(key(KeyCode::Home), &mut app);
-    assert_eq!(app.diff_h_scroll, 0);
+    assert_eq!(app.engine.state.diff_h_scroll, 0);
 }
 
 fn wheel(col: u16, row: u16, kind: MouseEventKind) -> MouseEvent {
@@ -136,7 +137,7 @@ fn git_focused_preview_wheel_in_left_columns_scrolls_diff_not_hidden_sidebar() {
     let backend = TestBackend::new(100, 24);
     let terminal = Terminal::new(backend).unwrap();
 
-    let before = app.diff_scroll;
+    let before = app.engine.state.diff_scroll;
     // Column 5 sits well inside what would have been the sidebar.
     input::handle_mouse(
         wheel(5, 10, MouseEventKind::ScrollDown),
@@ -144,12 +145,12 @@ fn git_focused_preview_wheel_in_left_columns_scrolls_diff_not_hidden_sidebar() {
         &terminal,
     );
     assert!(
-        app.diff_scroll > before,
+        app.engine.state.diff_scroll > before,
         "wheel in former-sidebar columns must scroll diff in 纯预览"
     );
-    let after_down = app.diff_scroll;
+    let after_down = app.engine.state.diff_scroll;
     input::handle_mouse(wheel(5, 10, MouseEventKind::ScrollUp), &mut app, &terminal);
-    assert!(app.diff_scroll < after_down);
+    assert!(app.engine.state.diff_scroll < after_down);
 }
 
 #[test]
@@ -166,9 +167,9 @@ fn files_focused_preview_wheel_scrolls_preview_at_any_column() {
     let terminal = Terminal::new(backend).unwrap();
 
     // Same column the (now-hidden) file tree would have lived in.
-    let before = app.preview_scroll;
+    let before = app.engine.state.preview_scroll;
     input::handle_mouse(wheel(3, 8, MouseEventKind::ScrollDown), &mut app, &terminal);
-    assert!(app.preview_scroll > before);
+    assert!(app.engine.state.preview_scroll > before);
 }
 
 #[test]
@@ -184,14 +185,14 @@ fn focused_preview_horizontal_wheel_routes_to_preview_or_diff() {
     let backend = TestBackend::new(100, 24);
     let terminal = Terminal::new(backend).unwrap();
 
-    let before = app.preview_h_scroll;
+    let before = app.engine.state.preview_h_scroll;
     input::handle_mouse(
         wheel(2, 5, MouseEventKind::ScrollRight),
         &mut app,
         &terminal,
     );
     assert!(
-        app.preview_h_scroll > before,
+        app.engine.state.preview_h_scroll > before,
         "horizontal wheel must move preview_h_scroll even in former-sidebar columns"
     );
 
@@ -200,13 +201,13 @@ fn focused_preview_horizontal_wheel_routes_to_preview_or_diff() {
     app.close_focused_preview();
     app.set_active_tab(Tab::Git);
     app.enter_focused_preview();
-    let dh_before = app.diff_h_scroll;
+    let dh_before = app.engine.state.diff_h_scroll;
     input::handle_mouse(
         wheel(4, 6, MouseEventKind::ScrollRight),
         &mut app,
         &terminal,
     );
-    assert!(app.diff_h_scroll > dh_before);
+    assert!(app.engine.state.diff_h_scroll > dh_before);
 }
 
 /// The wash must reach the path's *last* cell — diff_panel pads its
@@ -226,13 +227,16 @@ fn hover_wash_reaches_last_char_of_filename() {
 
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Git);
-    app.unstaged_files.push(reef_core::git::FileEntry {
-        path: name.to_string(),
-        status: reef_core::git::FileStatus::Modified,
-        additions: 0,
-        deletions: 0,
-    });
-    app.diff_content = Some(reef::app::HighlightedDiff::new(
+    app.engine
+        .state
+        .unstaged_files
+        .push(reef_core::git::FileEntry {
+            path: name.to_string(),
+            status: reef_core::git::FileStatus::Modified,
+            additions: 0,
+            deletions: 0,
+        });
+    app.engine.state.diff_content = Some(reef_app::HighlightedDiff::new(
         reef_core::diff::DiffContent {
             path: name.to_string(),
             hunks: Vec::new(),
@@ -242,7 +246,7 @@ fn hover_wash_reaches_last_char_of_filename() {
     app.enter_focused_preview();
     // Drive picker-open so the wash uses the accent (easier to spot than
     // hover_bg) and we're sure the path is up.
-    app.focused_preview_files_open = true;
+    app.engine.state.focused_preview_files_open = true;
 
     let backend = TestBackend::new(100, 24);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -279,15 +283,18 @@ fn hovering_file_path_washes_chip_and_path_only() {
 
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Git);
-    app.unstaged_files.push(reef_core::git::FileEntry {
-        path: long_name.to_string(),
-        status: reef_core::git::FileStatus::Modified,
-        additions: 0,
-        deletions: 0,
-    });
+    app.engine
+        .state
+        .unstaged_files
+        .push(reef_core::git::FileEntry {
+            path: long_name.to_string(),
+            status: reef_core::git::FileStatus::Modified,
+            additions: 0,
+            deletions: 0,
+        });
     // Seed diff_content so `focused_preview_interactive_width` can read
     // the path (matches what diff_panel draws in the header).
-    app.diff_content = Some(reef::app::HighlightedDiff::new(
+    app.engine.state.diff_content = Some(reef_app::HighlightedDiff::new(
         reef_core::diff::DiffContent {
             path: long_name.to_string(),
             hunks: Vec::new(),
@@ -344,13 +351,16 @@ fn clicking_inside_file_path_toggles_picker() {
 
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Git);
-    app.unstaged_files.push(reef_core::git::FileEntry {
-        path: long_name.to_string(),
-        status: reef_core::git::FileStatus::Modified,
-        additions: 0,
-        deletions: 0,
-    });
-    app.diff_content = Some(reef::app::HighlightedDiff::new(
+    app.engine
+        .state
+        .unstaged_files
+        .push(reef_core::git::FileEntry {
+            path: long_name.to_string(),
+            status: reef_core::git::FileStatus::Modified,
+            additions: 0,
+            deletions: 0,
+        });
+    app.engine.state.diff_content = Some(reef_app::HighlightedDiff::new(
         reef_core::diff::DiffContent {
             path: long_name.to_string(),
             hunks: Vec::new(),
@@ -377,7 +387,7 @@ fn clicking_inside_file_path_toggles_picker() {
         modifiers: KeyModifiers::NONE,
     };
     input::handle_mouse(click, &mut app, &terminal);
-    assert!(app.focused_preview_files_open);
+    assert!(app.engine.state.focused_preview_files_open);
 }
 
 /// Clicking on the tag tail (`[unified][compact] m/f toggle`) does
@@ -395,13 +405,16 @@ fn clicking_tag_tail_does_not_toggle_picker() {
 
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Git);
-    app.unstaged_files.push(reef_core::git::FileEntry {
-        path: "a.txt".to_string(),
-        status: reef_core::git::FileStatus::Modified,
-        additions: 0,
-        deletions: 0,
-    });
-    app.diff_content = Some(reef::app::HighlightedDiff::new(
+    app.engine
+        .state
+        .unstaged_files
+        .push(reef_core::git::FileEntry {
+            path: "a.txt".to_string(),
+            status: reef_core::git::FileStatus::Modified,
+            additions: 0,
+            deletions: 0,
+        });
+    app.engine.state.diff_content = Some(reef_app::HighlightedDiff::new(
         reef_core::diff::DiffContent {
             path: "a.txt".to_string(),
             hunks: Vec::new(),
@@ -442,12 +455,15 @@ fn chip_click_in_git_focused_preview_toggles_picker_not_diff_drag() {
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Git);
     // Fake an unstaged entry so the picker can open.
-    app.unstaged_files.push(reef_core::git::FileEntry {
-        path: "a.txt".to_string(),
-        status: reef_core::git::FileStatus::Modified,
-        additions: 0,
-        deletions: 0,
-    });
+    app.engine
+        .state
+        .unstaged_files
+        .push(reef_core::git::FileEntry {
+            path: "a.txt".to_string(),
+            status: reef_core::git::FileStatus::Modified,
+            additions: 0,
+            deletions: 0,
+        });
     app.enter_focused_preview();
 
     // Render once so the chip's hit zone (and last_diff_rect) lands in
@@ -473,7 +489,7 @@ fn chip_click_in_git_focused_preview_toggles_picker_not_diff_drag() {
         "chip hit zone missing at (1,0); got {action:?}"
     );
 
-    assert!(!app.focused_preview_files_open);
+    assert!(!app.engine.state.focused_preview_files_open);
     let entries = app.focused_preview_file_entries();
     assert!(
         !entries.is_empty(),
@@ -482,7 +498,7 @@ fn chip_click_in_git_focused_preview_toggles_picker_not_diff_drag() {
 
     input::handle_mouse(click, &mut app, &terminal);
     assert!(
-        app.focused_preview_files_open,
+        app.engine.state.focused_preview_files_open,
         "click on chip must open the picker — not start a diff drag"
     );
 }
@@ -502,7 +518,7 @@ fn graph_focused_preview_picks_commit_file_via_picker() {
     app.set_active_tab(Tab::Graph);
     // Stub commit_detail.detail with two changed files so
     // `focused_preview_file_entries` returns a non-empty list.
-    app.commit_detail.detail = Some(reef_core::git::CommitDetail {
+    app.engine.state.commit_detail.detail = Some(reef_core::git::CommitDetail {
         info: reef_core::git::CommitInfo {
             oid: "deadbeef".to_string(),
             short_oid: "dead".to_string(),
@@ -539,10 +555,7 @@ fn graph_focused_preview_picks_commit_file_via_picker() {
     let entries = app.focused_preview_file_entries();
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].path, "src/app.rs");
-    assert_eq!(
-        entries[0].source,
-        reef::app::FocusedPreviewFileSource::GraphCommit
-    );
+    assert_eq!(entries[0].source, FocusedPreviewFileSource::GraphCommit);
 
     // Open picker + pick row 1 (src/input.rs).
     app.open_focused_preview_files();
@@ -550,8 +563,8 @@ fn graph_focused_preview_picks_commit_file_via_picker() {
     // Without a real backend / git repo content, the load is fire-and-
     // forget; what we *can* assert is that the picker closed and the
     // selection cursor moved to the picked index.
-    assert!(!app.focused_preview_files_open);
-    assert_eq!(app.focused_preview_files_selected, 1);
+    assert!(!app.engine.state.focused_preview_files_open);
+    assert_eq!(app.engine.state.focused_preview_files_selected, 1);
 }
 
 /// Enter inside the picker confirms — for Git tab, this means
@@ -564,7 +577,7 @@ fn picker_enter_confirm_switches_diff_target() {
 
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Git);
-    app.unstaged_files = vec![
+    app.engine.state.unstaged_files = vec![
         reef_core::git::FileEntry {
             path: "a.txt".to_string(),
             status: reef_core::git::FileStatus::Modified,
@@ -584,11 +597,13 @@ fn picker_enter_confirm_switches_diff_target() {
     // Picker open, cursor at index 0 (a.txt — sort is lexical). Press
     // ↓ then Enter — should select b.txt and close the picker.
     input::handle_key(key(KeyCode::Down), &mut app);
-    assert_eq!(app.focused_preview_files_selected, 1);
+    assert_eq!(app.engine.state.focused_preview_files_selected, 1);
     input::handle_key(key(KeyCode::Enter), &mut app);
 
-    assert!(!app.focused_preview_files_open);
+    assert!(!app.engine.state.focused_preview_files_open);
     let sel = app
+        .engine
+        .state
         .selected_file
         .as_ref()
         .expect("Enter should set selected_file");
@@ -607,7 +622,7 @@ fn picker_selection_wraps_at_boundaries() {
 
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Git);
-    app.unstaged_files = (0..3)
+    app.engine.state.unstaged_files = (0..3)
         .map(|i| reef_core::git::FileEntry {
             path: format!("f{i}.txt"),
             status: reef_core::git::FileStatus::Modified,
@@ -617,15 +632,15 @@ fn picker_selection_wraps_at_boundaries() {
         .collect();
     app.enter_focused_preview();
     app.open_focused_preview_files();
-    assert_eq!(app.focused_preview_files_selected, 0);
+    assert_eq!(app.engine.state.focused_preview_files_selected, 0);
 
     // Up from 0 → wraps to last (2).
     input::handle_key(key(KeyCode::Up), &mut app);
-    assert_eq!(app.focused_preview_files_selected, 2);
+    assert_eq!(app.engine.state.focused_preview_files_selected, 2);
 
     // Down from last → wraps to 0.
     input::handle_key(key(KeyCode::Down), &mut app);
-    assert_eq!(app.focused_preview_files_selected, 0);
+    assert_eq!(app.engine.state.focused_preview_files_selected, 0);
 }
 
 /// Graph 2-col layout deliberately doesn't show the chip: the
@@ -669,42 +684,45 @@ fn focused_preview_swallows_destructive_keys_on_git_tab() {
 
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Git);
-    app.unstaged_files.push(reef_core::git::FileEntry {
-        path: "a.txt".to_string(),
-        status: reef_core::git::FileStatus::Modified,
-        additions: 0,
-        deletions: 0,
-    });
+    app.engine
+        .state
+        .unstaged_files
+        .push(reef_core::git::FileEntry {
+            path: "a.txt".to_string(),
+            status: reef_core::git::FileStatus::Modified,
+            additions: 0,
+            deletions: 0,
+        });
     // Pretend the user has a.txt selected — the discard chord would
     // target it if we let `d` fall through.
-    app.selected_file = Some(reef::app::SelectedFile {
+    app.engine.state.selected_file = Some(reef_app::SelectedFile {
         path: "a.txt".to_string(),
         is_staged: false,
     });
     app.enter_focused_preview();
 
     // No confirm modal should be up to begin with.
-    assert!(app.confirm_modal.is_none());
+    assert!(app.engine.confirm_request().is_none());
 
     // Bare 'd' on Git tab outside FocusedPreview opens the discard
     // confirmation. Inside FocusedPreview it must be swallowed.
     input::handle_key(key(KeyCode::Char('d')), &mut app);
     assert!(
-        app.confirm_modal.is_none(),
+        app.engine.confirm_request().is_none(),
         "bare 'd' in FocusedPreview must not open the discard prompt"
     );
     assert!(
-        app.git_status.confirm_discard.is_none(),
+        app.engine.state.git_status.confirm_discard.is_none(),
         "bare 'd' must not arm the discard-changes chord either"
     );
 
     // 's' (stage) and 'u' (unstage) likewise.
-    let unstaged_before = app.unstaged_files.len();
-    let staged_before = app.staged_files.len();
+    let unstaged_before = app.engine.state.unstaged_files.len();
+    let staged_before = app.engine.state.staged_files.len();
     input::handle_key(key(KeyCode::Char('s')), &mut app);
     input::handle_key(key(KeyCode::Char('u')), &mut app);
-    assert_eq!(app.unstaged_files.len(), unstaged_before);
-    assert_eq!(app.staged_files.len(), staged_before);
+    assert_eq!(app.engine.state.unstaged_files.len(), unstaged_before);
+    assert_eq!(app.engine.state.staged_files.len(), staged_before);
 }
 
 /// Regression for Fix #5: when the same path is in both staged and
@@ -719,20 +737,26 @@ fn picker_snaps_to_unstaged_when_viewing_unstaged_diff_of_dup_path() {
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Git);
     // Same path in both lists (committed + further edited).
-    app.staged_files.push(reef_core::git::FileEntry {
-        path: "a.txt".to_string(),
-        status: reef_core::git::FileStatus::Modified,
-        additions: 0,
-        deletions: 0,
-    });
-    app.unstaged_files.push(reef_core::git::FileEntry {
-        path: "a.txt".to_string(),
-        status: reef_core::git::FileStatus::Modified,
-        additions: 0,
-        deletions: 0,
-    });
+    app.engine
+        .state
+        .staged_files
+        .push(reef_core::git::FileEntry {
+            path: "a.txt".to_string(),
+            status: reef_core::git::FileStatus::Modified,
+            additions: 0,
+            deletions: 0,
+        });
+    app.engine
+        .state
+        .unstaged_files
+        .push(reef_core::git::FileEntry {
+            path: "a.txt".to_string(),
+            status: reef_core::git::FileStatus::Modified,
+            additions: 0,
+            deletions: 0,
+        });
     // Currently viewing the UNSTAGED diff of a.txt.
-    app.selected_file = Some(reef::app::SelectedFile {
+    app.engine.state.selected_file = Some(reef_app::SelectedFile {
         path: "a.txt".to_string(),
         is_staged: false,
     });
@@ -741,11 +765,11 @@ fn picker_snaps_to_unstaged_when_viewing_unstaged_diff_of_dup_path() {
 
     let entries = app.focused_preview_file_entries();
     assert_eq!(entries.len(), 2);
-    let selected = &entries[app.focused_preview_files_selected];
+    let selected = &entries[app.engine.state.focused_preview_files_selected];
     assert_eq!(selected.path, "a.txt");
     assert_eq!(
         selected.source,
-        reef::app::FocusedPreviewFileSource::GitUnstaged,
+        FocusedPreviewFileSource::GitUnstaged,
         "picker must snap to the unstaged duplicate when viewing unstaged diff"
     );
 }
@@ -761,23 +785,23 @@ fn quick_open_keeps_v_keystroke_after_leader() {
 
     let mut app = App::new(Theme::dark(), None);
     reef::quick_open::begin(&mut app);
-    assert!(app.quick_open.core.active);
-    assert!(app.quick_open.core.filter.is_empty());
+    assert!(app.engine.state.quick_open.core.active);
+    assert!(app.engine.state.quick_open.core.filter.is_empty());
 
     // Space arms the leader (allowed because query is empty).
     input::handle_key(key(KeyCode::Char(' ')), &mut app);
-    assert!(app.quick_open.space_leader_at.is_some());
+    assert!(app.quick_open_leader_at.is_some());
 
     // 'v' is now a chord target — must NOT close the palette. The
     // leader is cleared and `v` falls through to the char-append arm.
     input::handle_key(key(KeyCode::Char('v')), &mut app);
     assert!(
-        app.quick_open.core.active,
+        app.engine.state.quick_open.core.active,
         "Space+V must not close quick_open — it's not the palette's own chord"
     );
-    assert!(app.quick_open.space_leader_at.is_none());
+    assert!(app.quick_open_leader_at.is_none());
     assert_eq!(
-        app.quick_open.core.filter, "v",
+        app.engine.state.quick_open.core.filter, "v",
         "the 'v' keystroke should land in the query buffer"
     );
 
@@ -788,12 +812,12 @@ fn quick_open_keeps_v_keystroke_after_leader() {
     // again, which it isn't (we typed 'v'). With 'v' in query, the
     // leader isn't armed by Space, so Space appends to query.
     // Reset for a clean P-toggle check:
-    app.quick_open.core.filter.clear();
-    app.quick_open.core.cursor = 0;
+    app.engine.state.quick_open.core.filter.clear();
+    app.engine.state.quick_open.core.cursor = 0;
     input::handle_key(key(KeyCode::Char(' ')), &mut app);
     input::handle_key(key(KeyCode::Char('p')), &mut app);
     assert!(
-        !app.quick_open.core.active,
+        !app.engine.state.quick_open.core.active,
         "Space+P with empty query should close quick_open"
     );
 }
@@ -809,16 +833,16 @@ fn graph_two_col_o_keypress_does_not_open_invisible_picker() {
 
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Graph);
-    // Set last_total_width below the 3-col threshold so
+    // Set the TUI layout width below the 3-col threshold so
     // graph_uses_three_col() returns false.
-    app.last_total_width = 80;
+    app.layout.last_total_width = 80;
     app.enter_focused_preview();
 
     assert!(!app.focused_preview_chip_visible());
-    assert!(!app.focused_preview_files_open);
+    assert!(!app.engine.state.focused_preview_files_open);
     input::handle_key(key(KeyCode::Char('o')), &mut app);
     assert!(
-        !app.focused_preview_files_open,
+        !app.engine.state.focused_preview_files_open,
         "'o' on Graph 2-col must not open the picker (which wouldn't render)"
     );
 }
@@ -836,19 +860,19 @@ fn picker_open_swallows_scroll_keys_so_diff_stays_put() {
     // Picker open with at least one row so it gets armed; the row list
     // comes from staged+unstaged, which is empty in this fixture, so
     // simulate it being open via the explicit setter.
-    app.focused_preview_files_open = true;
+    app.engine.state.focused_preview_files_open = true;
 
-    let before = app.diff_scroll;
+    let before = app.engine.state.diff_scroll;
     input::handle_key(key(KeyCode::Down), &mut app);
     assert_eq!(
-        app.diff_scroll, before,
+        app.engine.state.diff_scroll, before,
         "diff should not scroll while picker has the keyboard"
     );
 
     // Esc closes picker without exiting focused preview.
     input::handle_key(key(KeyCode::Esc), &mut app);
-    assert!(!app.focused_preview_files_open);
-    assert_eq!(app.view_mode, ViewMode::FocusedPreview);
+    assert!(!app.engine.state.focused_preview_files_open);
+    assert_eq!(app.engine.state.view_mode, ViewMode::FocusedPreview);
 }
 
 // ─── `/` 底部输入框 / Ctrl+F noop / Space+F / vim gg-G ──────────────────
@@ -869,7 +893,7 @@ fn focused_preview_slash_renders_prompt_at_bottom() {
     app.enter_focused_preview();
 
     input::handle_key(key(KeyCode::Char('/')), &mut app);
-    assert!(app.search.active, "`/` must arm vim search");
+    assert!(app.engine.search().active, "`/` must arm vim search");
 
     let backend = TestBackend::new(40, 10);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -894,18 +918,24 @@ fn focused_preview_ctrl_f_is_noop() {
 
     let mut app = App::new(Theme::dark(), None);
     app.enter_focused_preview();
-    let view_before = app.view_mode;
+    let view_before = app.engine.state.view_mode;
 
     input::handle_key(
         key_with(KeyCode::Char('f'), KeyModifiers::CONTROL),
         &mut app,
     );
-    assert!(!app.search.active, "Ctrl+F must not arm vim search");
     assert!(
-        !app.find_widget.active,
+        !app.engine.search().active,
+        "Ctrl+F must not arm vim search"
+    );
+    assert!(
+        !app.engine.find_widget().active,
         "Ctrl+F must not open the FindWidget"
     );
-    assert_eq!(app.view_mode, view_before, "view_mode must be unchanged");
+    assert_eq!(
+        app.engine.state.view_mode, view_before,
+        "view_mode must be unchanged"
+    );
 }
 
 #[test]
@@ -936,7 +966,7 @@ fn focused_preview_space_f_opens_find_widget() {
     );
     input::handle_key(key(KeyCode::Char('f')), &mut app);
     assert!(
-        app.find_widget.active,
+        app.engine.find_widget().active,
         "Space+F must open the FindWidget overlay"
     );
 
@@ -946,7 +976,7 @@ fn focused_preview_space_f_opens_find_widget() {
     // is true — the overlay would be invisible to the user.
     terminal.draw(|f| ui::render(f, &mut app)).unwrap();
     assert!(
-        app.find_widget.last_widget_rect.is_some(),
+        app.find_widget_ui.last_widget_rect.is_some(),
         "FindWidget overlay must paint a rect in FocusedPreview, not just \
          flip the active flag"
     );
@@ -961,14 +991,20 @@ fn gg_scrolls_files_focused_preview_to_top() {
 
     let mut app = App::new(Theme::dark(), None);
     app.enter_focused_preview();
-    app.preview_scroll = 80;
+    app.engine.state.preview_scroll = 80;
 
     input::handle_key(key(KeyCode::Char('g')), &mut app);
     assert!(app.g_pending_at.is_some(), "first `g` arms the chord");
-    assert_eq!(app.preview_scroll, 80, "first `g` must not move yet");
+    assert_eq!(
+        app.engine.state.preview_scroll, 80,
+        "first `g` must not move yet"
+    );
 
     input::handle_key(key(KeyCode::Char('g')), &mut app);
-    assert_eq!(app.preview_scroll, 0, "second `g` jumps to top");
+    assert_eq!(
+        app.engine.state.preview_scroll, 0,
+        "second `g` jumps to top"
+    );
     assert!(
         app.g_pending_at.is_none(),
         "fired chord clears the pending slot"
@@ -984,11 +1020,11 @@ fn gg_scrolls_git_diff_focused_preview_to_top() {
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Git);
     app.enter_focused_preview();
-    app.diff_scroll = 42;
+    app.engine.state.diff_scroll = 42;
 
     input::handle_key(key(KeyCode::Char('g')), &mut app);
     input::handle_key(key(KeyCode::Char('g')), &mut app);
-    assert_eq!(app.diff_scroll, 0);
+    assert_eq!(app.engine.state.diff_scroll, 0);
 }
 
 #[test]
@@ -1000,11 +1036,11 @@ fn capital_g_scrolls_files_focused_preview_to_bottom() {
 
     let mut app = App::new(Theme::dark(), None);
     app.enter_focused_preview();
-    app.preview_scroll = 5;
+    app.engine.state.preview_scroll = 5;
 
     input::handle_key(key_with(KeyCode::Char('G'), KeyModifiers::SHIFT), &mut app);
     assert_eq!(
-        app.preview_scroll,
+        app.engine.state.preview_scroll,
         usize::MAX,
         "G sets preview_scroll to the saturation sentinel; render clamps"
     );
@@ -1020,14 +1056,14 @@ fn gg_timeout_does_not_trigger() {
 
     let mut app = App::new(Theme::dark(), None);
     app.enter_focused_preview();
-    app.preview_scroll = 50;
+    app.engine.state.preview_scroll = 50;
 
     input::handle_key(key(KeyCode::Char('g')), &mut app);
     // Backdate the pending arm past the 500ms window.
     app.g_pending_at = Some(Instant::now() - Duration::from_millis(800));
     input::handle_key(key(KeyCode::Char('g')), &mut app);
     assert_eq!(
-        app.preview_scroll, 50,
+        app.engine.state.preview_scroll, 50,
         "stale `g` must not fire scroll-to-top"
     );
     assert!(
@@ -1045,18 +1081,19 @@ fn gg_suppressed_inside_slash_search() {
 
     let mut app = App::new(Theme::dark(), None);
     app.enter_focused_preview();
-    app.preview_scroll = 25;
+    app.engine.state.preview_scroll = 25;
 
     input::handle_key(key(KeyCode::Char('/')), &mut app);
-    assert!(app.search.active);
+    assert!(app.engine.search().active);
     input::handle_key(key(KeyCode::Char('g')), &mut app);
     input::handle_key(key(KeyCode::Char('g')), &mut app);
     assert_eq!(
-        app.preview_scroll, 25,
+        app.engine.state.preview_scroll, 25,
         "while `/` owns input, `gg` must feed the query instead of scrolling"
     );
     assert_eq!(
-        app.search.query, "gg",
+        app.engine.search().query,
+        "gg",
         "the two `g` keystrokes should land in the search buffer"
     );
 }
@@ -1076,22 +1113,22 @@ fn ctrl_f_in_main_mode_git_tab_does_not_toggle_diff_mode() {
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Git);
 
-    let layout_before = app.diff_layout;
-    let mode_before = app.diff_mode;
+    let layout_before = app.engine.state.diff_layout;
+    let mode_before = app.engine.state.diff_mode;
     input::handle_key(
         key_with(KeyCode::Char('f'), KeyModifiers::CONTROL),
         &mut app,
     );
     assert_eq!(
-        app.diff_layout, layout_before,
+        app.engine.state.diff_layout, layout_before,
         "Ctrl+F must not call toggle_diff_layout in Git tab"
     );
     assert_eq!(
-        app.diff_mode, mode_before,
+        app.engine.state.diff_mode, mode_before,
         "Ctrl+F must not call toggle_diff_mode in Git tab"
     );
-    assert!(!app.search.active);
-    assert!(!app.find_widget.active);
+    assert!(!app.engine.search().active);
+    assert!(!app.engine.find_widget().active);
 }
 
 #[test]
@@ -1106,18 +1143,18 @@ fn ctrl_f_in_main_mode_graph_tab_does_not_reach_commit_detail() {
     let mut app = App::new(Theme::dark(), None);
     app.set_active_tab(Tab::Graph);
 
-    let cd_mode_before = app.commit_detail.diff_mode;
-    let cd_layout_before = app.commit_detail.diff_layout;
+    let cd_mode_before = app.engine.state.commit_detail.diff_mode;
+    let cd_layout_before = app.engine.state.commit_detail.diff_layout;
     input::handle_key(
         key_with(KeyCode::Char('f'), KeyModifiers::CONTROL),
         &mut app,
     );
     assert_eq!(
-        app.commit_detail.diff_mode, cd_mode_before,
+        app.engine.state.commit_detail.diff_mode, cd_mode_before,
         "Ctrl+F must not flip commit_detail diff_mode in Graph tab"
     );
     assert_eq!(
-        app.commit_detail.diff_layout, cd_layout_before,
+        app.engine.state.commit_detail.diff_layout, cd_layout_before,
         "Ctrl+F must not flip commit_detail diff_layout in Graph tab"
     );
 }
@@ -1136,18 +1173,18 @@ fn space_f_force_focuses_diff_panel_from_file_tree() {
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new(Theme::dark(), None);
-    assert_eq!(app.active_panel, reef::app::Panel::Files);
+    assert_eq!(app.engine.state.active_panel, reef_app::AppPanel::Files);
 
     input::handle_key(key(KeyCode::Char(' ')), &mut app);
     input::handle_key(key(KeyCode::Char('f')), &mut app);
 
     assert!(
-        app.find_widget.active,
+        app.engine.find_widget().active,
         "Space+F must open the FindWidget even with file-tree focus"
     );
     assert_eq!(
-        app.active_panel,
-        reef::app::Panel::Diff,
+        app.engine.state.active_panel,
+        reef_app::AppPanel::Diff,
         "Space+F must force-focus the Diff panel before opening"
     );
 }
@@ -1178,14 +1215,20 @@ fn stale_space_leader_does_not_bypass_focused_preview_whitelist() {
     // → discard). It's NOT in the FocusedPreview whitelist, so with the
     // bypass's timeout check correctly recognising the leader as stale,
     // the whitelist swallows the keystroke as if no leader were armed.
-    let layout_before = app.diff_layout;
-    let mode_before = app.diff_mode;
-    let stage_count_before = (app.staged_files.len(), app.unstaged_files.len());
+    let layout_before = app.engine.state.diff_layout;
+    let mode_before = app.engine.state.diff_mode;
+    let stage_count_before = (
+        app.engine.state.staged_files.len(),
+        app.engine.state.unstaged_files.len(),
+    );
     input::handle_key(key(KeyCode::Char('d')), &mut app);
-    assert_eq!(app.diff_layout, layout_before);
-    assert_eq!(app.diff_mode, mode_before);
+    assert_eq!(app.engine.state.diff_layout, layout_before);
+    assert_eq!(app.engine.state.diff_mode, mode_before);
     assert_eq!(
-        (app.staged_files.len(), app.unstaged_files.len()),
+        (
+            app.engine.state.staged_files.len(),
+            app.engine.state.unstaged_files.len()
+        ),
         stage_count_before,
         "stale leader must not let `d` reach git_status_panel discard"
     );

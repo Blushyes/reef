@@ -14,287 +14,17 @@
 //! async preview arrives. See `app::PreviewHighlight` + the tick handler.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use std::collections::HashSet;
 use std::ops::Range;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-use crate::app::{App, Tab};
+use crate::TuiApp as App;
 use crate::input::DOUBLE_CLICK_WINDOW;
-use crate::input_edit;
 use crate::keymap::{Command, InputScope, Keymap};
 use crate::ui::mouse::ClickAction;
-
-/// Hard cap on result count. VSCode uses 20k but virtualises its tree; our
-/// flat TUI list becomes unhelpful long before that, so we stop scanning
-/// and surface a "refine query" hint.
-pub const MAX_RESULTS: usize = 1000;
-
-/// Per-line preview text is truncated to this many chars (at a UTF-8
-/// boundary). Matches VSCode's `previewText` limit — long enough to see
-/// context, short enough that minified bundles don't wreck the list.
-pub const MAX_LINE_CHARS: usize = 250;
-
-/// Cap on `results_h_scroll` so `End` has something concrete to jump to
-/// and `Right` doesn't drift unbounded. Equals [`MAX_LINE_CHARS`] because
-/// there's never anything to scroll past that.
-pub const MAX_H_SCROLL: usize = MAX_LINE_CHARS;
-
-/// Debounce window from the last keystroke to the kickoff of a new search.
-/// 300ms matches VSCode's default `search.searchOnTypeDebouncePeriod`.
-pub const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
-
-/// Three-state focus for the Tab::Search left panel. The middle variant
-/// (`ReplaceInput`) is only reachable when `replace_open` is true. See
-/// `GlobalSearchState::focus`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SearchPanelFocus {
-    FindInput,
-    ReplaceInput,
-    List,
-}
-
-/// One search hit flattened for the UI. `line_text` is already truncated to
-/// [`MAX_LINE_CHARS`] chars, and `byte_range` has been clipped to fall
-/// within that truncated text so renderers can slice freely.
-#[derive(Debug, Clone)]
-pub struct MatchHit {
-    pub path: PathBuf,
-    /// Workdir-relative display string, pre-computed to avoid re-stringifying
-    /// on every render.
-    pub display: String,
-    /// 0-indexed line number.
-    pub line: usize,
-    pub line_text: String,
-    pub byte_range: Range<usize>,
-}
-
-pub struct GlobalSearchState {
-    /// Shared overlay scaffolding (`active`, `query` → `core.filter`,
-    /// `cursor`, `selected` → `core.selected_idx`, `last_popup_area`).
-    /// `replace_text` / `replace_cursor` are a SECOND single-line
-    /// buffer, edited directly via `input_edit::dispatch_key` when
-    /// `focus == ReplaceInput`. PickerCore only tracks the find buffer.
-    pub core: crate::picker_core::PickerCore,
-    pub scroll: usize,
-    /// Results are sorted by path so same-file hits are adjacent in the list
-    /// (mirrors VSCode's data-layer grouping without a full tree UI).
-    pub results: Vec<MatchHit>,
-    /// True once the worker reports hitting `MAX_RESULTS`; UI surfaces
-    /// "1000+ (refine query)" in the footer.
-    pub truncated: bool,
-
-    /// Shared with the worker thread. Flipping to `true` lets an in-flight
-    /// searcher bail on the next file boundary (worker polls it every few
-    /// files). A fresh `Arc` is allocated per search so the old thread's
-    /// observation of `true` doesn't affect the new one. Kept on this
-    /// struct rather than folded into `AsyncState` because cancellation
-    /// isn't part of the one-shot AsyncState contract — AsyncState handles
-    /// the generation/loading half, this handles cooperative abort.
-    pub cancel: Arc<AtomicBool>,
-    /// Timestamp of the most recent edit to `query`. `None` means "no
-    /// pending search" — set by edit helpers, cleared when `tick()` fires
-    /// the next search.
-    pub last_keystroke_at: Option<Instant>,
-    /// Query that actually ran (or is running). Tick compares against
-    /// `query` to avoid re-firing a search for an unchanged input.
-    pub last_searched_query: String,
-
-    pub last_view_h: u16,
-
-    /// Palette-side Space-leader slot. Re-uses `input::leader_decision` so
-    /// Space-F inside the palette (when `query` is empty) closes it, same
-    /// pattern as `quick_open::space_leader_at`. Only armed while the query
-    /// is empty so "foo" containing a space works as a literal char.
-    pub space_leader_at: Option<Instant>,
-
-    /// Where keyboard input lands inside the persistent Tab::Search view.
-    /// Three states because replace mode adds a second input row:
-    ///
-    /// - `FindInput` — typing edits `query` (search pattern).
-    /// - `ReplaceInput` — typing edits `replace_text`. Only reachable
-    ///   when `replace_open` is true.
-    /// - `List` — typing is dispatched to per-tab list-mode shortcuts
-    ///   (`↑↓`, `Enter`, `Space` to toggle a checkbox in replace mode,
-    ///   etc.). Bare chars become tab-cycle / search-step shortcuts via
-    ///   the global handler in `input.rs`.
-    ///
-    /// Transitions: `/` or `i` in list mode → `FindInput`; `Esc` in input
-    /// mode → `List`; `Tab` in input mode cycles
-    /// `FindInput → ReplaceInput → List → FindInput` (skipping
-    /// `ReplaceInput` when `replace_open` is false); overlay pin
-    /// (Alt/Ctrl+Enter) → `FindInput`. Preserved across tab-switches so
-    /// bouncing out to Files and back keeps you where you were.
-    ///
-    /// Unused by the overlay — the overlay is always implicitly focused
-    /// on its single input row (= `FindInput`-like behaviour).
-    pub focus: SearchPanelFocus,
-
-    /// VSCode-style "Replace in Files" toggle. When false, Tab::Search
-    /// behaves exactly as before (single input, no checkboxes). When
-    /// true, a second `replace_text` input row appears below the find
-    /// input, each result row gets a checkbox, and `Ctrl/Alt+Enter`
-    /// commits the replace via `FilesTask::ReplaceInFiles`. Toggled by
-    /// the chevron click, the Space+H leader chord, or bare `r` in
-    /// list mode.
-    pub replace_open: bool,
-    /// Replacement string. Empty allowed (= delete the matched span).
-    pub replace_text: String,
-    /// Byte offset of the caret in `replace_text`. Always on a char
-    /// boundary; same invariant as `cursor` for `query`.
-    pub replace_cursor: usize,
-    /// Per-match opt-out set, keyed by `(path, line)`. A `(p, l)` pair
-    /// in this set means "do NOT replace this hit when Apply runs."
-    /// Default behaviour is to include every streamed match — toggling
-    /// a checkbox off inserts here; toggling back on removes. Cleared
-    /// only on user-initiated `mark_query_edited` (a fresh search), so
-    /// fs-watcher-driven re-runs preserve the user's per-row choices.
-    pub excluded: HashSet<(PathBuf, usize)>,
-    /// `Some((files_done, files_total))` while a replace batch is in
-    /// flight, fed by `WorkerResult::ReplaceProgress` events. Footer
-    /// renders this as `Replacing N/M…`. `None` between batches.
-    ///
-    /// In-flight state itself lives on `App.replace_load: AsyncState`
-    /// (the same generation gate every other async path uses); the
-    /// footer reads `app.replace_load.loading`. Keep the progress
-    /// counter here because it's UI presentation state and the
-    /// `AsyncState` contract doesn't carry payloads.
-    pub replace_progress: Option<(usize, usize)>,
-
-    /// Uniform horizontal scroll offset applied to every result row's
-    /// line-text column. When `0`, the renderer falls back to the
-    /// per-row smart shift (match stays in view); any non-zero value
-    /// disables smart mode and all rows are rendered from this column,
-    /// so the user's scroll is predictable across the list.
-    ///
-    /// Reset to 0 on query change (alongside `selected` / `scroll`) so
-    /// fresh results land in smart-view rather than some stale offset.
-    pub results_h_scroll: usize,
-
-    /// When `Some(t)`, a preview-sync is pending and should fire at time
-    /// `t`. Written by `schedule_preview_sync` (called from keyboard nav
-    /// handlers) and drained by `App::tick`. Debounces the
-    /// `load_preview_for_path` calls so holding ↓ across 50 rows doesn't
-    /// pile up 50 supersedable jobs on the preview worker thread.
-    ///
-    /// Explicit actions (click, overlay pin, chunk-arrival sync) skip the
-    /// debounce and call `navigate_to_selected` directly — those are
-    /// user-initiated commits, not incremental browsing.
-    pub preview_sync_at: Option<Instant>,
-}
-
-impl Default for GlobalSearchState {
-    fn default() -> Self {
-        Self {
-            core: crate::picker_core::PickerCore::default(),
-            scroll: 0,
-            results: Vec::new(),
-            truncated: false,
-            cancel: Arc::new(AtomicBool::new(false)),
-            last_keystroke_at: None,
-            last_searched_query: String::new(),
-            last_view_h: 0,
-            space_leader_at: None,
-            focus: SearchPanelFocus::List,
-            replace_open: false,
-            replace_text: String::new(),
-            replace_cursor: 0,
-            excluded: HashSet::new(),
-            replace_progress: None,
-            results_h_scroll: 0,
-            preview_sync_at: None,
-        }
-    }
-}
-
-impl GlobalSearchState {
-    /// True iff focus is on either input row. The Tab::Search input
-    /// gating in `input.rs` and the empty-state hint logic in the panel
-    /// renderer key off this — neither cares which of the two inputs
-    /// has focus.
-    pub fn input_focused(&self) -> bool {
-        matches!(
-            self.focus,
-            SearchPanelFocus::FindInput | SearchPanelFocus::ReplaceInput
-        )
-    }
-
-    /// `true` iff the streamed match at `idx` is currently included in
-    /// the replace batch. New matches default to included; the user
-    /// flips them off via the checkbox. Out-of-range indices answer
-    /// `false` defensively (avoids a panic if the results vector
-    /// shrinks under us between render and apply).
-    pub fn is_match_included(&self, idx: usize) -> bool {
-        let Some(hit) = self.results.get(idx) else {
-            return false;
-        };
-        !self.excluded.contains(&(hit.path.clone(), hit.line))
-    }
-
-    /// Toggle inclusion of the match at `idx`. No-op for out-of-range
-    /// indices.
-    pub fn toggle_match_excluded(&mut self, idx: usize) {
-        let Some(hit) = self.results.get(idx).cloned() else {
-            return;
-        };
-        let key = (hit.path.clone(), hit.line);
-        if !self.excluded.remove(&key) {
-            self.excluded.insert(key);
-        }
-    }
-
-    /// Number of currently-included matches (= results.len() minus
-    /// `excluded` entries that still match a current hit). Used by the
-    /// footer's "N to replace" counter and by the apply gate.
-    ///
-    /// Single-pass over `results` with `O(1)` hash probes into
-    /// `excluded`; stale exclusions (entries whose key has no current
-    /// hit) contribute zero to the count automatically. Beats the
-    /// naive `excluded.iter().filter(any-match-in-results)` which is
-    /// `O(results × excluded)` per render.
-    pub fn included_count(&self) -> usize {
-        if self.excluded.is_empty() {
-            return self.results.len();
-        }
-        self.results
-            .iter()
-            .filter(|h| !self.excluded.contains(&(h.path.clone(), h.line)))
-            .count()
-    }
-
-    /// Cycle keyboard focus forward: `FindInput → ReplaceInput → List →
-    /// FindInput`. Skips `ReplaceInput` when `replace_open` is false so
-    /// the cycle still works in plain search mode. Bound to bare `Tab`
-    /// inside Tab::Search input modes; the global Ctrl+Tab tab-cycle
-    /// handler runs earlier so this never overrides it.
-    pub fn cycle_focus_forward(&mut self) {
-        self.focus = match (self.focus, self.replace_open) {
-            (SearchPanelFocus::FindInput, true) => SearchPanelFocus::ReplaceInput,
-            (SearchPanelFocus::FindInput, false) => SearchPanelFocus::List,
-            (SearchPanelFocus::ReplaceInput, _) => SearchPanelFocus::List,
-            (SearchPanelFocus::List, _) => SearchPanelFocus::FindInput,
-        };
-    }
-
-    /// Reverse of `cycle_focus_forward`. Bound to BackTab.
-    pub fn cycle_focus_backward(&mut self) {
-        self.focus = match (self.focus, self.replace_open) {
-            (SearchPanelFocus::FindInput, true) => SearchPanelFocus::List,
-            (SearchPanelFocus::FindInput, false) => SearchPanelFocus::List,
-            (SearchPanelFocus::ReplaceInput, _) => SearchPanelFocus::FindInput,
-            (SearchPanelFocus::List, true) => SearchPanelFocus::ReplaceInput,
-            (SearchPanelFocus::List, false) => SearchPanelFocus::FindInput,
-        };
-    }
-}
-
-/// Milliseconds to wait after a keyboard nav action before actually loading
-/// the preview. Short enough to feel responsive, long enough that holding
-/// an arrow key doesn't spam the preview worker with 30+ superseded jobs
-/// per second.
-pub const PREVIEW_SYNC_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(100);
+use reef_app::AppCommand;
+use reef_app::GLOBAL_SEARCH_MAX_LINE_CHARS as MAX_LINE_CHARS;
+#[cfg(test)]
+use reef_app::{GlobalSearchState, MatchHit, SearchPanelFocus};
 
 // ─── Entry points ────────────────────────────────────────────────────────────
 
@@ -304,20 +34,10 @@ pub const PREVIEW_SYNC_DEBOUNCE: std::time::Duration = std::time::Duration::from
 /// shortcut. Otherwise keeps the existing `query`/`results` so Esc-peek-
 /// and-return doesn't lose state.
 pub fn begin(app: &mut App) {
-    if let Some(seed) = current_text_selection(app)
-        && seed != app.global_search.core.filter
-    {
-        // Skip the rerun + excluded-clear when the seed equals the
-        // existing query: the user might have ticked off hits in
-        // replace mode and we don't want a no-op chord to wipe that.
-        app.global_search.core.filter = seed;
-        mark_query_edited(&mut app.global_search);
-    }
-    app.global_search.core.cursor = app.global_search.core.filter.len();
-    app.global_search.core.active = true;
-    // Fresh leader slot — a stale timestamp from a prior session would make
-    // the first Space-after-open surprisingly close the palette.
-    app.global_search.space_leader_at = None;
+    app.global_search_leader_at = None;
+    app.engine.dispatch(AppCommand::OpenGlobalSearch {
+        seed: current_text_selection(app),
+    });
 }
 
 /// Snapshot the user's current text selection as a one-line search seed.
@@ -337,9 +57,10 @@ pub fn begin(app: &mut App) {
 /// (`Space+F` in-panel find, `Space+Shift+F` global search) interpret
 /// the selection identically.
 pub(crate) fn current_text_selection(app: &App) -> Option<String> {
-    if let (Some(sel), Some(preview)) =
-        (app.preview_selection.as_ref(), app.preview_content.as_ref())
-        && !sel.is_empty()
+    if let (Some(sel), Some(preview)) = (
+        app.preview_selection.as_ref(),
+        app.engine.preview_content_ref(),
+    ) && !sel.is_empty()
         && preview.is_text()
     {
         let rows = preview.body.display_text_rows();
@@ -373,67 +94,36 @@ pub(crate) fn first_nonempty_trimmed_line(s: &str) -> Option<String> {
 /// Bracketed-paste arrival while the Space+F overlay is active. Strips
 /// newlines and re-runs the search. Called from `input::handle_paste`
 /// after the drop-path parser has declined the payload.
-pub fn handle_paste_overlay(s: &str, state: &mut GlobalSearchState) {
-    if input_edit::paste_single_line(s, &mut state.core.filter, &mut state.core.cursor) {
-        mark_query_edited(state);
-    }
+pub fn handle_paste_overlay(s: &str, app: &mut App) {
+    app.engine.dispatch(AppCommand::PasteGlobalSearchOverlay {
+        text: s.to_string(),
+        now: Instant::now(),
+    });
 }
 
 /// Bracketed-paste arrival while a Tab::Search input row is focused.
 /// Routes to `query` (FindInput) or `replace_text` (ReplaceInput) based
 /// on `focus`; List focus is a no-op (no text input to receive the
 /// payload).
-pub fn handle_paste_search_tab(s: &str, state: &mut GlobalSearchState) {
-    match state.focus {
-        SearchPanelFocus::FindInput => {
-            if input_edit::paste_single_line(s, &mut state.core.filter, &mut state.core.cursor) {
-                mark_query_edited(state);
-            }
-        }
-        SearchPanelFocus::ReplaceInput => {
-            input_edit::paste_single_line(s, &mut state.replace_text, &mut state.replace_cursor);
-        }
-        SearchPanelFocus::List => {}
-    }
+pub fn handle_paste_search_tab(s: &str, app: &mut App) {
+    app.engine.dispatch(AppCommand::PasteGlobalSearchTab {
+        text: s.to_string(),
+        now: Instant::now(),
+    });
 }
 
 /// Commit the selected hit: close the palette, switch to the Files tab,
 /// reveal the path, and stash a `PreviewHighlight` so the file preview
 /// panel highlights the matching row once it loads async.
 pub fn accept(app: &mut App) {
-    let Some(hit) = app
-        .global_search
-        .results
-        .get(app.global_search.core.selected_idx)
-        .cloned()
-    else {
-        app.global_search.core.active = false;
+    let Some(hit) = app.engine.selected_global_search_hit() else {
+        app.engine.dispatch(AppCommand::CloseGlobalSearch);
         return;
     };
 
-    // Defense-in-depth: the worker's snapshot may have disappeared by now.
-    // Just drop the missing entry and leave the palette open — the user can
-    // re-search.
-    let full = app.file_tree.root.join(&hit.path);
-    if !full.exists() {
-        let root = app.file_tree.root.clone();
-        app.global_search
-            .results
-            .retain(|h| root.join(&h.path).exists());
-        let len = app.global_search.results.len();
-        if app.global_search.core.selected_idx >= len {
-            app.global_search.core.selected_idx = len.saturating_sub(1);
-        }
-        return;
-    }
-
     app.push_location_before_jump();
-    app.global_search.core.active = false;
-    app.set_active_tab(Tab::Files);
-    app.file_tree.reveal(&hit.path);
-    app.refresh_file_tree_with_target(Some(hit.path.clone()));
-    app.set_preview_highlight_persistent(hit.path.clone(), hit.line, hit.byte_range.clone());
-    app.load_preview_for_path(hit.path);
+    app.engine.dispatch(AppCommand::AcceptGlobalSearchHit(hit));
+    app.drain_engine_runtime_events();
 }
 
 /// Dispatch one key while the palette is active. The caller (input.rs)
@@ -446,13 +136,13 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // empty query so a literal space in the search string is allowed.
     match crate::input::leader_decision(
         &key,
-        /* allow_arm */ app.global_search.core.filter.is_empty(),
-        app.global_search.space_leader_at,
+        /* allow_arm */ app.engine.global_search_query_is_empty(),
+        app.global_search_leader_at,
         Instant::now(),
         crate::input::LEADER_TIMEOUT,
     ) {
         crate::input::LeaderVerdict::Arm => {
-            app.global_search.space_leader_at = Some(Instant::now());
+            app.global_search_leader_at = Some(Instant::now());
             return;
         }
         crate::input::LeaderVerdict::Fire => {
@@ -461,15 +151,15 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             // a stray Space + chord-letter inside an empty query, and
             // the right thing is to let the literal char fall through
             // to the input-append arm rather than silently swallow it.
-            app.global_search.space_leader_at = None;
+            app.global_search_leader_at = None;
             if key.code == KeyCode::Char('F') && !ctrl && !alt {
-                app.global_search.core.active = false;
+                app.engine.dispatch(AppCommand::CloseGlobalSearch);
                 return;
             }
             // Fall through — non-Shift-F chord lands in the input handler.
         }
         crate::input::LeaderVerdict::Consume => {
-            app.global_search.space_leader_at = None;
+            app.global_search_leader_at = None;
             // Fall through — current key still runs below.
         }
         crate::input::LeaderVerdict::None => {}
@@ -478,59 +168,46 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // Palette-specific shortcuts that must precede PickerCore:
     // - Alt/Ctrl+Enter pins to Tab::Search (otherwise PickerCore would
     //   treat it as a plain Confirm)
-    // - PageUp/PageDown depend on `last_view_h` which PickerCore
+    // - PageUp/PageDown depend on the rendered list height which PickerCore
     //   doesn't see
     let mapped = Keymap::resolve(InputScope::GlobalSearch, &key);
     match mapped {
         Some(Command::PinGlobalSearch) => {
             app.push_location_before_jump();
-            app.global_search.core.active = false;
-            app.global_search.focus = SearchPanelFocus::FindInput;
-            app.set_active_tab(Tab::Search);
+            app.engine.dispatch(AppCommand::PinGlobalSearchToTab);
+            app.drain_engine_runtime_events();
             navigate_to_selected(app);
             return;
         }
         Some(Command::PageUp | Command::PageDown) => {
-            let step = app.global_search.last_view_h.max(1) as i32;
+            let step = app.layout.global_search_last_view_h.max(1) as i32;
             let signed = if mapped == Some(Command::PageUp) {
                 -step
             } else {
                 step
             };
-            move_selection(&mut app.global_search, signed);
+            app.engine.dispatch(AppCommand::MoveGlobalSearchSelection {
+                delta: signed,
+                visible_rows: app.layout.global_search_last_view_h as usize,
+            });
             return;
         }
         _ => {}
     }
 
-    use crate::picker_core::InputOutcome;
-    let visible = app.global_search.results.len();
-    match app
-        .global_search
-        .core
-        .dispatch_key(InputScope::GlobalSearch, &key, visible)
-    {
-        InputOutcome::Cancel => app.global_search.core.active = false,
-        InputOutcome::Quit => {
-            app.global_search.core.active = false;
-            app.should_quit = true;
-        }
-        InputOutcome::Confirm => accept(app),
-        InputOutcome::Edited => mark_query_edited(&mut app.global_search),
-        // Rejected only fires once PickerCore is wired to a filtered
-        // dispatcher (today unreachable). When that lands, decide
-        // whether a rejected char should also re-run the search;
-        // currently the buffer didn't change so the answer is no.
-        InputOutcome::Rejected
-        | InputOutcome::SelectionMoved
-        | InputOutcome::CursorMoved
-        | InputOutcome::Unhandled => {}
-    }
+    let input = crate::picker_core::input_for_key(InputScope::GlobalSearch, &key);
+    app.engine
+        .dispatch(AppCommand::ApplyGlobalSearchPickerInput {
+            input,
+            now: Instant::now(),
+            visible_rows: app.layout.global_search_last_view_h as usize,
+        });
+    app.drain_engine_runtime_events();
 }
 
 /// Dispatch one mouse event while the palette is active.
 pub fn handle_mouse(mouse: MouseEvent, app: &mut App) {
-    let popup = match app.global_search.core.last_popup_area {
+    let popup = match app.global_search_popup_area {
         Some(r) => r,
         None => return,
     };
@@ -542,7 +219,8 @@ pub fn handle_mouse(mouse: MouseEvent, app: &mut App) {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if !inside {
-                app.global_search.core.active = false;
+                app.global_search_leader_at = None;
+                app.engine.dispatch(AppCommand::CloseGlobalSearch);
                 app.last_click = None;
                 return;
             }
@@ -559,7 +237,10 @@ pub fn handle_mouse(mouse: MouseEvent, app: &mut App) {
             if let Some(ClickAction::GlobalSearchSelect(idx)) =
                 app.hit_registry.hit_test(mouse.column, mouse.row)
             {
-                app.global_search.core.selected_idx = idx;
+                app.engine.dispatch(AppCommand::SelectGlobalSearchResult {
+                    idx,
+                    visible_rows: app.layout.global_search_last_view_h as usize,
+                });
                 if is_double {
                     accept(app);
                     app.last_click = None;
@@ -574,39 +255,24 @@ pub fn handle_mouse(mouse: MouseEvent, app: &mut App) {
             };
         }
         MouseEventKind::ScrollUp if inside => {
-            move_selection(&mut app.global_search, -3);
+            app.engine.dispatch(AppCommand::MoveGlobalSearchSelection {
+                delta: -3,
+                visible_rows: app.layout.global_search_last_view_h as usize,
+            });
         }
         MouseEventKind::ScrollDown if inside => {
-            move_selection(&mut app.global_search, 3);
+            app.engine.dispatch(AppCommand::MoveGlobalSearchSelection {
+                delta: 3,
+                visible_rows: app.layout.global_search_last_view_h as usize,
+            });
         }
         _ => {}
     }
 }
 
-/// Stamp `last_keystroke_at` so the `App::tick` debounce trips and kicks off
-/// a new search for the updated query. Called on every edit (insert, delete,
-/// clear, delete-word). `pub(crate)` so both the overlay handler and the
-/// Tab::Search input handler in `input.rs` drive the same signal.
-///
-/// Also clears the per-match `excluded` set: a fresh query produces a
-/// fresh result list, and any `(path, line)` pair the user previously
-/// opted out of has no semantic carry-over to the new search. Without
-/// this, a stale exclusion on a coincidentally-reused `(path, line)` key
-/// would silently skip a match the user expects to replace.
-pub(crate) fn mark_query_edited(state: &mut GlobalSearchState) {
-    state.last_keystroke_at = Some(Instant::now());
-    state.excluded.clear();
-}
-
+#[cfg(test)]
 fn move_selection(state: &mut GlobalSearchState, delta: i32) {
-    if state.results.is_empty() {
-        state.core.selected_idx = 0;
-        return;
-    }
-    let last = state.results.len() - 1;
-    let cur = state.core.selected_idx as i32;
-    let next = (cur + delta).clamp(0, last as i32) as usize;
-    state.core.selected_idx = next;
+    reef_app::move_global_search_selection(state, delta);
 }
 
 /// Public wrapper around `move_selection` for call sites outside the
@@ -618,7 +284,10 @@ fn move_selection(state: &mut GlobalSearchState, delta: i32) {
 /// Click handlers and chunk-arrival syncs skip the debounce and call
 /// `navigate_to_selected` directly for immediate feedback.
 pub fn move_selection_by(app: &mut App, delta: i32) {
-    move_selection(&mut app.global_search, delta);
+    app.engine.dispatch(AppCommand::MoveGlobalSearchSelection {
+        delta,
+        visible_rows: app.layout.global_search_last_view_h as usize,
+    });
     schedule_preview_sync(app);
 }
 
@@ -626,7 +295,10 @@ pub fn move_selection_by(app: &mut App, delta: i32) {
 /// `navigate_to_selected` once `PREVIEW_SYNC_DEBOUNCE` has elapsed. Each
 /// call pushes the deadline forward, so the last nav in a burst wins.
 pub fn schedule_preview_sync(app: &mut App) {
-    app.global_search.preview_sync_at = Some(Instant::now() + PREVIEW_SYNC_DEBOUNCE);
+    app.engine
+        .dispatch(AppCommand::ScheduleGlobalSearchPreviewSync {
+            now: Instant::now(),
+        });
 }
 
 /// Force the next tick to re-run the current query — used by the `r`
@@ -635,11 +307,12 @@ pub fn schedule_preview_sync(app: &mut App) {
 /// debounce gate fires. Does nothing when the query is empty (there's
 /// nothing to reload).
 pub fn reload(app: &mut App) {
-    if app.global_search.core.filter.is_empty() {
+    if app.engine.global_search_query_is_empty() {
         return;
     }
-    app.global_search.last_searched_query.clear();
-    app.global_search.last_keystroke_at = Some(Instant::now());
+    app.engine.dispatch(AppCommand::ReloadGlobalSearch {
+        now: Instant::now(),
+    });
 }
 
 /// Sync `preview_highlight` + kick off a preview load for the currently
@@ -652,17 +325,8 @@ pub fn reload(app: &mut App) {
 /// Supersedes any pending debounced sync (`preview_sync_at`): an immediate
 /// nav is definitionally fresher than a scheduled one.
 pub fn navigate_to_selected(app: &mut App) {
-    app.global_search.preview_sync_at = None;
-    let Some(hit) = app
-        .global_search
-        .results
-        .get(app.global_search.core.selected_idx)
-        .cloned()
-    else {
-        return;
-    };
-    app.set_preview_highlight_persistent(hit.path.clone(), hit.line, hit.byte_range.clone());
-    app.load_preview_for_path(hit.path);
+    app.engine
+        .dispatch(AppCommand::SyncGlobalSearchPreviewToSelected);
 }
 
 // ─── Line-text truncation helpers ────────────────────────────────────────────
@@ -686,6 +350,7 @@ pub fn clip_range(range: Range<usize>, max_end: usize) -> Option<Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn truncate_line_returns_input_when_short() {
@@ -805,7 +470,7 @@ mod tests {
         };
         s.toggle_match_excluded(0);
         assert!(!s.excluded.is_empty());
-        mark_query_edited(&mut s);
+        reef_app::mark_global_search_query_edited_at(&mut s, Instant::now());
         assert!(
             s.excluded.is_empty(),
             "edit-driven query change must reset per-match opt-outs"
@@ -834,9 +499,9 @@ mod tests {
         // want move_selection to snap it back to 0 when there's nothing in
         // the list.
         let mut s = GlobalSearchState {
-            core: crate::picker_core::PickerCore {
+            core: reef_app::PickerState {
                 selected_idx: 5,
-                ..crate::picker_core::PickerCore::default()
+                ..reef_app::PickerState::default()
             },
             ..GlobalSearchState::default()
         };
@@ -879,105 +544,5 @@ mod tests {
             first_nonempty_trimmed_line("    fn foo()   "),
             Some("fn foo()".to_string()),
         );
-    }
-
-    // ── handle_paste_overlay ────────────────────────────────────────────
-
-    #[test]
-    fn handle_paste_overlay_inserts_and_marks_edited() {
-        let mut state = GlobalSearchState::default();
-        assert!(state.last_keystroke_at.is_none());
-        handle_paste_overlay("hello", &mut state);
-        assert_eq!(state.core.filter, "hello");
-        assert_eq!(state.core.cursor, 5);
-        assert!(
-            state.last_keystroke_at.is_some(),
-            "non-empty paste must arm the search-rerun debounce",
-        );
-    }
-
-    #[test]
-    fn handle_paste_overlay_pure_newlines_do_not_trigger_rerun() {
-        let mut state = GlobalSearchState::default();
-        handle_paste_overlay("\n\r\n", &mut state);
-        assert_eq!(state.core.filter, "");
-        assert!(
-            state.last_keystroke_at.is_none(),
-            "all-newline paste inserts nothing → search rerun must NOT fire",
-        );
-    }
-
-    #[test]
-    fn handle_paste_overlay_does_not_clear_unrelated_state() {
-        // Regression guard: the rerun debounce is the only side-effect
-        // the overlay paste should have. `selected` and `replace_text`
-        // must survive untouched.
-        let mut state = GlobalSearchState {
-            results: vec![dummy_hit("a"), dummy_hit("b"), dummy_hit("c")],
-            core: crate::picker_core::PickerCore {
-                selected_idx: 2,
-                ..crate::picker_core::PickerCore::default()
-            },
-            replace_text: "kept".to_string(),
-            replace_cursor: 4,
-            ..GlobalSearchState::default()
-        };
-        handle_paste_overlay("foo", &mut state);
-        assert_eq!(state.core.selected_idx, 2);
-        assert_eq!(state.replace_text, "kept");
-        assert_eq!(state.replace_cursor, 4);
-    }
-
-    // ── handle_paste_search_tab ─────────────────────────────────────────
-
-    #[test]
-    fn handle_paste_search_tab_routes_find_input_to_query() {
-        let mut state = GlobalSearchState {
-            focus: SearchPanelFocus::FindInput,
-            ..GlobalSearchState::default()
-        };
-        handle_paste_search_tab("abc", &mut state);
-        assert_eq!(state.core.filter, "abc");
-        assert_eq!(state.core.cursor, 3);
-        assert!(state.last_keystroke_at.is_some());
-        assert_eq!(state.replace_text, "");
-    }
-
-    #[test]
-    fn handle_paste_search_tab_routes_replace_input_to_replace_text() {
-        let mut state = GlobalSearchState {
-            focus: SearchPanelFocus::ReplaceInput,
-            replace_open: true,
-            ..GlobalSearchState::default()
-        };
-        handle_paste_search_tab("xyz", &mut state);
-        assert_eq!(state.replace_text, "xyz");
-        assert_eq!(state.replace_cursor, 3);
-        assert_eq!(state.core.filter, "");
-        assert!(
-            state.last_keystroke_at.is_none(),
-            "replace-input edits never re-run the search",
-        );
-    }
-
-    #[test]
-    fn handle_paste_search_tab_list_focus_is_noop() {
-        // List focus = no text input is selected → bracketed paste has
-        // nowhere to land. Must not silently leak into either field.
-        let mut state = GlobalSearchState {
-            focus: SearchPanelFocus::List,
-            core: crate::picker_core::PickerCore {
-                filter: "kept-query".to_string(),
-                cursor: 10,
-                ..crate::picker_core::PickerCore::default()
-            },
-            replace_text: "kept-replace".to_string(),
-            replace_cursor: 12,
-            ..GlobalSearchState::default()
-        };
-        handle_paste_search_tab("LEAK", &mut state);
-        assert_eq!(state.core.filter, "kept-query");
-        assert_eq!(state.replace_text, "kept-replace");
-        assert!(state.last_keystroke_at.is_none());
     }
 }

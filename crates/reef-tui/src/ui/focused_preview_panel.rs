@@ -14,7 +14,7 @@
 //! - When the picker is open, a 36×N popup hangs under the chip with
 //!   the changed-files list; row clicks dispatch `PickFocusedPreviewFile`.
 
-use crate::app::{App, Tab};
+use crate::TuiApp as App;
 use crate::i18n::{Msg, t};
 use crate::ui::mouse::ClickAction;
 use crate::ui::text::truncate_to_width;
@@ -23,6 +23,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use reef_app::AppTab as Tab;
 use unicode_width::UnicodeWidthStr;
 
 /// Width of the ☰ chip in the upper-left of the focused-preview body.
@@ -35,18 +36,18 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     if area.height == 0 {
         return;
     }
-    app.last_total_width = area.width;
+    app.layout.last_total_width = area.width;
 
     let body_h = area.height.saturating_sub(1);
     let body = Rect::new(area.x, area.y, area.width, body_h);
     let hint_row = Rect::new(area.x, area.y + body_h, area.width, 1);
 
-    match app.active_tab {
+    match app.engine.active_tab() {
         Tab::Files | Tab::Search => {
             preview::render(f, app, body, true);
         }
         Tab::Git => {
-            if app.backend.has_repo() {
+            if app.engine.backend_has_repo() {
                 diff_panel::render(f, app, body);
             } else {
                 super::render_no_repo(f, app, body);
@@ -74,7 +75,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     // fallthrough (hit_test scans in reverse — later-registered =
     // higher z-order).
     if app.focused_preview_chip_visible() {
-        if app.focused_preview_files_open {
+        if app.engine.focused_preview_files_open() {
             render_picker(f, app, body);
         }
         render_chip(f, app, body);
@@ -93,7 +94,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     // return. Without this hop, Ctrl+click / `gd` in focused mode
     // would set `nav_candidates` but the popup would never paint —
     // the user sees "no reaction". Render over the full takeover area.
-    if app.nav_candidates.is_some() {
+    if app.engine.nav_candidates_active() {
         super::nav_candidates_popup::render(f, app, area);
     }
 
@@ -102,9 +103,9 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     // capture keystrokes against an invisible input. Mirror the same
     // priority order `render_status_bar` uses (active prompt → dormant
     // counter → hint) so the bottom row stays meaningful in every state.
-    if app.search.active {
+    if app.engine.search().active {
         super::render_search_prompt(f, app, hint_row);
-    } else if !app.search.matches.is_empty() {
+    } else if !app.engine.search().matches.is_empty() {
         super::render_search_dormant(f, app, hint_row);
     } else {
         render_hint(f, app, hint_row);
@@ -132,10 +133,10 @@ fn render_chip(f: &mut Frame, app: &mut App, body: Rect) {
     // wrote the path text into the buffer, so we patch its background
     // via `buffer_mut().set_style` (keeps glyphs + foreground intact)
     // rather than re-rendering a Line over it.
-    if is_hovered && !app.focused_preview_files_open {
+    if is_hovered && !app.engine.focused_preview_files_open() {
         let wash = Style::default().bg(th.hover_bg);
         f.buffer_mut().set_style(row_rect, wash);
-    } else if app.focused_preview_files_open {
+    } else if app.engine.focused_preview_files_open() {
         // Picker-open state: mirror the chip's inverted look across
         // the file-path span so the "active" surface is visually
         // continuous with the chip itself.
@@ -143,7 +144,7 @@ fn render_chip(f: &mut Frame, app: &mut App, body: Rect) {
         f.buffer_mut().set_style(row_rect, wash);
     }
 
-    let style = if app.focused_preview_files_open {
+    let style = if app.engine.focused_preview_files_open() {
         Style::default()
             .fg(th.chrome_bg)
             .bg(th.accent)
@@ -186,10 +187,11 @@ fn render_chip(f: &mut Frame, app: &mut App, body: Rect) {
 /// character of the filename reads as un-highlighted.
 fn interactive_width(app: &App, body_w: u16) -> u16 {
     let chip_w = UnicodeWidthStr::width(FOCUSED_PREVIEW_CHIP) as u16;
-    let path: Option<&str> = match app.active_tab {
-        Tab::Git => app.diff_content.as_ref().map(|d| d.diff.path.as_str()),
+    let path: Option<&str> = match app.engine.active_tab() {
+        Tab::Git => app.engine.diff_content().map(|d| d.diff.path.as_str()),
         Tab::Graph => app
-            .commit_detail
+            .engine
+            .commit_detail()
             .file_diff
             .as_ref()
             .map(|d| d.path.as_str()),
@@ -199,20 +201,23 @@ fn interactive_width(app: &App, body_w: u16) -> u16 {
         return chip_w.min(body_w);
     };
     // Mirror diff_panel's header tag exactly: Git tab uses the top-level
-    // `app.diff_layout/diff_mode`, Graph tab uses `commit_detail`'s
+    // `app.engine.diff_layout()/diff_mode`, Graph tab uses `commit_detail`'s
     // independent pair. Mismatched math leaves the wash a few cells
     // short of (or past) the path's actual end.
-    let (layout, mode) = match app.active_tab {
-        Tab::Graph => (app.commit_detail.diff_layout, app.commit_detail.diff_mode),
-        _ => (app.diff_layout, app.diff_mode),
+    let (layout, mode) = match app.engine.active_tab() {
+        Tab::Graph => (
+            app.engine.commit_detail().diff_layout,
+            app.engine.commit_detail().diff_mode,
+        ),
+        _ => (app.engine.diff_layout(), app.engine.diff_mode()),
     };
     let layout_label = match layout {
         reef_core::diff::DiffLayout::Unified => t(Msg::LayoutUnified),
         reef_core::diff::DiffLayout::SideBySide => t(Msg::LayoutSideBySide),
     };
     let mode_label = match mode {
-        crate::app::DiffMode::Compact => t(Msg::ModeCompact),
-        crate::app::DiffMode::FullFile => t(Msg::ModeFullFile),
+        reef_app::DiffMode::Compact => t(Msg::ModeCompact),
+        reef_app::DiffMode::FullFile => t(Msg::ModeFullFile),
     };
     let tag = crate::i18n::diff_mode_hint(layout_label, mode_label);
     let tag_w = UnicodeWidthStr::width(tag.as_str()) as u16;
@@ -271,7 +276,7 @@ fn render_picker(f: &mut Frame, app: &mut App, body: Rect) {
         );
     }
 
-    let header_msg = match app.active_tab {
+    let header_msg = match app.engine.active_tab() {
         Tab::Git => Msg::FocusedPreviewPickerHeaderGit,
         _ => Msg::FocusedPreviewPickerHeaderCommit,
     };
@@ -288,7 +293,8 @@ fn render_picker(f: &mut Frame, app: &mut App, body: Rect) {
 
     let rows_avail = popup.height.saturating_sub(1) as usize;
     let sel = app
-        .focused_preview_files_selected
+        .engine
+        .focused_preview_files_selected()
         .min(entries.len().saturating_sub(1));
     let scroll = if sel >= rows_avail {
         sel + 1 - rows_avail

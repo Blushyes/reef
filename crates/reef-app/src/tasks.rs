@@ -4,87 +4,24 @@
 //! the filesystem, diff generation, or syntax highlighting is routed through
 //! these workers and merged back into `App` from `tick()`.
 
-use crate::app::{CommitFileDiff, DiffHighlighted, HighlightedDiff};
-use crate::global_search::MatchHit;
-use crate::ui::highlight;
+use crate::app::{
+    CommitFileDiff, DiffHighlighted, GLOBAL_SEARCH_MAX_LINE_CHARS, GLOBAL_SEARCH_MAX_RESULTS,
+    HighlightedDiff, MatchHit,
+};
 use reef_core::diff::DiffContent;
 use reef_core::file_ops::Resolution;
 use reef_core::git::graph::GraphRow;
 use reef_core::git::{CommitDetail, FileEntry, GraphScope, RefLabel};
 use reef_core::preview::PreviewDocument as PreviewContent;
-use reef_io::Backend;
 use reef_io::TreeEntry;
-use std::collections::HashMap;
+use reef_io::{Backend, BackendError, WalkOpts};
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
-
-#[derive(Debug, Default)]
-pub struct AsyncState {
-    pub generation: u64,
-    pub loading: bool,
-    pub stale: bool,
-    pub error: Option<String>,
-}
-
-impl AsyncState {
-    pub fn mark_stale(&mut self) {
-        self.stale = true;
-    }
-
-    pub fn begin(&mut self) -> u64 {
-        self.generation = self.generation.wrapping_add(1).max(1);
-        self.loading = true;
-        self.stale = false;
-        self.error = None;
-        self.generation
-    }
-
-    /// Cancel any in-flight load and reset the state to "idle" with a
-    /// fresh generation. Use this when the caller's reason for issuing
-    /// the original load no longer holds (e.g. the user changed scope
-    /// so the selected commit is gone) and no follow-up dispatch is
-    /// lined up.
-    ///
-    /// Semantically: "any worker still chewing on the old generation
-    /// will have its result discarded by `complete_ok`'s generation
-    /// check; pretend that already happened." `loading` is forced false
-    /// so the status bar doesn't render a phantom "<label> refreshing…"
-    /// for a load nobody is going to consume.
-    pub fn invalidate(&mut self) {
-        self.generation = self.generation.wrapping_add(1).max(1);
-        self.loading = false;
-        self.stale = false;
-        self.error = None;
-    }
-
-    pub fn complete_ok(&mut self, generation: u64) -> bool {
-        if generation != self.generation {
-            return false;
-        }
-        self.loading = false;
-        self.stale = false;
-        self.error = None;
-        true
-    }
-
-    pub fn complete_err(&mut self, generation: u64, error: String) -> bool {
-        if generation != self.generation {
-            return false;
-        }
-        self.loading = false;
-        self.stale = true;
-        self.error = Some(error);
-        true
-    }
-
-    pub fn should_request(&self) -> bool {
-        self.stale && !self.loading
-    }
-}
 
 #[derive(Debug)]
 pub struct GitStatusPayload {
@@ -98,6 +35,26 @@ pub struct GitStatusPayload {
 pub struct FileTreePayload {
     pub entries: Vec<TreeEntry>,
     pub selected_idx: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRevertPath {
+    pub path: String,
+    pub is_staged: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitMutation {
+    Stage(Vec<String>),
+    Unstage(Vec<String>),
+    Revert(Vec<GitRevertPath>),
+}
+
+#[derive(Debug)]
+pub struct GitMutationPayload {
+    pub mutation: GitMutation,
+    pub touched: Vec<String>,
+    pub errors: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -114,6 +71,82 @@ pub struct GraphPayload {
 }
 
 #[derive(Debug)]
+pub struct DbPagePayload {
+    pub path: PathBuf,
+    pub key: reef_sqlite_preview::DbObjectKey,
+    pub page: u64,
+    pub rows: Vec<Vec<reef_sqlite_preview::SqliteValue>>,
+    pub reset_h_scroll: bool,
+}
+
+#[derive(Debug)]
+pub struct DbPageRequest {
+    pub path: PathBuf,
+    pub key: reef_sqlite_preview::DbObjectKey,
+    pub page: u64,
+    pub rows_per_page: u32,
+    pub reset_h_scroll: bool,
+}
+
+#[derive(Debug)]
+pub struct DbDetailPayload {
+    pub path: PathBuf,
+    pub key: reef_sqlite_preview::DbObjectKey,
+    pub detail: reef_sqlite_preview::DbObjectDetail,
+}
+
+#[derive(Debug, Clone)]
+pub enum TreeEditMutation {
+    CreateFile {
+        rel: PathBuf,
+        display_name: String,
+    },
+    CreateFolder {
+        rel: PathBuf,
+        display_name: String,
+    },
+    Rename {
+        old_rel: PathBuf,
+        new_rel: PathBuf,
+        old_name: String,
+        new_name: String,
+    },
+}
+
+#[derive(Debug)]
+pub struct TreeEditPlan {
+    pub mutation: TreeEditMutation,
+    pub select_on_done: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+pub enum TreeEditPlanError {
+    Validation {
+        error: reef_core::file_ops::FileNameError,
+    },
+    Backend {
+        mutation: TreeEditMutation,
+        error: String,
+    },
+}
+
+#[derive(Debug)]
+pub struct PastePlanError {
+    pub op: reef_core::file_ops::ClipMode,
+    pub error: String,
+}
+
+#[derive(Debug)]
+pub struct PastePlanPayload {
+    pub op: reef_core::file_ops::ClipMode,
+    pub dest_rel: PathBuf,
+    pub auto_decisions: Vec<(PathBuf, Resolution)>,
+    pub pending: Vec<reef_core::file_ops::ConflictItem>,
+    pub used_names: HashSet<String>,
+    pub self_descent_blocked: usize,
+}
+
+#[derive(Debug)]
 pub enum WorkerResult {
     FileTree {
         generation: u64,
@@ -123,9 +156,42 @@ pub enum WorkerResult {
         generation: u64,
         result: Result<Option<PreviewContent>, String>,
     },
+    DbPage {
+        generation: u64,
+        result: Result<DbPagePayload, String>,
+    },
+    DbDetail {
+        generation: u64,
+        result: Result<DbDetailPayload, String>,
+    },
+    QuickOpenIndex {
+        generation: u64,
+        result: Result<Vec<crate::features::quick_open::Candidate>, String>,
+    },
+    TreeEditPlan {
+        generation: u64,
+        result: Result<TreeEditPlan, TreeEditPlanError>,
+    },
+    PastePlan {
+        generation: u64,
+        result: Result<PastePlanPayload, PastePlanError>,
+    },
     GitStatus {
         generation: u64,
         result: Result<GitStatusPayload, String>,
+    },
+    GitMutation {
+        generation: u64,
+        result: Result<GitMutationPayload, String>,
+    },
+    Commit {
+        generation: u64,
+        result: Result<(), String>,
+    },
+    Push {
+        generation: u64,
+        force: bool,
+        result: Result<(), String>,
     },
     Diff {
         generation: u64,
@@ -151,7 +217,7 @@ pub enum WorkerResult {
         result: Result<Vec<FileEntry>, String>,
     },
     /// Single-file diff for a commit range, same semantics as `CommitFileDiff`
-    /// but sourced from `GitRepo::get_range_file_diff`.
+    /// but sourced from `Backend::range_file_diff`.
     RangeFileDiff {
         generation: u64,
         result: Result<Option<CommitFileDiff>, String>,
@@ -206,7 +272,7 @@ pub enum WorkerResult {
         generation: u64,
         result: Result<ReplaceSummary, String>,
     },
-    /// Phase 2 code-navigation: workspace symbol index build finished.
+    /// Workspace symbol index build finished.
     /// Carries the whole `WorkspaceIndex` since cross-file `gd` /
     /// `gr` query against it from the main thread. Stale results are
     /// dropped via `nav_workspace_load`'s generation token.
@@ -214,11 +280,10 @@ pub enum WorkerResult {
         generation: u64,
         result: Result<reef_core::nav::WorkspaceIndex, String>,
     },
-    /// Phase 3 LSP refinement. `location` is `Some` when rust-analyzer
-    /// returned a definition for the identifier; `None` when it
-    /// declined or the request failed. Either way, the main thread
-    /// writes to `nav_refine_cache` so the next `gd` on the same
-    /// `(lang, identifier)` skips the round-trip.
+    /// LSP refinement. `rel_location` is already workdir-relative when the
+    /// server returned an in-workspace definition; `None` means either no
+    /// definition or a definition outside the workspace. `server_returned_location`
+    /// lets the merge path choose the right toast text.
     LspRefineDone {
         generation: u64,
         /// Refine-cache epoch captured at dispatch. The main thread
@@ -230,9 +295,10 @@ pub enum WorkerResult {
         epoch: u64,
         lang: reef_core::nav::NavLang,
         identifier: String,
-        location: Option<reef_core::nav::LspLocation>,
+        rel_location: Option<reef_core::nav::LspLocation>,
+        server_returned_location: bool,
     },
-    /// Phase 3 supervisor state change — drives the status-bar badge.
+    /// LSP supervisor state change; drives the status-bar badge.
     LspStateChange {
         lang: reef_core::nav::NavLang,
         state: reef_core::nav::LspBadge,
@@ -351,6 +417,21 @@ enum FilesTask {
         dark: bool,
         wants_decoded_image: bool,
     },
+    LoadDbPage {
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        request: DbPageRequest,
+    },
+    LoadDbDetail {
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        path: PathBuf,
+        key: reef_sqlite_preview::DbObjectKey,
+    },
+    BuildQuickOpenIndex {
+        generation: u64,
+        backend: Arc<dyn Backend>,
+    },
     /// Warm the preview cache for a neighbor of the currently-selected
     /// file. Same decode path as `LoadPreview`, but the result is
     /// **discarded** — the side effect is populating
@@ -363,14 +444,24 @@ enum FilesTask {
         dark: bool,
         wants_decoded_image: bool,
     },
-    /// Drag-and-drop copy: each source lands under `dest_dir`. A name
-    /// collision auto-renames VSCode-style (`foo.txt` → `foo (1).txt`).
-    /// Directory sources are copied recursively; symlinks are skipped
-    /// (documented in `copy_sources`).
-    ///
-    /// Paths here are still absolute because copy sources can be external
-    /// (drag-drop from Finder) or inside the workdir; the `App` layer
-    /// guards external drag-drop on remote backends.
+    PlanTreeEdit {
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        mode: crate::features::tree_edit::TreeEditMode,
+        parent_rel: PathBuf,
+        rename_source: Option<PathBuf>,
+        name: String,
+    },
+    PlanPaste {
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        op: reef_core::file_ops::ClipMode,
+        dest_rel: PathBuf,
+        sources: Vec<PathBuf>,
+    },
+    /// Drag-and-drop copy: each source lands under `dest_dir`. Sources can
+    /// be external host-local paths or workdir-local paths; `reef-io`
+    /// performs the actual local copy or remote upload.
     CopyFiles {
         generation: u64,
         backend: Arc<dyn Backend>,
@@ -500,6 +591,21 @@ enum GitTask {
         /// `LoadCommitFileDiff.dark` / `LoadPreview.dark`.
         dark: bool,
     },
+    Mutate {
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        mutation: GitMutation,
+    },
+    Commit {
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        message: String,
+    },
+    Push {
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        force: bool,
+    },
 }
 
 enum GlobalSearchTask {
@@ -511,7 +617,7 @@ enum GlobalSearchTask {
     },
 }
 
-/// Phase 3 LSP-refine task — serviced by the dedicated LSP worker.
+/// LSP-refine task serviced by the dedicated LSP worker.
 /// Fire-and-forget: the answer lands in `nav_refine_cache` on the main
 /// thread when (or if) it arrives. `identifier` carries the position
 /// cache key (`refine_key`), not a symbol name.
@@ -583,7 +689,7 @@ pub struct TaskCoordinator {
     graph_tx: mpsc::Sender<GraphTask>,
     global_search_tx: mpsc::Sender<GlobalSearchTask>,
     result_tx: mpsc::Sender<WorkerResult>,
-    /// Phase 3 LSP worker. Holds the per-language `LspClient`s +
+    /// LSP worker. Holds the per-language `LspClient`s +
     /// spawn-failure backoff.
     lsp_tx: mpsc::Sender<LspTask>,
     result_rx: mpsc::Receiver<WorkerResult>,
@@ -604,20 +710,17 @@ impl TaskCoordinator {
         }
     }
 
-    pub fn build_nav_workspace(&self, generation: u64, root: PathBuf) {
+    pub fn build_nav_workspace(&self, generation: u64, backend: Arc<dyn Backend>) {
         let result_tx = self.result_tx.clone();
         let _ = thread::Builder::new()
             .name("reef-nav-index".into())
             .spawn(move || {
-                let index = reef_core::nav::build_workspace_index(root);
-                let _ = result_tx.send(WorkerResult::NavWorkspaceBuilt {
-                    generation,
-                    result: Ok(index),
-                });
+                let result = build_nav_workspace_index(backend.as_ref());
+                let _ = result_tx.send(WorkerResult::NavWorkspaceBuilt { generation, result });
             });
     }
 
-    /// Dispatch a Phase 3 LSP refine. Fire-and-forget; the answer (or
+    /// Dispatch an LSP refine. Fire-and-forget; the answer (or
     /// a state-change update on failure) arrives as
     /// `WorkerResult::LspRefineDone` / `LspStateChange`.
     #[allow(clippy::too_many_arguments)]
@@ -689,6 +792,36 @@ impl TaskCoordinator {
         });
     }
 
+    pub fn load_db_page(&self, generation: u64, backend: Arc<dyn Backend>, request: DbPageRequest) {
+        let _ = self.preview_tx.send(FilesTask::LoadDbPage {
+            generation,
+            backend,
+            request,
+        });
+    }
+
+    pub fn load_db_detail(
+        &self,
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        path: PathBuf,
+        key: reef_sqlite_preview::DbObjectKey,
+    ) {
+        let _ = self.preview_tx.send(FilesTask::LoadDbDetail {
+            generation,
+            backend,
+            path,
+            key,
+        });
+    }
+
+    pub fn build_quick_open_index(&self, generation: u64, backend: Arc<dyn Backend>) {
+        let _ = self.files_tx.send(FilesTask::BuildQuickOpenIndex {
+            generation,
+            backend,
+        });
+    }
+
     /// Warm the preview cache for a file the user hasn't selected yet
     /// but probably will. Result is dropped by the worker; the cache
     /// side effect is the point.
@@ -719,6 +852,42 @@ impl TaskCoordinator {
             backend,
             sources,
             dest_dir,
+        });
+    }
+
+    pub fn plan_tree_edit(
+        &self,
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        mode: crate::features::tree_edit::TreeEditMode,
+        parent_rel: PathBuf,
+        rename_source: Option<PathBuf>,
+        name: String,
+    ) {
+        let _ = self.files_tx.send(FilesTask::PlanTreeEdit {
+            generation,
+            backend,
+            mode,
+            parent_rel,
+            rename_source,
+            name,
+        });
+    }
+
+    pub fn plan_paste(
+        &self,
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        op: reef_core::file_ops::ClipMode,
+        dest_rel: PathBuf,
+        sources: Vec<PathBuf>,
+    ) {
+        let _ = self.files_tx.send(FilesTask::PlanPaste {
+            generation,
+            backend,
+            op,
+            dest_rel,
+            sources,
         });
     }
 
@@ -879,6 +1048,30 @@ impl TaskCoordinator {
         });
     }
 
+    pub fn mutate_git(&self, generation: u64, backend: Arc<dyn Backend>, mutation: GitMutation) {
+        let _ = self.git_tx.send(GitTask::Mutate {
+            generation,
+            backend,
+            mutation,
+        });
+    }
+
+    pub fn commit(&self, generation: u64, backend: Arc<dyn Backend>, message: String) {
+        let _ = self.git_tx.send(GitTask::Commit {
+            generation,
+            backend,
+            message,
+        });
+    }
+
+    pub fn push(&self, generation: u64, backend: Arc<dyn Backend>, force: bool) {
+        let _ = self.git_tx.send(GitTask::Push {
+            generation,
+            backend,
+            force,
+        });
+    }
+
     pub fn refresh_graph(
         &self,
         generation: u64,
@@ -962,7 +1155,7 @@ impl TaskCoordinator {
     /// (respecting `.gitignore` via the same `ignore` crate path the
     /// quick-open index uses), runs `grep-searcher` with a smart-case
     /// literal `RegexMatcher`, and streams hits back as
-    /// `WorkerResult::GlobalSearchChunk` followed by a terminal
+    /// `WorkerResult::GlobalSearchChunk` followed by a final
     /// `GlobalSearchDone`. Flipping `cancel` to `true` asks the worker to
     /// bail on its next file-boundary poll.
     pub fn search_all(
@@ -1005,6 +1198,16 @@ fn spawn_files_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Fil
                         );
                         let _ = result_tx.send(WorkerResult::FileTree { generation, result });
                     }
+                    FilesTask::BuildQuickOpenIndex {
+                        generation,
+                        backend,
+                    } => {
+                        let result = backend
+                            .walk_repo_paths(&WalkOpts::default())
+                            .map(|resp| reef_core::quick_open::build_candidates(resp.paths))
+                            .map_err(|e| e.to_string());
+                        let _ = result_tx.send(WorkerResult::QuickOpenIndex { generation, result });
+                    }
                     FilesTask::LoadPreview {
                         generation,
                         backend,
@@ -1021,8 +1224,34 @@ fn spawn_files_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Fil
                         sources,
                         dest_dir,
                     } => {
-                        let result = copy_sources(backend.as_ref(), &sources, &dest_dir);
+                        let result = reef_io::copy_local_sources_to_backend(
+                            backend.as_ref(),
+                            &sources,
+                            &dest_dir,
+                        );
                         let _ = result_tx.send(WorkerResult::FileCopy { generation, result });
+                    }
+                    FilesTask::PlanTreeEdit {
+                        generation,
+                        backend,
+                        mode,
+                        parent_rel,
+                        rename_source,
+                        name,
+                    } => {
+                        let result =
+                            plan_tree_edit(backend.as_ref(), mode, parent_rel, rename_source, name);
+                        let _ = result_tx.send(WorkerResult::TreeEditPlan { generation, result });
+                    }
+                    FilesTask::PlanPaste {
+                        generation,
+                        backend,
+                        op,
+                        dest_rel,
+                        sources,
+                    } => {
+                        let result = plan_paste(backend.as_ref(), op, dest_rel, sources);
+                        let _ = result_tx.send(WorkerResult::PastePlan { generation, result });
                     }
                     FilesTask::CreateFile {
                         generation,
@@ -1162,10 +1391,11 @@ fn spawn_files_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Fil
                             &result_tx,
                         );
                     }
-                    // Prefetch routes to the preview worker; this arm
-                    // never fires in practice but exhaustiveness needs
-                    // it.
-                    FilesTask::PrefetchPreview { .. } => {}
+                    // These routes belong to the preview worker; these
+                    // arms only satisfy exhaustiveness.
+                    FilesTask::LoadDbPage { .. }
+                    | FilesTask::LoadDbDetail { .. }
+                    | FilesTask::PrefetchPreview { .. } => {}
                 }
             }
         });
@@ -1174,11 +1404,9 @@ fn spawn_files_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Fil
 
 // ─── FS mutation helpers ─────────────────────────────────────────────────────
 //
-// These direct-fs helpers used to live on the worker path; M3 routed the
-// workers through `Backend` so the local/remote implementations stay byte-
-// equivalent. The helpers remain because the unit tests in
-// `fs_mutation_tests` still exercise them as a regression guard for the
-// original `std::fs::*` semantics.
+// Production workers route through `Backend` so local and remote
+// implementations stay equivalent. These direct-fs helpers remain test-only
+// regression guards for the original `std::fs::*` semantics.
 
 #[cfg(test)]
 fn basename_str(path: &Path) -> String {
@@ -1241,8 +1469,7 @@ fn run_rename(old: &Path, new: &Path) -> (FsMutationKind, Result<(), String>) {
 #[allow(dead_code)]
 fn run_trash(paths: &[PathBuf]) -> (FsMutationKind, Result<(), String>) {
     // The kind string reports the first path's basename to keep the toast
-    // short; if the user trashed many at once (future: multi-select) the
-    // toast can reach into the worker task's list itself.
+    // short for batch deletes.
     let name = paths.first().map(|p| basename_str(p)).unwrap_or_default();
     let kind = FsMutationKind::Trashed { name: name.clone() };
     let result = trash::delete_all(paths).map_err(|e| format!("trash {name:?}: {e}"));
@@ -1266,131 +1493,88 @@ fn run_hard_delete(paths: &[PathBuf]) -> (FsMutationKind, Result<(), String>) {
     (kind, Ok(()))
 }
 
-// ─── Drag-and-drop copy helpers ──────────────────────────────────────────────
-
-/// Copy every `source` into `dest_dir`, auto-renaming on name collision
-/// (`foo.txt` → `foo (1).txt` → `foo (2).txt`, …). Directory sources are
-/// recursively copied; the rename rule only applies to the top-level name.
-///
-/// Symlinks encountered during a recursive directory walk are skipped —
-/// Finder's default would be to dereference them and copy the target, but
-/// that widens scope (cycles, broken links, permission surprises) beyond
-/// what this first cut needs to handle. The renderer-side banner flags
-/// "recursive copy"; if symlink fidelity becomes important we can revisit.
-///
-/// Returns the count of top-level items successfully placed, or the first
-/// error encountered. We fail fast on the first error rather than
-/// best-effort so a partial copy doesn't silently miss a file and leave
-/// the user thinking everything succeeded.
-fn copy_sources(
+fn existing_basenames(
     backend: &dyn Backend,
-    sources: &[PathBuf],
-    dest_dir: &Path,
-) -> Result<usize, String> {
-    let workdir = backend.workdir_path();
-    let dest_rel = dest_dir
-        .strip_prefix(&workdir)
-        .map(|p| p.to_path_buf())
-        .unwrap_or_default();
-    let is_remote = backend.is_remote();
+    dest_rel: &Path,
+) -> Result<HashSet<String>, BackendError> {
+    backend
+        .list_dir(dest_rel)
+        .map(|entries| entries.into_iter().map(|entry| entry.name).collect())
+}
 
-    // On remote, `dest_dir` is an absolute path on the REMOTE host (the
-    // workdir passed to `--ssh`). It doesn't exist on this machine, so
-    // the local-filesystem probes below (`canonicalize`, `.is_dir()`)
-    // would fail. We defer all existence checks to the backend for
-    // remote and only run the name-conflict arithmetic off the
-    // workdir-relative shape.
-    let canon_dest = if is_remote {
-        None
-    } else {
-        if !dest_dir.is_dir() {
-            return Err(format!("destination is not a directory: {:?}", dest_dir));
+fn plan_tree_edit(
+    backend: &dyn Backend,
+    mode: crate::features::tree_edit::TreeEditMode,
+    parent_rel: PathBuf,
+    rename_source: Option<PathBuf>,
+    name: String,
+) -> Result<TreeEditPlan, TreeEditPlanError> {
+    let target_rel = parent_rel.join(&name);
+    let mutation = match mode {
+        crate::features::tree_edit::TreeEditMode::NewFile => TreeEditMutation::CreateFile {
+            rel: target_rel.clone(),
+            display_name: name.clone(),
+        },
+        crate::features::tree_edit::TreeEditMode::NewFolder => TreeEditMutation::CreateFolder {
+            rel: target_rel.clone(),
+            display_name: name.clone(),
+        },
+        crate::features::tree_edit::TreeEditMode::Rename => {
+            let old_rel = rename_source.ok_or(TreeEditPlanError::Validation {
+                error: reef_core::file_ops::FileNameError::InvalidName,
+            })?;
+            let old_name = old_rel
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(String::from)
+                .unwrap_or_else(|| old_rel.to_string_lossy().to_string());
+            TreeEditMutation::Rename {
+                old_rel,
+                new_rel: target_rel.clone(),
+                old_name,
+                new_name: name.clone(),
+            }
         }
-        // Canonicalise dest_dir once up front so the self-reference
-        // check below works even when `dest_dir` was passed in as a
-        // relative or symlinked path.
-        Some(
-            dest_dir
-                .canonicalize()
-                .map_err(|e| format!("cannot canonicalize destination {:?}: {}", dest_dir, e))?,
-        )
     };
 
-    let mut count = 0;
-    for source in sources {
-        let basename = source
-            .file_name()
-            .ok_or_else(|| format!("source has no basename: {:?}", source))?;
-
-        // P0 safety for local copies: block copying a directory INTO
-        // itself or any of its descendants. Remote uploads can't hit
-        // this case — the source is on the client and the dest is on
-        // the server.
-        if !is_remote && source.is_dir() {
-            let canon_src = source
-                .canonicalize()
-                .map_err(|e| format!("cannot canonicalize source {:?}: {}", source, e))?;
-            let canon_dest = canon_dest.as_ref().unwrap();
-            if canon_dest == &canon_src || canon_dest.starts_with(&canon_src) {
-                return Err(format!(
-                    "cannot copy {:?} into itself or a descendant {:?}",
-                    source, dest_dir
-                ));
-            }
-        }
-
-        // `resolve_name_conflict` probes the local disk with `.exists()`.
-        // On remote we don't have access to the tree, so we skip auto-
-        // rename and let the agent reject a collision via
-        // `BackendError::PathExists`. Dropping a duplicate name twice on
-        // a remote tree is an error rather than an auto-rename; that's a
-        // step down from local behaviour but matches the protocol:
-        // `CreateFile`/`CopyFile` use `create_new` semantics.
-        let final_dest: PathBuf = if is_remote {
-            dest_dir.join(basename)
-        } else {
-            resolve_name_conflict(dest_dir, basename)
-        };
-
-        let src_rel = source.strip_prefix(&workdir).ok();
-        let final_rel = final_dest
-            .strip_prefix(&workdir)
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|_| {
-                // For remote external uploads, `final_dest` starts with
-                // the remote workdir string so strip_prefix succeeds;
-                // for local out-of-tree paths we fall back to the
-                // basename relative to `dest_rel`.
-                dest_rel.join(basename)
-            });
-
-        if source.is_dir() {
-            match src_rel {
-                Some(s) => backend
-                    .copy_dir_recursive(s, &final_rel)
-                    .map_err(|e| format!("copy {:?} → {:?}: {}", source, final_dest, e))?,
-                None => {
-                    // External (host-local) source → needs the upload
-                    // hook so remote backends can scp and local
-                    // backends can still do a plain recursive copy.
-                    backend
-                        .upload_from_local(source, &final_rel)
-                        .map_err(|e| format!("upload {:?} → {:?}: {}", source, final_dest, e))?;
-                }
-            }
-        } else {
-            match src_rel {
-                Some(s) => backend
-                    .copy_file(s, &final_rel)
-                    .map_err(|e| format!("copy {:?} → {:?}: {}", source, final_dest, e))?,
-                None => backend
-                    .upload_from_local(source, &final_rel)
-                    .map_err(|e| format!("upload {:?} → {:?}: {}", source, final_dest, e))?,
-            }
-        }
-        count += 1;
+    let existing =
+        existing_basenames(backend, &parent_rel).map_err(|e| TreeEditPlanError::Backend {
+            mutation: mutation.clone(),
+            error: e.to_string(),
+        })?;
+    if existing.contains(&name) {
+        return Err(TreeEditPlanError::Validation {
+            error: reef_core::file_ops::FileNameError::NameAlreadyExists(name),
+        });
     }
-    Ok(count)
+
+    Ok(TreeEditPlan {
+        mutation,
+        select_on_done: Some(target_rel),
+    })
+}
+
+fn plan_paste(
+    backend: &dyn Backend,
+    op: reef_core::file_ops::ClipMode,
+    dest_rel: PathBuf,
+    sources: Vec<PathBuf>,
+) -> Result<PastePlanPayload, PastePlanError> {
+    let existing = existing_basenames(backend, &dest_rel).map_err(|e| PastePlanError {
+        op,
+        error: format!("read destination {:?}: {e}", dest_rel),
+    })?;
+    let cls = reef_core::file_ops::classify_paste(op, &dest_rel, &sources, &existing);
+    let used_names =
+        reef_core::file_ops::used_names_after_auto_decisions(&existing, &cls.auto_decisions);
+    Ok(PastePlanPayload {
+        op,
+        dest_rel,
+        auto_decisions: cls.auto_decisions,
+        pending: cls.pending,
+        used_names,
+        self_descent_blocked: cls.self_descent_blocked,
+    })
 }
 
 /// Drive a Cut/Copy paste batch — `items` is the per-source decision
@@ -1399,7 +1583,7 @@ fn copy_sources(
 /// pre-trashes the existing destination so the user can recover via OS
 /// Trash. `Skip` and `Cancel` are noops.
 ///
-/// Fail-fast on the first error to match `copy_sources` semantics —
+/// Fail-fast on the first error to match drag-and-drop copy semantics —
 /// callers prefer one clear error over a partial-completion riddle.
 /// `placed` counts items that successfully landed *before* any error,
 /// so the toast can still report progress.
@@ -1408,11 +1592,8 @@ fn copy_sources(
 /// extra `trash` RPC per `Replace`). A 50-item Replace paste over SSH
 /// = ~100 round-trips; on a 200ms-RTT link that's ~10s of latency
 /// dominating any actual transfer cost. Batching `trash` and
-/// `rename`/`copy` would need new `Backend::trash_multi` /
-/// `Backend::rename_multi` entry points and matching agent-side
-/// handlers — out of scope for v1, but the obvious follow-up if real-
-/// world reports surface it. Local-backend per-item cost is in the
-/// microseconds and not worth batching.
+/// `rename`/`copy` would need batch backend operations. Local-backend
+/// per-item cost is tiny and not worth batching.
 fn run_paste_batch(
     backend: &dyn Backend,
     items: &[PasteItem],
@@ -1460,11 +1641,9 @@ fn run_paste_batch(
         //      done" with "couldn't trash". The follow-up copy/rename
         //      will overwrite the dest unconditionally either way.
         //   3. Permission denied → user gets the overwrite without the
-        //      Trash safety net. Semi-surprising, but flagging it
-        //      reliably needs a probe at startup; v1 trade-off.
-        // Follow-up worth doing if real-world reports surface: thread
-        // the trash result back into `FsMutationKind::Moved/CopiedTo`
-        // so the toast can warn "overwrote without trash".
+        //      Trash safety net. Threading the trash result into
+        //      `FsMutationKind::Moved/CopiedTo` would let the toast warn
+        //      "overwrote without trash".
         if matches!(item.resolution, Resolution::Replace) {
             let _ = backend.trash(std::slice::from_ref(&dest_rel));
         }
@@ -1524,57 +1703,6 @@ fn run_paste_batch(
     (kind, result)
 }
 
-/// Find the first non-existing destination filename by appending
-/// ` (N)` to the stem for N = 1, 2, 3… . Matches VSCode's Finder-style
-/// duplicate behavior. Dotfiles (leading-dot, no extension) get the
-/// counter after the whole name: `.env` → `.env (1)`.
-fn resolve_name_conflict(dest_dir: &Path, basename: &std::ffi::OsStr) -> PathBuf {
-    let candidate = dest_dir.join(basename);
-    if !candidate.exists() {
-        return candidate;
-    }
-    let name = basename.to_string_lossy().into_owned();
-    let (stem, ext) = split_stem_ext(&name);
-    for n in 1..u32::MAX {
-        let renamed = match ext {
-            Some(e) => format!("{} ({}).{}", stem, n, e),
-            None => format!("{} ({})", stem, n),
-        };
-        let c = dest_dir.join(&renamed);
-        if !c.exists() {
-            return c;
-        }
-    }
-    // Astronomically unlikely; fall back to a timestamp-style name so we
-    // never loop forever or panic in a production run.
-    dest_dir.join(format!(
-        "{}-{}",
-        name,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ))
-}
-
-/// Split a filename into `(stem, ext)` at the LAST dot — matching the way
-/// users read filenames. Leading-dot files (no embedded dot) are treated
-/// as "no extension" so `.env` → (".env", None), not ("", "env").
-fn split_stem_ext(name: &str) -> (&str, Option<&str>) {
-    // A leading dot doesn't count as an extension separator.
-    let trimmed = name.trim_start_matches('.');
-    let leading_dots = name.len() - trimmed.len();
-    match trimmed.rfind('.') {
-        Some(rel) => {
-            let abs = leading_dots + rel;
-            let (stem, ext) = name.split_at(abs);
-            // ext starts with '.', skip it
-            (stem, Some(&ext[1..]))
-        }
-        None => (name, None),
-    }
-}
-
 /// Dedicated worker thread for `FilesTask::LoadPreview`. Same task
 /// shape as the main files worker, but sitting on its own channel so
 /// slow preview decodes can't queue behind a big tree rebuild or a
@@ -1620,6 +1748,41 @@ fn spawn_preview_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<F
                             backend.load_preview(&rel_path, dark, wants_decoded_image)
                         });
                         let _ = result_tx.send(WorkerResult::Preview { generation, result });
+                    }
+                    FilesTask::LoadDbPage {
+                        generation,
+                        backend,
+                        request,
+                    } => {
+                        let offset = request.page.saturating_mul(request.rows_per_page as u64);
+                        let result = backend
+                            .db_load_page(
+                                &request.path,
+                                &request.key,
+                                offset,
+                                request.rows_per_page,
+                            )
+                            .map(|page_data| DbPagePayload {
+                                path: request.path,
+                                key: request.key,
+                                page: request.page,
+                                rows: page_data.rows,
+                                reset_h_scroll: request.reset_h_scroll,
+                            })
+                            .map_err(|e| e.to_string());
+                        let _ = result_tx.send(WorkerResult::DbPage { generation, result });
+                    }
+                    FilesTask::LoadDbDetail {
+                        generation,
+                        backend,
+                        path,
+                        key,
+                    } => {
+                        let result = backend
+                            .db_load_object_detail(&path, &key)
+                            .map(|detail| DbDetailPayload { path, key, detail })
+                            .map_err(|e| e.to_string());
+                        let _ = result_tx.send(WorkerResult::DbDetail { generation, result });
                     }
                     FilesTask::PrefetchPreview {
                         backend,
@@ -1684,10 +1847,81 @@ fn spawn_git_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<GitTa
                         .map(|opt| opt.map(|diff| build_highlighted_diff(&path, diff, dark)));
                         let _ = result_tx.send(WorkerResult::Diff { generation, result });
                     }
+                    GitTask::Mutate {
+                        generation,
+                        backend,
+                        mutation,
+                    } => {
+                        let result = run_git_mutation(backend.as_ref(), mutation);
+                        let _ = result_tx.send(WorkerResult::GitMutation { generation, result });
+                    }
+                    GitTask::Commit {
+                        generation,
+                        backend,
+                        message,
+                    } => {
+                        let result = backend.commit(&message).map_err(|e| e.to_string());
+                        let _ = result_tx.send(WorkerResult::Commit { generation, result });
+                    }
+                    GitTask::Push {
+                        generation,
+                        backend,
+                        force,
+                    } => {
+                        let result = backend.push(force).map_err(|e| e.to_string());
+                        let _ = result_tx.send(WorkerResult::Push {
+                            generation,
+                            force,
+                            result,
+                        });
+                    }
                 }
             }
         });
     tx
+}
+
+fn run_git_mutation(
+    backend: &dyn Backend,
+    mutation: GitMutation,
+) -> Result<GitMutationPayload, String> {
+    let mut touched = Vec::new();
+    let mut errors = Vec::new();
+    match &mutation {
+        GitMutation::Stage(paths) => {
+            for path in paths {
+                match backend.stage(path) {
+                    Ok(()) => touched.push(path.clone()),
+                    Err(error) => errors.push(format!("{path}: {error}")),
+                }
+            }
+        }
+        GitMutation::Unstage(paths) => {
+            for path in paths {
+                match backend.unstage(path) {
+                    Ok(()) => touched.push(path.clone()),
+                    Err(error) => errors.push(format!("{path}: {error}")),
+                }
+            }
+        }
+        GitMutation::Revert(paths) => {
+            for item in paths {
+                match backend.revert_path(&item.path, item.is_staged) {
+                    Ok(()) => touched.push(item.path.clone()),
+                    Err(error) => errors.push(format!("{}: {error}", item.path)),
+                }
+            }
+        }
+    }
+
+    if touched.is_empty() && !errors.is_empty() {
+        return Err(errors.join("\n"));
+    }
+    Ok(GitMutationPayload {
+        mutation,
+        touched,
+        errors,
+    })
 }
 
 fn spawn_graph_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<GraphTask> {
@@ -2227,7 +2461,7 @@ pub fn highlight_diff(path: &str, diff: &DiffContent, dark: bool) -> Option<Arc<
             flat.push(line.content.to_string());
         }
     }
-    let result = highlight::highlight_file(path, &flat, dark).map(|flat_tokens| {
+    let result = reef_core::highlight::highlight_file(path, &flat, dark).map(|flat_tokens| {
         // Wrap each line's tokens in `Arc` so downstream `tokens_for(li)`
         // clones are O(1). The iterator-based split hands each Arc to its
         // owning hunk without re-bumping refcounts.
@@ -2319,6 +2553,34 @@ fn build_file_tree_payload(
         entries,
         selected_idx,
     })
+}
+
+fn build_nav_workspace_index(
+    backend: &dyn Backend,
+) -> Result<reef_core::nav::WorkspaceIndex, String> {
+    let root = backend.workdir_path();
+    let walk = backend
+        .walk_repo_paths(&WalkOpts {
+            include_hidden: true,
+            respect_gitignore: true,
+            max_files: None,
+        })
+        .map_err(|e| e.to_string())?;
+    let files = walk.paths.into_iter().filter_map(|path| {
+        let rel = PathBuf::from(path);
+        let _lang = reef_core::nav::NavLang::from_path(&rel)?;
+        let bytes = backend
+            .read_file(&rel, reef_core::nav::workspace::MAX_FILE_BYTES_INDEX + 1)
+            .ok()?;
+        if bytes.len() as u64 > reef_core::nav::workspace::MAX_FILE_BYTES_INDEX {
+            return None;
+        }
+        Some(reef_core::nav::WorkspaceIndexFile {
+            path: rel,
+            source: Arc::from(bytes.into_boxed_slice()),
+        })
+    });
+    Ok(reef_core::nav::build_workspace_index(root, files))
 }
 
 /// `true` if `target` (a fully-qualified ref like `refs/heads/main`)
@@ -2509,12 +2771,24 @@ fn spawn_lsp_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<LspTa
                         None
                     }
                 };
+                let server_returned_location = location.is_some();
+                let rel_location = location.as_ref().and_then(|loc| {
+                    reef_io::workdir_relative_path(&workspace_root, &loc.path).map(|rel| {
+                        reef_core::nav::LspLocation {
+                            path: rel,
+                            line: loc.line,
+                            character: loc.character,
+                            character_end: loc.character_end,
+                        }
+                    })
+                });
                 let _ = result_tx.send(WorkerResult::LspRefineDone {
                     generation,
                     epoch,
                     lang,
                     identifier,
-                    location,
+                    rel_location,
+                    server_returned_location,
                 });
             }
         });
@@ -2547,8 +2821,8 @@ fn run_global_search_via_backend(
         pattern: query.to_string(),
         fixed_strings: true,
         case_sensitive: None,
-        max_results: crate::global_search::MAX_RESULTS as u32,
-        max_line_chars: crate::global_search::MAX_LINE_CHARS as u32,
+        max_results: GLOBAL_SEARCH_MAX_RESULTS as u32,
+        max_line_chars: GLOBAL_SEARCH_MAX_LINE_CHARS as u32,
     };
 
     let mut on_chunk = |hits: Vec<reef_io::ContentMatchHit>| -> std::ops::ControlFlow<()> {
@@ -2791,7 +3065,7 @@ fn replace_one_file(
         let snapshot = target.expected_text.as_str();
         let matches_snapshot = match std::str::from_utf8(body) {
             Ok(text) => {
-                if snapshot.chars().count() >= crate::global_search::MAX_LINE_CHARS {
+                if snapshot.chars().count() >= GLOBAL_SEARCH_MAX_LINE_CHARS {
                     text.starts_with(snapshot)
                 } else {
                     text == snapshot
@@ -2858,188 +3132,6 @@ fn replace_one_file(
     FileReplaceOutcome::Changed {
         lines_replaced,
         stale,
-    }
-}
-
-#[cfg(test)]
-mod copy_tests {
-    use super::*;
-    use reef_io::LocalBackend;
-    use std::fs;
-    use tempfile::TempDir;
-
-    /// Build a `LocalBackend` rooted at `root`. The backend is wrapped in
-    /// `Arc<dyn Backend>` because `copy_sources` now takes a `&dyn Backend`.
-    fn test_backend(root: &std::path::Path) -> LocalBackend {
-        LocalBackend::open_at(root.to_path_buf())
-    }
-
-    #[test]
-    fn split_stem_ext_basic() {
-        assert_eq!(split_stem_ext("foo.txt"), ("foo", Some("txt")));
-        assert_eq!(
-            split_stem_ext("archive.tar.gz"),
-            ("archive.tar", Some("gz"))
-        );
-        assert_eq!(split_stem_ext("README"), ("README", None));
-        // Leading dot alone is not an extension separator.
-        assert_eq!(split_stem_ext(".env"), (".env", None));
-        // But `.env.local` has a real separator after the leading dot.
-        assert_eq!(split_stem_ext(".env.local"), (".env", Some("local")));
-    }
-
-    #[test]
-    fn resolve_name_conflict_increments() {
-        let tmp = TempDir::new().unwrap();
-        let basename = std::ffi::OsString::from("foo.txt");
-
-        // First call returns the plain name.
-        let p0 = resolve_name_conflict(tmp.path(), &basename);
-        assert_eq!(p0.file_name().unwrap(), "foo.txt");
-
-        // Once the plain name exists, the next call renames to "(1)".
-        fs::write(&p0, "").unwrap();
-        let p1 = resolve_name_conflict(tmp.path(), &basename);
-        assert_eq!(p1.file_name().unwrap(), "foo (1).txt");
-
-        fs::write(&p1, "").unwrap();
-        let p2 = resolve_name_conflict(tmp.path(), &basename);
-        assert_eq!(p2.file_name().unwrap(), "foo (2).txt");
-    }
-
-    #[test]
-    fn resolve_name_conflict_dotfile() {
-        let tmp = TempDir::new().unwrap();
-        let basename = std::ffi::OsString::from(".env");
-        fs::write(tmp.path().join(".env"), "").unwrap();
-        let p = resolve_name_conflict(tmp.path(), &basename);
-        assert_eq!(p.file_name().unwrap(), ".env (1)");
-    }
-
-    #[test]
-    fn copy_sources_file_into_dir() {
-        let src_tmp = TempDir::new().unwrap();
-        let dst_tmp = TempDir::new().unwrap();
-        let src = src_tmp.path().join("alpha.txt");
-        fs::write(&src, "hello").unwrap();
-
-        let b = test_backend(dst_tmp.path());
-        let count = copy_sources(&b, &[src], dst_tmp.path()).unwrap();
-        assert_eq!(count, 1);
-        assert_eq!(
-            fs::read_to_string(dst_tmp.path().join("alpha.txt")).unwrap(),
-            "hello"
-        );
-    }
-
-    #[test]
-    fn copy_sources_recurses_into_directories() {
-        let src_tmp = TempDir::new().unwrap();
-        let dst_tmp = TempDir::new().unwrap();
-
-        let pkg = src_tmp.path().join("pkg");
-        fs::create_dir(&pkg).unwrap();
-        fs::write(pkg.join("one.txt"), "1").unwrap();
-        fs::create_dir(pkg.join("nested")).unwrap();
-        fs::write(pkg.join("nested").join("two.txt"), "2").unwrap();
-
-        let b = test_backend(dst_tmp.path());
-        let count = copy_sources(&b, std::slice::from_ref(&pkg), dst_tmp.path()).unwrap();
-        assert_eq!(count, 1);
-        assert_eq!(
-            fs::read_to_string(dst_tmp.path().join("pkg").join("one.txt")).unwrap(),
-            "1"
-        );
-        assert_eq!(
-            fs::read_to_string(dst_tmp.path().join("pkg").join("nested").join("two.txt")).unwrap(),
-            "2"
-        );
-    }
-
-    #[test]
-    fn copy_sources_auto_renames_on_collision() {
-        let src_tmp = TempDir::new().unwrap();
-        let dst_tmp = TempDir::new().unwrap();
-
-        let src = src_tmp.path().join("dup.txt");
-        fs::write(&src, "new").unwrap();
-        // Pre-populate dest with the same basename.
-        fs::write(dst_tmp.path().join("dup.txt"), "old").unwrap();
-
-        let b = test_backend(dst_tmp.path());
-        copy_sources(&b, &[src], dst_tmp.path()).unwrap();
-        // Original untouched.
-        assert_eq!(
-            fs::read_to_string(dst_tmp.path().join("dup.txt")).unwrap(),
-            "old"
-        );
-        // New landed with counter.
-        assert_eq!(
-            fs::read_to_string(dst_tmp.path().join("dup (1).txt")).unwrap(),
-            "new"
-        );
-    }
-
-    #[test]
-    fn copy_sources_rejects_non_directory_dest() {
-        let dst_tmp = TempDir::new().unwrap();
-        let not_a_dir = dst_tmp.path().join("nope.txt");
-        fs::write(&not_a_dir, "").unwrap();
-        let src_tmp = TempDir::new().unwrap();
-        let src = src_tmp.path().join("x");
-        fs::write(&src, "").unwrap();
-        let b = test_backend(dst_tmp.path());
-        assert!(copy_sources(&b, &[src], &not_a_dir).is_err());
-    }
-
-    #[test]
-    fn copy_sources_blocks_copy_into_self() {
-        // Regression guard for the infinite-recursion bug where dropping
-        // a directory onto itself would walk the tree while creating
-        // new subdirectories under the walked path, blowing out
-        // PATH_MAX. Users hit this by dragging `src/` from Finder and
-        // dropping it onto `src/` in the tree — the bug fills disk.
-        let tmp = TempDir::new().unwrap();
-        let pkg = tmp.path().join("pkg");
-        fs::create_dir(&pkg).unwrap();
-        fs::write(pkg.join("a.txt"), "").unwrap();
-        let b = test_backend(tmp.path());
-        let err = copy_sources(&b, std::slice::from_ref(&pkg), &pkg).unwrap_err();
-        assert!(
-            err.contains("into itself") || err.contains("descendant"),
-            "expected self-copy rejection, got: {err}"
-        );
-    }
-
-    #[test]
-    fn copy_sources_blocks_copy_into_descendant() {
-        // Subcase: dropping `src/` onto `src/ui/` — still recursive,
-        // still blocked.
-        let tmp = TempDir::new().unwrap();
-        let pkg = tmp.path().join("pkg");
-        let nested = pkg.join("nested");
-        fs::create_dir_all(&nested).unwrap();
-        let b = test_backend(tmp.path());
-        let err = copy_sources(&b, std::slice::from_ref(&pkg), &nested).unwrap_err();
-        assert!(err.contains("into itself") || err.contains("descendant"));
-    }
-
-    #[test]
-    fn copy_sources_allows_sibling_dest_same_parent() {
-        // Sanity check: dropping `src/` onto its parent directory (so
-        // the copy lands as an auto-renamed sibling) must still work.
-        // This is the most common "duplicate" case.
-        let tmp = TempDir::new().unwrap();
-        let pkg = tmp.path().join("pkg");
-        fs::create_dir(&pkg).unwrap();
-        fs::write(pkg.join("a.txt"), "hello").unwrap();
-        let b = test_backend(tmp.path());
-        let count = copy_sources(&b, std::slice::from_ref(&pkg), tmp.path()).unwrap();
-        assert_eq!(count, 1);
-        assert_eq!(
-            fs::read_to_string(tmp.path().join("pkg (1)").join("a.txt")).unwrap(),
-            "hello"
-        );
     }
 }
 
@@ -3345,6 +3437,102 @@ mod fs_mutation_tests {
             fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
             "data",
             "moved file must land at workspace root, not anywhere else"
+        );
+    }
+
+    #[test]
+    fn tree_edit_plan_uses_backend_dir_listing_for_collisions() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/existing.rs"), "").unwrap();
+        let backend = make_local(&tmp);
+
+        let err = plan_tree_edit(
+            &backend,
+            crate::features::tree_edit::TreeEditMode::NewFile,
+            PathBuf::from("src"),
+            None,
+            "existing.rs".to_string(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            TreeEditPlanError::Validation {
+                error: reef_core::file_ops::FileNameError::NameAlreadyExists(name)
+            } if name == "existing.rs"
+        ));
+    }
+
+    #[test]
+    fn tree_edit_plan_builds_relative_rename_mutation() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/old.rs"), "").unwrap();
+        let backend = make_local(&tmp);
+
+        let plan = plan_tree_edit(
+            &backend,
+            crate::features::tree_edit::TreeEditMode::Rename,
+            PathBuf::from("src"),
+            Some(PathBuf::from("src/old.rs")),
+            "new.rs".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.select_on_done, Some(PathBuf::from("src/new.rs")));
+        assert!(matches!(
+            plan.mutation,
+            TreeEditMutation::Rename {
+                old_rel,
+                new_rel,
+                old_name,
+                new_name
+            } if old_rel == Path::new("src/old.rs")
+                && new_rel == Path::new("src/new.rs")
+                && old_name == "old.rs"
+                && new_name == "new.rs"
+        ));
+    }
+
+    #[test]
+    fn paste_plan_uses_backend_dir_listing_for_conflicts_and_keep_both_names() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("src")).unwrap();
+        fs::create_dir(tmp.path().join("dst")).unwrap();
+        fs::write(tmp.path().join("src/a.txt"), "new").unwrap();
+        fs::write(tmp.path().join("dst/a.txt"), "old").unwrap();
+        fs::write(tmp.path().join("dst/a copy.txt"), "older copy").unwrap();
+        let backend = make_local(&tmp);
+
+        let payload = plan_paste(
+            &backend,
+            reef_core::file_ops::ClipMode::Copy,
+            PathBuf::from("dst"),
+            vec![PathBuf::from("src/a.txt")],
+        )
+        .unwrap();
+
+        assert!(payload.auto_decisions.is_empty());
+        assert_eq!(payload.pending.len(), 1);
+        let mut prompt = reef_core::file_ops::PasteConflictPrompt::new(
+            payload.op,
+            payload.dest_rel,
+            payload.auto_decisions,
+            payload.pending,
+            payload.used_names,
+        );
+        assert_eq!(
+            prompt.keep_both_name_for_current().as_deref(),
+            Some("a copy 2.txt")
+        );
+        prompt.resolve_one(Resolution::KeepBoth("a copy 2.txt".to_string()));
+        assert_eq!(
+            prompt.into_decisions(),
+            vec![(
+                PathBuf::from("src/a.txt"),
+                Resolution::KeepBoth("a copy 2.txt".to_string())
+            )]
         );
     }
 }

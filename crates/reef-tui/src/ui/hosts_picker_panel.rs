@@ -1,6 +1,6 @@
 //! Hosts picker overlay (bound to Ctrl+O; see `crate::hosts_picker`).
 //!
-//! Renders on top of the normal UI when `app.hosts_picker.core.active` is true.
+//! Renders on top of the normal UI when the hosts picker overlay is active.
 //! Three regions inside the popup: a single-row input line (filter or
 //! literal path), the visible-row list (recent targets + parsed
 //! `~/.ssh/config` entries), and a help footer. Registers a `ClickAction`
@@ -13,9 +13,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding};
 
-use crate::app::App;
-use crate::hosts_picker::{InputMode, PickerRow};
+use crate::TuiApp as App;
 use crate::ui::mouse::ClickAction;
+use reef_app::InputMode;
 
 pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     let th = app.theme;
@@ -26,11 +26,13 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     let y = screen.y + screen.height.saturating_sub(popup_h) / 2;
     let area = Rect::new(x, y, popup_w, popup_h);
 
-    app.hosts_picker.core.last_popup_area = Some(area);
+    app.hosts_picker_popup_area = Some(area);
 
     f.render_widget(Clear, area);
 
-    let title = match app.hosts_picker.input_mode {
+    let snapshot = app.engine.snapshot().hosts_picker;
+
+    let title = match snapshot.input_mode {
         InputMode::Search => " Connect to · filter ",
         InputMode::Path => " Connect to · [user@]host[:path] ",
     };
@@ -62,17 +64,8 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     };
 
     // Input row.
-    let (input_text, cursor_byte) = match app.hosts_picker.input_mode {
-        InputMode::Search => (
-            app.hosts_picker.core.filter.as_str(),
-            app.hosts_picker.core.cursor,
-        ),
-        InputMode::Path => (
-            app.hosts_picker.path_buffer.as_str(),
-            app.hosts_picker.path_cursor,
-        ),
-    };
-    let prompt = match app.hosts_picker.input_mode {
+    let input_text = snapshot.input_text.as_str();
+    let prompt = match snapshot.input_mode {
         InputMode::Search => "› ",
         InputMode::Path => "➜ ",
     };
@@ -86,7 +79,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     // Visible caret. Width-aware so multi-byte chars don't desync,
     // clamped so a very long buffer doesn't park the caret past the
     // popup's right border.
-    let cursor_clamped = cursor_byte.min(input_text.len());
+    let cursor_clamped = snapshot.cursor.min(input_text.len());
     let cursor_w = unicode_width::UnicodeWidthStr::width(&input_text[..cursor_clamped]) as u16;
     let max_caret_offset = inner.width.saturating_sub(prompt_w + 1);
     let caret_x = inner.x + prompt_w + cursor_w.min(max_caret_offset);
@@ -99,30 +92,16 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
 
     // Visible rows. The picker's computed list drives both the render
     // and the selected_idx clamp; we pull once per frame.
-    let rows = app.hosts_picker.visible_rows();
-
-    for (row_idx, row) in rows.iter().enumerate().take(list_h as usize) {
+    for (row_idx, row) in app.engine.hosts_picker_rows(0, list_h as usize) {
         let y = list_y + row_idx as u16;
-        let is_selected = row_idx == app.hosts_picker.core.selected_idx;
-        let (left, right, is_recent) = match row {
-            PickerRow::Recent(t) => (t.to_arg(), "recent".to_string(), true),
-            PickerRow::Entry(h) => {
-                let right = match (&h.hostname, &h.user) {
-                    (Some(host), Some(user)) => format!("{user}@{host}"),
-                    (Some(host), None) => host.clone(),
-                    (None, Some(user)) => format!("{user}@"),
-                    (None, None) => String::new(),
-                };
-                (h.alias.clone(), right, false)
-            }
-        };
+        let is_selected = row_idx == snapshot.selected_idx;
 
         let left_style = if is_selected {
             Style::default()
                 .fg(th.chrome_bg)
                 .bg(th.accent)
                 .add_modifier(Modifier::BOLD)
-        } else if is_recent {
+        } else if row.recent {
             Style::default().fg(th.accent)
         } else {
             Style::default().fg(th.fg_primary)
@@ -134,8 +113,8 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
         };
 
         let line = Line::from(vec![
-            Span::styled(format!(" {left} "), left_style),
-            Span::styled(format!(" {right} "), right_style),
+            Span::styled(format!(" {} ", row.left), left_style),
+            Span::styled(format!(" {} ", row.right), right_style),
         ]);
         let row_rect = Rect::new(inner.x, y, inner.width, 1);
         f.render_widget(line, row_rect);
@@ -145,7 +124,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
             .register(row_rect, ClickAction::HostsPickerSelect(row_idx));
     }
 
-    if rows.is_empty() {
+    if snapshot.row_count == 0 {
         let empty = Line::from(Span::styled(
             "  no matches — press Ctrl+P to type a target",
             Style::default()
@@ -157,7 +136,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
 
     if has_footer {
         let footer_y = inner.y + inner.height - 1;
-        let footer = match app.hosts_picker.input_mode {
+        let footer = match snapshot.input_mode {
             InputMode::Search => "  Enter connect · Ctrl+P path mode · Esc cancel",
             InputMode::Path => "  Enter connect · Esc back to filter",
         };

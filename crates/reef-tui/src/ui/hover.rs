@@ -5,7 +5,7 @@
 //! under the cursor. Callers pass the theme's `hover_bg` explicitly so this
 //! module stays free of a back-dependency on `ui::theme`.
 
-use crate::app::App;
+use crate::TuiApp as App;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 

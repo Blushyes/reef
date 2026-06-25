@@ -3,13 +3,32 @@
 //!   - `gr` populates the candidates popup with references workspace-wide,
 //!   - per-language filtering keeps `foo` in Python out of `foo` in Rust.
 
-use reef_core::nav::{NavLang, build_workspace_index};
+use reef_core::nav::{NavLang, WorkspaceIndex, WorkspaceIndexFile, build_workspace_index};
+use reef_io::{Backend, LocalBackend, WalkOpts};
 use std::fs;
+use std::path::Path;
+use std::sync::Arc;
 use std::sync::Mutex;
 use tempfile::TempDir;
 use test_support::CwdGuard;
 
 static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+fn build_index_via_backend(root: &Path) -> WorkspaceIndex {
+    let backend = LocalBackend::open_at(root.to_path_buf());
+    let walk = backend.walk_repo_paths(&WalkOpts::default()).unwrap();
+    let files = walk.paths.into_iter().filter_map(|path| {
+        let rel = std::path::PathBuf::from(path);
+        let bytes = backend
+            .read_file(&rel, reef_core::nav::workspace::MAX_FILE_BYTES_INDEX + 1)
+            .ok()?;
+        Some(WorkspaceIndexFile {
+            path: rel,
+            source: Arc::from(bytes.into_boxed_slice()),
+        })
+    });
+    build_workspace_index(backend.workdir_path(), files)
+}
 
 #[test]
 fn index_finds_rust_function_across_files() {
@@ -24,7 +43,7 @@ fn index_finds_rust_function_across_files() {
     )
     .unwrap();
 
-    let index = build_workspace_index(tmp.path().to_path_buf());
+    let index = build_index_via_backend(tmp.path());
 
     // Defs side: `helper` only declared in a.rs.
     let defs = index.defs_by_name.get("helper").expect("helper indexed");
@@ -52,7 +71,7 @@ fn index_filters_by_language() {
     fs::write(tmp.path().join("a.rs"), "fn shared() {}\n").unwrap();
     fs::write(tmp.path().join("b.py"), "def shared():\n    pass\n").unwrap();
 
-    let index = build_workspace_index(tmp.path().to_path_buf());
+    let index = build_index_via_backend(tmp.path());
 
     let defs = index.defs_by_name.get("shared").expect("shared indexed");
     // Both should be present BUT with distinct lang tags so callers
@@ -77,7 +96,7 @@ fn index_respects_gitignore() {
     )
     .unwrap();
 
-    let index = build_workspace_index(tmp.path().to_path_buf());
+    let index = build_index_via_backend(tmp.path());
     assert!(index.defs_by_name.contains_key("visible"));
     assert!(
         !index.defs_by_name.contains_key("hidden"),
@@ -104,7 +123,7 @@ fn vue_files_parse_without_panicking_even_with_no_queries() {
     .unwrap();
     fs::write(tmp.path().join("plain.rs"), "fn rust_marker() {}\n").unwrap();
 
-    let index = reef_core::nav::build_workspace_index(tmp.path().to_path_buf());
+    let index = build_index_via_backend(tmp.path());
     // Rust file picked up normally — proves the walker isn't crashing
     // on the Vue file mid-walk.
     assert!(index.defs_by_name.contains_key("rust_marker"));
@@ -119,7 +138,7 @@ fn empty_workspace_yields_empty_index() {
     let tmp = TempDir::new().unwrap();
     let _g = CwdGuard::enter(tmp.path());
 
-    let index = build_workspace_index(tmp.path().to_path_buf());
+    let index = build_index_via_backend(tmp.path());
     assert_eq!(index.file_count, 0);
     assert!(index.defs_by_name.is_empty());
     assert!(index.refs_by_name.is_empty());

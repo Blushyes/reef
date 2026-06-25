@@ -3,11 +3,13 @@
 
 use reef_io::fs_watcher;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use test_support::{commit_file, tempdir_repo, write_file};
+
+static WATCHER_LOCK: Mutex<()> = Mutex::new(());
 
 /// macOS tempdirs live under `/var/folders/...` which symlinks to
 /// `/private/var/folders/...`. notify delivers canonical paths, so prefix
@@ -29,7 +31,7 @@ fn wait_until_ready(workdir: &Path, rx: &mpsc::Receiver<()>) {
         std::fs::write(&marker, attempt.to_string()).unwrap();
         match rx.recv_timeout(Duration::from_millis(700)) {
             Ok(()) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) if start.elapsed() < Duration::from_secs(5) => {
+            Err(mpsc::RecvTimeoutError::Timeout) if start.elapsed() < Duration::from_secs(15) => {
                 continue;
             }
             Err(e) => panic!("watcher did not become ready: {e:?}"),
@@ -41,6 +43,7 @@ fn wait_until_ready(workdir: &Path, rx: &mpsc::Receiver<()>) {
 
 #[test]
 fn workdir_write_triggers_event() {
+    let _lock = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
     commit_file(&raw, "existing.txt", "v1", "init");
 
@@ -60,6 +63,7 @@ fn workdir_write_triggers_event() {
 
 #[test]
 fn gitignored_write_does_not_trigger() {
+    let _lock = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
     commit_file(&raw, ".gitignore", "target/\n", "add gitignore");
 
@@ -81,6 +85,7 @@ fn gitignored_write_does_not_trigger() {
 
 #[test]
 fn dotgit_internal_write_does_not_trigger() {
+    let _lock = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
     commit_file(&raw, "keep.txt", "v1", "init");
 
@@ -102,6 +107,7 @@ fn dotgit_internal_write_does_not_trigger() {
 
 #[test]
 fn non_git_dir_still_triggers() {
+    let _lock = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = TempDir::new().expect("tempdir");
     let workdir = canonical(tmp.path());
     let rx = fs_watcher::spawn(workdir);
@@ -119,6 +125,7 @@ fn non_git_dir_still_triggers() {
 
 #[test]
 fn debounce_coalesces_bursts() {
+    let _lock = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, _raw) = tempdir_repo();
 
     let workdir = canonical(tmp.path());

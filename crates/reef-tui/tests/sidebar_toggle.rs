@@ -7,10 +7,11 @@
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
-use reef::app::{App, Panel};
+use reef::TuiApp as App;
 use reef::ui::mouse::ClickAction;
 use reef::ui::theme::Theme;
 use reef::ui::{self, SIDEBAR_TOGGLE_GLYPH_HIDDEN, SIDEBAR_TOGGLE_GLYPH_VISIBLE};
+use reef_app::AppPanel as Panel;
 use std::sync::Mutex;
 use tempfile::TempDir;
 use test_support::{CwdGuard, force_en_lang};
@@ -41,7 +42,7 @@ fn sidebar_visible_by_default() {
     let _g = CwdGuard::enter(tmp.path());
 
     let app = App::new(Theme::dark(), None);
-    assert!(app.sidebar_visible);
+    assert!(app.engine.state.sidebar_visible);
     assert!(app.graph_sidebar_width(200) > 0);
 }
 
@@ -53,7 +54,7 @@ fn toggle_hides_sidebar_and_zeroes_width() {
 
     let mut app = App::new(Theme::dark(), None);
     app.toggle_sidebar();
-    assert!(!app.sidebar_visible);
+    assert!(!app.engine.state.sidebar_visible);
     assert_eq!(app.graph_sidebar_width(200), 0);
 }
 
@@ -66,7 +67,7 @@ fn toggle_restores_sidebar() {
     let mut app = App::new(Theme::dark(), None);
     app.toggle_sidebar();
     app.toggle_sidebar();
-    assert!(app.sidebar_visible);
+    assert!(app.engine.state.sidebar_visible);
     assert!(app.graph_sidebar_width(200) > 0);
 }
 
@@ -77,9 +78,9 @@ fn hiding_demotes_files_focus_to_diff() {
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new(Theme::dark(), None);
-    app.active_panel = Panel::Files;
+    app.engine.state.active_panel = Panel::Files;
     app.toggle_sidebar();
-    assert_eq!(app.active_panel, Panel::Diff);
+    assert_eq!(app.engine.state.active_panel, Panel::Diff);
 }
 
 #[test]
@@ -89,9 +90,9 @@ fn hiding_preserves_non_files_focus() {
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new(Theme::dark(), None);
-    app.active_panel = Panel::Diff;
+    app.engine.state.active_panel = Panel::Diff;
     app.toggle_sidebar();
-    assert_eq!(app.active_panel, Panel::Diff);
+    assert_eq!(app.engine.state.active_panel, Panel::Diff);
 }
 
 #[test]
@@ -117,10 +118,10 @@ fn normalize_panel_catches_stranded_files_focus() {
     // Direct field write bypasses `toggle_sidebar`'s focus demotion —
     // `normalize_active_panel` must catch it on the next render.
     let mut app = App::new(Theme::dark(), None);
-    app.sidebar_visible = false;
-    app.active_panel = Panel::Files;
+    app.engine.state.sidebar_visible = false;
+    app.engine.state.active_panel = Panel::Files;
     app.normalize_active_panel();
-    assert_eq!(app.active_panel, Panel::Diff);
+    assert_eq!(app.engine.state.active_panel, Panel::Diff);
 }
 
 #[test]
@@ -130,15 +131,23 @@ fn first_hide_pushes_toast_subsequent_dont() {
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new(Theme::dark(), None);
-    let before = app.toasts.len();
+    let before = app.engine.state.toasts.len();
     app.toggle_sidebar(); // hide → expect one new toast
-    assert_eq!(app.toasts.len(), before + 1);
-    assert!(app.toasts.last().unwrap().message.contains("Ctrl+B"));
+    assert_eq!(app.engine.state.toasts.len(), before + 1);
+    assert!(
+        app.engine
+            .state
+            .toasts
+            .last()
+            .unwrap()
+            .message
+            .contains("Ctrl+B")
+    );
 
     app.toggle_sidebar(); // show
     app.toggle_sidebar(); // hide again
     // Hint flag stays set for the session; second hide must stay quiet.
-    assert_eq!(app.toasts.len(), before + 1);
+    assert_eq!(app.engine.state.toasts.len(), before + 1);
 }
 
 #[test]

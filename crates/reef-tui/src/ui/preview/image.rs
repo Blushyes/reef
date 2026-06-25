@@ -1,4 +1,4 @@
-use crate::app::App;
+use crate::TuiApp as App;
 use crate::i18n::{Msg, t};
 use crate::ui::preview::chrome::render_card_header;
 use ratatui::Frame;

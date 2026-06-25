@@ -1,6 +1,10 @@
 # Integration test recipe
 
-For tests that use real `git2::Repository` or real filesystem. Live under `crates/reef-tui/tests/<name>_integration.rs`.
+For tests that use real `git2::Repository` or real filesystem. Put them next to the crate whose boundary they exercise:
+
+- `crates/reef-app/tests/<name>_integration.rs` for renderer-neutral app engine / worker contracts.
+- `crates/reef-io/tests/<name>_loopback.rs` for backend, agent, protocol, and Local-vs-Remote IO contracts.
+- `crates/reef-tui/tests/<name>_integration.rs` only when the test exercises terminal adapter, input, mouse, or rendering behavior.
 
 ## Basic skeleton
 
@@ -44,11 +48,11 @@ fn scenario_expected_outcome() {
 }
 ```
 
-The `CwdGuard` and `CWD_LOCK` pattern is identical across files (`git_repo_integration.rs`, `ui_snapshots.rs`, `app_error_paths.rs`). Copy it; it hasn't needed to diverge.
+The `CwdGuard` and `CWD_LOCK` pattern is identical across files (`ui_snapshots.rs`, `app_error_paths.rs`). Copy it; it hasn't needed to diverge.
 
 ## HOME isolation pattern
 
-For tests that call `App::new()` or anything else that reads `std::env::var("HOME")` — specifically `src/prefs.rs`:
+For tests that call `TuiApp::new()` or anything else that reads `std::env::var("HOME")` — specifically `src/prefs.rs`:
 
 ```rust
 static HOME_LOCK: Mutex<()> = Mutex::new(());   // or reuse CWD_LOCK if paired

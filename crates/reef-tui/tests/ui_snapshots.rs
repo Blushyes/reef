@@ -181,6 +181,7 @@ fn snapshot_tree_edit_row_new_file() {
     let mut app = App::new(Theme::dark(), None);
     app.refresh_file_tree();
     wait_for_file_tree(&mut app);
+    wait_for_git_status(&mut app);
 
     // Kick off a NewFile edit anchored on the first top-level folder so
     // the editable row renders indented one deeper than the folder.
@@ -211,6 +212,7 @@ fn snapshot_tree_context_menu() {
     let mut app = App::new(Theme::dark(), None);
     app.refresh_file_tree();
     wait_for_file_tree(&mut app);
+    wait_for_git_status(&mut app);
 
     // Open menu anchored at column 4, row 5 — arbitrary coords that
     // leave room for the popup to render inline without getting

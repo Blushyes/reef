@@ -164,6 +164,81 @@ pub struct DiffSelection {
     pub side: DiffSide,
 }
 
+#[derive(Debug, Clone)]
+pub struct CommitDetailHitRow {
+    pub row_idx: usize,
+    pub text: String,
+    pub selectable: bool,
+}
+
+/// Per-frame geometry + visible row text snapshot for Graph commit detail.
+/// Unlike `DiffHit`, this only stores visible rows: commit-detail text
+/// selection has no autoscroll path, so copying never needs hidden rows.
+#[derive(Debug, Clone)]
+pub struct CommitDetailHit {
+    pub content_x: u16,
+    pub content_y: u16,
+    pub h_scroll: usize,
+    pub rows: Vec<CommitDetailHitRow>,
+}
+
+impl CommitDetailHit {
+    pub fn coord_for(&self, col: u16, row: u16) -> Option<(usize, usize)> {
+        if self.rows.is_empty() {
+            return None;
+        }
+        let visible_row = if row < self.content_y {
+            0
+        } else {
+            (row - self.content_y) as usize
+        }
+        .min(self.rows.len() - 1);
+        let hit_row = self.rows.get(visible_row)?;
+        let visible_col = (col.saturating_sub(self.content_x) as usize) + self.h_scroll;
+        let byte_offset = col_to_byte_offset(&hit_row.text, visible_col);
+        Some((hit_row.row_idx, byte_offset))
+    }
+
+    pub fn selectable_coord_for(&self, col: u16, row: u16) -> Option<(usize, usize)> {
+        let visible_row = row.checked_sub(self.content_y)? as usize;
+        self.selectable_coord_at_visible_row(col, visible_row)
+    }
+
+    pub fn selectable_coord_for_clamped(&self, col: u16, row: u16) -> Option<(usize, usize)> {
+        if self.rows.is_empty() {
+            return None;
+        }
+        let visible_row = if row < self.content_y {
+            0
+        } else {
+            (row - self.content_y) as usize
+        }
+        .min(self.rows.len() - 1);
+        self.selectable_coord_at_visible_row(col, visible_row)
+    }
+
+    fn selectable_coord_at_visible_row(
+        &self,
+        col: u16,
+        visible_row: usize,
+    ) -> Option<(usize, usize)> {
+        let hit_row = self.rows.get(visible_row)?;
+        if !hit_row.selectable {
+            return None;
+        }
+        let visible_col = (col.saturating_sub(self.content_x) as usize) + self.h_scroll;
+        let byte_offset = col_to_byte_offset(&hit_row.text, visible_col);
+        Some((hit_row.row_idx, byte_offset))
+    }
+
+    pub fn text_for_row(&self, row_idx: usize) -> Option<&str> {
+        self.rows
+            .iter()
+            .find(|row| row.row_idx == row_idx && row.selectable)
+            .map(|row| row.text.as_str())
+    }
+}
+
 /// Identifier under a Ctrl+hover in the diff panel — drives the
 /// underline-on-hover affordance (the diff analogue of
 /// `App::ctrl_hover_target`). `row` is the display-row index; `range` is
@@ -328,6 +403,38 @@ pub fn collect_diff_selected_text(hit: &DiffHit, sel: &DiffSelection) -> String 
     out
 }
 
+pub fn collect_commit_detail_selected_text(
+    hit: &CommitDetailHit,
+    sel: &PreviewSelection,
+) -> String {
+    if sel.is_empty() || hit.rows.is_empty() {
+        return String::new();
+    }
+    let (start, end) = sel.normalized();
+    let first_visible = hit.rows.first().map(|row| row.row_idx).unwrap_or(0);
+    let last_visible = hit.rows.last().map(|row| row.row_idx).unwrap_or(0);
+    let first = start.0.max(first_visible);
+    let last = end.0.min(last_visible);
+    if first > last {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    for row_idx in first..=last {
+        if let Some(line) = hit.text_for_row(row_idx)
+            && let Some(range) = sel.line_byte_range(row_idx, line)
+            && range.start < line.len()
+        {
+            let end_clamped = range.end.min(line.len());
+            out.push_str(&line[range.start..end_clamped]);
+        }
+        if row_idx < last {
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// 把选中范围从 `lines` 提取成一段纯文本。多行之间用 `\n` 连接。
 pub fn collect_selected_text(lines: &[String], sel: &PreviewSelection) -> String {
     collect_selected_text_from_rows(lines.iter().map(String::as_str), lines.len(), sel)
@@ -455,6 +562,67 @@ mod tests {
             dragging: false,
         };
         assert_eq!(s.line_byte_range(5, "anything"), None);
+    }
+
+    #[test]
+    fn commit_detail_hit_maps_visible_coords_to_row_offsets() {
+        let hit = CommitDetailHit {
+            content_x: 10,
+            content_y: 5,
+            h_scroll: 2,
+            rows: vec![
+                CommitDetailHitRow {
+                    row_idx: 7,
+                    text: "abcdef".to_string(),
+                    selectable: true,
+                },
+                CommitDetailHitRow {
+                    row_idx: 8,
+                    text: "second".to_string(),
+                    selectable: false,
+                },
+            ],
+        };
+
+        assert_eq!(hit.selectable_coord_for(11, 5), Some((7, 3)));
+        assert_eq!(hit.selectable_coord_for(11, 6), None);
+        assert_eq!(hit.coord_for(99, 99), Some((8, "second".len())));
+    }
+
+    #[test]
+    fn collect_commit_detail_selected_text_skips_unselectable_rows() {
+        let hit = CommitDetailHit {
+            content_x: 0,
+            content_y: 0,
+            h_scroll: 0,
+            rows: vec![
+                CommitDetailHitRow {
+                    row_idx: 10,
+                    text: "commit abc".to_string(),
+                    selectable: true,
+                },
+                CommitDetailHitRow {
+                    row_idx: 11,
+                    text: "clicked file".to_string(),
+                    selectable: false,
+                },
+                CommitDetailHitRow {
+                    row_idx: 12,
+                    text: "message body".to_string(),
+                    selectable: true,
+                },
+            ],
+        };
+        let sel = PreviewSelection {
+            anchor: (10, 7),
+            active: (12, 7),
+            dragging: false,
+        };
+
+        assert_eq!(
+            collect_commit_detail_selected_text(&hit, &sel),
+            "abc\n\nmessage"
+        );
     }
 
     #[test]

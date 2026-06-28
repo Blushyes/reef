@@ -1,6 +1,4 @@
-use crate::app::App;
-use crate::find_widget::FindTarget;
-use crate::search::SearchTarget;
+use crate::TuiApp as App;
 use crate::ui::mouse::ClickAction;
 use crate::ui::preview::chrome::render_card_header;
 use crate::ui::text::{clip_spans, overlay_match_highlight, overlay_selection_highlight, spaces};
@@ -8,6 +6,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use reef_app::{AppCommand, FindTarget, SearchTarget};
 use reef_core::preview::PreviewDocument as PreviewContent;
 use unicode_width::UnicodeWidthStr;
 
@@ -23,15 +22,16 @@ pub(in crate::ui) fn render(
     let max_y = area.y + area.height;
     let y = render_card_header(f, area, &preview.path, &th, focused, None);
     let content_height = (max_y - y) as usize;
-    app.last_preview_view_h = content_height as u16;
+    app.layout.last_preview_view_h = content_height as u16;
     let max_scroll = markdown.text_rows.len().saturating_sub(content_height);
-    app.preview_scroll = app.preview_scroll.min(max_scroll);
+    app.engine
+        .dispatch(AppCommand::ClampPreviewVerticalScroll(max_scroll));
 
     let content_w = area.width as usize;
     let max_visible_w = markdown
         .rows
         .iter()
-        .skip(app.preview_scroll)
+        .skip(app.engine.preview_scroll())
         .take(content_height)
         .map(|row| {
             row.iter()
@@ -41,19 +41,25 @@ pub(in crate::ui) fn render(
         .max()
         .unwrap_or(0);
     let max_h = max_visible_w.saturating_sub(content_w);
-    app.preview_h_scroll = app.preview_h_scroll.min(max_h);
-    let h = app.preview_h_scroll;
+    app.engine
+        .dispatch(AppCommand::ClampPreviewHorizontalScroll(max_h));
+    let h = app.engine.preview_h_scroll();
 
     app.last_preview_content_origin = None;
     app.last_markdown_content_origin = Some((area.x, y));
     let selection = app.preview_selection;
 
-    for (i, row) in markdown.rows.iter().skip(app.preview_scroll).enumerate() {
+    for (i, row) in markdown
+        .rows
+        .iter()
+        .skip(app.engine.preview_scroll())
+        .enumerate()
+    {
         let cy = y + i as u16;
         if cy >= max_y {
             break;
         }
-        let real_idx = app.preview_scroll + i;
+        let real_idx = app.engine.preview_scroll() + i;
         let base_tokens: Vec<(Style, std::borrow::Cow<'_, str>)> = row
             .iter()
             .scan(0usize, |pos, span| {
@@ -66,11 +72,13 @@ pub(in crate::ui) fn render(
                 Some((style, std::borrow::Cow::Borrowed(span.text.as_str())))
             })
             .collect();
-        let (ranges, cur) = if app.find_widget.target == Some(FindTarget::FilePreview) {
-            app.find_widget
+        let (ranges, cur) = if app.engine.find_widget().target == Some(FindTarget::FilePreview) {
+            app.engine
+                .find_widget()
                 .ranges_on_row(FindTarget::FilePreview, real_idx)
         } else {
-            app.search
+            app.engine
+                .search()
                 .ranges_on_row(SearchTarget::FilePreview, real_idx)
         };
         let tokens = if ranges.is_empty() {

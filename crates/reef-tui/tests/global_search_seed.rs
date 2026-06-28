@@ -4,7 +4,7 @@
 //! Selection"). Without a selection, the existing `query` survives so
 //! Esc-peek-and-return is non-destructive.
 
-use reef::app::App;
+use reef::TuiApp as App;
 use reef::global_search;
 use reef::ui::selection::PreviewSelection;
 use reef::ui::theme::Theme;
@@ -27,23 +27,29 @@ fn fresh_app() -> (App, TempDir, CwdGuard) {
 }
 
 fn install_text_preview(app: &mut App, lines: &[&str]) {
-    app.preview_content = Some(PreviewContent {
-        path: "scratch.txt".to_string(),
-        body: PreviewBody::Text(TextPreview {
-            lines: lines.iter().map(|s| s.to_string()).collect(),
-            highlighted: None,
-            parsed: None,
-        }),
-    });
+    app.engine.state.preview_content = Some(
+        PreviewContent {
+            path: "scratch.txt".to_string(),
+            body: PreviewBody::Text(TextPreview {
+                lines: lines.iter().map(|s| s.to_string()).collect(),
+                highlighted: None,
+                parsed: None,
+            }),
+        }
+        .into(),
+    );
 }
 
 fn install_markdown_preview(app: &mut App, source: &str) {
     let markdown = reef_core::markdown::build_markdown_preview("README.md", source, true)
         .expect("markdown preview");
-    app.preview_content = Some(PreviewContent {
-        path: "README.md".to_string(),
-        body: PreviewBody::Markdown(markdown),
-    });
+    app.engine.state.preview_content = Some(
+        PreviewContent {
+            path: "README.md".to_string(),
+            body: PreviewBody::Markdown(markdown),
+        }
+        .into(),
+    );
 }
 
 fn select_byte_range(app: &mut App, start: (usize, usize), end: (usize, usize)) {
@@ -57,14 +63,14 @@ fn select_byte_range(app: &mut App, start: (usize, usize), end: (usize, usize)) 
 fn begin_without_selection_preserves_existing_query() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp, _g) = fresh_app();
-    app.global_search.core.filter = "previous".to_string();
-    app.global_search.core.cursor = "previous".len();
+    app.engine.state.global_search.core.filter = "previous".to_string();
+    app.engine.state.global_search.core.cursor = "previous".len();
 
     global_search::begin(&mut app);
 
-    assert!(app.global_search.core.active);
-    assert_eq!(app.global_search.core.filter, "previous");
-    assert_eq!(app.global_search.core.cursor, "previous".len());
+    assert!(app.engine.state.global_search.core.active);
+    assert_eq!(app.engine.state.global_search.core.filter, "previous");
+    assert_eq!(app.engine.state.global_search.core.cursor, "previous".len());
 }
 
 #[test]
@@ -77,9 +83,9 @@ fn begin_seeds_query_from_preview_selection() {
 
     global_search::begin(&mut app);
 
-    assert_eq!(app.global_search.core.filter, "bar();");
-    assert_eq!(app.global_search.core.cursor, "bar();".len());
-    assert!(app.global_search.core.active);
+    assert_eq!(app.engine.state.global_search.core.filter, "bar();");
+    assert_eq!(app.engine.state.global_search.core.cursor, "bar();".len());
+    assert!(app.engine.state.global_search.core.active);
 }
 
 #[test]
@@ -93,7 +99,7 @@ fn begin_seeds_first_nonempty_line_when_selection_spans_multiple_rows() {
     global_search::begin(&mut app);
 
     assert_eq!(
-        app.global_search.core.filter, "hello",
+        app.engine.state.global_search.core.filter, "hello",
         "leading blank row must be skipped, indent must be trimmed",
     );
 }
@@ -106,8 +112,10 @@ fn begin_with_seed_equal_to_existing_query_keeps_excluded_set() {
     // Guard: `begin()` skips `mark_query_edited` when the seed matches.
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp, _g) = fresh_app();
-    app.global_search.core.filter = "bar".to_string();
-    app.global_search
+    app.engine.state.global_search.core.filter = "bar".to_string();
+    app.engine
+        .state
+        .global_search
         .excluded
         .insert((PathBuf::from("a.rs"), 1));
     install_text_preview(&mut app, &["bar"]);
@@ -115,9 +123,9 @@ fn begin_with_seed_equal_to_existing_query_keeps_excluded_set() {
 
     global_search::begin(&mut app);
 
-    assert_eq!(app.global_search.core.filter, "bar");
+    assert_eq!(app.engine.state.global_search.core.filter, "bar");
     assert!(
-        !app.global_search.excluded.is_empty(),
+        !app.engine.state.global_search.excluded.is_empty(),
         "no-op seed must not wipe per-match opt-outs",
     );
 }
@@ -129,13 +137,13 @@ fn begin_with_empty_selection_keeps_existing_query() {
     // seed with, so the existing query stays.
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp, _g) = fresh_app();
-    app.global_search.core.filter = "kept".to_string();
+    app.engine.state.global_search.core.filter = "kept".to_string();
     install_text_preview(&mut app, &["foo bar"]);
     select_byte_range(&mut app, (0, 2), (0, 2));
 
     global_search::begin(&mut app);
 
-    assert_eq!(app.global_search.core.filter, "kept");
+    assert_eq!(app.engine.state.global_search.core.filter, "kept");
 }
 
 #[test]
@@ -143,7 +151,7 @@ fn begin_seeds_from_markdown_rendered_rows() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp, _g) = fresh_app();
     install_markdown_preview(&mut app, "| Name | Count |\n|---|---:|\n| reef | 12 |\n");
-    let rendered = match &app.preview_content.as_ref().unwrap().body {
+    let rendered = match &app.engine.state.preview_content.as_ref().unwrap().body {
         PreviewBody::Markdown(markdown) => markdown.text_rows[1].clone(),
         _ => panic!("markdown preview expected"),
     };
@@ -152,5 +160,5 @@ fn begin_seeds_from_markdown_rendered_rows() {
 
     global_search::begin(&mut app);
 
-    assert_eq!(app.global_search.core.filter, rendered);
+    assert_eq!(app.engine.state.global_search.core.filter, rendered);
 }

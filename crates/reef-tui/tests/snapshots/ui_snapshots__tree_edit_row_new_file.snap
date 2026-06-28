@@ -1,11 +1,11 @@
 ---
-source: tests/ui_snapshots.rs
-assertion_line: 214
+source: crates/reef-tui/tests/ui_snapshots.rs
+assertion_line: 197
 expression: output
 ---
  reef  [TMPDIR]  ⎇ master
  📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph        ⊟  1:Files 2:Search 3:Git 4:Graph
- +   📁    ↻   ⊟        │
+ +   +   ⊟             │
  ▸ src ●               │
       New file name…   │
    README.md           │
@@ -22,4 +22,4 @@ expression: output
                        │
                        │
                        │
- 🔗  SSH        ⚙  q:quit Tab:switch s:stage u:unstage r:refresh h:help  [Files]
+ SSH           ⚙  q:quit Tab:switch s:stage u:unstage r:refresh h:help  [Files]

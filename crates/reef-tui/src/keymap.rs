@@ -185,42 +185,43 @@ impl Keymap {
     }
 }
 
-pub fn scope_for_app(app: &crate::app::App) -> InputScope {
-    if app.db_goto_input.is_some() {
+pub fn scope_for_app(app: &crate::TuiApp) -> InputScope {
+    let snapshot = app.engine.snapshot();
+    if snapshot.overlays.db_goto {
         InputScope::DbGoto
-    } else if app.hosts_picker.core.active {
+    } else if snapshot.overlays.hosts_picker {
         InputScope::HostsPicker
-    } else if app.graph_branch_picker.core.active {
+    } else if snapshot.overlays.graph_branch_picker {
         InputScope::GraphBranchPicker
-    } else if app.find_widget.active {
+    } else if app.engine.find_widget().active {
         InputScope::FindWidget
-    } else if app.global_search.core.active {
+    } else if snapshot.overlays.global_search {
         InputScope::GlobalSearch
-    } else if app.quick_open.core.active {
+    } else if snapshot.overlays.quick_open {
         InputScope::QuickOpen
-    } else if app.search.active {
+    } else if app.engine.search().active {
         InputScope::VimSearch
-    } else if app.tree_edit.active {
+    } else if snapshot.overlays.tree_edit {
         InputScope::TreeEdit
-    } else if app.tree_context_menu.active {
+    } else if snapshot.overlays.tree_context_menu {
         InputScope::TreeContextMenu
-    } else if app.nav_candidates.is_some() {
+    } else if snapshot.overlays.nav_candidates {
         InputScope::NavCandidates
-    } else if app.confirm_modal.is_some() {
+    } else if snapshot.overlays.confirm.is_some() {
         InputScope::ConfirmModal
-    } else if app.paste_conflict.is_some() {
+    } else if snapshot.overlays.paste_conflict {
         InputScope::PasteConflict
-    } else if app.place_mode.active {
+    } else if snapshot.overlays.place_mode {
         InputScope::PlaceMode
-    } else if app.tree_drag.active {
+    } else if snapshot.overlays.tree_drag {
         InputScope::TreeDrag
-    } else if app.view_mode == crate::app::ViewMode::Settings {
+    } else if snapshot.view_mode == reef_app::ViewMode::Settings {
         InputScope::Settings
-    } else if app.view_mode == crate::app::ViewMode::FocusedPreview {
+    } else if snapshot.view_mode == reef_app::ViewMode::FocusedPreview {
         InputScope::FocusedPreview
-    } else if app.git_status.commit_editing {
+    } else if snapshot.overlays.commit_editor {
         InputScope::CommitEditor
-    } else if app.global_search.input_focused() {
+    } else if snapshot.overlays.search_input {
         InputScope::SearchInput
     } else {
         InputScope::Normal

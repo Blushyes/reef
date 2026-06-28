@@ -1,6 +1,6 @@
 # Property test recipe
 
-For asserting invariants that hold over a wide input space. Uses `proptest` (already a dev-dependency in `reef`). Live under `crates/reef-tui/tests/<name>_properties.rs`.
+For asserting invariants that hold over a wide input space. Uses `proptest` as a dev-dependency of the crate whose logic is under test. Put the file next to that crate's boundary, for example `crates/reef-core/tests/<name>_properties.rs` for core algorithms and `crates/reef-tui/tests/<name>_properties.rs` for terminal adapter behavior.
 
 ## When to use proptest vs. unit tests
 
@@ -85,7 +85,7 @@ Key moves:
 2. Map the shape to valid structures
 3. Rely on `%` to keep parent indices in range (instead of filtering, which slows generation)
 
-See `crates/reef-tui/tests/git_graph_properties.rs` for the complete version.
+See `crates/reef-core/tests/git_graph_properties.rs` for the complete version.
 
 ## Useful property patterns
 

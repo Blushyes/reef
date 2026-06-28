@@ -2,8 +2,8 @@
 //! directory tree, plus the `collapsed_key` helper used when persisting which
 //! subtrees the user has collapsed in the Git status sidebar.
 //!
-//! The rendering side (ratatui rows, click targets) lives with each panel
-//! in `ui/*_panel.rs` so the tree stays decoupled from output format.
+//! Renderer-specific rows and click targets live with each frontend panel
+//! so the tree stays decoupled from output format.
 
 use super::FileEntry;
 use std::collections::{BTreeMap, HashSet};

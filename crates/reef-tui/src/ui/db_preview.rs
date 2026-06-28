@@ -9,20 +9,19 @@
 //! calls into [`render`] for the Database arm; everything else here
 //! is private.
 //!
-//! Public helpers `natural_column_widths` / `total_table_width` are
-//! consumed by [`crate::app::DbPreviewState::recompute_layout`] so
-//! the cache stays the single source of truth for the data pane's
-//! layout. They live here (with the rest of the column-width logic)
-//! rather than on App, but stay `pub(crate)` so the boundary's
-//! intentional.
+//! Public helpers `natural_column_widths` / `total_table_width` feed
+//! the TUI-only data-pane layout cache. The selected object, page, and
+//! current rows live in `reef-app`; this module keeps only terminal
+//! drawing math.
 
-use crate::app::App;
+use crate::TuiApp as App;
 use crate::i18n::{Msg, t};
 use crate::ui::text::clip_spans;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use reef_app::AppCommand;
 use reef_sqlite_preview::{ColumnInfo, DatabaseInfoV2, DbObject, DbObjectKind, SqliteValue};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -129,15 +128,11 @@ pub(in crate::ui) fn render(
     }
 
     // Navigation state for this `.db`. Cloned up front so the borrow
-    // releases before the pane renderers take `&mut app`. The clone is
-    // now small (no schema graph copy — that lives in `info`); the only
-    // heap fields left are the current page's rows + cached col_widths
-    // + the `expanded` set, all <1 KB in practice.
-    let state: Option<crate::app::DbPreviewState> = app
-        .db_preview_state
-        .as_ref()
-        .filter(|s| s.path == path)
-        .cloned();
+    // releases before the pane renderers take `&mut app`. The schema
+    // graph stays in `info`; app state carries only the selected object,
+    // expanded schemas, current page, rows, and detail payload.
+    let state: Option<reef_app::DbPreviewState> =
+        app.engine.db_preview().filter(|s| s.path == path).cloned();
     let state_ref = state.as_ref();
 
     // Locate the currently-selected object across every schema. Falls
@@ -159,10 +154,9 @@ pub(in crate::ui) fn render(
     // unconditionally; we snap back here so an over-scroll past the
     // bottom doesn't leave the data pane empty.
     let max_scroll = rows.len().saturating_sub(1);
-    if app.preview_scroll > max_scroll {
-        app.preview_scroll = max_scroll;
-    }
-    let row_offset = app.preview_scroll;
+    app.engine
+        .dispatch(AppCommand::ClampPreviewVerticalScroll(max_scroll));
+    let row_offset = app.engine.preview_scroll();
 
     // Reserve last row for the page footer; the body sits between
     // `y` and `body_max_y`. Skipping the footer if there's only one
@@ -201,19 +195,29 @@ pub(in crate::ui) fn render(
 
     match selected_object {
         Some(o) if o.kind.has_rows() => {
-            // Column widths come from the cache on `db_preview_state` —
-            // recomputed only when current_rows / selected change, not
-            // on every render. This makes h-scroll cheap: a single
-            // keypress is O(1) work in the render path (clip_spans on
-            // visible rows only), no O(rows × cols × avg_str_len)
-            // re-walk per frame. When state is missing (the rare race
-            // window between preview-land and the apply_worker_result
-            // hook) we fall back to computing on the fly so the table
-            // still draws.
+            // Column widths are TUI-only derived layout. The app engine
+            // owns the rows and selection; the renderer caches widths
+            // keyed by that state so horizontal scrolling stays cheap.
             let owned_widths: Vec<usize>;
             let owned_total_w: usize;
             let (col_widths, total_table_w) = match state_ref {
-                Some(s) if !s.col_widths.is_empty() => (s.col_widths.as_slice(), s.total_table_w),
+                Some(s) => {
+                    let needs_rebuild = app
+                        .db_preview_layout
+                        .as_ref()
+                        .map(|cache| !cache.matches(path, s))
+                        .unwrap_or(true);
+                    if needs_rebuild {
+                        app.db_preview_layout = Some(
+                            crate::tui_app::DbPreviewLayoutCache::rebuild(path, s, &o.columns),
+                        );
+                    }
+                    let cache = app
+                        .db_preview_layout
+                        .as_ref()
+                        .expect("db preview layout cache was just built");
+                    (cache.col_widths.as_slice(), cache.total_table_w)
+                }
                 _ => {
                     owned_widths = natural_column_widths(&o.columns, rows);
                     owned_total_w = total_table_width(&owned_widths);
@@ -221,10 +225,9 @@ pub(in crate::ui) fn render(
                 }
             };
             let max_h_scroll = total_table_w.saturating_sub(data_w as usize);
-            if app.preview_h_scroll > max_h_scroll {
-                app.preview_h_scroll = max_h_scroll;
-            }
-            let h_scroll = app.preview_h_scroll;
+            app.engine
+                .dispatch(AppCommand::ClampPreviewHorizontalScroll(max_h_scroll));
+            let h_scroll = app.engine.preview_h_scroll();
 
             render_data_pane(
                 f,
@@ -238,7 +241,7 @@ pub(in crate::ui) fn render(
 
             // Pagination footer.
             if body_max_y < max_y {
-                if let Some(buf) = app.db_goto_input.as_ref() {
+                if let Some(buf) = app.engine.db_goto_input() {
                     let prompt_text = format!("{}: ", t(Msg::DbGotoPagePrompt));
                     let prompt_w =
                         unicode_width::UnicodeWidthStr::width(prompt_text.as_str()) as u16;
@@ -249,7 +252,7 @@ pub(in crate::ui) fn render(
                                 .fg(th.fg_primary)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(buf.clone(), Style::default().fg(th.fg_primary)),
+                        Span::styled(buf.to_string(), Style::default().fg(th.fg_primary)),
                         Span::styled(
                             format!("  {}", t(Msg::DbGotoPageHint)),
                             Style::default().fg(th.fg_secondary),
@@ -261,7 +264,7 @@ pub(in crate::ui) fn render(
                     // convention used by every other input in reef. The
                     // 18-char cap means this is always a valid char
                     // boundary on ASCII digits.
-                    let cursor_byte = app.db_goto_cursor.min(buf.len());
+                    let cursor_byte = app.engine.db_goto_cursor().min(buf.len());
                     let cursor_w =
                         unicode_width::UnicodeWidthStr::width(&buf[..cursor_byte]) as u16;
                     let caret_x = prompt_rect.x
@@ -845,7 +848,7 @@ enum SidebarRow<'a> {
 /// elided.
 fn build_sidebar_rows<'a>(
     info: &'a reef_sqlite_preview::DatabaseInfoV2,
-    state: Option<&'a crate::app::DbPreviewState>,
+    state: Option<&'a reef_app::DbPreviewState>,
 ) -> Vec<SidebarRow<'a>> {
     let mut rows = Vec::new();
     for schema in &info.schemas {
@@ -947,7 +950,7 @@ fn render_objects_pane(
     theme: &crate::ui::theme::Theme,
     area: Rect,
     rows: &[SidebarRow<'_>],
-    state: Option<&crate::app::DbPreviewState>,
+    state: Option<&reef_app::DbPreviewState>,
 ) {
     if area.width < 4 || area.height < 1 || rows.is_empty() {
         return;
@@ -958,7 +961,7 @@ fn render_objects_pane(
     let selected_row_idx = state
         .and_then(|s| {
             rows.iter().position(|r| match r {
-                SidebarRow::Object(o) => o.name == s.selection.name && o.kind == s.selection.kind,
+                SidebarRow::Object(o) => o.key() == s.selection,
                 _ => false,
             })
         })
@@ -1035,8 +1038,7 @@ fn render_objects_pane(
                 );
             }
             SidebarRow::Object(o) => {
-                let is_selected =
-                    state.is_some_and(|s| o.name == s.selection.name && o.kind == s.selection.kind);
+                let is_selected = state.is_some_and(|s| o.key() == s.selection);
                 render_object_row(f, app, theme, area, y, o, is_selected);
             }
         }

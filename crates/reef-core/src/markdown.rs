@@ -1,6 +1,7 @@
 use pulldown_cmark::{
     Alignment as MdAlignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd,
 };
+use std::path::{Component, Path, PathBuf};
 use unicode_width::UnicodeWidthStr;
 
 use crate::text::TextStyle;
@@ -375,6 +376,48 @@ pub fn build_markdown_preview(path: &str, source: &str, dark: bool) -> Option<Ma
     Some(MarkdownPreview { rows, text_rows })
 }
 
+pub fn is_url_link(target: &str) -> bool {
+    url::Url::parse(target).is_ok_and(|url| matches!(url.scheme(), "http" | "https" | "mailto"))
+}
+
+pub fn link_path_without_fragment(target: &str) -> Option<&str> {
+    let path = target
+        .split_once('#')
+        .map(|(path, _)| path)
+        .unwrap_or(target);
+    (!path.is_empty()).then_some(path)
+}
+
+pub fn normalize_relative_link_path(path: PathBuf) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => out.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop().then_some(())?;
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(out)
+}
+
+pub fn resolve_relative_link(preview_path: &Path, target: &str) -> Option<PathBuf> {
+    let path = link_path_without_fragment(target)?;
+    let path = Path::new(path);
+    if path.is_absolute() {
+        return None;
+    }
+    let base = preview_path.parent().unwrap_or_else(|| Path::new(""));
+    normalize_relative_link_path(base.join(path))
+}
+
+pub fn remote_absolute_link_under_root(root: &Path, abs: &Path) -> Option<PathBuf> {
+    let rel = abs.strip_prefix(root).ok()?;
+    normalize_relative_link_path(rel.to_path_buf())
+}
+
 pub fn is_markdown_path(path: &str) -> bool {
     let p = std::path::Path::new(path);
     matches!(
@@ -617,6 +660,43 @@ mod tests {
         assert!(is_markdown_path("README.md"));
         assert!(is_markdown_path("notes.Markdown"));
         assert!(!is_markdown_path("notes.txt"));
+    }
+
+    #[test]
+    fn markdown_link_helpers_resolve_urls_and_relative_paths() {
+        assert!(is_url_link("https://example.com/a"));
+        assert!(is_url_link("mailto:hello@example.com"));
+        assert!(!is_url_link("../intro.md"));
+
+        assert_eq!(
+            normalize_relative_link_path(PathBuf::from("docs/../README.md")),
+            Some(PathBuf::from("README.md"))
+        );
+        assert_eq!(
+            normalize_relative_link_path(PathBuf::from("../outside.md")),
+            None
+        );
+        assert_eq!(
+            resolve_relative_link(Path::new("docs/guide/index.md"), "../intro.md#top"),
+            Some(PathBuf::from("docs/intro.md"))
+        );
+        assert_eq!(
+            resolve_relative_link(Path::new("README.md"), "#local"),
+            None
+        );
+    }
+
+    #[test]
+    fn remote_absolute_link_must_stay_under_root() {
+        let root = PathBuf::from("/home/me/repo");
+        assert_eq!(
+            remote_absolute_link_under_root(&root, Path::new("/home/me/repo/docs/a.md")),
+            Some(PathBuf::from("docs/a.md"))
+        );
+        assert_eq!(
+            remote_absolute_link_under_root(&root, Path::new("/etc/passwd")),
+            None
+        );
     }
 
     #[test]

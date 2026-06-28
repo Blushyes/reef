@@ -9,7 +9,7 @@
 //! would fail here even if the UI layer happened to paper over it.
 
 use ratatui_image::picker::Picker;
-use reef::app::App;
+use reef::TuiApp as App;
 use reef::ui::theme::Theme;
 use reef_core::preview::PreviewBody;
 use std::sync::Mutex;
@@ -27,7 +27,7 @@ fn wait_for_preview(app: &mut App) {
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
         app.tick();
-        if !app.preview_load.loading && app.preview_content.is_some() {
+        if !app.engine.state.preview_load.loading && app.engine.state.preview_content.is_some() {
             return;
         }
         thread::sleep(Duration::from_millis(10));
@@ -52,22 +52,31 @@ fn selecting_png_decodes_and_builds_protocol() {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         app.tick();
-        if !app.file_tree_load.loading && !app.file_tree.entries.is_empty() {
+        if !app.engine.state.file_tree_load.loading
+            && !app.engine.state.file_tree.entries.is_empty()
+        {
             break;
         }
         thread::sleep(Duration::from_millis(10));
     }
     let idx = app
+        .engine
+        .state
         .file_tree
         .entries
         .iter()
         .position(|e| e.name == "img.png")
         .expect("img.png in tree");
-    app.file_tree.selected = idx;
+    app.engine.state.file_tree.selected = idx;
     app.load_preview();
     wait_for_preview(&mut app);
 
-    let preview = app.preview_content.as_ref().expect("preview present");
+    let preview = app
+        .engine
+        .state
+        .preview_content
+        .as_ref()
+        .expect("preview present");
     match &preview.body {
         PreviewBody::Image(img) => {
             assert_eq!(img.width_px, 16);
@@ -85,7 +94,7 @@ fn selecting_png_decodes_and_builds_protocol() {
     // The decoded `DynamicImage` was moved into the protocol, so the
     // ImagePreview we're holding shouldn't still be carrying a copy
     // (that would double the memory footprint per selection).
-    if let PreviewBody::Image(img) = &app.preview_content.as_ref().unwrap().body {
+    if let PreviewBody::Image(img) = &app.engine.state.preview_content.as_ref().unwrap().body {
         assert!(
             img.image.is_none(),
             "pixels must be moved into the protocol, not duplicated on PreviewContent"
@@ -115,18 +124,22 @@ fn re_selecting_same_image_reuses_protocol() {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         app.tick();
-        if !app.file_tree_load.loading && !app.file_tree.entries.is_empty() {
+        if !app.engine.state.file_tree_load.loading
+            && !app.engine.state.file_tree.entries.is_empty()
+        {
             break;
         }
         thread::sleep(Duration::from_millis(10));
     }
     let idx = app
+        .engine
+        .state
         .file_tree
         .entries
         .iter()
         .position(|e| e.name == "img.png")
         .expect("img.png in tree");
-    app.file_tree.selected = idx;
+    app.engine.state.file_tree.selected = idx;
     app.load_preview();
     wait_for_preview(&mut app);
     assert!(app.preview_image_protocol.is_some());
@@ -167,22 +180,26 @@ fn selecting_png_without_picker_keeps_body_but_no_protocol() {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         app.tick();
-        if !app.file_tree_load.loading && !app.file_tree.entries.is_empty() {
+        if !app.engine.state.file_tree_load.loading
+            && !app.engine.state.file_tree.entries.is_empty()
+        {
             break;
         }
         thread::sleep(Duration::from_millis(10));
     }
     let idx = app
+        .engine
+        .state
         .file_tree
         .entries
         .iter()
         .position(|e| e.name == "img.png")
         .expect("img.png in tree");
-    app.file_tree.selected = idx;
+    app.engine.state.file_tree.selected = idx;
     app.load_preview();
     wait_for_preview(&mut app);
 
-    match app.preview_content.as_ref().unwrap().body {
+    match app.engine.state.preview_content.as_ref().unwrap().body {
         PreviewBody::Image(_) => {}
         ref other => panic!("expected Image body, got {other:?}"),
     }
@@ -206,22 +223,26 @@ fn pdf_is_classified_as_non_image_binary() {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         app.tick();
-        if !app.file_tree_load.loading && !app.file_tree.entries.is_empty() {
+        if !app.engine.state.file_tree_load.loading
+            && !app.engine.state.file_tree.entries.is_empty()
+        {
             break;
         }
         thread::sleep(Duration::from_millis(10));
     }
     let idx = app
+        .engine
+        .state
         .file_tree
         .entries
         .iter()
         .position(|e| e.name == "doc.pdf")
         .expect("doc.pdf in tree");
-    app.file_tree.selected = idx;
+    app.engine.state.file_tree.selected = idx;
     app.load_preview();
     wait_for_preview(&mut app);
 
-    match &app.preview_content.as_ref().unwrap().body {
+    match &app.engine.state.preview_content.as_ref().unwrap().body {
         PreviewBody::Binary(info) => {
             assert_eq!(info.mime, Some("application/pdf"));
         }

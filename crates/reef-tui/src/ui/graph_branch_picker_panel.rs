@@ -12,8 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding};
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::App;
-use crate::graph_branch_picker::{BranchKind, BranchPickerRow};
+use crate::TuiApp as App;
 use crate::ui::mouse::ClickAction;
 
 pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
@@ -25,9 +24,10 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     let y = screen.y + screen.height.saturating_sub(popup_h) / 2;
     let area = Rect::new(x, y, popup_w, popup_h);
 
-    app.graph_branch_picker.core.last_popup_area = Some(area);
+    app.graph_branch_picker_popup_area = Some(area);
 
     f.render_widget(Clear, area);
+    let snapshot = app.engine.snapshot().graph_branch_picker;
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -60,23 +60,15 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     let prompt_w = UnicodeWidthStr::width(prompt) as u16;
     let input_line = Line::from(vec![
         Span::styled(prompt, Style::default().fg(th.accent)),
-        Span::styled(
-            app.graph_branch_picker.core.filter.clone(),
-            Style::default().fg(th.fg_primary),
-        ),
+        Span::styled(snapshot.query.clone(), Style::default().fg(th.fg_primary)),
     ]);
     f.render_widget(input_line, Rect::new(inner.x, input_y, inner.width, 1));
     // Visible caret — same trick `quick_open_panel` uses. Width-aware
     // so it lands between CJK / wide chars correctly, and clamped to
     // the popup's interior so a very long filter doesn't park the
     // caret past the border.
-    let cursor_byte = app
-        .graph_branch_picker
-        .core
-        .cursor
-        .min(app.graph_branch_picker.core.filter.len());
-    let cursor_w =
-        UnicodeWidthStr::width(&app.graph_branch_picker.core.filter[..cursor_byte]) as u16;
+    let cursor_byte = snapshot.cursor.min(snapshot.query.len());
+    let cursor_w = UnicodeWidthStr::width(&snapshot.query[..cursor_byte]) as u16;
     let max_caret_offset = inner.width.saturating_sub(prompt_w + 1);
     let caret_x = inner.x + prompt_w + cursor_w.min(max_caret_offset);
     f.set_cursor_position((caret_x, input_y));
@@ -86,57 +78,28 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     let sep_line = Line::from(Span::styled(sep, Style::default().fg(th.border)));
     f.render_widget(sep_line, Rect::new(inner.x, sep_y, inner.width, 1));
 
-    let rows = app.graph_branch_picker.visible_rows();
-
-    // Auto-scroll so `selected_idx` stays in the visible window.
-    // Same pattern as `quick_open_panel`: only adjust scroll when the
-    // selection moves outside the window, so the user can scroll
-    // independently (mouse wheel etc.) without snapping back. Without
-    // this, monorepos with hundreds of branches push the highlight
-    // off-screen on Down-key autorepeat.
-    let sel = app.graph_branch_picker.core.selected_idx;
     let list_h_usize = list_h as usize;
-    if sel < app.graph_branch_picker.scroll {
-        app.graph_branch_picker.scroll = sel;
-    } else if list_h_usize > 0 && sel >= app.graph_branch_picker.scroll + list_h_usize {
-        app.graph_branch_picker.scroll = sel + 1 - list_h_usize;
-    }
-    let scroll = app
-        .graph_branch_picker
-        .scroll
-        .min(rows.len().saturating_sub(1));
+    let scroll = visible_scroll(
+        snapshot.scroll,
+        snapshot.selected_idx,
+        list_h_usize,
+        snapshot.row_count,
+    );
 
-    for (visible_row, row) in rows.iter().skip(scroll).take(list_h_usize).enumerate() {
-        let row_idx = scroll + visible_row;
+    for (visible_row, (row_idx, row)) in app
+        .engine
+        .graph_branch_picker_rows(scroll, list_h_usize)
+        .enumerate()
+    {
         let y = list_y + visible_row as u16;
-        let is_selected = row_idx == app.graph_branch_picker.core.selected_idx;
-
-        let (left, right, accent) = match row {
-            BranchPickerRow::AllRefs => ("[ All refs ]".to_string(), "default".to_string(), true),
-            BranchPickerRow::Recent(b) => {
-                let prefix = if b.is_head { "* " } else { "  " };
-                let kind = match b.kind {
-                    BranchKind::Local => "recent · local",
-                    BranchKind::Remote => "recent · remote",
-                };
-                (format!("{prefix}{}", b.display), kind.to_string(), true)
-            }
-            BranchPickerRow::Branch(b) => {
-                let prefix = if b.is_head { "* " } else { "  " };
-                let kind = match b.kind {
-                    BranchKind::Local => "local",
-                    BranchKind::Remote => "remote",
-                };
-                (format!("{prefix}{}", b.display), kind.to_string(), false)
-            }
-        };
+        let is_selected = row_idx == snapshot.selected_idx;
 
         let left_style = if is_selected {
             Style::default()
                 .fg(th.chrome_bg)
                 .bg(th.accent)
                 .add_modifier(Modifier::BOLD)
-        } else if accent {
+        } else if row.accent {
             Style::default().fg(th.accent)
         } else {
             Style::default().fg(th.fg_primary)
@@ -148,8 +111,8 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
         };
 
         let line = Line::from(vec![
-            Span::styled(format!(" {left} "), left_style),
-            Span::styled(format!(" {right} "), right_style),
+            Span::styled(format!(" {} ", row.left), left_style),
+            Span::styled(format!(" {} ", row.right), right_style),
         ]);
         let row_rect = Rect::new(inner.x, y, inner.width, 1);
         f.render_widget(line, row_rect);
@@ -158,7 +121,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
             .register(row_rect, ClickAction::GraphBranchPickerSelect(row_idx));
     }
 
-    if rows.is_empty() {
+    if snapshot.row_count == 0 {
         let empty = Line::from(Span::styled(
             "  no branches match — clear the filter or press Esc",
             Style::default()
@@ -174,4 +137,18 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
         let footer_line = Line::from(Span::styled(footer, Style::default().fg(Color::DarkGray)));
         f.render_widget(footer_line, Rect::new(inner.x, footer_y, inner.width, 1));
     }
+}
+
+fn visible_scroll(scroll: usize, selected: usize, visible_rows: usize, total_rows: usize) -> usize {
+    if visible_rows == 0 || total_rows == 0 {
+        return 0;
+    }
+    let max_scroll = total_rows.saturating_sub(visible_rows);
+    let mut next = scroll.min(max_scroll);
+    if selected < next {
+        next = selected;
+    } else if selected >= next + visible_rows {
+        next = selected + 1 - visible_rows;
+    }
+    next.min(max_scroll)
 }

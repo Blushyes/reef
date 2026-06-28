@@ -13,8 +13,7 @@
 //! PR A renders only the find row (no Replace expansion); the chevron
 //! and replace input row are reserved for PR B.
 
-use crate::app::App;
-use crate::find_widget::{FindTarget, FindWidgetState};
+use crate::TuiApp as App;
 use crate::ui::mouse::ClickAction;
 use crate::ui::theme::Theme;
 use ratatui::Frame;
@@ -22,6 +21,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Clear;
+use reef_app::{FindTarget, FindWidgetState};
 use unicode_width::UnicodeWidthStr;
 
 /// Target visible width of the widget. Caller clamps against the anchor
@@ -40,10 +40,10 @@ const BUTTON_LEN: u16 = 3; // " ↑ "
 const COUNTER_LEN: u16 = 11; // " 1234/1234 "
 
 pub fn render(f: &mut Frame, app: &mut App) {
-    if !app.find_widget.active {
+    if !app.engine.find_widget().active {
         return;
     }
-    let Some(target) = app.find_widget.target else {
+    let Some(target) = app.engine.find_widget().target else {
         return;
     };
     // Pick the anchor rect from whichever content panel hosts the
@@ -71,7 +71,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let x = anchor.x + anchor.width.saturating_sub(width);
     let y = anchor.y;
     let rect = Rect::new(x, y, width, WIDGET_HEIGHT);
-    app.find_widget.last_widget_rect = Some(rect);
+    app.find_widget_ui.last_widget_rect = Some(rect);
 
     let th = app.theme;
     let chip_bg = th.chrome_active_bg;
@@ -95,6 +95,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
 }
 
 fn render_find_row(f: &mut Frame, app: &mut App, th: &Theme, area: Rect, content_y: u16) {
+    let state = app.engine.find_widget();
     let usable_x = area.x + H_PAD;
     let usable_end = area.x + area.width - H_PAD;
 
@@ -111,11 +112,7 @@ fn render_find_row(f: &mut Frame, app: &mut App, th: &Theme, area: Rect, content
     let query_w = case_x.saturating_sub(query_x).saturating_sub(1);
 
     // ─── Query input ───
-    let query_text = visible_query_text(
-        &app.find_widget.query,
-        app.find_widget.cursor,
-        query_w as usize,
-    );
+    let query_text = visible_query_text(&state.query, state.cursor, query_w as usize);
     let query_style = Style::default()
         .fg(th.chrome_active_fg)
         .bg(th.chrome_active_bg);
@@ -123,7 +120,7 @@ fn render_find_row(f: &mut Frame, app: &mut App, th: &Theme, area: Rect, content
         .fg(th.chrome_muted_fg)
         .bg(th.chrome_active_bg)
         .add_modifier(Modifier::ITALIC);
-    let query_span = if app.find_widget.query.is_empty() {
+    let query_span = if state.query.is_empty() {
         Span::styled(
             format!("{:<w$}", "Find", w = query_w as usize),
             placeholder_style,
@@ -140,9 +137,8 @@ fn render_find_row(f: &mut Frame, app: &mut App, th: &Theme, area: Rect, content
     );
 
     // Cursor lands at column = display width of query[..cursor]
-    let cursor_col = UnicodeWidthStr::width(
-        &app.find_widget.query[..app.find_widget.cursor.min(app.find_widget.query.len())],
-    ) as u16;
+    let cursor_col =
+        UnicodeWidthStr::width(&state.query[..state.cursor.min(state.query.len())]) as u16;
     let cursor_x_actual = query_x + cursor_col.min(query_w.saturating_sub(1));
     f.set_cursor_position((cursor_x_actual, content_y));
 
@@ -152,19 +148,19 @@ fn render_find_row(f: &mut Frame, app: &mut App, th: &Theme, area: Rect, content
         (
             "Aa",
             case_x,
-            app.find_widget.match_case,
+            state.match_case,
             ClickAction::FindWidgetToggleCase,
         ),
         (
             "ab",
             word_x,
-            app.find_widget.whole_word,
+            state.whole_word,
             ClickAction::FindWidgetToggleWord,
         ),
         (
             ".*",
             regex_x,
-            app.find_widget.regex,
+            state.regex,
             ClickAction::FindWidgetToggleRegex,
         ),
     ];
@@ -186,14 +182,14 @@ fn render_find_row(f: &mut Frame, app: &mut App, th: &Theme, area: Rect, content
         );
     }
 
-    let counter_text = match &app.find_widget.regex_error {
+    let counter_text = match &state.regex_error {
         Some(_) => " regex! ".to_string(),
-        None => format_counter(&app.find_widget),
+        None => format_counter(state),
     };
     let counter_padded = format!("{:^w$}", counter_text, w = COUNTER_LEN as usize);
-    let counter_fg = if app.find_widget.regex_error.is_some() {
+    let counter_fg = if state.regex_error.is_some() {
         th.removed_accent
-    } else if app.find_widget.matches.is_empty() {
+    } else if state.matches.is_empty() {
         th.chrome_muted_fg
     } else {
         th.chrome_active_fg
@@ -364,11 +360,11 @@ mod tests {
     fn counter_with_matches() {
         let mut s = FindWidgetState::default();
         s.set_matches(vec![
-            crate::search::MatchLoc {
+            reef_app::MatchLoc {
                 row: 0,
                 byte_range: 0..1,
             },
-            crate::search::MatchLoc {
+            reef_app::MatchLoc {
                 row: 0,
                 byte_range: 2..3,
             },

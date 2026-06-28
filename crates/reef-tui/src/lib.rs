@@ -2,32 +2,26 @@
 //! integration tests under `tests/` can exercise them. The `reef` binary
 //! (`src/main.rs`) is a thin wrapper that consumes this library.
 
-pub mod app;
+#[path = "app/mod.rs"]
+mod tui_app;
+
+pub use tui_app::TuiApp;
 pub mod clipboard;
 pub mod editor;
-pub mod file_clipboard;
-pub mod file_selection;
-pub mod file_tree;
 pub mod find_widget;
 pub mod global_search;
-pub mod graph_branch_picker;
-pub mod hosts_picker;
+pub(crate) mod hosts_picker;
 pub mod i18n;
 pub mod images;
 pub mod input;
-pub mod input_edit;
-pub mod input_edit_multi;
+pub(crate) mod input_edit;
+pub(crate) mod input_edit_multi;
 pub mod keymap;
-pub mod picker_core;
-pub mod place_mode;
+pub(crate) mod picker_core;
 pub mod prefs;
 pub mod quick_open;
 pub mod reveal;
 pub mod search;
 pub mod settings;
 pub mod shell_integration;
-pub mod tasks;
-pub mod tree_context_menu;
-pub mod tree_drag;
-pub mod tree_edit;
 pub mod ui;

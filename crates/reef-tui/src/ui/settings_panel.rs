@@ -9,9 +9,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding};
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::App;
+use crate::TuiApp as App;
 use crate::i18n::{Msg, t};
-use crate::settings::{ItemValue, LspRowState, SettingItem, SettingSection, current_value};
+use crate::settings::{
+    ItemValue, LspRowState, SettingItem, SettingSection, current_value, item_description,
+    item_label, section_label,
+};
 use crate::ui::mouse::ClickAction;
 
 const LABEL_COL_WIDTH: u16 = 28;
@@ -43,10 +46,10 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     let body_h = inner.height.saturating_sub(2);
     let body_rect = Rect::new(inner.x, inner.y, inner.width, body_h);
 
-    let selected = app.settings.selected();
+    let selected = app.engine.settings().selected();
     render_body(f, app, body_rect, selected);
 
-    let editing_editor = app.settings.editor_edit.is_some();
+    let editing_editor = app.engine.settings().editor_edit.is_some();
     if editing_editor {
         render_inline_editor_prompt(f, app, Rect::new(inner.x, desc_y, inner.width, 1));
     } else {
@@ -58,17 +61,18 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
                 None => format!("  {bin}"),
             }
         } else {
-            format!("  {}", t(selected.description()))
+            format!("  {}", t(item_description(selected)))
         };
         let line = Line::from(Span::styled(desc, Style::default().fg(th.fg_secondary)));
         f.render_widget(line, Rect::new(inner.x, desc_y, inner.width, 1));
     }
 
-    let toast_line = app.toasts.last().map(|toast| {
+    let snapshot = app.engine.snapshot();
+    let toast_line = snapshot.toast.as_ref().map(|toast| {
         let color = match toast.level {
-            crate::ui::toast::ToastLevel::Info => th.accent,
-            crate::ui::toast::ToastLevel::Warn => th.warn_bg,
-            crate::ui::toast::ToastLevel::Error => th.removed_accent,
+            reef_app::ToastLevel::Info => th.accent,
+            reef_app::ToastLevel::Warn => th.warn_bg,
+            reef_app::ToastLevel::Error => th.removed_accent,
         };
         let mut s = toast.message.clone();
         let max = inner.width.saturating_sub(2) as usize;
@@ -116,7 +120,7 @@ fn render_body(f: &mut Frame, app: &mut App, area: Rect, selected: SettingItem) 
                 }
             }
             let header = Line::from(Span::styled(
-                t(section.label()).to_uppercase(),
+                t(section_label(section)).to_uppercase(),
                 Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
             ));
             f.render_widget(header, Rect::new(area.x, y, area.width, 1));
@@ -156,7 +160,7 @@ fn render_row(
     // translation key.
     let label_text: &str = match item {
         SettingItem::Lsp(lang) => lang.profile().display_name,
-        _ => t(item.label()),
+        _ => t(item_label(item)),
     };
     let (value_text, value_style) = format_value(&current_value(item, app), th, selected);
 
@@ -255,7 +259,7 @@ fn format_value(value: &ItemValue, th: crate::ui::theme::Theme, selected: bool) 
 
 fn render_inline_editor_prompt(f: &mut Frame, app: &App, area: Rect) {
     let th = app.theme;
-    let Some(edit) = app.settings.editor_edit.as_ref() else {
+    let Some(edit) = app.engine.settings().editor_edit.as_ref() else {
         return;
     };
     let prompt = "  › ";

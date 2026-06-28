@@ -1,10 +1,11 @@
 //! Settings page entry / exit + inline-editor key dispatch.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use reef::app::{App, Panel, Tab, ViewMode};
+use reef::TuiApp as App;
 use reef::input;
 use reef::settings::SettingItem;
 use reef::ui::theme::Theme;
+use reef_app::{AppPanel as Panel, AppTab as Tab, ViewMode};
 use std::sync::MutexGuard;
 use tempfile::TempDir;
 use test_support::{CwdGuard, HOME_LOCK, HomeGuard};
@@ -52,42 +53,43 @@ fn editor_command_idx() -> usize {
 #[test]
 fn ctrl_comma_opens_settings_and_esc_closes() {
     let (_lock, _h, _g, _home, _cwd, mut app) = isolated_app();
-    assert_eq!(app.view_mode, ViewMode::Main);
+    assert_eq!(app.engine.state.view_mode, ViewMode::Main);
 
     input::handle_key(ctrl_comma(), &mut app);
-    assert_eq!(app.view_mode, ViewMode::Settings);
+    assert_eq!(app.engine.state.view_mode, ViewMode::Settings);
 
     input::handle_key(esc(), &mut app);
-    assert_eq!(app.view_mode, ViewMode::Main);
+    assert_eq!(app.engine.state.view_mode, ViewMode::Main);
 }
 
 #[test]
 fn ctrl_comma_suppressed_in_commit_message_input_mode() {
     let (_lock, _h, _g, _home, _cwd, mut app) = isolated_app();
     app.set_active_tab(Tab::Git);
-    app.active_panel = Panel::Files;
-    app.git_status.commit_editing = true;
-    app.git_status.commit_message = "fix:".into();
-    app.git_status.commit_cursor = app.git_status.commit_message.len();
+    app.engine.state.active_panel = Panel::Files;
+    app.engine.state.git_status.commit_editing = true;
+    app.engine.state.git_status.commit_message = "fix:".into();
+    app.engine.state.git_status.commit_cursor = app.engine.state.git_status.commit_message.len();
 
     input::handle_key(ctrl_comma(), &mut app);
-    assert_eq!(app.view_mode, ViewMode::Main);
+    assert_eq!(app.engine.state.view_mode, ViewMode::Main);
 }
 
 #[test]
 fn enter_on_editor_command_row_opens_inline_editor() {
     let (_lock, _h, _g, _home, _cwd, mut app) = isolated_app();
     input::handle_key(ctrl_comma(), &mut app);
-    app.settings.select(editor_command_idx());
+    app.engine
+        .dispatch(reef_app::AppCommand::SelectSettingsRow(editor_command_idx()));
 
     input::handle_key(enter(), &mut app);
-    assert!(app.settings.editor_edit.is_some());
+    assert!(app.engine.settings().editor_edit.is_some());
 
     for c in "nvim".chars() {
         input::handle_key(char_key(c), &mut app);
     }
     input::handle_key(enter(), &mut app);
-    assert!(app.settings.editor_edit.is_none());
+    assert!(app.engine.settings().editor_edit.is_none());
     assert_eq!(reef::prefs::get("editor.command").as_deref(), Some("nvim"));
 }
 
@@ -96,7 +98,8 @@ fn esc_in_inline_editor_cancels_without_writing_prefs() {
     let (_lock, _h, _g, _home, _cwd, mut app) = isolated_app();
     reef::prefs::set("editor.command", "vim");
     input::handle_key(ctrl_comma(), &mut app);
-    app.settings.select(editor_command_idx());
+    app.engine
+        .dispatch(reef_app::AppCommand::SelectSettingsRow(editor_command_idx()));
     input::handle_key(enter(), &mut app);
 
     for c in "garbage".chars() {
@@ -104,10 +107,10 @@ fn esc_in_inline_editor_cancels_without_writing_prefs() {
     }
     // First Esc closes the inline editor; second Esc closes the page.
     input::handle_key(esc(), &mut app);
-    assert!(app.settings.editor_edit.is_none());
-    assert_eq!(app.view_mode, ViewMode::Settings);
+    assert!(app.engine.settings().editor_edit.is_none());
+    assert_eq!(app.engine.state.view_mode, ViewMode::Settings);
     assert_eq!(reef::prefs::get("editor.command").as_deref(), Some("vim"));
 
     input::handle_key(esc(), &mut app);
-    assert_eq!(app.view_mode, ViewMode::Main);
+    assert_eq!(app.engine.state.view_mode, ViewMode::Main);
 }

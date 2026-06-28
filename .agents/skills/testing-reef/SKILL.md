@@ -11,7 +11,8 @@ A project-specific test playbook. Follow this when adding **any** test. The goal
 
 Reef is a single-process binary plus shared internal crates. There is no plugin subsystem.
 
-- **`crates/reef-tui` (`reef` crate)** — `src/` (App runtime, TUI rendering, input orchestration), `tests/` (integration), `benches/` (criterion).
+- **`crates/reef-app`** — renderer-neutral app engine, task orchestration, command dispatch, snapshots, and app-state tests.
+- **`crates/reef-tui` (`reef` crate)** — terminal adapter, TUI rendering, input/mouse decoding, terminal image protocol, `tests/` (terminal adapter / UI integration), `benches/` (criterion).
 - **`crates/reef-core`** — UI-independent git, diff, preview, markdown, highlight, nav/LSP, file-op, host parsing, and history logic.
 - **`crates/reef-agent` / `crates/reef-proto` / `crates/reef-sqlite-preview`** — remote agent/protocol and SQLite preview support.
 - **`crates/test-support`** — shared fixtures (`tempdir_repo`, `commit_file`, `write_file`, `HomeGuard`).
@@ -22,7 +23,9 @@ Reef is a single-process binary plus shared internal crates. There is no plugin 
 | Scenario | Test type | Where it goes |
 |----------|-----------|---------------|
 | Pure function, no I/O | Unit test | `#[cfg(test)] mod tests` inline at bottom of the source file |
-| Uses `git2::Repository`, real fs | Integration test | `crates/reef-tui/tests/<name>_integration.rs` |
+| Renderer-neutral app engine / worker contract | Integration test | `crates/reef-app/tests/<name>_integration.rs` |
+| Backend / agent / Local-vs-Remote IO contract | Integration test | `crates/reef-io/tests/<name>_loopback.rs` |
+| TUI adapter behavior with real fs/git | Integration test | `crates/reef-tui/tests/<name>_integration.rs` |
 | Algorithmic invariant over random inputs | Property test | `crates/reef-tui/tests/<name>_properties.rs` (uses `proptest`) |
 | Full UI rendered to terminal buffer | Snapshot | `crates/reef-tui/tests/<name>_snapshots.rs` (uses `insta` + `ratatui::TestBackend`) |
 | Hot-path performance | Benchmark | `crates/reef-tui/benches/<name>.rs` (uses `criterion`) |
@@ -46,7 +49,7 @@ If something's missing from `test-support`, add it there rather than duplicating
 
 ### 1. UI snapshot tests must redirect `$HOME` to a tempdir
 
-`App::new()` reads `~/.config/reef/prefs` (and, once, the legacy `~/.config/reef/git.prefs`) to seed view-mode toggles. If the test runs with the developer's real `HOME`, the saved `status.tree_mode = true` on their machine bleeds into the snapshot and CI disagrees. Wrap each snapshot test with a `HomeGuard` that points `HOME` at the test's tempdir before calling `App::new()`.
+`TuiApp::new()` reads `~/.config/reef/prefs` (and, once, the legacy `~/.config/reef/git.prefs`) to seed view-mode toggles. If the test runs with the developer's real `HOME`, the saved `status.tree_mode = true` on their machine bleeds into the snapshot and CI disagrees. Wrap each snapshot test with a `HomeGuard` that points `HOME` at the test's tempdir before calling `TuiApp::new()`.
 
 ```rust
 struct HomeGuard { original: Option<std::ffi::OsString> }
@@ -73,11 +76,11 @@ let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());  // serialises H
 let (tmp, _raw) = tempdir_repo();
 let _home = HomeGuard::enter(tmp.path());
 let _cwd  = CwdGuard::enter(tmp.path());
-let mut app = App::new();
+let mut app = TuiApp::new(Theme::dark(), None);
 // ... render + snapshot
 ```
 
-The `CWD_LOCK` does double duty: it also guards the HOME mutation, so we don't need a second lock. `App::new()` runs `prefs::migrate_legacy_prefs()`; the migrator is a no-op (no fs write) when the tempdir has no prefs file, so the tempdir isn't polluted with a spurious `.config/reef/prefs`.
+The `CWD_LOCK` does double duty: it also guards the HOME mutation, so we don't need a second lock. `TuiApp::new()` runs `prefs::migrate_legacy_prefs()`; the migrator is a no-op (no fs write) when the tempdir has no prefs file, so the tempdir isn't polluted with a spurious `.config/reef/prefs`.
 
 Full snapshot recipe: **`references/recipes/snapshot.md`**.
 
@@ -105,8 +108,8 @@ Then test every branch of `relative_time_at` with fixed `now` values. The wrappe
 
 Two sources of process-global state in reef tests:
 
-- **cwd** (`std::env::set_current_dir`) — integration tests that call `GitRepo::open()` or `App::new()` need to be in a real git directory.
-- **HOME** (`std::env::set_var("HOME", ...)`) — snapshot tests redirect HOME so `App::new()`'s prefs read doesn't leak the developer's machine state.
+- **cwd** (`std::env::set_current_dir`) — integration tests that call cwd-based APIs such as `TuiApp::new()` need to be in a real git directory.
+- **HOME** (`std::env::set_var("HOME", ...)`) — snapshot tests redirect HOME so `TuiApp::new()`'s prefs read doesn't leak the developer's machine state.
 
 Cargo runs tests in parallel threads by default. Without a lock, test A changes cwd, test B reads it mid-operation, both fail unpredictably. Always use this pattern:
 
@@ -125,7 +128,7 @@ fn my_test() {
 
 In practice `ui_snapshots.rs` uses a single `CWD_LOCK` for both cwd and HOME because every HOME swap in this codebase is paired with a cwd swap. If you add a test that touches only HOME, a separate `HOME_LOCK` is fine; don't over-share.
 
-See existing examples: `crates/reef-tui/tests/ui_snapshots.rs`, `crates/reef-tui/tests/git_repo_integration.rs`.
+See existing examples: `crates/reef-tui/tests/ui_snapshots.rs`, `crates/reef-app/tests/global_search_integration.rs`, and `crates/reef-io/tests/backend_loopback.rs`.
 
 ### 4. Canonicalize tempdir paths on macOS before handing them to watchers
 

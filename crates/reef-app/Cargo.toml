@@ -1,0 +1,25 @@
+[package]
+name = "reef-app"
+version = "0.41.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+test-helpers = []
+
+[dependencies]
+grep-matcher = "0.1.8"
+grep-regex = "0.1.14"
+reef-core = { path = "../reef-core" }
+reef-io = { path = "../reef-io" }
+reef-sqlite-preview = { path = "../reef-sqlite-preview" }
+serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+trash = "5"
+test-support = { path = "../test-support" }

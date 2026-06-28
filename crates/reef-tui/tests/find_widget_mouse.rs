@@ -10,12 +10,13 @@
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use reef::app::{App, Panel, Tab};
+use reef::TuiApp as App;
 use reef::find_widget;
 use reef::ui;
 use reef::ui::mouse::ClickAction;
 use reef::ui::selection::PreviewSelection;
 use reef::ui::theme::Theme;
+use reef_app::{AppPanel as Panel, AppTab as Tab};
 use reef_core::preview::{PreviewBody, PreviewDocument as PreviewContent, TextPreview};
 use std::sync::Mutex;
 use tempfile::TempDir;
@@ -27,25 +28,28 @@ fn fresh_app() -> (App, TempDir, CwdGuard) {
     let tmp = TempDir::new().unwrap();
     let g = CwdGuard::enter(tmp.path());
     let mut app = App::new(Theme::dark(), None);
-    app.active_tab = Tab::Files;
-    app.active_panel = Panel::Diff;
-    app.preview_content = Some(PreviewContent {
-        path: "scratch.txt".to_string(),
-        body: PreviewBody::Text(TextPreview {
-            lines: vec![
-                "foo bar baz".to_string(),
-                "    bar();".to_string(),
-                "    bar();".to_string(),
-            ],
-            highlighted: None,
-            parsed: None,
-        }),
-    });
+    app.engine.state.active_tab = Tab::Files;
+    app.engine.state.active_panel = Panel::Diff;
+    app.engine.state.preview_content = Some(
+        PreviewContent {
+            path: "scratch.txt".to_string(),
+            body: PreviewBody::Text(TextPreview {
+                lines: vec![
+                    "foo bar baz".to_string(),
+                    "    bar();".to_string(),
+                    "    bar();".to_string(),
+                ],
+                highlighted: None,
+                parsed: None,
+            }),
+        }
+        .into(),
+    );
     (app, tmp, g)
 }
 
 /// Render once into a `TestBackend` so `find_widget_panel` populates
-/// `app.hit_registry` and `app.find_widget.last_widget_rect`.
+/// `app.hit_registry` and `app.find_widget_ui.last_widget_rect`.
 fn render_once(app: &mut App) {
     let backend = TestBackend::new(100, 24);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -57,7 +61,7 @@ fn render_once(app: &mut App) {
 /// by enum discriminant. Avoids hardcoding the widget's internal x-
 /// layout in the test.
 fn find_button_col(app: &App, target: &ClickAction) -> Option<u16> {
-    let rect = app.find_widget.last_widget_rect?;
+    let rect = app.find_widget_ui.last_widget_rect?;
     let content_row = rect.y + 1;
     for col in rect.x..rect.x + rect.width {
         if let Some(action) = app.hit_registry.hit_test(col, content_row)
@@ -82,16 +86,16 @@ fn close_button_dispatches_to_widget_close() {
     let (mut app, _tmp, _g) = fresh_app();
     select(&mut app, 0, 0, 3); // "foo"
     find_widget::begin_with_selection(&mut app);
-    assert!(app.find_widget.active);
+    assert!(app.engine.find_widget().active);
     render_once(&mut app);
 
     let col = find_button_col(&app, &ClickAction::FindWidgetClose)
         .expect("close button hit zone must be registered");
-    let row = app.find_widget.last_widget_rect.unwrap().y + 1;
+    let row = app.find_widget_ui.last_widget_rect.unwrap().y + 1;
     let action = app.hit_registry.hit_test(col, row).unwrap();
     app.handle_action(action);
 
-    assert!(!app.find_widget.active);
+    assert!(!app.engine.find_widget().active);
 }
 
 #[test]
@@ -100,15 +104,15 @@ fn next_button_advances_current_match() {
     let (mut app, _tmp, _g) = fresh_app();
     select(&mut app, 1, 4, 7); // "bar"
     find_widget::begin_with_selection(&mut app);
-    assert_eq!(app.find_widget.current, Some(0));
+    assert_eq!(app.engine.find_widget().current, Some(0));
     render_once(&mut app);
 
     let col = find_button_col(&app, &ClickAction::FindWidgetNext).unwrap();
-    let row = app.find_widget.last_widget_rect.unwrap().y + 1;
+    let row = app.find_widget_ui.last_widget_rect.unwrap().y + 1;
     let action = app.hit_registry.hit_test(col, row).unwrap();
     app.handle_action(action);
 
-    assert_eq!(app.find_widget.current, Some(1));
+    assert_eq!(app.engine.find_widget().current, Some(1));
 }
 
 #[test]
@@ -121,14 +125,14 @@ fn prev_button_steps_backward() {
     // Step forward twice via API so prev has somewhere to go.
     find_widget::step(&mut app, false);
     find_widget::step(&mut app, false);
-    assert_eq!(app.find_widget.current, Some(2));
+    assert_eq!(app.engine.find_widget().current, Some(2));
 
     let col = find_button_col(&app, &ClickAction::FindWidgetPrev).unwrap();
-    let row = app.find_widget.last_widget_rect.unwrap().y + 1;
+    let row = app.find_widget_ui.last_widget_rect.unwrap().y + 1;
     let action = app.hit_registry.hit_test(col, row).unwrap();
     app.handle_action(action);
 
-    assert_eq!(app.find_widget.current, Some(1));
+    assert_eq!(app.engine.find_widget().current, Some(1));
 }
 
 #[test]
@@ -136,86 +140,95 @@ fn match_case_toggle_flips_and_rematches() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp, _g) = fresh_app();
     // Use a query that proves case-sensitivity matters: "Bar" vs "bar".
-    app.preview_content = Some(PreviewContent {
-        path: "scratch.txt".to_string(),
-        body: PreviewBody::Text(TextPreview {
-            lines: vec!["Bar bar BAR".to_string()],
-            highlighted: None,
-            parsed: None,
-        }),
-    });
+    app.engine.state.preview_content = Some(
+        PreviewContent {
+            path: "scratch.txt".to_string(),
+            body: PreviewBody::Text(TextPreview {
+                lines: vec!["Bar bar BAR".to_string()],
+                highlighted: None,
+                parsed: None,
+            }),
+        }
+        .into(),
+    );
     select(&mut app, 0, 0, 3); // "Bar"
     find_widget::begin_with_selection(&mut app);
     // match_case starts off → insensitive → 3 hits
-    assert_eq!(app.find_widget.matches.len(), 3);
+    assert_eq!(app.engine.find_widget().matches.len(), 3);
     render_once(&mut app);
 
     let col = find_button_col(&app, &ClickAction::FindWidgetToggleCase).unwrap();
-    let row = app.find_widget.last_widget_rect.unwrap().y + 1;
+    let row = app.find_widget_ui.last_widget_rect.unwrap().y + 1;
     let action = app.hit_registry.hit_test(col, row).unwrap();
     app.handle_action(action);
 
-    assert!(app.find_widget.match_case);
+    assert!(app.engine.find_widget().match_case);
     // Case-sensitive "Bar" → only the literal "Bar" matches.
-    assert_eq!(app.find_widget.matches.len(), 1);
+    assert_eq!(app.engine.find_widget().matches.len(), 1);
 }
 
 #[test]
 fn whole_word_toggle_flips_and_filters_matches() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp, _g) = fresh_app();
-    app.preview_content = Some(PreviewContent {
-        path: "scratch.txt".to_string(),
-        body: PreviewBody::Text(TextPreview {
-            lines: vec!["foo food foobar foo!".to_string()],
-            highlighted: None,
-            parsed: None,
-        }),
-    });
+    app.engine.state.preview_content = Some(
+        PreviewContent {
+            path: "scratch.txt".to_string(),
+            body: PreviewBody::Text(TextPreview {
+                lines: vec!["foo food foobar foo!".to_string()],
+                highlighted: None,
+                parsed: None,
+            }),
+        }
+        .into(),
+    );
     select(&mut app, 0, 0, 3);
     find_widget::begin_with_selection(&mut app);
     // Without whole_word: "foo" appears in food, foobar, foo, foo —
     // 4 substring hits.
-    assert_eq!(app.find_widget.matches.len(), 4);
+    assert_eq!(app.engine.find_widget().matches.len(), 4);
     render_once(&mut app);
 
     let col = find_button_col(&app, &ClickAction::FindWidgetToggleWord).unwrap();
-    let row = app.find_widget.last_widget_rect.unwrap().y + 1;
+    let row = app.find_widget_ui.last_widget_rect.unwrap().y + 1;
     let action = app.hit_registry.hit_test(col, row).unwrap();
     app.handle_action(action);
 
-    assert!(app.find_widget.whole_word);
+    assert!(app.engine.find_widget().whole_word);
     // With whole_word: only standalone "foo" and "foo!" match. food
     // and foobar are filtered out.
-    assert_eq!(app.find_widget.matches.len(), 2);
+    assert_eq!(app.engine.find_widget().matches.len(), 2);
 }
 
 #[test]
 fn regex_toggle_reinterprets_query() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp, _g) = fresh_app();
-    app.preview_content = Some(PreviewContent {
-        path: "scratch.txt".to_string(),
-        body: PreviewBody::Text(TextPreview {
-            lines: vec!["abc 12 d345 ef".to_string()],
-            highlighted: None,
-            parsed: None,
-        }),
-    });
+    app.engine.state.preview_content = Some(
+        PreviewContent {
+            path: "scratch.txt".to_string(),
+            body: PreviewBody::Text(TextPreview {
+                lines: vec!["abc 12 d345 ef".to_string()],
+                highlighted: None,
+                parsed: None,
+            }),
+        }
+        .into(),
+    );
     // Seed with the literal "\d+" — without regex it matches no chars.
     find_widget::begin_with_selection(&mut app);
-    app.find_widget.query = r"\d+".to_string();
-    app.find_widget.cursor = 3;
+    app.engine.state.find_widget.query = r"\d+".to_string();
+    app.engine.state.find_widget.cursor = 3;
     find_widget::recompute(&mut app);
-    assert!(app.find_widget.matches.is_empty());
+    assert!(app.engine.find_widget().matches.is_empty());
     render_once(&mut app);
 
     let col = find_button_col(&app, &ClickAction::FindWidgetToggleRegex).unwrap();
-    let row = app.find_widget.last_widget_rect.unwrap().y + 1;
+    let row = app.find_widget_ui.last_widget_rect.unwrap().y + 1;
     let action = app.hit_registry.hit_test(col, row).unwrap();
     app.handle_action(action);
 
-    assert!(app.find_widget.regex);
+    assert!(app.engine.find_widget().regex);
     // `\d+` as a regex now matches "12" and "345".
-    assert_eq!(app.find_widget.matches.len(), 2);
+    assert_eq!(app.engine.find_widget().matches.len(), 2);
 }

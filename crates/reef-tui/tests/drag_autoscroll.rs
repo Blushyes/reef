@@ -8,10 +8,11 @@
 //! `selection.active` refresh that makes the selection appear to "follow"
 //! the autoscroll.
 
-use reef::app::{App, Tab};
+use reef::TuiApp as App;
 use reef::input::tick_drag_autoscroll;
 use reef::ui::selection::{DiffHit, DiffSelection, PreviewSelection};
 use reef::ui::theme::Theme;
+use reef_app::AppTab as Tab;
 use reef_core::diff::{DiffLayout, DiffRowText, DiffSide};
 use reef_core::preview::{PreviewBody, PreviewDocument as PreviewContent, TextPreview};
 use std::sync::Mutex;
@@ -51,9 +52,9 @@ fn preview_scrolls_up_and_extends_active_when_mouse_above_viewport() {
 
     // Viewport: content_y = 5, view_h = 20 → content rows 5..25.
     // Mouse at row 2 (3 cells above the top). Scroll currently at 30.
-    app.preview_content = Some(text_preview(200));
-    app.preview_scroll = 30;
-    app.last_preview_view_h = 20;
+    app.engine.state.preview_content = Some(text_preview(200).into());
+    app.engine.state.preview_scroll = 30;
+    app.layout.last_preview_view_h = 20;
     app.last_preview_content_origin = Some((0, 5, 0));
     app.last_drag_mouse = Some((0, 2));
     app.preview_selection = Some(PreviewSelection {
@@ -65,7 +66,10 @@ fn preview_scrolls_up_and_extends_active_when_mouse_above_viewport() {
     tick_drag_autoscroll(&mut app);
 
     // dist=3, step=-(1+1)=-2 → scroll moves from 30 to 28.
-    assert_eq!(app.preview_scroll, 28, "scroll up by step magnitude");
+    assert_eq!(
+        app.engine.state.preview_scroll, 28,
+        "scroll up by step magnitude"
+    );
 
     // selection.active follows the scroll — at the new scroll, the
     // visible row 0 (where the clamped mouse Y lands) maps to file line
@@ -88,9 +92,9 @@ fn preview_scroll_down_clamps_at_max_scroll() {
     // 30 lines, view_h 20 → max_scroll = 10. Already at scroll=9, view
     // mouse far below content_bottom (=25): should clamp at 10, not
     // overshoot.
-    app.preview_content = Some(text_preview(30));
-    app.preview_scroll = 9;
-    app.last_preview_view_h = 20;
+    app.engine.state.preview_content = Some(text_preview(30).into());
+    app.engine.state.preview_scroll = 9;
+    app.layout.last_preview_view_h = 20;
     app.last_preview_content_origin = Some((0, 5, 0));
     app.last_drag_mouse = Some((0, 200));
     app.preview_selection = Some(PreviewSelection {
@@ -101,7 +105,7 @@ fn preview_scroll_down_clamps_at_max_scroll() {
 
     tick_drag_autoscroll(&mut app);
 
-    assert_eq!(app.preview_scroll, 10, "clamped at max_scroll");
+    assert_eq!(app.engine.state.preview_scroll, 10, "clamped at max_scroll");
 }
 
 #[test]
@@ -109,9 +113,9 @@ fn preview_already_at_top_stays_put_with_no_throttle_stamp() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp) = fresh_app();
 
-    app.preview_content = Some(text_preview(200));
-    app.preview_scroll = 0;
-    app.last_preview_view_h = 20;
+    app.engine.state.preview_content = Some(text_preview(200).into());
+    app.engine.state.preview_scroll = 0;
+    app.layout.last_preview_view_h = 20;
     app.last_preview_content_origin = Some((0, 5, 0));
     app.last_drag_mouse = Some((0, 0)); // way above the viewport
     app.preview_selection = Some(PreviewSelection {
@@ -123,7 +127,10 @@ fn preview_already_at_top_stays_put_with_no_throttle_stamp() {
 
     tick_drag_autoscroll(&mut app);
 
-    assert_eq!(app.preview_scroll, 0, "no scroll possible at top");
+    assert_eq!(
+        app.engine.state.preview_scroll, 0,
+        "no scroll possible at top"
+    );
     // No-op path → throttle stamp must NOT be set (else the next genuine
     // step after a clamp would be delayed for no reason).
     assert!(
@@ -137,9 +144,9 @@ fn preview_throttle_rejects_second_call_inside_interval() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp) = fresh_app();
 
-    app.preview_content = Some(text_preview(200));
-    app.preview_scroll = 30;
-    app.last_preview_view_h = 20;
+    app.engine.state.preview_content = Some(text_preview(200).into());
+    app.engine.state.preview_scroll = 30;
+    app.layout.last_preview_view_h = 20;
     app.last_preview_content_origin = Some((0, 5, 0));
     app.last_drag_mouse = Some((0, 4)); // 1 above content_top=5, dist=1
     app.preview_selection = Some(PreviewSelection {
@@ -150,7 +157,7 @@ fn preview_throttle_rejects_second_call_inside_interval() {
 
     // First call: dist=1 step=-1 → scroll 29, stamp now.
     tick_drag_autoscroll(&mut app);
-    assert_eq!(app.preview_scroll, 29);
+    assert_eq!(app.engine.state.preview_scroll, 29);
     let stamp_after_first = app.preview_autoscroll_at;
     assert!(stamp_after_first.is_some());
 
@@ -158,7 +165,7 @@ fn preview_throttle_rejects_second_call_inside_interval() {
     // interval is 90ms, and we're firing back-to-back synchronously.
     tick_drag_autoscroll(&mut app);
     assert_eq!(
-        app.preview_scroll, 29,
+        app.engine.state.preview_scroll, 29,
         "second call inside throttle is no-op"
     );
     assert_eq!(
@@ -172,9 +179,9 @@ fn preview_inside_viewport_does_nothing() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp) = fresh_app();
 
-    app.preview_content = Some(text_preview(200));
-    app.preview_scroll = 30;
-    app.last_preview_view_h = 20;
+    app.engine.state.preview_content = Some(text_preview(200).into());
+    app.engine.state.preview_scroll = 30;
+    app.layout.last_preview_view_h = 20;
     app.last_preview_content_origin = Some((0, 5, 0));
     app.last_drag_mouse = Some((0, 15)); // squarely inside content area
     app.preview_selection = Some(PreviewSelection {
@@ -186,7 +193,7 @@ fn preview_inside_viewport_does_nothing() {
     tick_drag_autoscroll(&mut app);
 
     assert_eq!(
-        app.preview_scroll, 30,
+        app.engine.state.preview_scroll, 30,
         "no scroll when mouse inside viewport"
     );
     assert!(app.preview_autoscroll_at.is_none());
@@ -199,17 +206,20 @@ fn preview_non_text_body_aborts() {
 
     // Construct a Binary body (an image picker isn't available in this
     // test env, so use Binary which doesn't need image decoding).
-    app.preview_content = Some(PreviewContent {
-        path: "blob.bin".into(),
-        body: PreviewBody::Binary(reef_core::preview::BinaryInfo {
-            bytes_on_disk: 42,
-            mime: None,
-            reason: reef_core::preview::BinaryReason::NullBytes,
-            meta_line: "x".into(),
-        }),
-    });
-    app.preview_scroll = 30;
-    app.last_preview_view_h = 20;
+    app.engine.state.preview_content = Some(
+        PreviewContent {
+            path: "blob.bin".into(),
+            body: PreviewBody::Binary(reef_core::preview::BinaryInfo {
+                bytes_on_disk: 42,
+                mime: None,
+                reason: reef_core::preview::BinaryReason::NullBytes,
+                meta_line: "x".into(),
+            }),
+        }
+        .into(),
+    );
+    app.engine.state.preview_scroll = 30;
+    app.layout.last_preview_view_h = 20;
     app.last_preview_content_origin = Some((0, 5, 0));
     app.last_drag_mouse = Some((0, 0));
     app.preview_selection = Some(PreviewSelection {
@@ -222,7 +232,7 @@ fn preview_non_text_body_aborts() {
 
     // Non-text bodies can't be selected; autoscroll must not pretend
     // otherwise (would scroll past the cached line index and panic).
-    assert_eq!(app.preview_scroll, 30);
+    assert_eq!(app.engine.state.preview_scroll, 30);
 }
 
 #[test]
@@ -230,9 +240,9 @@ fn preview_no_drag_no_op() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp) = fresh_app();
 
-    app.preview_content = Some(text_preview(200));
-    app.preview_scroll = 30;
-    app.last_preview_view_h = 20;
+    app.engine.state.preview_content = Some(text_preview(200).into());
+    app.engine.state.preview_scroll = 30;
+    app.layout.last_preview_view_h = 20;
     app.last_preview_content_origin = Some((0, 5, 0));
     app.last_drag_mouse = Some((0, 0));
     // Selection present but NOT dragging — autoscroll must stay quiet
@@ -245,7 +255,7 @@ fn preview_no_drag_no_op() {
 
     tick_drag_autoscroll(&mut app);
 
-    assert_eq!(app.preview_scroll, 30);
+    assert_eq!(app.engine.state.preview_scroll, 30);
 }
 
 // ── diff ─────────────────────────────────────────────────────────────────
@@ -275,10 +285,10 @@ fn diff_git_tab_scrolls_app_diff_scroll() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp) = fresh_app();
 
-    app.active_tab = Tab::Git;
-    app.diff_scroll = 30;
-    app.commit_detail.file_diff_scroll = 999; // bystander, must not move
-    app.last_diff_view_h = 20;
+    app.engine.state.active_tab = Tab::Git;
+    app.engine.state.diff_scroll = 30;
+    app.engine.state.commit_detail.file_diff_scroll = 999; // bystander, must not move
+    app.layout.last_diff_view_h = 20;
     app.last_diff_hit = Some(unified_hit(200, 30));
     app.last_drag_mouse = Some((0, 2));
     app.diff_selection = Some(DiffSelection {
@@ -292,16 +302,16 @@ fn diff_git_tab_scrolls_app_diff_scroll() {
 
     tick_drag_autoscroll(&mut app);
 
-    assert_eq!(app.diff_scroll, 28, "scroll up by step=-2");
+    assert_eq!(app.engine.state.diff_scroll, 28, "scroll up by step=-2");
     assert_eq!(
-        app.commit_detail.file_diff_scroll, 999,
+        app.engine.state.commit_detail.file_diff_scroll, 999,
         "graph diff scroll untouched on Git tab"
     );
     // Cached hit.scroll synced in place so the next coord_for is accurate.
     let hit = app.last_diff_hit.as_ref().unwrap();
     assert_eq!(
         hit.scroll, 28,
-        "DiffHit scroll synced to new app.diff_scroll"
+        "DiffHit scroll synced to new app.engine.state.diff_scroll"
     );
 
     let sel = app.diff_selection.unwrap();
@@ -314,10 +324,10 @@ fn diff_graph_tab_routes_to_commit_detail_field() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp) = fresh_app();
 
-    app.active_tab = Tab::Graph;
-    app.diff_scroll = 999; // bystander
-    app.commit_detail.file_diff_scroll = 30;
-    app.last_diff_view_h = 20;
+    app.engine.state.active_tab = Tab::Graph;
+    app.engine.state.diff_scroll = 999; // bystander
+    app.engine.state.commit_detail.file_diff_scroll = 30;
+    app.layout.last_diff_view_h = 20;
     app.last_diff_hit = Some(unified_hit(200, 30));
     app.last_drag_mouse = Some((0, 2));
     app.diff_selection = Some(DiffSelection {
@@ -332,11 +342,11 @@ fn diff_graph_tab_routes_to_commit_detail_field() {
     tick_drag_autoscroll(&mut app);
 
     assert_eq!(
-        app.commit_detail.file_diff_scroll, 28,
+        app.engine.state.commit_detail.file_diff_scroll, 28,
         "graph 3-col diff scroll moved"
     );
     assert_eq!(
-        app.diff_scroll, 999,
+        app.engine.state.diff_scroll, 999,
         "git-tab scroll untouched on Graph tab"
     );
 }
@@ -350,10 +360,10 @@ fn diff_files_tab_with_stuck_selection_is_safe_noop() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp) = fresh_app();
 
-    app.active_tab = Tab::Files;
-    app.diff_scroll = 30;
-    app.commit_detail.file_diff_scroll = 30;
-    app.last_diff_view_h = 20;
+    app.engine.state.active_tab = Tab::Files;
+    app.engine.state.diff_scroll = 30;
+    app.engine.state.commit_detail.file_diff_scroll = 30;
+    app.layout.last_diff_view_h = 20;
     app.last_diff_hit = Some(unified_hit(200, 30));
     app.last_drag_mouse = Some((0, 2));
     app.diff_selection = Some(DiffSelection {
@@ -367,8 +377,8 @@ fn diff_files_tab_with_stuck_selection_is_safe_noop() {
 
     tick_drag_autoscroll(&mut app);
 
-    assert_eq!(app.diff_scroll, 30);
-    assert_eq!(app.commit_detail.file_diff_scroll, 30);
+    assert_eq!(app.engine.state.diff_scroll, 30);
+    assert_eq!(app.engine.state.commit_detail.file_diff_scroll, 30);
 }
 
 #[test]
@@ -383,9 +393,9 @@ fn diff_throttle_is_independent_of_preview_throttle() {
     app.preview_autoscroll_at = Some(Instant::now());
     app.diff_autoscroll_at = None;
 
-    app.active_tab = Tab::Git;
-    app.diff_scroll = 30;
-    app.last_diff_view_h = 20;
+    app.engine.state.active_tab = Tab::Git;
+    app.engine.state.diff_scroll = 30;
+    app.layout.last_diff_view_h = 20;
     app.last_diff_hit = Some(unified_hit(200, 30));
     app.last_drag_mouse = Some((0, 2));
     app.diff_selection = Some(DiffSelection {
@@ -400,7 +410,7 @@ fn diff_throttle_is_independent_of_preview_throttle() {
     tick_drag_autoscroll(&mut app);
 
     assert_eq!(
-        app.diff_scroll, 28,
+        app.engine.state.diff_scroll, 28,
         "diff autoscroll runs even though preview throttle is hot"
     );
 }
@@ -410,9 +420,9 @@ fn diff_no_drag_no_op() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp) = fresh_app();
 
-    app.active_tab = Tab::Git;
-    app.diff_scroll = 30;
-    app.last_diff_view_h = 20;
+    app.engine.state.active_tab = Tab::Git;
+    app.engine.state.diff_scroll = 30;
+    app.layout.last_diff_view_h = 20;
     app.last_diff_hit = Some(unified_hit(200, 30));
     app.last_drag_mouse = Some((0, 0));
     app.diff_selection = Some(DiffSelection {
@@ -426,7 +436,7 @@ fn diff_no_drag_no_op() {
 
     tick_drag_autoscroll(&mut app);
 
-    assert_eq!(app.diff_scroll, 30);
+    assert_eq!(app.engine.state.diff_scroll, 30);
 }
 
 #[test]
@@ -434,9 +444,9 @@ fn diff_empty_rows_no_op() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp) = fresh_app();
 
-    app.active_tab = Tab::Git;
-    app.diff_scroll = 0;
-    app.last_diff_view_h = 20;
+    app.engine.state.active_tab = Tab::Git;
+    app.engine.state.diff_scroll = 0;
+    app.layout.last_diff_view_h = 20;
     app.last_diff_hit = Some(unified_hit(0, 0)); // empty diff
     app.last_drag_mouse = Some((0, 0));
     app.diff_selection = Some(DiffSelection {
@@ -450,7 +460,7 @@ fn diff_empty_rows_no_op() {
 
     tick_drag_autoscroll(&mut app);
 
-    assert_eq!(app.diff_scroll, 0);
+    assert_eq!(app.engine.state.diff_scroll, 0);
 }
 
 // ── elapsed throttle ─────────────────────────────────────────────────────
@@ -460,9 +470,9 @@ fn preview_throttle_releases_after_interval_elapses() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp) = fresh_app();
 
-    app.preview_content = Some(text_preview(200));
-    app.preview_scroll = 30;
-    app.last_preview_view_h = 20;
+    app.engine.state.preview_content = Some(text_preview(200).into());
+    app.engine.state.preview_scroll = 30;
+    app.layout.last_preview_view_h = 20;
     app.last_preview_content_origin = Some((0, 5, 0));
     app.last_drag_mouse = Some((0, 4)); // dist=1, interval=90ms
     app.preview_selection = Some(PreviewSelection {
@@ -473,7 +483,7 @@ fn preview_throttle_releases_after_interval_elapses() {
 
     // First step → scrolls + stamps.
     tick_drag_autoscroll(&mut app);
-    assert_eq!(app.preview_scroll, 29);
+    assert_eq!(app.engine.state.preview_scroll, 29);
     // Manually backdate the stamp past the interval so we don't have to
     // sleep in a unit test.
     app.preview_autoscroll_at = Some(Instant::now() - Duration::from_millis(200));
@@ -481,7 +491,7 @@ fn preview_throttle_releases_after_interval_elapses() {
     // Second step now should pass the throttle.
     tick_drag_autoscroll(&mut app);
     assert_eq!(
-        app.preview_scroll, 28,
+        app.engine.state.preview_scroll, 28,
         "second step fires after interval elapses"
     );
 }

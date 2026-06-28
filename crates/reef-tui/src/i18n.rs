@@ -84,9 +84,7 @@ pub enum Msg {
     // Toasts
     PushSuccess,
     ForcePushSuccess,
-    PushThreadCrashed,
     CommitSuccess,
-    CommitThreadCrashed,
     ClipboardCopied,
     ClipboardCopyFailed,
 
@@ -316,9 +314,7 @@ fn t_zh(m: Msg) -> &'static str {
         SearchReplaceTitle => " 🔎 查找与替换 ",
         PushSuccess => "推送成功",
         ForcePushSuccess => "强制推送成功",
-        PushThreadCrashed => "推送线程异常退出，请重试",
         CommitSuccess => "提交成功",
-        CommitThreadCrashed => "提交线程异常退出，请重试",
         ClipboardCopied => "已复制到剪贴板",
         ClipboardCopyFailed => "复制到剪贴板失败",
         PushingHint => "  ⋯ 推送中…",
@@ -497,9 +493,7 @@ fn t_en(m: Msg) -> &'static str {
         SearchReplaceTitle => " 🔎 Find & Replace ",
         PushSuccess => "Push succeeded",
         ForcePushSuccess => "Force push succeeded",
-        PushThreadCrashed => "Push worker crashed, please retry",
         CommitSuccess => "Commit succeeded",
-        CommitThreadCrashed => "Commit worker crashed, please retry",
         ClipboardCopied => "Copied to clipboard",
         ClipboardCopyFailed => "Clipboard copy failed",
         PushingHint => "  ⋯ Pushing…",
@@ -786,8 +780,8 @@ pub fn diff_mode_hint(layout_label: &str, mode_label: &str) -> String {
 
 /// Counter + wrap message for active search. `wrap` is `Some(WrapMsg::Top)` /
 /// `Some(WrapMsg::Bottom)` / `None`. Caller passes the raw state.
-pub fn search_counter(i: usize, n: usize, wrap: Option<crate::search::WrapMsg>) -> String {
-    use crate::search::WrapMsg;
+pub fn search_counter(i: usize, n: usize, wrap: Option<reef_app::WrapMsg>) -> String {
+    use reef_app::WrapMsg;
     match (wrap, lang()) {
         (Some(WrapMsg::Bottom), Lang::Zh) => format!("{}/{}  ↻ 回到顶部 ", i + 1, n),
         (Some(WrapMsg::Bottom), Lang::En) => format!("{}/{}  ↻ top ", i + 1, n),
@@ -874,8 +868,8 @@ pub fn place_mode_copying_banner() -> String {
 /// Trash / HardDelete). The `kind` is carried on the `WorkerResult::FsMutation`
 /// so each branch can pick an appropriate verb without the merge site
 /// having to re-derive it from paths.
-pub fn fs_mutation_success_toast(kind: &crate::tasks::FsMutationKind) -> String {
-    use crate::tasks::FsMutationKind as K;
+pub fn fs_mutation_success_toast(kind: &reef_app::FsMutationKind) -> String {
+    use reef_app::FsMutationKind as K;
     match (lang(), kind) {
         (Lang::Zh, K::CreatedFile { name }) => format!("已创建文件 {name}"),
         (Lang::En, K::CreatedFile { name }) => format!("Created {name}"),
@@ -909,8 +903,8 @@ pub fn fs_mutation_success_toast(kind: &crate::tasks::FsMutationKind) -> String 
 /// Toast text after a file-tree mutation fails. Carries the raw error
 /// string from the worker so permission / EEXIST / cross-device-link
 /// failures aren't silently swallowed.
-pub fn fs_mutation_error_toast(kind: &crate::tasks::FsMutationKind, error: &str) -> String {
-    use crate::tasks::FsMutationKind as K;
+pub fn fs_mutation_error_toast(kind: &reef_app::FsMutationKind, error: &str) -> String {
+    use reef_app::FsMutationKind as K;
     let verb = match (lang(), kind) {
         (Lang::Zh, K::CreatedFile { .. }) => "创建文件失败",
         (Lang::En, K::CreatedFile { .. }) => "Create file failed",
@@ -935,8 +929,8 @@ pub fn fs_mutation_error_toast(kind: &crate::tasks::FsMutationKind, error: &str)
 /// Placeholder shown in an empty editable row when the user hasn't
 /// typed yet. Differs by mode so the hint tells them what they're
 /// about to create.
-pub fn tree_edit_placeholder(mode: crate::tree_edit::TreeEditMode) -> &'static str {
-    use crate::tree_edit::TreeEditMode as M;
+pub fn tree_edit_placeholder(mode: reef_app::TreeEditMode) -> &'static str {
+    use reef_app::TreeEditMode as M;
     match (lang(), mode) {
         (Lang::Zh, M::NewFile) => "新文件名…",
         (Lang::En, M::NewFile) => "New file name…",
@@ -1125,8 +1119,8 @@ pub fn tree_reveal_unsupported_platform() -> String {
 
 /// Right-click context-menu item labels. Kept parallel with
 /// `ContextMenuItem` so the render loop can map 1:1.
-pub fn tree_context_menu_label(item: &crate::tree_context_menu::ContextMenuItem) -> &'static str {
-    use crate::tree_context_menu::ContextMenuItem as I;
+pub fn tree_context_menu_label(item: &reef_app::ContextMenuItem) -> &'static str {
+    use reef_app::ContextMenuItem as I;
     match (lang(), item) {
         (Lang::Zh, I::Cut) => "剪切",
         (Lang::En, I::Cut) => "Cut",
@@ -1165,12 +1159,6 @@ pub fn tree_toolbar_new_folder() -> &'static str {
     match lang() {
         Lang::Zh => "新建文件夹",
         Lang::En => "New Folder",
-    }
-}
-pub fn tree_toolbar_refresh() -> &'static str {
-    match lang() {
-        Lang::Zh => "刷新",
-        Lang::En => "Refresh",
     }
 }
 pub fn tree_toolbar_collapse_all() -> &'static str {

@@ -1,15 +1,15 @@
 //! Graph tab's left sidebar — DAG of commits with lane rendering and
 //! ref-label chips.
 
-use crate::app::{App, shorthand_for_full_ref};
 use crate::i18n::{Msg, t};
-use crate::search::SearchTarget;
+use crate::tui_app::{TuiApp as App, shorthand_for_full_ref};
 use crate::ui::mouse::ClickAction;
 use crate::ui::text::overlay_match_highlight;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use reef_app::SearchTarget;
 use reef_core::git::graph::{GraphRow, LaneCell};
 use reef_core::git::{GraphScope, RefLabel};
 use serde_json::Value;
@@ -19,7 +19,7 @@ use unicode_width::UnicodeWidthStr;
 pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
     let area = draw_scope_header_if_any(f, app, area);
 
-    if app.git_graph.rows.is_empty() {
+    if app.engine.git_graph().rows.is_empty() {
         let line = Line::from(Span::styled(
             t(Msg::NoCommits),
             Style::default().fg(app.theme.fg_secondary),
@@ -30,57 +30,50 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
 
     let show_meta = area.width >= 60;
     let max_subject = (area.width as usize).saturating_sub(if show_meta { 40 } else { 14 });
-    let head_oid = app
-        .git_graph
-        .cache_key
-        .as_ref()
-        .map(|(head, _, _)| head.as_str());
+    let head_oid = app.engine.graph_head_oid();
 
     // Clamp scroll to a valid range. Auto-scroll into view only when the
     // selection actually moved since the last render — running this every
     // frame meant mouse-wheel scroll (which only changes `scroll`, not
     // `selected_idx`) got snapped back to the selected commit on the next
     // tick. Graph-tab equivalent of #10 / follow-up to #13.
-    let total = app.git_graph.rows.len();
     let height = area.height as usize;
-    let max_scroll = total.saturating_sub(height);
-    let mut scroll = app.git_graph.scroll.min(max_scroll);
+    let sel = app.engine.git_graph().selected_idx;
+    let selection_changed = app.layout.last_rendered_graph_selected != Some(sel);
+    app.engine
+        .dispatch(reef_app::AppCommand::ReconcileGraphScroll {
+            visible_rows: height,
+            selection_changed,
+        });
+    let scroll = app.engine.git_graph().scroll;
+    app.layout.last_rendered_graph_selected = Some(sel);
 
-    let sel = app.git_graph.selected_idx;
-    if app.git_graph.last_rendered_selected != Some(sel) {
-        if sel < scroll {
-            scroll = sel;
-        } else if sel >= scroll + height && height > 0 {
-            scroll = sel + 1 - height;
-        }
-        scroll = scroll.min(max_scroll);
-        app.git_graph.last_rendered_selected = Some(sel);
-    }
-    app.git_graph.scroll = scroll;
-
-    let rows: Vec<&GraphRow> = app.git_graph.rows.iter().collect();
+    let rows = app.engine.git_graph().rows.clone();
     let theme = app.theme;
     // Range highlight bounds. Collapsed range (lo == hi) = single-select;
     // `in_range` check below only fires when the user actually Shift-extended.
-    let (range_lo, range_hi) = app.git_graph.selected_range();
-    let is_range = app.git_graph.is_range();
-    let anchor_idx = app.git_graph.selection_anchor;
+    let (range_lo, range_hi) = app.engine.git_graph().selected_range();
+    let is_range = app.engine.git_graph().is_range();
+    let anchor_idx = app.engine.git_graph().selection_anchor;
     for (i, row) in rows.iter().skip(scroll).take(height).enumerate() {
         let idx = scroll + i;
         let y = area.y + i as u16;
         let hover = crate::ui::hover::is_hover(app, area, y);
-        let (search_ranges, search_cur) = app.search.ranges_on_row(SearchTarget::CommitGraph, idx);
+        let (search_ranges, search_cur) = app
+            .engine
+            .search()
+            .ranges_on_row(SearchTarget::CommitGraph, idx);
         let in_range = is_range && idx >= range_lo && idx <= range_hi;
         let is_anchor = is_range && Some(idx) == anchor_idx;
         let (line, click_x_w) = build_row_line(
             row,
-            idx == app.git_graph.selected_idx,
+            idx == app.engine.git_graph().selected_idx,
             in_range,
             is_anchor,
             show_meta,
             max_subject,
-            head_oid,
-            &app.git_graph.ref_map,
+            head_oid.as_deref(),
+            &app.engine.git_graph().ref_map,
             hover,
             &theme,
             &search_ranges,
@@ -92,7 +85,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
         app.hit_registry.register_row(
             area.x,
             y,
-            click_x_w,
+            click_x_w.min(area.width),
             ClickAction::GitCommand {
                 command: "git.selectCommit".into(),
                 args: serde_json::json!({ "oid": row.commit.oid }),
@@ -107,7 +100,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
 /// a too-short panel) the input rect is returned unchanged so the
 /// rows panel sits flush against the top.
 fn draw_scope_header_if_any(f: &mut Frame, app: &App, area: Rect) -> Rect {
-    let label = match &app.git_graph.scope {
+    let label = match &app.engine.git_graph().scope {
         GraphScope::AllRefs => return area,
         GraphScope::Branch(full_ref) => shorthand_for_full_ref(full_ref),
     };
@@ -161,17 +154,13 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             // Out of visual mode, single-select behaviour as before.
             let oid = args.get("oid").and_then(|v| v.as_str()).unwrap_or("");
             if !oid.is_empty()
-                && let Some(idx) = app.git_graph.find_row_by_oid(oid)
+                && let Some(idx) = app.engine.git_graph().find_row_by_oid(oid)
             {
-                if app.git_graph.in_visual_mode() {
-                    let delta = idx as i32 - app.git_graph.selected_idx as i32;
+                if app.engine.git_graph().in_visual_mode() {
+                    let delta = idx as i32 - app.engine.git_graph().selected_idx as i32;
                     app.extend_graph_selection(delta);
                 } else {
-                    app.git_graph.selected_idx = idx;
-                    app.git_graph.selected_commit = Some(oid.to_string());
-                    app.commit_detail.range_detail = None;
-                    app.commit_detail.scroll = 0;
-                    app.load_commit_detail();
+                    app.select_graph_commit(oid);
                 }
             }
             true
@@ -181,21 +170,13 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             // on the target commit, regardless of visual mode. Emitted by
             // the commit_detail_panel range-header commit list.
             let oid = args.get("oid").and_then(|v| v.as_str()).unwrap_or("");
-            if !oid.is_empty()
-                && let Some(idx) = app.git_graph.find_row_by_oid(oid)
-            {
-                app.git_graph.selected_idx = idx;
-                app.git_graph.selected_commit = Some(oid.to_string());
-                app.git_graph.selection_anchor = None;
-                app.commit_detail.range_detail = None;
-                app.commit_detail.scroll = 0;
-                app.load_commit_detail();
+            if !oid.is_empty() && app.engine.git_graph().find_row_by_oid(oid).is_some() {
+                app.focus_graph_commit(oid);
             }
             true
         }
         "git.graph.refresh" => {
-            app.git_graph.cache_key = None;
-            app.refresh_graph();
+            app.refresh_graph_uncached();
             true
         }
         _ => false,
@@ -203,12 +184,8 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
 }
 
 pub fn scroll(app: &mut App, delta: i32) {
-    let s = &mut app.git_graph.scroll;
-    *s = if delta < 0 {
-        s.saturating_sub(delta.unsigned_abs() as usize)
-    } else {
-        s.saturating_add(delta as usize)
-    };
+    app.engine
+        .dispatch(reef_app::AppCommand::ScrollGraphVertical(delta));
 }
 
 // ─── Row builder ──────────────────────────────────────────────────────────────

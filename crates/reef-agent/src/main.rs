@@ -208,27 +208,19 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
 
         Request::Subscribe => Ok(serde_json::json!({"subscribed": true})),
 
-        Request::ReadDir { path } => {
-            let rel = PathBuf::from(&path);
-            let abs = if rel.as_os_str().is_empty() {
-                workdir.to_path_buf()
-            } else {
-                workdir.join(&rel)
-            };
-            match std::fs::read_dir(&abs) {
-                Ok(iter) => {
-                    let mut entries = Vec::new();
-                    for entry in iter.flatten() {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        let is_dir = entry.path().is_dir();
-                        entries.push(DirEntryDto { name, is_dir });
-                    }
-                    serde_json::to_value(entries)
-                        .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}")))
-                }
-                Err(e) => Err((ErrorCode::Io, e.to_string())),
-            }
-        }
+        Request::ReadDir { path } => match backend.list_dir(Path::new(&path)) {
+            Ok(entries) => serde_json::to_value(
+                entries
+                    .into_iter()
+                    .map(|entry| DirEntryDto {
+                        name: entry.name,
+                        is_dir: entry.is_dir,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
+            Err(e) => Err(backend_err(e)),
+        },
 
         Request::ReadFile { path, max_bytes } => read_file_response(workdir, &path, max_bytes),
 

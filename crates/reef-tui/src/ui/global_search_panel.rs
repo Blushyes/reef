@@ -14,10 +14,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::App;
-use crate::global_search::{MAX_RESULTS, MatchHit, SearchPanelFocus};
+use crate::TuiApp as App;
 use crate::ui::mouse::ClickAction;
 use crate::ui::theme::Theme;
+use reef_app::{
+    GLOBAL_SEARCH_MAX_RESULTS as MAX_RESULTS, GlobalSearchPanelSnapshot, MatchHit, SearchPanelFocus,
+};
 
 /// Width (in display cols) of the per-row checkbox column when
 /// `replace_open` is true: `"[✓] "` / `"[ ] "` are 4 cells. Zero when
@@ -47,7 +49,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     let y = screen.y + screen.height.saturating_sub(popup_h) / 2;
     let area = Rect::new(x, y, popup_w, popup_h);
 
-    app.global_search.core.last_popup_area = Some(area);
+    app.global_search_popup_area = Some(area);
 
     f.render_widget(Clear, area);
 
@@ -78,24 +80,25 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
 /// `input_focused` controls the visible cues (cursor, prompt colour,
 /// empty-state hint) without changing which keys are handled — that's the
 /// caller's job in `input::handle_key_search`. Overlay passes true; the
-/// tab passes `app.global_search.input_focused()`.
+/// tab passes whether the search input is focused.
 ///
-/// Writes `app.global_search.last_view_h` so PageUp/PageDown (overlay and
-/// tab both bind them) get a correct step size, and registers one
+/// Writes the TUI list height cache so PageUp/PageDown (overlay and tab both
+/// bind them) get a correct step size, and registers one
 /// `GlobalSearchSelect` hit-test row per visible result.
 pub fn render_body(f: &mut Frame, app: &mut App, inner: Rect, input_focused: bool) {
     let th = app.theme;
     if inner.height < 3 {
         return;
     }
+    let snapshot = app.engine.snapshot().search;
 
     // Layout budgets shift by ±1 row when the user toggles the Replace
     // input on. `toggle_in_use` gates whether the prompt arrow doubles
     // as a replace-toggle button — overlay is single-input + transient,
     // so its prompt is just a prompt; Tab::Search makes the prompt
     // clickable.
-    let replace_open = app.global_search.replace_open;
-    let toggle_in_use = !app.global_search.core.active; // overlay sets `active=true`
+    let replace_open = snapshot.replace_open;
+    let toggle_in_use = !snapshot.active; // overlay sets `active=true`
     let header_rows: u16 = if replace_open { 2 } else { 1 };
 
     let find_y = inner.y;
@@ -110,13 +113,13 @@ pub fn render_body(f: &mut Frame, app: &mut App, inner: Rect, input_focused: boo
     };
     let footer_y = inner.y + inner.height.saturating_sub(1);
 
-    app.global_search.last_view_h = list_h;
+    app.layout.global_search_last_view_h = list_h;
 
     // ── Find input row ────────────────────────────────────────────────
     // Overlay has only one input row, so any input-focus there is by
     // definition Find. Tab::Search uses the focus enum to disambiguate.
-    let find_focused = input_focused
-        && (!toggle_in_use || matches!(app.global_search.focus, SearchPanelFocus::FindInput));
+    let find_focused =
+        input_focused && (!toggle_in_use || matches!(snapshot.focus, SearchPanelFocus::FindInput));
     // Prompt arrow doubles as the replace-toggle on Tab::Search:
     // `> ` when collapsed, `▾ ` (U+25BE BLACK DOWN-POINTING SMALL
     // TRIANGLE) when the replace row is showing. Picked from a few
@@ -146,14 +149,12 @@ pub fn render_body(f: &mut Frame, app: &mut App, inner: Rect, input_focused: boo
     f.render_widget(
         Line::from(vec![
             Span::styled(prompt_glyph.to_string(), prompt_style),
-            Span::styled(app.global_search.core.filter.clone(), query_style),
+            Span::styled(snapshot.query.clone(), query_style),
         ]),
         Rect::new(inner.x, find_y, inner.width, 1),
     );
     if find_focused {
-        let cursor_w =
-            UnicodeWidthStr::width(&app.global_search.core.filter[..app.global_search.core.cursor])
-                as u16;
+        let cursor_w = UnicodeWidthStr::width(&snapshot.query[..snapshot.query_cursor]) as u16;
         let cursor_x = inner.x + PROMPT_COL_W + cursor_w.min(inner.width.saturating_sub(3));
         f.set_cursor_position((cursor_x, find_y));
     }
@@ -178,7 +179,7 @@ pub fn render_body(f: &mut Frame, app: &mut App, inner: Rect, input_focused: boo
 
     // ── Replace input row ─────────────────────────────────────────────
     if replace_open {
-        let replace_focused = matches!(app.global_search.focus, SearchPanelFocus::ReplaceInput);
+        let replace_focused = matches!(snapshot.focus, SearchPanelFocus::ReplaceInput);
         let r_prompt_style = if replace_focused {
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
         } else {
@@ -190,7 +191,7 @@ pub fn render_body(f: &mut Frame, app: &mut App, inner: Rect, input_focused: boo
             Style::default().fg(th.fg_secondary)
         };
         let placeholder = crate::i18n::t(crate::i18n::Msg::ReplaceWithPlaceholder);
-        let body: Span<'static> = if app.global_search.replace_text.is_empty() && !replace_focused {
+        let body: Span<'static> = if snapshot.replace_text.is_empty() && !replace_focused {
             Span::styled(
                 placeholder.to_string(),
                 Style::default()
@@ -198,16 +199,15 @@ pub fn render_body(f: &mut Frame, app: &mut App, inner: Rect, input_focused: boo
                     .add_modifier(Modifier::ITALIC),
             )
         } else {
-            Span::styled(app.global_search.replace_text.clone(), r_query_style)
+            Span::styled(snapshot.replace_text.clone(), r_query_style)
         };
         f.render_widget(
             Line::from(vec![Span::styled("↪ ", r_prompt_style), body]),
             Rect::new(inner.x, replace_y, inner.width, 1),
         );
         if replace_focused {
-            let cursor_w = UnicodeWidthStr::width(
-                &app.global_search.replace_text[..app.global_search.replace_cursor],
-            ) as u16;
+            let cursor_w =
+                UnicodeWidthStr::width(&snapshot.replace_text[..snapshot.replace_cursor]) as u16;
             let cursor_x = inner.x + PROMPT_COL_W + cursor_w.min(inner.width.saturating_sub(3));
             f.set_cursor_position((cursor_x, replace_y));
         } else {
@@ -230,9 +230,9 @@ pub fn render_body(f: &mut Frame, app: &mut App, inner: Rect, input_focused: boo
     );
 
     // ── List ───────────────────────────────────────────────────────────
-    let loading = app.global_search_load.loading;
-    if app.global_search.results.is_empty() {
-        let msg = if app.global_search.core.filter.is_empty() {
+    let loading = snapshot.load.loading;
+    if snapshot.result_count == 0 {
+        let msg = if snapshot.query.is_empty() {
             if input_focused {
                 "Type to search file contents…"
             } else {
@@ -253,29 +253,22 @@ pub fn render_body(f: &mut Frame, app: &mut App, inner: Rect, input_focused: boo
             Rect::new(inner.x, list_y, inner.width, 1),
         );
     } else {
-        let sel = app.global_search.core.selected_idx;
-        if sel < app.global_search.scroll {
-            app.global_search.scroll = sel;
-        } else if list_h > 0 && sel >= app.global_search.scroll + list_h as usize {
-            app.global_search.scroll = sel + 1 - list_h as usize;
-        }
-        let scroll = app.global_search.scroll;
-
-        // Clamp to MAX_H_SCROLL so a fast trackpad flick can't leave the
-        // row permanently blank. Write it back so the next render reads
-        // the clamped value (mouse handlers don't clamp themselves).
-        app.global_search.results_h_scroll = app
-            .global_search
-            .results_h_scroll
-            .min(crate::global_search::MAX_H_SCROLL);
-        let h_scroll = app.global_search.results_h_scroll;
-        for row in 0..list_h as usize {
-            let hit_idx = scroll + row;
-            let Some(hit) = app.global_search.results.get(hit_idx) else {
-                break;
-            };
+        let scroll = visible_scroll(
+            snapshot.scroll,
+            snapshot.selected_idx,
+            list_h as usize,
+            snapshot.result_count,
+        );
+        let h_scroll = snapshot.h_scroll.min(reef_app::GLOBAL_SEARCH_MAX_H_SCROLL);
+        let sel = snapshot.selected_idx;
+        for (row, (hit_idx, item)) in app
+            .engine
+            .global_search_rows(scroll, list_h as usize)
+            .enumerate()
+        {
+            let hit = item.hit;
             let is_sel = hit_idx == sel;
-            let included = app.global_search.is_match_included(hit_idx);
+            let included = item.included;
             let y = list_y + row as u16;
             let row_area = Rect::new(inner.x, y, inner.width, 1);
             let hover = crate::ui::hover::is_hover(app, row_area, y);
@@ -307,7 +300,7 @@ pub fn render_body(f: &mut Frame, app: &mut App, inner: Rect, input_focused: boo
 
             let body_x = inner.x + checkbox_w;
             let body_w = inner.width.saturating_sub(checkbox_w);
-            let line = build_row_line(hit, is_sel, hover, body_w, h_scroll, included, &th);
+            let line = build_row_line(&hit, is_sel, hover, body_w, h_scroll, included, &th);
             f.render_widget(line, Rect::new(body_x, y, body_w, 1));
             app.hit_registry.register_row(
                 body_x,
@@ -320,20 +313,20 @@ pub fn render_body(f: &mut Frame, app: &mut App, inner: Rect, input_focused: boo
 
     // ── Footer ─────────────────────────────────────────────────────────
     if has_footer {
-        let base_text = render_footer_text(&app.global_search, loading);
+        let base_text = render_footer_text(&snapshot);
 
         if replace_open {
             // Replace footer adds a count + clickable Apply button. Lay
             // it out as: `<base>  ·  N <suffix>  ·  [Apply]`. The Apply
             // span gets its own hit-test so the rest of the footer is
             // inert.
-            let included_count = app.global_search.included_count();
+            let included_count = snapshot.included_count;
             let suffix = crate::i18n::t(crate::i18n::Msg::ReplaceCountSuffix);
             let count_text = format!(" · {included_count} {suffix} · ");
-            let in_flight = app.replace_load.loading;
+            let in_flight = snapshot.replace_load.loading;
             let apply_label = if in_flight {
                 let hint = crate::i18n::t(crate::i18n::Msg::ReplacingHint);
-                match app.global_search.replace_progress {
+                match snapshot.replace_progress {
                     Some((done, total)) if total > 0 => format!(" {hint} {done}/{total} "),
                     _ => format!(" {hint} "),
                 }
@@ -393,26 +386,40 @@ pub fn render_body(f: &mut Frame, app: &mut App, inner: Rect, input_focused: boo
 /// tail when the worker truncated. `loading` comes from
 /// `App.global_search_load.loading` — passed in so this stays a pure
 /// function of the search's public state.
-fn render_footer_text(state: &crate::global_search::GlobalSearchState, loading: bool) -> String {
-    let cur = if state.results.is_empty() {
+fn render_footer_text(snapshot: &GlobalSearchPanelSnapshot) -> String {
+    let cur = if snapshot.result_count == 0 {
         0
     } else {
-        state.core.selected_idx + 1
+        snapshot.selected_idx + 1
     };
-    let total = state.results.len();
+    let total = snapshot.result_count;
     let mut s = format!("{cur} / {total}");
-    if state.results_h_scroll > 0 {
+    if snapshot.h_scroll > 0 {
         // `←` signals "content shifted left, Home to reset" — both the
         // direction of the shift and the escape hatch.
-        s.push_str(&format!(" · ←{}", state.results_h_scroll));
+        s.push_str(&format!(" · ←{}", snapshot.h_scroll));
     }
-    if loading {
+    if snapshot.load.loading {
         s.push_str(" · scanning…");
     }
-    if state.truncated {
+    if snapshot.truncated {
         s.push_str(&format!(" · {MAX_RESULTS}+ (refine)"));
     }
     s
+}
+
+fn visible_scroll(scroll: usize, selected: usize, visible_rows: usize, total_rows: usize) -> usize {
+    if visible_rows == 0 || total_rows == 0 {
+        return 0;
+    }
+    let max_scroll = total_rows.saturating_sub(visible_rows);
+    let mut next = scroll.min(max_scroll);
+    if selected < next {
+        next = selected;
+    } else if selected >= next + visible_rows {
+        next = selected + 1 - visible_rows;
+    }
+    next.min(max_scroll)
 }
 
 /// Fixed path-column width. Must stay constant per render so whole-row

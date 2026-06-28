@@ -26,12 +26,18 @@ use reef_core::preview::PreviewDocument as PreviewContent;
 use std::collections::{HashMap, HashSet};
 
 pub mod agent_deploy;
+mod file_copy;
 pub mod fs_watcher;
 pub mod local;
 pub mod remote;
+mod target;
 
+pub use file_copy::copy_local_sources_to_backend;
 pub use local::LocalBackend;
 pub use remote::RemoteBackend;
+pub use target::{
+    ResolvedLocalTarget, expand_tilde_path, resolve_local_target, workdir_relative_path,
+};
 
 pub type EditorResolver = fn() -> Option<(String, Vec<String>)>;
 
@@ -219,6 +225,13 @@ pub struct WalkResponse {
     pub truncated: bool,
 }
 
+/// One direct child entry returned by `Backend::list_dir`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: String,
+    pub is_dir: bool,
+}
+
 /// One content-search hit, backend-side. Mirrors `global_search::MatchHit`
 /// but the latter lives in the UI layer and carries UI invariants
 /// (truncated `line_text`). We keep the shapes identical so conversion is
@@ -278,8 +291,8 @@ pub struct EditorLaunchSpec {
     pub inherit_tty: bool,
 }
 
-/// Backend abstraction. Phase 0 defines the methods the app and the workers
-/// need; remote/local implementations satisfy the same contract.
+/// Backend abstraction used by app workers. Remote and local implementations
+/// satisfy the same contract.
 pub trait Backend: Send + Sync {
     // ─── identity / workdir metadata ────────────────────────────────────────
     fn workdir_path(&self) -> PathBuf;
@@ -321,6 +334,11 @@ pub trait Backend: Send + Sync {
         dark: bool,
         wants_decoded_image: bool,
     ) -> Option<PreviewContent>;
+
+    /// List direct children of a directory under the backend workdir.
+    /// Callers use this for collision checks and other small probes that
+    /// must behave the same for local and remote workspaces.
+    fn list_dir(&self, rel_path: &Path) -> Result<Vec<DirEntry>, BackendError>;
 
     /// Raw file bytes. Returns `BackendError::NotFound` if the path isn't a
     /// regular file. `max_bytes` caps how many bytes are returned; remote
@@ -381,9 +399,7 @@ pub trait Backend: Send + Sync {
     /// section discard flows. Staged paths are first unstaged, then the
     /// workdir restored to HEAD; unstaged paths only get workdir restore.
     /// Collapsed into a single trait method so `RemoteBackend` can reach
-    /// the agent-side `git2::Repository` in one round-trip (the free
-    /// `revert_path` helper in `app.rs` assumed a local repo handle and
-    /// silently no-op'd on remote before M4).
+    /// the agent-side `git2::Repository` in one round-trip.
     fn revert_path(&self, path: &str, is_staged: bool) -> Result<(), BackendError>;
 
     fn push(&self, force: bool) -> Result<(), BackendError>;
@@ -433,10 +449,9 @@ pub trait Backend: Send + Sync {
     /// the remote agent (RemoteBackend).
     fn subscribe_fs_events(&self) -> mpsc::Receiver<()>;
 
-    /// Best-effort editor launch hook. M1 remote backend leaves this as
-    /// `BackendError::Unimplemented` — the main loop still calls the local
-    /// `editor::launch` via the shared terminal to preserve behaviour until
-    /// Phase 6 ships SSH -t transparent forwarding.
+    /// Best-effort editor launch hook. Remote backends may return
+    /// `BackendError::Unimplemented`; callers can then use
+    /// [`Self::editor_launch_spec`] and handle terminal teardown themselves.
     fn launch_editor(&self, rel_path: &Path) -> Result<(), BackendError>;
 
     /// Build a `Command` spec for spawning the user's editor on the
@@ -450,7 +465,7 @@ pub trait Backend: Send + Sync {
     /// the real terminal without hard-coding the local-vs-remote split.
     fn editor_launch_spec(&self, rel_path: &Path) -> Result<EditorLaunchSpec, BackendError>;
 
-    // ─── M3 Track 1: write operations (all paths workdir-relative) ──────────
+    // ─── write operations (all paths workdir-relative) ──────────────────────
     /// Create an empty file at `rel_path`. Fails `PathExists` if it
     /// already exists (`OpenOptions::create_new` semantics — no truncate
     /// race with an external writer).
@@ -471,10 +486,7 @@ pub trait Backend: Send + Sync {
     /// `fs::copy` / `copy_dir_recursive`. RemoteBackend: `scp` subprocess
     /// reusing the session's ControlMaster.
     ///
-    /// This is the M4 Track C "drag-drop from local Finder onto a remote
-    /// tree" primitive; the caller (`tasks::copy_sources`) picks it over
-    /// `copy_file` / `copy_dir_recursive` when the source path isn't
-    /// under the workdir.
+    /// Used when the source path is outside the backend workdir.
     fn upload_from_local(
         &self,
         local_src: &Path,
@@ -507,7 +519,7 @@ pub trait Backend: Send + Sync {
     /// detour.
     fn hard_delete(&self, rel_paths: &[PathBuf]) -> Result<(), BackendError>;
 
-    // ─── M3 Track 2: walk + content search ──────────────────────────────────
+    // ─── walk + content search ──────────────────────────────────────────────
     /// Walk every file under the workdir (respecting `.gitignore` when
     /// `opts.respect_gitignore` is set). Output is sorted + capped. Used
     /// by the quick-open palette.

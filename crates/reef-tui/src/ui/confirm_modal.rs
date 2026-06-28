@@ -1,19 +1,12 @@
 //! Generic centered confirm modal — `[Cancel] [Primary]`.
 //!
-//! Callers build a `ConfirmModal` (body text + two `FnOnce` callbacks) and
-//! hand it to `App::show_confirm`. `App::fire_confirm_primary` /
-//! `fire_confirm_cancel` `take()` the modal before calling the closure, so
-//! the closure receives a clean `&mut App` and can even re-`show_confirm`
-//! itself — that's the "keep open while a prior op is still running" retry
-//! path used by `execute_tree_delete`.
-//!
 //! Rendered last in `ui::render` so it floats above other overlays; mouse +
 //! keyboard are gated in `input::*` so events never reach the panels
 //! underneath. A full-screen `ConfirmModalCancel` hit zone is registered
 //! first and button zones last — reverse-order hit-testing makes outside
 //! clicks dismiss while button clicks resolve normally.
 
-use crate::app::App;
+use crate::TuiApp as App;
 use crate::ui::hover;
 use crate::ui::layout::center_rect;
 use crate::ui::mouse::ClickAction;
@@ -22,26 +15,15 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear};
+use reef_app::{ConfirmRequest, ConfirmTone};
 use unicode_width::UnicodeWidthStr;
 
-pub struct ConfirmModal {
-    pub title: String,
-    pub tone: ModalTone,
-    /// Body text. Split on `'\n'` for multi-line rendering.
-    pub body: String,
-    pub primary_label: String,
-    pub cancel_label: String,
-    /// Keys that fire `on_confirm`. Typically `['y', 'Y']`. Empty means
-    /// "only the mouse can confirm" — Esc / N / C still cancel.
-    pub confirm_keys: Vec<char>,
-    pub on_confirm: Box<dyn FnOnce(&mut App)>,
-    pub on_cancel: Box<dyn FnOnce(&mut App)>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModalTone {
-    Default,
-    Danger,
+struct ConfirmModalView {
+    title: String,
+    tone: ConfirmTone,
+    body: String,
+    primary_label: String,
+    cancel_label: String,
 }
 
 const MIN_W: u16 = 44;
@@ -53,10 +35,35 @@ const PAD_BOTTOM: u16 = 1;
 const TITLE_TO_BODY: u16 = 1;
 const BODY_TO_BUTTONS: u16 = 1;
 
+fn view_for_request(request: &ConfirmRequest) -> ConfirmModalView {
+    match request {
+        ConfirmRequest::TreeDelete(pending) => ConfirmModalView {
+            title: crate::i18n::confirm_destructive_title(),
+            tone: request.tone(),
+            body: crate::i18n::tree_delete_body(
+                &pending.display_name,
+                pending.is_dir,
+                pending.hard,
+            ),
+            primary_label: if pending.hard {
+                crate::i18n::confirm_delete_label()
+            } else {
+                crate::i18n::confirm_trash_label()
+            },
+            cancel_label: crate::i18n::confirm_cancel_label(),
+        },
+    }
+}
+
+pub fn confirm_key_matches(request: &ConfirmRequest, ch: char) -> bool {
+    matches!(request, ConfirmRequest::TreeDelete(_)) && matches!(ch, 'y' | 'Y')
+}
+
 pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
-    let Some(modal) = app.confirm_modal.as_ref() else {
+    let Some(request) = app.engine.confirm_request() else {
         return;
     };
+    let modal = view_for_request(request);
     let th = app.theme;
 
     let body_lines: Vec<&str> = modal.body.lines().collect();
@@ -121,8 +128,8 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
 
     let card_bg = th.chrome_active_bg;
     let title_accent = match modal.tone {
-        ModalTone::Danger => th.removed_accent,
-        ModalTone::Default => th.accent,
+        ConfirmTone::Danger => th.removed_accent,
+        ConfirmTone::Default => th.accent,
     };
 
     let inner_x = area.x + SIDE_PAD;
@@ -213,8 +220,8 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
         // give us dark-text-on-cyan, which fights the high-contrast
         // light preset).
         let (primary_bg, primary_fg) = match modal.tone {
-            ModalTone::Danger => (th.error_bg, th.fg_primary),
-            ModalTone::Default => (th.accent, th.chrome_bg),
+            ConfirmTone::Danger => (th.error_bg, th.fg_primary),
+            ConfirmTone::Default => (th.accent, th.chrome_bg),
         };
         let mut primary_style = Style::default()
             .fg(primary_fg)

@@ -17,7 +17,7 @@ pub mod workspace;
 
 pub use grammars::{LangProfile, LspProfile, NavLang};
 pub use lsp::{LspBadge, LspClient, LspLocation};
-pub use workspace::{SymbolLoc, WorkspaceIndex, build_workspace_index};
+pub use workspace::{SymbolLoc, WorkspaceIndex, WorkspaceIndexFile, build_workspace_index};
 
 /// `(file_line, byte_column_in_line)` — same coordinate system as
 /// `mouse_to_file_coord` returns and `preview_selection.active` uses.

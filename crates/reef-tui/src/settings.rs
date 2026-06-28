@@ -1,119 +1,51 @@
-//! Settings page state + pure helpers. The renderer lives in
-//! `ui::settings_panel`; the keyboard router in `input::handle_key_settings`.
-//! Adding a new row is one [`SettingItem`] variant + an entry in
-//! [`SettingItem::ALL`] + match arms in `section`/`label`/`description`/
-//! [`current_value`]/[`cycle`].
+//! TUI settings labels, values, and persistence adapter.
 
-use crate::app::{App, DiffMode};
+use crate::TuiApp as App;
+use reef_app::AppCommand;
+use reef_app::DiffMode;
+pub use reef_app::{SettingItem, SettingSection};
 use reef_core::diff::DiffLayout;
 use reef_core::nav::NavLang;
 use reef_core::prefs::{EDITOR_COMMAND, ThemePref, UI_THEME};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettingSection {
-    General,
-    Editor,
-    Git,
-    Graph,
-    /// Phase 3 LSP / code-nav rows: state + click-to-install per
-    /// language. See `SettingItem::Lsp(NavLang)`.
-    Nav,
-}
-
-impl SettingSection {
-    pub(crate) fn label(self) -> crate::i18n::Msg {
-        use crate::i18n::Msg;
-        match self {
-            SettingSection::General => Msg::SettingsSectionGeneral,
-            SettingSection::Editor => Msg::SettingsSectionEditor,
-            SettingSection::Git => Msg::SettingsSectionGit,
-            SettingSection::Graph => Msg::SettingsSectionGraph,
-            SettingSection::Nav => Msg::SettingsSectionNav,
-        }
+pub(crate) fn section_label(section: SettingSection) -> crate::i18n::Msg {
+    use crate::i18n::Msg;
+    match section {
+        SettingSection::General => Msg::SettingsSectionGeneral,
+        SettingSection::Editor => Msg::SettingsSectionEditor,
+        SettingSection::Git => Msg::SettingsSectionGit,
+        SettingSection::Graph => Msg::SettingsSectionGraph,
+        SettingSection::Nav => Msg::SettingsSectionNav,
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettingItem {
-    Theme,
-    EditorCommand,
-    DiffLayout,
-    DiffMode,
-    StatusTreeMode,
-    CommitDiffLayout,
-    CommitDiffMode,
-    CommitFilesTreeMode,
-    /// One row per language served by the navigation engine. The
-    /// renderer pulls the language name + LSP binary from
-    /// `NavLang::profile()` rather than going through i18n, so adding
-    /// a language doesn't require new translation strings.
-    Lsp(NavLang),
+pub(crate) fn item_label(item: SettingItem) -> crate::i18n::Msg {
+    use crate::i18n::Msg;
+    match item {
+        SettingItem::Theme => Msg::SettingsItemTheme,
+        SettingItem::EditorCommand => Msg::SettingsItemEditor,
+        SettingItem::DiffLayout => Msg::SettingsItemDiffLayout,
+        SettingItem::DiffMode => Msg::SettingsItemDiffMode,
+        SettingItem::StatusTreeMode => Msg::SettingsItemStatusTreeMode,
+        SettingItem::CommitDiffLayout => Msg::SettingsItemCommitDiffLayout,
+        SettingItem::CommitDiffMode => Msg::SettingsItemCommitDiffMode,
+        SettingItem::CommitFilesTreeMode => Msg::SettingsItemCommitFilesTreeMode,
+        SettingItem::Lsp(_) => Msg::SettingsItemLsp,
+    }
 }
 
-impl SettingItem {
-    pub const ALL: &'static [SettingItem] = &[
-        SettingItem::Theme,
-        SettingItem::EditorCommand,
-        SettingItem::DiffLayout,
-        SettingItem::DiffMode,
-        SettingItem::StatusTreeMode,
-        SettingItem::CommitDiffLayout,
-        SettingItem::CommitDiffMode,
-        SettingItem::CommitFilesTreeMode,
-        SettingItem::Lsp(NavLang::Rust),
-        SettingItem::Lsp(NavLang::TypeScript),
-        SettingItem::Lsp(NavLang::Tsx),
-        SettingItem::Lsp(NavLang::Python),
-        SettingItem::Lsp(NavLang::Go),
-        SettingItem::Lsp(NavLang::Vue),
-    ];
-
-    pub(crate) fn section(self) -> SettingSection {
-        match self {
-            SettingItem::Theme => SettingSection::General,
-            SettingItem::EditorCommand => SettingSection::Editor,
-            SettingItem::DiffLayout | SettingItem::DiffMode | SettingItem::StatusTreeMode => {
-                SettingSection::Git
-            }
-            SettingItem::CommitDiffLayout
-            | SettingItem::CommitDiffMode
-            | SettingItem::CommitFilesTreeMode => SettingSection::Graph,
-            SettingItem::Lsp(_) => SettingSection::Nav,
-        }
-    }
-
-    pub(crate) fn label(self) -> crate::i18n::Msg {
-        use crate::i18n::Msg;
-        match self {
-            SettingItem::Theme => Msg::SettingsItemTheme,
-            SettingItem::EditorCommand => Msg::SettingsItemEditor,
-            SettingItem::DiffLayout => Msg::SettingsItemDiffLayout,
-            SettingItem::DiffMode => Msg::SettingsItemDiffMode,
-            SettingItem::StatusTreeMode => Msg::SettingsItemStatusTreeMode,
-            SettingItem::CommitDiffLayout => Msg::SettingsItemCommitDiffLayout,
-            SettingItem::CommitDiffMode => Msg::SettingsItemCommitDiffMode,
-            SettingItem::CommitFilesTreeMode => Msg::SettingsItemCommitFilesTreeMode,
-            // The render path special-cases `Lsp(lang)` and replaces
-            // this label with the language's `display_name`. Keep
-            // this Msg as the generic fallback so any path that
-            // doesn't special-case still surfaces something readable.
-            SettingItem::Lsp(_) => Msg::SettingsItemLsp,
-        }
-    }
-
-    pub(crate) fn description(self) -> crate::i18n::Msg {
-        use crate::i18n::Msg;
-        match self {
-            SettingItem::Theme => Msg::SettingsDescTheme,
-            SettingItem::EditorCommand => Msg::SettingsDescEditor,
-            SettingItem::DiffLayout => Msg::SettingsDescDiffLayout,
-            SettingItem::DiffMode => Msg::SettingsDescDiffMode,
-            SettingItem::StatusTreeMode => Msg::SettingsDescStatusTreeMode,
-            SettingItem::CommitDiffLayout => Msg::SettingsDescCommitDiffLayout,
-            SettingItem::CommitDiffMode => Msg::SettingsDescCommitDiffMode,
-            SettingItem::CommitFilesTreeMode => Msg::SettingsDescCommitFilesTreeMode,
-            SettingItem::Lsp(_) => Msg::SettingsDescLsp,
-        }
+pub(crate) fn item_description(item: SettingItem) -> crate::i18n::Msg {
+    use crate::i18n::Msg;
+    match item {
+        SettingItem::Theme => Msg::SettingsDescTheme,
+        SettingItem::EditorCommand => Msg::SettingsDescEditor,
+        SettingItem::DiffLayout => Msg::SettingsDescDiffLayout,
+        SettingItem::DiffMode => Msg::SettingsDescDiffMode,
+        SettingItem::StatusTreeMode => Msg::SettingsDescStatusTreeMode,
+        SettingItem::CommitDiffLayout => Msg::SettingsDescCommitDiffLayout,
+        SettingItem::CommitDiffMode => Msg::SettingsDescCommitDiffMode,
+        SettingItem::CommitFilesTreeMode => Msg::SettingsDescCommitFilesTreeMode,
+        SettingItem::Lsp(_) => Msg::SettingsDescLsp,
     }
 }
 
@@ -126,52 +58,16 @@ fn theme_label_msg(pref: ThemePref) -> crate::i18n::Msg {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct EditorEdit {
-    pub buffer: String,
-    pub cursor: usize,
-}
-
-#[derive(Debug, Default)]
-pub struct SettingsState {
-    pub selected_idx: usize,
-    pub editor_edit: Option<EditorEdit>,
-    /// Pref-backed values cached so [`current_value`] reads memory, not
-    /// disk. Refreshed by [`refresh_pref_cache`] on every entry to the
-    /// page and after every mutation.
-    theme_pref: ThemePref,
-    editor_command: String,
-}
-
-impl SettingsState {
-    pub fn selected(&self) -> SettingItem {
-        let i = self.selected_idx.min(SettingItem::ALL.len() - 1);
-        SettingItem::ALL[i]
-    }
-
-    pub fn move_selection(&mut self, delta: i32) {
-        let n = SettingItem::ALL.len() as i32;
-        let cur = (self.selected_idx as i32).clamp(0, n - 1);
-        let next = (cur + delta).rem_euclid(n);
-        self.selected_idx = next as usize;
-    }
-
-    pub fn select(&mut self, idx: usize) {
-        if idx < SettingItem::ALL.len() {
-            self.selected_idx = idx;
-        }
-    }
-}
-
-/// Reload the pref-backed cache from disk. Cheap (one prefs read) but
-/// not free, so we only call this on transitions: opening the page, and
-/// after each mutation that could have changed a cached value.
-pub fn refresh_pref_cache(state: &mut SettingsState) {
-    state.theme_pref = crate::prefs::get(UI_THEME)
+pub fn refresh_pref_cache(app: &mut App) {
+    let theme_pref = crate::prefs::get(UI_THEME)
         .as_deref()
         .map(ThemePref::from_pref_str)
         .unwrap_or_default();
-    state.editor_command = crate::prefs::get(EDITOR_COMMAND).unwrap_or_default();
+    let editor_command = crate::prefs::get(EDITOR_COMMAND).unwrap_or_default();
+    app.engine.dispatch(AppCommand::SetSettingsPrefCache {
+        theme_pref,
+        editor_command,
+    });
 }
 
 #[derive(Debug, Clone)]
@@ -209,18 +105,20 @@ pub enum LspRowState {
 pub(crate) fn current_value(item: SettingItem, app: &App) -> ItemValue {
     use crate::i18n::t;
     match item {
-        SettingItem::Theme => ItemValue::Choice(t(theme_label_msg(app.settings.theme_pref))),
-        SettingItem::EditorCommand => ItemValue::Text(app.settings.editor_command.clone()),
-        SettingItem::DiffLayout => ItemValue::Choice(diff_layout_label(app.diff_layout)),
-        SettingItem::DiffMode => ItemValue::Choice(diff_mode_label(app.diff_mode)),
-        SettingItem::StatusTreeMode => ItemValue::Bool(app.git_status.tree_mode),
+        SettingItem::Theme => {
+            ItemValue::Choice(t(theme_label_msg(app.engine.settings().theme_pref)))
+        }
+        SettingItem::EditorCommand => ItemValue::Text(app.engine.settings().editor_command.clone()),
+        SettingItem::DiffLayout => ItemValue::Choice(diff_layout_label(app.engine.diff_layout())),
+        SettingItem::DiffMode => ItemValue::Choice(diff_mode_label(app.engine.diff_mode())),
+        SettingItem::StatusTreeMode => ItemValue::Bool(app.engine.status_tree_mode()),
         SettingItem::CommitDiffLayout => {
-            ItemValue::Choice(diff_layout_label(app.commit_detail.diff_layout))
+            ItemValue::Choice(diff_layout_label(app.engine.commit_diff_layout()))
         }
         SettingItem::CommitDiffMode => {
-            ItemValue::Choice(diff_mode_label(app.commit_detail.diff_mode))
+            ItemValue::Choice(diff_mode_label(app.engine.commit_diff_mode()))
         }
-        SettingItem::CommitFilesTreeMode => ItemValue::Bool(app.commit_detail.files_tree_mode),
+        SettingItem::CommitFilesTreeMode => ItemValue::Bool(app.engine.commit_files_tree_mode()),
         SettingItem::Lsp(lang) => ItemValue::LspStatus {
             lang,
             state: app.lsp_view_for(lang),
@@ -261,11 +159,11 @@ pub fn cycle(app: &mut App, item: SettingItem) {
             return;
         }
     }
-    refresh_pref_cache(&mut app.settings);
+    refresh_pref_cache(app);
 }
 
 fn cycle_theme(app: &mut App) {
-    let next = app.settings.theme_pref.next();
+    let next = app.engine.settings().theme_pref.next();
     crate::prefs::set(UI_THEME, next.pref_str());
     match next {
         ThemePref::Dark => app.theme = crate::ui::theme::Theme::dark(),
@@ -274,43 +172,26 @@ fn cycle_theme(app: &mut App) {
         // it from here. Keep the current live theme and tell the user
         // their pick takes effect on next launch.
         ThemePref::Auto => {
-            app.toasts
-                .push(crate::ui::toast::Toast::info(crate::i18n::t(
-                    crate::i18n::Msg::SettingsAutoThemeOnNextLaunch,
-                )));
+            app.push_toast(reef_app::Toast::info(crate::i18n::t(
+                crate::i18n::Msg::SettingsAutoThemeOnNextLaunch,
+            )));
         }
     }
 }
 
-pub fn begin_edit_editor_command(state: &mut SettingsState) {
-    let current = state.editor_command.clone();
-    let cursor = current.len();
-    state.editor_edit = Some(EditorEdit {
-        buffer: current,
-        cursor,
-    });
-}
-
-/// Sanitises control characters before writing: the prefs file is a
-/// flat `key=value` per line, so a stray `\n` would corrupt every key
-/// after `editor.command`.
-pub(crate) fn commit_editor_command(state: &mut SettingsState) {
-    if let Some(edit) = state.editor_edit.take() {
-        let trimmed = edit.buffer.replace(['\n', '\r', '\t'], " ");
-        let trimmed = trimmed.trim();
-        crate::prefs::set(EDITOR_COMMAND, trimmed);
-        state.editor_command = trimmed.to_string();
+pub(crate) fn commit_editor_command(app: &mut App) {
+    let outcome = app
+        .engine
+        .dispatch(AppCommand::CommitSettingsEditorCommandEdit);
+    if let Some(value) = outcome.committed_editor_command {
+        crate::prefs::set(EDITOR_COMMAND, &value);
     }
-}
-
-pub(crate) fn cancel_editor_command(state: &mut SettingsState) {
-    state.editor_edit = None;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::App;
+    use crate::TuiApp as App;
     use crate::ui::theme::Theme;
     use std::sync::MutexGuard;
     use tempfile::TempDir;
@@ -334,49 +215,28 @@ mod tests {
     }
 
     #[test]
-    fn move_selection_wraps() {
-        let mut s = SettingsState::default();
-        s.move_selection(-1);
-        assert_eq!(s.selected_idx, SettingItem::ALL.len() - 1);
-        s.move_selection(1);
-        assert_eq!(s.selected_idx, 0);
-    }
-
-    #[test]
-    fn move_selection_clamps_starting_idx() {
-        // ALL shrinking between sessions could leave a stale idx in
-        // saved state — next nav must recover, not panic.
-        let mut s = SettingsState {
-            selected_idx: 999,
-            ..Default::default()
-        };
-        s.move_selection(1);
-        assert_eq!(s.selected_idx, 0);
-    }
-
-    #[test]
     fn settings_section_assignment_is_complete() {
         for item in SettingItem::ALL {
             let _ = item.section();
-            let _ = item.label();
-            let _ = item.description();
+            let _ = item_label(*item);
+            let _ = item_description(*item);
         }
     }
 
     #[test]
     fn cycle_status_tree_mode_updates_app_and_prefs() {
         let (_lock, _h, _g, _home, _cwd, mut app) = isolated_app();
-        assert!(!app.git_status.tree_mode);
+        assert!(!app.engine.state.git_status.tree_mode);
 
         cycle(&mut app, SettingItem::StatusTreeMode);
-        assert!(app.git_status.tree_mode);
+        assert!(app.engine.state.git_status.tree_mode);
         assert_eq!(
             crate::prefs::get("status.tree_mode").as_deref(),
             Some("true")
         );
 
         cycle(&mut app, SettingItem::StatusTreeMode);
-        assert!(!app.git_status.tree_mode);
+        assert!(!app.engine.state.git_status.tree_mode);
         assert_eq!(
             crate::prefs::get("status.tree_mode").as_deref(),
             Some("false")
@@ -386,24 +246,24 @@ mod tests {
     #[test]
     fn cycle_theme_walks_auto_dark_light() {
         let (_lock, _h, _g, _home, _cwd, mut app) = isolated_app();
-        refresh_pref_cache(&mut app.settings);
-        assert_eq!(app.settings.theme_pref, ThemePref::Auto);
+        refresh_pref_cache(&mut app);
+        assert_eq!(app.engine.settings().theme_pref, ThemePref::Auto);
 
         cycle(&mut app, SettingItem::Theme);
-        assert_eq!(app.settings.theme_pref, ThemePref::Dark);
+        assert_eq!(app.engine.settings().theme_pref, ThemePref::Dark);
         assert!(app.theme.is_dark);
 
         cycle(&mut app, SettingItem::Theme);
-        assert_eq!(app.settings.theme_pref, ThemePref::Light);
+        assert_eq!(app.engine.settings().theme_pref, ThemePref::Light);
         assert!(!app.theme.is_dark);
 
         // Auto must NOT change the live theme — the probe ran before
         // raw mode and we can't redo it. Toast covers the visible-no-op.
-        let toasts_before = app.toasts.len();
+        let toasts_before = app.engine.state.toasts.len();
         cycle(&mut app, SettingItem::Theme);
-        assert_eq!(app.settings.theme_pref, ThemePref::Auto);
+        assert_eq!(app.engine.settings().theme_pref, ThemePref::Auto);
         assert!(!app.theme.is_dark, "auto must not change live theme");
-        assert!(app.toasts.len() > toasts_before);
+        assert!(app.engine.state.toasts.len() > toasts_before);
     }
 
     #[test]
@@ -413,7 +273,7 @@ mod tests {
         let (_lock, _h, _g, _home, _cwd, mut app) = isolated_app();
         cycle(&mut app, SettingItem::CommitDiffLayout);
         assert!(matches!(
-            app.commit_detail.diff_layout,
+            app.engine.state.commit_detail.diff_layout,
             DiffLayout::SideBySide
         ));
         assert_eq!(
@@ -427,41 +287,52 @@ mod tests {
     fn commit_editor_command_empty_clears_pref() {
         let (_lock, _h, _g, _home, _cwd, mut app) = isolated_app();
         crate::prefs::set("editor.command", "old");
-        app.settings.editor_edit = Some(EditorEdit {
-            buffer: "   \t  ".to_string(),
-            cursor: 0,
+        app.engine.dispatch(AppCommand::SetSettingsPrefCache {
+            theme_pref: ThemePref::Auto,
+            editor_command: String::new(),
         });
-        commit_editor_command(&mut app.settings);
-        assert!(app.settings.editor_edit.is_none());
+        app.engine
+            .dispatch(AppCommand::BeginSettingsEditorCommandEdit);
+        app.engine.dispatch(AppCommand::PasteSettingsEditorCommand(
+            "   \t  ".to_string(),
+        ));
+        commit_editor_command(&mut app);
+        assert!(app.engine.settings().editor_edit.is_none());
         assert_eq!(crate::prefs::get("editor.command").as_deref(), Some(""));
     }
 
     #[test]
-    fn commit_editor_command_sanitises_control_chars() {
+    fn commit_editor_command_persists_single_line_value_without_control_chars() {
         let (_lock, _h, _g, _home, _cwd, mut app) = isolated_app();
-        app.settings.editor_edit = Some(EditorEdit {
-            buffer: "code\n--wait\tfoo".to_string(),
-            cursor: 0,
-        });
-        commit_editor_command(&mut app.settings);
+        app.engine
+            .dispatch(AppCommand::BeginSettingsEditorCommandEdit);
+        app.engine.dispatch(AppCommand::PasteSettingsEditorCommand(
+            "code\n--wait\tfoo".to_string(),
+        ));
+        commit_editor_command(&mut app);
         let saved = crate::prefs::get("editor.command").unwrap();
         assert!(!saved.contains('\n'));
         assert!(!saved.contains('\t'));
         assert!(!saved.contains('\r'));
-        let (prog, _) = crate::editor::parse_editor_command(&saved).unwrap();
-        assert_eq!(prog, "code");
+        assert_eq!(saved, "code--wait foo");
     }
 
     #[test]
     fn cancel_editor_command_does_not_write_prefs() {
         let (_lock, _h, _g, _home, _cwd, mut app) = isolated_app();
         crate::prefs::set("editor.command", "vim");
-        app.settings.editor_edit = Some(EditorEdit {
-            buffer: "garbage".to_string(),
-            cursor: 0,
+        app.engine.dispatch(AppCommand::SetSettingsPrefCache {
+            theme_pref: ThemePref::Auto,
+            editor_command: "vim".to_string(),
         });
-        cancel_editor_command(&mut app.settings);
-        assert!(app.settings.editor_edit.is_none());
+        app.engine
+            .dispatch(AppCommand::BeginSettingsEditorCommandEdit);
+        app.engine.dispatch(AppCommand::PasteSettingsEditorCommand(
+            "garbage".to_string(),
+        ));
+        app.engine
+            .dispatch(AppCommand::CancelSettingsEditorCommandEdit);
+        assert!(app.engine.settings().editor_edit.is_none());
         assert_eq!(crate::prefs::get("editor.command").as_deref(), Some("vim"));
     }
 
@@ -469,11 +340,9 @@ mod tests {
     fn open_settings_idempotent_preserves_edit() {
         let (_lock, _h, _g, _home, _cwd, mut app) = isolated_app();
         app.open_settings();
-        app.settings.editor_edit = Some(EditorEdit {
-            buffer: "in progress".to_string(),
-            cursor: 0,
-        });
+        app.engine
+            .dispatch(AppCommand::BeginSettingsEditorCommandEdit);
         app.open_settings();
-        assert!(app.settings.editor_edit.is_some());
+        assert!(app.engine.settings().editor_edit.is_some());
     }
 }

@@ -296,7 +296,7 @@ pub enum Request {
         to_rel: String,
     },
     /// Recursively copy a directory within the workdir. Symlinks are
-    /// skipped — matches `crates/reef-tui/src/tasks.rs::copy_dir_recursive`.
+    /// skipped by backend implementations.
     CopyDirRecursive {
         from_rel: String,
         to_rel: String,

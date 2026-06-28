@@ -1245,7 +1245,7 @@ dependencies = [
  "console",
  "once_cell",
  "regex",
- "similar 2.7.0",
+ "similar",
  "tempfile",
 ]
 
@@ -2317,14 +2317,11 @@ dependencies = [
  "criterion",
  "crossterm",
  "git2",
- "grep-matcher",
- "grep-regex",
- "ignore",
  "image",
  "insta",
- "proptest",
  "ratatui",
  "ratatui-image",
+ "reef-app",
  "reef-core",
  "reef-io",
  "reef-proto",
@@ -2332,13 +2329,10 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "similar 3.1.0",
  "tempfile",
  "terminal-colorsaurus",
  "test-support",
- "trash",
  "unicode-width",
- "url",
 ]
 
 [[package]]
@@ -2356,14 +2350,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "reef-app"
+version = "0.41.0"
+dependencies = [
+ "grep-matcher",
+ "grep-regex",
+ "reef-core",
+ "reef-io",
+ "reef-sqlite-preview",
+ "serde",
+ "tempfile",
+ "test-support",
+ "trash",
+]
+
+[[package]]
 name = "reef-core"
 version = "0.41.0"
 dependencies = [
  "git2",
- "ignore",
  "image",
  "infer",
  "nucleo-matcher",
+ "proptest",
  "pulldown-cmark",
  "reef-sqlite-preview",
  "regex",
@@ -2371,6 +2380,7 @@ dependencies = [
  "serde_json",
  "syntect",
  "tempfile",
+ "test-support",
  "tree-sitter",
  "tree-sitter-go",
  "tree-sitter-python",
@@ -2395,9 +2405,11 @@ dependencies = [
  "reef-core",
  "reef-proto",
  "reef-sqlite-preview",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
+ "test-support",
  "trash",
 ]
 
@@ -2672,15 +2684,6 @@ name = "similar"
 version = "2.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
-
-[[package]]
-name = "similar"
-version = "3.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04d93e861ede2e497b47833469b8ec9d5c07fa4c78ce7a00f6eb7dd8168b4b3f"
-dependencies = [
- "bstr",
-]
 
 [[package]]
 name = "siphasher"

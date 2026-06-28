@@ -10,7 +10,7 @@
 //! Keyboard navigation is handled in `input::handle_key_tree_context_menu`;
 //! this module only renders.
 
-use crate::app::App;
+use crate::TuiApp as App;
 use crate::ui::mouse::ClickAction;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -19,7 +19,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear};
 
 pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
-    if !app.tree_context_menu.active {
+    if !app.engine.tree_context_menu_active() {
         return;
     }
     let th = app.theme;
@@ -28,8 +28,8 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     // border, 2 for the inside padding. Clamp to screen width so a
     // narrow terminal doesn't push the menu off the right edge.
     let items: Vec<&'static str> = app
-        .tree_context_menu
-        .items
+        .engine
+        .tree_context_menu_items()
         .iter()
         .map(crate::i18n::tree_context_menu_label)
         .collect();
@@ -39,10 +39,10 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
         .max()
         .unwrap_or(0);
     let popup_w = (max_label_w as u16 + 4 + 2).min(screen.width);
-    let popup_h = app.tree_context_menu.items.len() as u16 + 2;
+    let popup_h = app.engine.tree_context_menu_items_len() as u16 + 2;
     let popup_h = popup_h.min(screen.height);
 
-    let (anchor_x, anchor_y) = app.tree_context_menu.anchor;
+    let (anchor_x, anchor_y) = app.engine.tree_context_menu_anchor();
     // Clamp so the menu stays fully on-screen even when the click
     // landed near the right/bottom edge. Prefer the click position
     // when there's room, fall back to shifting left/up otherwise.
@@ -75,8 +75,10 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     f.render_widget(block, area);
 
     // Render each item row with hover/selected highlight.
-    let clipboard_empty = app.file_clipboard.is_empty();
-    for (i, item) in app.tree_context_menu.items.iter().enumerate() {
+    let clipboard_empty = app.engine.file_clipboard_empty();
+    let items = app.engine.tree_context_menu_items();
+    let selected = app.engine.tree_context_menu_selected();
+    for (i, item) in items.iter().enumerate() {
         let y = inner.y + i as u16;
         if y >= inner.y + inner.height {
             break;
@@ -88,7 +90,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
                 .hover_col
                 .map(|c| c >= inner.x && c < inner.x + inner.width)
                 .unwrap_or(false);
-        let is_selected = i == app.tree_context_menu.selected;
+        let is_selected = i == selected;
         let bg = if is_selected || is_hovered {
             th.selection_bg
         } else {

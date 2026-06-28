@@ -2,13 +2,12 @@
 //!
 //! Draws the same three regions as the Space+F overlay — input, result
 //! list, footer — but without a popup block, so it fills the tab's left
-//! pane. State comes from `app.global_search`, which is shared with the
-//! overlay: pinning the overlay via Alt/Ctrl+Enter is a state-preserving
-//! hand-off to this panel.
+//! pane. State comes from the shared search snapshot, so pinning the
+//! overlay via Alt/Ctrl+Enter is a state-preserving hand-off to this panel.
 //!
 //! Right panel (`ui::preview`) handles the preview; see `ui::mod::render`.
 
-use crate::app::App;
+use crate::TuiApp as App;
 use crate::ui::global_search_panel;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -18,8 +17,9 @@ use ratatui::widgets::{Block, Borders};
 
 pub fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
-    let input_focused = app.global_search.input_focused();
-    let replace_open = app.global_search.replace_open;
+    let snapshot = app.engine.snapshot();
+    let input_focused = snapshot.overlays.search_input;
+    let replace_open = snapshot.search.replace_open;
 
     // Outer block with a mode-aware title: replace mode wins (rarer
     // state, want it telegraphed); list mode surfaces the "press / to
@@ -53,9 +53,8 @@ pub fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    // Delegate to the overlay's row renderer. It reads/writes `last_view_h`
-    // on `app.global_search`, which is fine: only one of {overlay, tab} has
-    // focus at a time, and both contexts paginate by the same view height.
+    // Delegate to the overlay's row renderer; both contexts paginate by
+    // the same TUI-local list-height cache.
     global_search_panel::render_body(f, app, inner, input_focused);
 }
 

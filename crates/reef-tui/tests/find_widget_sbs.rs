@@ -3,11 +3,12 @@
 //! side, and run the match only against that side's content. No
 //! selection in SBS layout defaults to the right (new code) side.
 
-use reef::app::{App, HighlightedDiff, Panel, Tab};
+use reef::TuiApp as App;
 use reef::find_widget;
-use reef::find_widget::FindTarget;
 use reef::ui::selection::{DiffSelection, PreviewSelection};
 use reef::ui::theme::Theme;
+use reef_app::FindTarget;
+use reef_app::{AppPanel as Panel, AppTab as Tab, HighlightedDiff};
 use reef_core::diff::{DiffContent, DiffHunk, DiffLayout, DiffLine, DiffSide, LineTag};
 use std::sync::Mutex;
 use tempfile::TempDir;
@@ -19,9 +20,9 @@ fn fresh_app() -> (App, TempDir, CwdGuard) {
     let tmp = TempDir::new().unwrap();
     let g = CwdGuard::enter(tmp.path());
     let mut app = App::new(Theme::dark(), None);
-    app.active_tab = Tab::Git;
-    app.active_panel = Panel::Diff;
-    app.diff_layout = DiffLayout::SideBySide;
+    app.engine.state.active_tab = Tab::Git;
+    app.engine.state.active_panel = Panel::Diff;
+    app.engine.state.diff_layout = DiffLayout::SideBySide;
     (app, tmp, g)
 }
 
@@ -58,7 +59,7 @@ fn install_paired_diff(app: &mut App) {
             },
         ],
     };
-    app.diff_content = Some(HighlightedDiff::new(
+    app.engine.state.diff_content = Some(HighlightedDiff::new(
         DiffContent {
             path: "scratch.rs".to_string(),
             hunks: vec![hunk],
@@ -88,7 +89,10 @@ fn left_side_selection_targets_sbs_left() {
 
     find_widget::begin_with_selection(&mut app);
 
-    assert_eq!(app.find_widget.target, Some(FindTarget::DiffSbsLeft));
+    assert_eq!(
+        app.engine.find_widget().target,
+        Some(FindTarget::DiffSbsLeft)
+    );
 }
 
 #[test]
@@ -100,7 +104,10 @@ fn right_side_selection_targets_sbs_right() {
 
     find_widget::begin_with_selection(&mut app);
 
-    assert_eq!(app.find_widget.target, Some(FindTarget::DiffSbsRight));
+    assert_eq!(
+        app.engine.find_widget().target,
+        Some(FindTarget::DiffSbsRight)
+    );
 }
 
 #[test]
@@ -112,19 +119,25 @@ fn no_selection_defaults_to_sbs_right() {
 
     find_widget::begin_with_selection(&mut app);
 
-    assert_eq!(app.find_widget.target, Some(FindTarget::DiffSbsRight));
+    assert_eq!(
+        app.engine.find_widget().target,
+        Some(FindTarget::DiffSbsRight)
+    );
 }
 
 #[test]
 fn unified_layout_targets_diff_unified() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp, _g) = fresh_app();
-    app.diff_layout = DiffLayout::Unified;
+    app.engine.state.diff_layout = DiffLayout::Unified;
     install_paired_diff(&mut app);
 
     find_widget::begin_with_selection(&mut app);
 
-    assert_eq!(app.find_widget.target, Some(FindTarget::DiffUnified));
+    assert_eq!(
+        app.engine.find_widget().target,
+        Some(FindTarget::DiffUnified)
+    );
 }
 
 #[test]
@@ -139,21 +152,21 @@ fn left_search_finds_old_text_not_new_text() {
 
     find_widget::begin_with_selection(&mut app);
     // No selection text to seed with — type manually via handle_key.
-    // Simpler: poke `app.find_widget.query` directly and recompute via
+    // Simpler: poke `app.engine.find_widget().query` directly and recompute via
     // the public re-match entry point.
-    app.find_widget.query = "old".to_string();
-    app.find_widget.cursor = 3;
+    app.engine.state.find_widget.query = "old".to_string();
+    app.engine.state.find_widget.cursor = 3;
     find_widget::recompute(&mut app);
     assert!(
-        !app.find_widget.matches.is_empty(),
+        !app.engine.find_widget().matches.is_empty(),
         "'old' is on the left side and should match"
     );
 
-    app.find_widget.query = "new".to_string();
-    app.find_widget.cursor = 3;
+    app.engine.state.find_widget.query = "new".to_string();
+    app.engine.state.find_widget.cursor = 3;
     find_widget::recompute(&mut app);
     assert!(
-        app.find_widget.matches.is_empty(),
+        app.engine.find_widget().matches.is_empty(),
         "'new' lives only on the right side; SbsLeft target shouldn't see it"
     );
 }
@@ -166,13 +179,13 @@ fn right_search_finds_new_text_not_old_text() {
     app.diff_selection = Some(diff_selection(DiffSide::SbsRight));
 
     find_widget::begin_with_selection(&mut app);
-    app.find_widget.query = "new".to_string();
-    app.find_widget.cursor = 3;
+    app.engine.state.find_widget.query = "new".to_string();
+    app.engine.state.find_widget.cursor = 3;
     find_widget::recompute(&mut app);
-    assert!(!app.find_widget.matches.is_empty());
+    assert!(!app.engine.find_widget().matches.is_empty());
 
-    app.find_widget.query = "old".to_string();
-    app.find_widget.cursor = 3;
+    app.engine.state.find_widget.query = "old".to_string();
+    app.engine.state.find_widget.cursor = 3;
     find_widget::recompute(&mut app);
-    assert!(app.find_widget.matches.is_empty());
+    assert!(app.engine.find_widget().matches.is_empty());
 }

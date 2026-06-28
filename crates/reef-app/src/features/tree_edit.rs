@@ -46,14 +46,12 @@ pub struct TreeEditState {
 
     pub mode: Option<TreeEditMode>,
 
-    /// Absolute path of the directory the new entry will land in
-    /// (for NewFile / NewFolder), or the directory containing the
-    /// entry being renamed (for Rename). Used to validate collisions
-    /// and to construct the final path on commit.
+    /// Workdir-relative directory the new entry will land in (for
+    /// NewFile / NewFolder), or the directory containing the entry
+    /// being renamed (for Rename). Empty means workspace root.
     pub parent_dir: Option<PathBuf>,
 
-    /// For Rename: the original absolute path, so the worker can do
-    /// `fs::rename(original, parent_dir.join(buffer))`. None for
+    /// For Rename: the original workdir-relative path. None for
     /// NewFile / NewFolder.
     pub rename_target: Option<PathBuf>,
 

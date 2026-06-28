@@ -1,8 +1,8 @@
 //! `App::new(Theme::dark(), None)` error-path tests: verify graceful degradation when the
 //! environment is missing pieces — most importantly when the cwd is not
-//! inside a git repo, so `GitRepo::open()` returns `None`.
+//! inside a git repo, so the backend reports `has_repo = false`.
 
-use reef::app::App;
+use reef::TuiApp as App;
 use reef::ui::theme::Theme;
 use std::sync::Mutex;
 use tempfile::TempDir;
@@ -18,9 +18,9 @@ fn app_new_outside_git_repo_does_not_panic() {
     let _g = CwdGuard::enter(tmp.path());
 
     let app = App::new(Theme::dark(), None);
-    assert!(app.repo.is_none(), "no repo outside a git dir");
-    assert!(app.staged_files.is_empty());
-    assert!(app.unstaged_files.is_empty());
+    assert!(!app.engine.backend_has_repo(), "no repo outside a git dir");
+    assert!(app.engine.state.staged_files.is_empty());
+    assert!(app.engine.state.unstaged_files.is_empty());
 }
 
 #[test]
@@ -31,7 +31,7 @@ fn app_new_refresh_status_is_noop_without_repo() {
 
     let mut app = App::new(Theme::dark(), None);
     app.refresh_status(); // must not panic when repo is None
-    assert!(app.staged_files.is_empty());
+    assert!(app.engine.state.staged_files.is_empty());
 }
 
 #[test]

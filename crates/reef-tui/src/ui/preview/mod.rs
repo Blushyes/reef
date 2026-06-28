@@ -4,7 +4,7 @@ pub mod image;
 pub mod markdown;
 pub mod text;
 
-use crate::app::App;
+use crate::TuiApp as App;
 use crate::i18n::{Msg, t};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -22,11 +22,10 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     app.last_preview_rect = Some(inner);
 
     let loading_target = app
-        .preview_schedule
-        .as_ref()
-        .map(|(p, _)| p.clone())
-        .or_else(|| app.preview_in_flight_path.clone());
-    let show_loading = match (&loading_target, app.preview_content.as_ref()) {
+        .engine
+        .preview_scheduled_path()
+        .or_else(|| app.engine.preview_in_flight_path());
+    let show_loading = match (&loading_target, app.engine.preview_content_ref()) {
         (Some(target), Some(current)) => current.path != target.to_string_lossy(),
         (Some(_), None) => true,
         _ => false,
@@ -36,7 +35,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         return;
     }
 
-    let preview = match app.preview_content.take() {
+    let preview = match app.engine.preview_content() {
         None => {
             render_empty(f, app, inner);
             return;
@@ -44,7 +43,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         Some(preview) => preview,
     };
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &preview.body {
+    match &preview.body {
         PreviewBody::Text(_) => text::render(f, app, inner, &preview, focused),
         PreviewBody::Markdown(markdown) => {
             markdown::render(f, app, inner, &preview, markdown, focused);
@@ -54,12 +53,6 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         PreviewBody::Database(info) => {
             crate::ui::db_preview::render(f, app, inner, &preview.path, info, focused);
         }
-    }));
-
-    app.preview_content = Some(preview);
-
-    if let Err(payload) = result {
-        std::panic::resume_unwind(payload);
     }
 }
 

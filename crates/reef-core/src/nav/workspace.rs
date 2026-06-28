@@ -16,16 +16,15 @@
 //! false positives" — is fine: rust-analyzer / pyright fix the
 //! precision later, transparently.
 //!
-//! Walks are gitignore-aware via the `ignore` crate (already in tree
-//! for grep-searcher). Files beyond the per-file size cap are
-//! skipped to keep index build sub-second on medium repos.
+//! The caller owns workspace IO. This module only indexes relative
+//! paths plus source bytes, keeping `reef-core` independent from local
+//! filesystem walking.
 
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ignore::WalkBuilder;
 use std::sync::OnceLock;
 
 use tree_sitter::{Query, QueryCursor, StreamingIterator};
@@ -34,7 +33,7 @@ use super::{NavLang, intrafile};
 
 /// Cap per-file bytes for indexing. Matches the highlight cap so the
 /// index covers exactly the same files the preview highlights.
-const MAX_FILE_BYTES_INDEX: u64 = 512 * 1024;
+pub const MAX_FILE_BYTES_INDEX: u64 = 512 * 1024;
 
 /// Bounded snippet length for the candidate / refs UI.
 pub(crate) const SNIPPET_MAX_W: usize = 80;
@@ -60,58 +59,84 @@ pub struct SymbolLoc {
     pub lang: NavLang,
 }
 
-/// Build (or rebuild) the workspace symbol index. Runs in the nav
-/// worker thread — callers dispatch via `TaskCoordinator::build_nav_workspace`.
-///
-/// Walks `root` honoring `.gitignore` (via `ignore::WalkBuilder`),
-/// parses every file whose extension matches a supported `NavLang`,
-/// and accumulates definition + reference sites.
-pub fn build_workspace_index(root: PathBuf) -> WorkspaceIndex {
+#[derive(Debug, Clone)]
+pub struct WorkspaceIndexFile {
+    pub path: PathBuf,
+    pub source: Arc<[u8]>,
+}
+
+impl WorkspaceIndex {
+    pub fn definitions_for(
+        &self,
+        name: &str,
+        lang: NavLang,
+        skip_site: Option<(&Path, Option<usize>)>,
+    ) -> Vec<super::Location> {
+        self.defs_by_name
+            .get(name)
+            .map(|defs| symbol_locs_to_locations(defs, lang, skip_site))
+            .unwrap_or_default()
+    }
+
+    pub fn references_for(&self, name: &str, lang: NavLang) -> Vec<super::Location> {
+        self.refs_by_name
+            .get(name)
+            .map(|refs| symbol_locs_to_locations(refs, lang, None))
+            .unwrap_or_default()
+    }
+}
+
+fn symbol_locs_to_locations(
+    symbols: &[SymbolLoc],
+    lang: NavLang,
+    skip_site: Option<(&Path, Option<usize>)>,
+) -> Vec<super::Location> {
+    symbols
+        .iter()
+        .filter(|symbol| symbol.lang == lang)
+        .filter(|symbol| {
+            !skip_site.is_some_and(|(path, line)| {
+                symbol.path == path && line.is_none_or(|line| symbol.line == line)
+            })
+        })
+        .map(|symbol| super::Location {
+            path: Some(symbol.path.clone()),
+            line: symbol.line,
+            byte_range: symbol.byte_range.clone(),
+            snippet: symbol.snippet.clone(),
+        })
+        .collect()
+}
+
+/// Build (or rebuild) the workspace symbol index from already-loaded
+/// workspace files. Callers are responsible for walking the workspace,
+/// honoring ignore rules, applying path security, and reading bytes.
+pub fn build_workspace_index(
+    root: PathBuf,
+    files: impl IntoIterator<Item = WorkspaceIndexFile>,
+) -> WorkspaceIndex {
     let mut defs_by_name: HashMap<String, Vec<SymbolLoc>> = HashMap::new();
     let mut refs_by_name: HashMap<String, Vec<SymbolLoc>> = HashMap::new();
     let mut file_count = 0usize;
 
-    let walker = WalkBuilder::new(&root)
-        .standard_filters(true)
-        .git_ignore(true)
-        // Apply .gitignore even when the directory isn't a git repo
-        // — matches reef's overall design ("works on any directory,
-        // not just git checkouts"). Without this flag, the walker
-        // would only honour `.gitignore` inside a `.git`-having tree.
-        .require_git(false)
-        .hidden(true)
-        .build();
-
-    for entry in walker.flatten() {
-        if entry.file_type().is_none_or(|t| !t.is_file()) {
+    for file in files {
+        let rel_path = file.path;
+        let Some(lang) = NavLang::from_path(&rel_path) else {
+            continue;
+        };
+        if file.source.len() as u64 > MAX_FILE_BYTES_INDEX {
             continue;
         }
-        let abs = entry.path();
-        let Ok(rel) = abs.strip_prefix(&root) else {
-            continue;
-        };
-        let Some(lang) = NavLang::from_path(abs) else {
-            continue;
-        };
-        let Ok(meta) = entry.metadata() else { continue };
-        if meta.len() > MAX_FILE_BYTES_INDEX {
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(abs) else {
-            continue;
-        };
         // Skip apparent binaries: tree-sitter parsers happily accept
         // garbage and emit useless ERROR nodes; the index would gain
         // noise without value.
-        if bytes.iter().take(8192).any(|b| *b == 0) {
+        if file.source.iter().take(8192).any(|b| *b == 0) {
             continue;
         }
-        let source: Arc<[u8]> = Arc::from(bytes.into_boxed_slice());
-        let Some(parse) = super::parse_file_if_supported(lang, source) else {
+        let Some(parse) = super::parse_file_if_supported(lang, file.source) else {
             continue;
         };
         file_count += 1;
-        let rel_path: PathBuf = rel.to_path_buf();
         extract_definitions(&parse, &rel_path, lang, &mut defs_by_name);
         extract_references(&parse, &rel_path, lang, &mut refs_by_name);
     }
@@ -275,3 +300,67 @@ const GO_REF_QUERY: &str = r#"
 ((type_identifier) @ref)
 ((field_identifier) @ref)
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn symbol(path: &str, line: usize, lang: NavLang) -> SymbolLoc {
+        SymbolLoc {
+            path: PathBuf::from(path),
+            line,
+            byte_range: 1..4,
+            snippet: "foo".to_string(),
+            lang,
+        }
+    }
+
+    #[test]
+    fn definitions_for_filters_lang_and_skip_site() {
+        let mut defs_by_name = HashMap::new();
+        defs_by_name.insert(
+            "foo".to_string(),
+            vec![
+                symbol("src/a.rs", 1, NavLang::Rust),
+                symbol("src/b.rs", 2, NavLang::Rust),
+                symbol("src/a.py", 1, NavLang::Python),
+            ],
+        );
+        let index = WorkspaceIndex {
+            root: PathBuf::new(),
+            defs_by_name,
+            refs_by_name: HashMap::new(),
+            file_count: 0,
+        };
+
+        let defs =
+            index.definitions_for("foo", NavLang::Rust, Some((Path::new("src/a.rs"), Some(1))));
+
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].path.as_deref(), Some(Path::new("src/b.rs")));
+    }
+
+    #[test]
+    fn definitions_for_can_skip_whole_path() {
+        let mut defs_by_name = HashMap::new();
+        defs_by_name.insert(
+            "foo".to_string(),
+            vec![
+                symbol("src/a.rs", 1, NavLang::Rust),
+                symbol("src/a.rs", 2, NavLang::Rust),
+                symbol("src/b.rs", 3, NavLang::Rust),
+            ],
+        );
+        let index = WorkspaceIndex {
+            root: PathBuf::new(),
+            defs_by_name,
+            refs_by_name: HashMap::new(),
+            file_count: 0,
+        };
+
+        let defs = index.definitions_for("foo", NavLang::Rust, Some((Path::new("src/a.rs"), None)));
+
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].path.as_deref(), Some(Path::new("src/b.rs")));
+    }
+}

@@ -1,14 +1,11 @@
 //! Git tab's left sidebar.
 //!
-//! All state lives on `App` (staged_files/unstaged_files/selected_file/
-//! diff_layout/diff_mode and the dedicated `App.git_status`). This module
-//! is pure render + event/command dispatch: no git2 calls here, those all
-//! go through `App`'s methods (`stage_file`, `confirm_discard`, `run_push`,
-//! …) which keeps host side state coherent.
+//! Business state lives in the renderer-neutral app engine. This module is
+//! render + event/command dispatch: no git2 calls here; host work goes
+//! through engine commands and background tasks.
 
-use crate::app::{App, DiscardTarget, Panel, SelectedFile, Tab};
+use crate::TuiApp as App;
 use crate::i18n::{Msg, t};
-use crate::search::SearchTarget;
 use crate::ui::mouse::ClickAction;
 use crate::ui::text::overlay_match_highlight;
 use crate::ui::theme::Theme;
@@ -16,6 +13,8 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use reef_app::{AppCommand, SearchTarget};
+use reef_app::{AppPanel as Panel, AppTab as Tab, CommitError, DiscardTarget, PushError};
 use reef_core::git::tree::{self as gtree, Node};
 use reef_core::git::{FileEntry, FileStatus};
 use serde_json::Value;
@@ -31,17 +30,19 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
 
     // Clamp scroll to a valid range so content can't be scrolled past its end.
     let max_scroll = total.saturating_sub(area.height as usize);
-    if app.git_status.scroll > max_scroll {
-        app.git_status.scroll = max_scroll;
-    }
-    let scroll = app.git_status.scroll;
+    app.engine
+        .dispatch(AppCommand::ClampGitStatusScroll(max_scroll));
+    let scroll = app.engine.git_status().scroll;
 
     let visible = rows.iter().skip(scroll).take(area.height as usize);
     for (i, row) in visible.enumerate() {
         let y = area.y + i as u16;
         let hover = crate::ui::hover::is_hover(app, area, y);
         let (ranges, cur) = match row.search_row_idx {
-            Some(idx) => app.search.ranges_on_row(SearchTarget::GitStatus, idx),
+            Some(idx) => app
+                .engine
+                .search()
+                .ranges_on_row(SearchTarget::GitStatus, idx),
             None => (Vec::new(), None),
         };
         let spans: Vec<Span<'static>> = if ranges.is_empty() {
@@ -109,7 +110,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
 pub fn handle_key(app: &mut App, key: &str) -> bool {
     match key {
         "s" => {
-            if let Some(ref sel) = app.selected_file.clone() {
+            if let Some(sel) = app.engine.selected_file().cloned() {
                 if !sel.is_staged {
                     app.stage_file(&sel.path);
                 }
@@ -117,7 +118,7 @@ pub fn handle_key(app: &mut App, key: &str) -> bool {
             true
         }
         "u" => {
-            if let Some(ref sel) = app.selected_file.clone() {
+            if let Some(sel) = app.engine.selected_file().cloned() {
                 if sel.is_staged {
                     app.unstage_file(&sel.path);
                 }
@@ -126,48 +127,48 @@ pub fn handle_key(app: &mut App, key: &str) -> bool {
         }
         "d" => {
             let path = app
-                .selected_file
-                .as_ref()
+                .engine
+                .selected_file()
                 .filter(|s| !s.is_staged)
                 .and_then(|sel| {
-                    app.unstaged_files
+                    app.engine
+                        .unstaged_files()
                         .iter()
                         .find(|f| f.path == sel.path)
                         .map(|f| f.path.clone())
                 });
             if let Some(path) = path {
-                app.git_status.confirm_discard = Some(DiscardTarget::File(path));
+                app.engine.dispatch(AppCommand::PromptDiscardFile {
+                    is_staged: false,
+                    path,
+                });
             }
             true
         }
         "y" => {
-            if app.git_status.confirm_discard.is_some() {
+            if app.engine.git_status().confirm_discard.is_some() {
                 app.confirm_discard();
                 true
-            } else if app.git_status.confirm_force_push {
-                app.git_status.confirm_force_push = false;
-                app.run_push(true);
+            } else if app.engine.git_status().confirm_force_push {
+                app.engine.dispatch(AppCommand::ConfirmPush { force: true });
                 true
-            } else if app.git_status.confirm_push {
-                app.git_status.confirm_push = false;
-                app.run_push(false);
+            } else if app.engine.git_status().confirm_push {
+                app.engine
+                    .dispatch(AppCommand::ConfirmPush { force: false });
                 true
             } else {
                 false
             }
         }
         "n" | "Escape" => {
-            if app.git_status.confirm_discard.is_some() {
-                app.git_status.confirm_discard = None;
+            let has_confirmation = app.engine.git_status().confirm_discard.is_some()
+                || app.engine.git_status().confirm_force_push
+                || app.engine.git_status().confirm_push;
+            if has_confirmation {
+                app.engine.dispatch(AppCommand::CancelGitConfirmations);
                 true
-            } else if app.git_status.confirm_force_push {
-                app.git_status.confirm_force_push = false;
-                true
-            } else if app.git_status.confirm_push {
-                app.git_status.confirm_push = false;
-                true
-            } else if app.git_status.push_error.is_some() {
-                app.git_status.push_error = None;
+            } else if app.engine.git_status().push_error.is_some() {
+                app.engine.dispatch(AppCommand::DismissPushError);
                 true
             } else {
                 false
@@ -199,19 +200,17 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
                 .get("staged")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            app.selected_file = Some(SelectedFile { path, is_staged });
-            app.git_status.confirm_discard = None;
-            app.diff_scroll = 0;
-            app.diff_h_scroll = 0;
-            app.load_diff();
+            app.select_file(&path, is_staged);
             true
         }
         "git.toggleStaged" => {
-            app.staged_collapsed = !app.staged_collapsed;
+            app.engine
+                .dispatch(reef_app::AppCommand::ToggleStagedSection);
             true
         }
         "git.toggleUnstaged" => {
-            app.unstaged_collapsed = !app.unstaged_collapsed;
+            app.engine
+                .dispatch(reef_app::AppCommand::ToggleUnstagedSection);
             true
         }
         "git.toggleTree" => {
@@ -225,10 +224,11 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             if !path.is_empty() {
-                let key = gtree::collapsed_key(is_staged, path);
-                if !app.git_status.collapsed_dirs.remove(&key) {
-                    app.git_status.collapsed_dirs.insert(key);
-                }
+                app.engine
+                    .dispatch(reef_app::AppCommand::ToggleGitStatusDir {
+                        is_staged,
+                        path: path.to_string(),
+                    });
             }
             true
         }
@@ -237,12 +237,7 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
                 .get("path")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
-                .or_else(|| {
-                    app.selected_file
-                        .as_ref()
-                        .filter(|s| !s.is_staged)
-                        .map(|s| s.path.clone())
-                });
+                .or_else(|| app.engine.selected_file_path_if_staged(false));
             if let Some(path) = path {
                 app.stage_file(&path);
             }
@@ -253,12 +248,7 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
                 .get("path")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
-                .or_else(|| {
-                    app.selected_file
-                        .as_ref()
-                        .filter(|s| s.is_staged)
-                        .map(|s| s.path.clone())
-                });
+                .or_else(|| app.engine.selected_file_path_if_staged(true));
             if let Some(path) = path {
                 app.unstage_file(&path);
             }
@@ -278,15 +268,12 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let is_staged = args
+                .get("staged")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             if !path.is_empty() {
-                app.selected_file = Some(SelectedFile {
-                    path: path.clone(),
-                    is_staged: false,
-                });
-                app.git_status.confirm_discard = Some(DiscardTarget::File(path));
-                app.diff_scroll = 0;
-                app.diff_h_scroll = 0;
-                app.load_diff();
+                app.select_git_file_for_discard(path, is_staged);
             }
             true
         }
@@ -301,7 +288,8 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             if !path.is_empty() {
-                app.git_status.confirm_discard = Some(DiscardTarget::Folder { is_staged, path });
+                app.engine
+                    .dispatch(AppCommand::PromptDiscardFolder { is_staged, path });
             }
             true
         }
@@ -324,14 +312,8 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
                 .get("staged")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let has_any = if is_staged {
-                !app.staged_files.is_empty()
-            } else {
-                !app.unstaged_files.is_empty()
-            };
-            if has_any {
-                app.git_status.confirm_discard = Some(DiscardTarget::Section { is_staged });
-            }
+            app.engine
+                .dispatch(AppCommand::PromptDiscardSection { is_staged });
             true
         }
         "git.discardConfirm" => {
@@ -339,47 +321,36 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.discardCancel" => {
-            app.git_status.confirm_discard = None;
+            app.engine.dispatch(AppCommand::CancelGitConfirmations);
             true
         }
         "git.pushPrompt" => {
-            if app.push_in_flight {
-                return true;
-            }
-            app.git_status.confirm_push = true;
-            app.git_status.confirm_force_push = false;
-            app.git_status.push_error = None;
+            app.engine.dispatch(AppCommand::PromptPush { force: false });
             true
         }
         "git.pushConfirm" => {
-            app.git_status.confirm_push = false;
-            app.run_push(false);
+            app.engine
+                .dispatch(AppCommand::ConfirmPush { force: false });
             true
         }
         "git.pushCancel" => {
-            app.git_status.confirm_push = false;
+            app.engine.dispatch(AppCommand::CancelGitConfirmations);
             true
         }
         "git.forcePushPrompt" => {
-            if app.push_in_flight {
-                return true;
-            }
-            app.git_status.confirm_force_push = true;
-            app.git_status.confirm_push = false;
-            app.git_status.push_error = None;
+            app.engine.dispatch(AppCommand::PromptPush { force: true });
             true
         }
         "git.forcePushConfirm" => {
-            app.git_status.confirm_force_push = false;
-            app.run_push(true);
+            app.engine.dispatch(AppCommand::ConfirmPush { force: true });
             true
         }
         "git.forcePushCancel" => {
-            app.git_status.confirm_force_push = false;
+            app.engine.dispatch(AppCommand::CancelGitConfirmations);
             true
         }
         "git.dismissPushError" => {
-            app.git_status.push_error = None;
+            app.engine.dispatch(AppCommand::DismissPushError);
             true
         }
         "git.refresh" => {
@@ -388,19 +359,19 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             true
         }
         "git.commitFocus" => {
-            app.git_status.commit_editing = true;
+            app.engine.dispatch(AppCommand::SetCommitEditing(true));
             true
         }
         "git.commitBlur" => {
-            app.git_status.commit_editing = false;
+            app.engine.dispatch(AppCommand::SetCommitEditing(false));
             true
         }
         "git.commitSubmit" => {
-            app.run_commit();
+            app.engine.dispatch(AppCommand::RunCommit);
             true
         }
         "git.dismissCommitError" => {
-            app.git_status.commit_error = None;
+            app.engine.dispatch(AppCommand::DismissCommitError);
             true
         }
         "git.revealInTree" => {
@@ -408,7 +379,8 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             if !path.is_empty() {
                 let rel = std::path::PathBuf::from(path);
                 app.set_active_tab(Tab::Files);
-                app.file_tree.reveal(&rel);
+                app.engine
+                    .dispatch(reef_app::AppCommand::RevealFileTreePath(rel.clone()));
                 app.refresh_file_tree_with_target(Some(rel.clone()));
                 app.load_preview_for_path(rel);
             }
@@ -490,13 +462,13 @@ impl Row {
 
 fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
-    let status = &app.git_status;
+    let status = &app.engine.git_status();
     // Slightly narrower budget to accommodate the ↗ open and ↺ discard buttons.
     let max_path = (width as usize).saturating_sub(12);
 
     // Push-in-flight banner — shown while the worker thread is running.
     // Non-interactive: user just waits for tick() to drain the result.
-    if app.push_in_flight {
+    if app.engine.push_in_flight() {
         rows.push(Row::new(vec![RowSpan::styled(
             t(Msg::PushingHint),
             Style::default()
@@ -508,7 +480,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
 
     // Push error banner
     if let Some(ref err) = status.push_error {
-        let mut msg = err.clone();
+        let mut msg = push_error_text(err);
         truncate_in_place(&mut msg, max_path);
         rows.push(
             Row::new(vec![
@@ -530,7 +502,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     // Push / force-push confirmation banner
     if status.confirm_push || status.confirm_force_push {
         let force = status.confirm_force_push;
-        let ahead = app.git_status.ahead_behind.map(|(a, _)| a).unwrap_or(0);
+        let ahead = app.engine.git_ahead_count();
 
         if force {
             rows.push(Row::new(vec![
@@ -592,13 +564,13 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
 
     // Push indicator (only when tree is clean, no confirmation banner is
     // already shown, and no push is currently in flight).
-    if app.staged_files.is_empty()
-        && app.unstaged_files.is_empty()
+    if app.engine.staged_files().is_empty()
+        && app.engine.unstaged_files().is_empty()
         && !status.confirm_push
         && !status.confirm_force_push
-        && !app.push_in_flight
+        && !app.engine.push_in_flight()
     {
-        if let Some((ahead, behind)) = app.git_status.ahead_behind {
+        if let Some((ahead, behind)) = app.engine.git_status().ahead_behind {
             if let Some(row) = push_indicator_row(ahead, behind) {
                 rows.push(row);
                 rows.push(Row::blank());
@@ -609,7 +581,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     // Commit in-flight banner — while the worker is committing, the
     // input is read-only (commit_in_flight gates run_commit) and the
     // UI shows a spinner.
-    if app.commit_in_flight {
+    if app.engine.commit_in_flight() {
         rows.push(Row::new(vec![RowSpan::styled(
             t(Msg::CommittingHint),
             Style::default()
@@ -622,7 +594,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     // Commit error banner — mirrors push_error. Sticks around until
     // the user clicks [dismiss] or starts a new commit attempt.
     if let Some(ref err) = status.commit_error {
-        let mut msg = err.clone();
+        let mut msg = commit_error_text(err);
         truncate_in_place(&mut msg, max_path);
         rows.push(
             Row::new(vec![
@@ -664,7 +636,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     rows.push(Row::blank());
 
     // Staged section
-    if !app.staged_files.is_empty() {
+    if !app.engine.staged_files().is_empty() {
         let staged_actions = if matches!(
             status.confirm_discard,
             Some(DiscardTarget::Section { is_staged: true })
@@ -687,23 +659,31 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
             ]
         };
         rows.push(section_header(
-            app.staged_collapsed,
+            app.engine.staged_collapsed(),
             t(Msg::StagedChanges),
-            app.staged_files.len(),
+            app.engine.staged_files().len(),
             Color::Green,
             "git.toggleStaged",
             &staged_actions,
             width,
             theme,
         ));
-        if !app.staged_collapsed {
-            render_files(&mut rows, app, &app.staged_files, true, max_path, theme, 0);
+        if !app.engine.staged_collapsed() {
+            render_files(
+                &mut rows,
+                app,
+                app.engine.staged_files(),
+                true,
+                max_path,
+                theme,
+                0,
+            );
         }
         rows.push(Row::blank());
     }
 
     // Unstaged section
-    let unstaged_actions: Vec<HeaderAction> = if app.unstaged_files.is_empty() {
+    let unstaged_actions: Vec<HeaderAction> = if app.engine.unstaged_files().is_empty() {
         Vec::new()
     } else if matches!(
         status.confirm_discard,
@@ -727,26 +707,26 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
         ]
     };
     rows.push(section_header(
-        app.unstaged_collapsed,
+        app.engine.unstaged_collapsed(),
         t(Msg::Changes),
-        app.unstaged_files.len(),
+        app.engine.unstaged_files().len(),
         Color::Blue,
         "git.toggleUnstaged",
         &unstaged_actions,
         width,
         theme,
     ));
-    if !app.unstaged_collapsed {
+    if !app.engine.unstaged_collapsed() {
         render_files(
             &mut rows,
             app,
-            &app.unstaged_files,
+            app.engine.unstaged_files(),
             false,
             max_path,
             theme,
-            app.staged_files.len(),
+            app.engine.staged_files().len(),
         );
-        if app.unstaged_files.is_empty() {
+        if app.engine.unstaged_files().is_empty() {
             rows.push(Row::new(vec![RowSpan::styled(
                 t(Msg::NoFiles),
                 Style::default().fg(theme.fg_secondary),
@@ -762,10 +742,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
 /// leaking across sections (e.g. the previously-unstaged selection shouldn't
 /// light up a same-named row under the staged header).
 fn selected_path_for(app: &App, is_staged: bool) -> Option<String> {
-    app.selected_file
-        .as_ref()
-        .filter(|s| s.is_staged == is_staged)
-        .map(|s| s.path.clone())
+    app.engine.selected_file_path_if_staged(is_staged)
 }
 
 /// `search_base` is the offset applied to each file's `search_row_idx` —
@@ -780,7 +757,7 @@ fn render_files(
     theme: &Theme,
     search_base: usize,
 ) {
-    let status = &app.git_status;
+    let status = &app.engine.git_status();
     let sel_path = selected_path_for(app, is_staged);
     let pending_discard = status.confirm_discard.as_ref();
     if status.tree_mode {
@@ -1084,7 +1061,7 @@ fn file_row(
     if !ctx.is_staged {
         let confirming = matches!(
             ctx.pending_discard,
-            Some(DiscardTarget::File(p)) if p == &file.path
+            Some(DiscardTarget::File { is_staged, path }) if !*is_staged && path == &file.path
         );
         if confirming {
             push_inline_confirm_spans(&mut spans, ctx.theme, base_bg);
@@ -1094,7 +1071,7 @@ fn file_row(
                 style: apply_bg(Style::default().fg(Color::Red), base_bg),
                 click: Some((
                     "git.discardPrompt".to_string(),
-                    serde_json::json!({ "path": file.path }),
+                    serde_json::json!({ "path": file.path, "staged": ctx.is_staged }),
                 )),
             });
             spans.push(RowSpan::styled(
@@ -1190,9 +1167,9 @@ fn section_header(
 ///   stay inside the sidebar width; the full buffer is preserved in
 ///   state and ships to `git commit -F -` verbatim.
 fn push_commit_box(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Theme) {
-    let msg = &app.git_status.commit_message;
-    let editing = app.git_status.commit_editing;
-    let cursor = app.git_status.commit_cursor.min(msg.len());
+    let msg = &app.engine.git_status().commit_message;
+    let editing = app.engine.git_status().commit_editing;
+    let cursor = app.engine.git_status().commit_cursor.min(msg.len());
     let has_text = !msg.trim().is_empty();
     let border_color = if editing {
         theme.accent
@@ -1299,7 +1276,8 @@ fn push_commit_box(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Them
     // Action row: [✓ Commit] + hint. Button is dimmed when the
     // draft or staged tree is empty — click still works but the
     // toast/banner tells the user why nothing happened.
-    let enabled = has_text && !app.staged_files.is_empty() && !app.commit_in_flight;
+    let enabled =
+        has_text && !app.engine.staged_files().is_empty() && !app.engine.commit_in_flight();
     let (btn_fg, btn_bg) = if enabled {
         (Color::Black, Color::Green)
     } else {
@@ -1489,6 +1467,19 @@ fn section_confirm_actions(theme: &Theme) -> Vec<HeaderAction> {
     ]
 }
 
+fn push_error_text(err: &PushError) -> String {
+    match err {
+        PushError::Failed(error) => error.clone(),
+    }
+}
+
+fn commit_error_text(err: &CommitError) -> String {
+    match err {
+        CommitError::NothingStaged => t(Msg::CommitNothingStaged).to_string(),
+        CommitError::Failed(error) => error.clone(),
+    }
+}
+
 fn truncate_in_place(s: &mut String, max: usize) {
     if max == 0 {
         s.clear();
@@ -1504,21 +1495,15 @@ fn truncate_in_place(s: &mut String, max: usize) {
 
 // ─── Mouse scroll helper used by main.rs ──────────────────────────────────────
 
-/// Apply a vertical scroll delta to the inline git.status panel. Used by the
-/// mouse handler after M2 so the sidebar uses `App.git_status.scroll`
-/// instead of the legacy `panel_scroll` map.
+/// Apply a vertical scroll delta to the inline git.status panel.
 pub fn scroll(app: &mut App, delta: i32) {
-    let s = &mut app.git_status.scroll;
-    *s = if delta < 0 {
-        s.saturating_sub(delta.unsigned_abs() as usize)
-    } else {
-        s.saturating_add(delta as usize)
-    };
+    app.engine
+        .dispatch(reef_app::AppCommand::ScrollGitStatusVertical(delta));
 }
 
 /// Return true when the Git sidebar is currently focused — used by callers
 /// that need to know whether to route keys here.
 #[allow(dead_code)]
 pub fn is_focused(app: &App) -> bool {
-    matches!(app.active_panel, Panel::Files)
+    matches!(app.engine.active_panel(), Panel::Files)
 }

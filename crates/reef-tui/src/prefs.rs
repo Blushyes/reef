@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn migrate_folds_git_prefs_and_deletes_it() {
         // End-to-end: a pre-deplugin install has both files. One boot of
-        // App::new() (which calls migrate_legacy_prefs at the top) must
+        // TuiApp::new() (which calls migrate_legacy_prefs at the top) must
         // leave every inline panel reading the user's real saved state.
         let (_lock, _home, tmp) = isolated_home();
         let dir = tmp.path().join(".config").join("reef");

@@ -5,122 +5,17 @@
 //! side-by-side diff (targets one half based on selection side), and
 //! exposes Match Case / Whole Word / Regex toggles.
 //!
-//! Mutual exclusion: opening the widget force-clears `app.search` so there's
+//! Mutual exclusion: opening the widget force-clears vim search so there's
 //! exactly one source of match highlights at any time. Opening `/` is
 //! expected to call `find_widget::close` to do the reverse.
 
-use crate::app::App;
+use crate::TuiApp as App;
 use crate::input;
-use crate::input_edit;
 use crate::keymap::{Command, InputScope, Keymap};
-use crate::search::{MatchLoc, Snapshot, center_scroll, restore_snapshot, take_snapshot};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use reef_core::diff::{DiffLayout, DiffRowText, DiffSide};
-use reef_core::search::{SearchOptions, build_row_index, ranges_on_row};
-use std::ops::Range;
+use reef_app::{AppCommand, FindTarget, FindWidgetToggle, SearchViewport};
+use reef_core::diff::{DiffRowText, DiffSide};
 use std::time::Instant;
-
-/// VSCode-style find widget state. Mutually exclusive with `app.search`:
-/// opening either side clears the other so a frame never paints two
-/// match colors over the same rows.
-#[derive(Debug, Default)]
-pub struct FindWidgetState {
-    pub active: bool,
-
-    pub query: String,
-    /// Byte offset into `query`; always on a char boundary.
-    pub cursor: usize,
-
-    pub match_case: bool,
-    pub whole_word: bool,
-    pub regex: bool,
-
-    pub target: Option<FindTarget>,
-    /// Match locations. **Invariant**: must agree with `row_index` —
-    /// mutate ONLY through `set_matches` / `clear_matches`. Direct
-    /// `matches.push(...)` or `matches = vec![...]` leaves `row_index`
-    /// stale and `ranges_on_row` will silently return empty results
-    /// for the desynced rows.
-    pub matches: Vec<MatchLoc>,
-    pub current: Option<usize>,
-    pub snapshot: Option<Snapshot>,
-
-    /// `row → indices into matches`. Rebuilt by `set_matches` /
-    /// `clear_matches`. Mirrors `SearchState::row_index` so per-row
-    /// overlay lookup stays O(1+k) instead of O(matches.len()).
-    ///
-    /// **Invariant:** kept in sync via `set_matches` / `clear_matches`.
-    /// External code (tests etc.) using the struct-literal form should
-    /// pass `Default::default()` here; mutating after construction is
-    /// not supported.
-    pub row_index: std::collections::HashMap<usize, Vec<usize>>,
-
-    /// Cached widget rect for mouse hit-testing.
-    pub last_widget_rect: Option<ratatui::layout::Rect>,
-    /// Mirror leader slot so a second `Space+F` inside the widget toggles
-    /// it off (when the query is empty), same idiom as `quick_open` /
-    /// `global_search`.
-    pub space_leader_at: Option<Instant>,
-    /// `Some(msg)` when the regex toggle is on and the current query
-    /// fails to compile. UI surfaces this in place of the counter.
-    pub regex_error: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FindTarget {
-    FilePreview,
-    DiffUnified,
-    DiffSbsLeft,
-    DiffSbsRight,
-    GraphDiffUnified,
-    GraphDiffSbsLeft,
-    GraphDiffSbsRight,
-}
-
-impl FindWidgetState {
-    /// Replace `matches` and rebuild the per-row lookup. Also resets
-    /// `current` to `None` — callers picking a fresh "current" must
-    /// assign it right after this call. Mirrors `SearchState::set_matches`'s
-    /// invariant so a future caller can't accidentally carry a stale
-    /// `current >= matches.len()` past the swap.
-    ///
-    /// Panic-safe: see `SearchState::set_matches` for the rationale on
-    /// the assign-before-index ordering.
-    pub fn set_matches(&mut self, matches: Vec<MatchLoc>) {
-        self.matches = matches;
-        self.current = None;
-        self.row_index = build_row_index(&self.matches);
-    }
-
-    /// Empty `matches` + reset associated fields (index, current,
-    /// regex_error). Also clears `regex_error` so a panel-blur / Esc /
-    /// mode-swap path doesn't leak a stale error string into the
-    /// prompt render.
-    pub fn clear_matches(&mut self) {
-        self.matches.clear();
-        self.row_index.clear();
-        self.current = None;
-        self.regex_error = None;
-    }
-
-    /// Ranges of matches on `row` for `target` plus the current-match
-    /// range if it lives on this row. Render-time helper, mirrors
-    /// `SearchState::ranges_on_row` — O(1+k) via `row_index`.
-    pub fn ranges_on_row(
-        &self,
-        target: FindTarget,
-        row: usize,
-    ) -> (Vec<Range<usize>>, Option<Range<usize>>) {
-        if self.target != Some(target) || self.matches.is_empty() {
-            return (Vec::new(), None);
-        }
-        ranges_on_row(&self.matches, &self.row_index, self.current, row)
-    }
-
-    pub fn clear(&mut self) {
-        *self = FindWidgetState::default();
-    }
-}
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
@@ -132,7 +27,7 @@ impl FindWidgetState {
 /// No-op when the active panel has no in-panel find target (e.g. focus
 /// is on the Search tab's left list).
 pub fn begin_with_selection(app: &mut App) {
-    use crate::app::{Panel, Tab};
+    use reef_app::{AppPanel as Panel, AppTab as Tab};
     // VSCode-style "find in this file" — if focus is currently on a
     // list panel (file tree, git status, commit graph) that has no
     // searchable preview target, force-focus onto the content column
@@ -146,44 +41,28 @@ pub fn begin_with_selection(app: &mut App) {
     // row, not a list — pulling focus away from it would lose the
     // user's half-typed query. Leave it alone; the user can Tab into
     // the preview panel themselves if they want find-in-file there.
-    let on_search_input = app.active_tab == Tab::Search && app.active_panel == Panel::Files;
-    if !on_search_input && resolve_target(app).is_none() && app.active_panel != Panel::Diff {
-        app.active_panel = Panel::Diff;
+    let on_search_input =
+        app.engine.active_tab() == Tab::Search && app.engine.active_panel() == Panel::Files;
+    if !on_search_input && resolve_target(app).is_none() && app.engine.active_panel() != Panel::Diff
+    {
+        app.set_active_panel(Panel::Diff);
     }
     let Some(target) = resolve_target(app) else {
         return;
     };
-    // Force-close legacy `/` find first so we don't overlap highlights.
-    app.search.clear();
-    let snapshot = take_snapshot(app);
-    // Preserve the three toggles across re-opens so the user doesn't
-    // lose Aa/ab/.* selections each time they pop the widget.
-    let preserve_match_case = app.find_widget.match_case;
-    let preserve_whole_word = app.find_widget.whole_word;
-    let preserve_regex = app.find_widget.regex;
     let query = crate::global_search::current_text_selection(app).unwrap_or_default();
-    let cursor = query.len();
-    app.find_widget = FindWidgetState {
-        active: true,
-        query,
-        cursor,
-        match_case: preserve_match_case,
-        whole_word: preserve_whole_word,
-        regex: preserve_regex,
-        target: Some(target),
-        snapshot: Some(snapshot),
-        ..FindWidgetState::default()
-    };
-    recompute(app);
+    app.engine
+        .dispatch(AppCommand::BeginFindWidget { target, query });
+    app.drain_engine_runtime_events();
 }
 
 /// Close the widget, restoring pre-find scroll. Idempotent — safe to call
 /// when widget is already inactive.
 pub fn close(app: &mut App) {
-    if let Some(snap) = app.find_widget.snapshot.clone() {
-        restore_snapshot(app, &snap);
-    }
-    app.find_widget.clear();
+    app.engine.dispatch(AppCommand::CloseFindWidget {
+        dark: app.theme.is_dark,
+    });
+    app.find_widget_ui = Default::default();
 }
 
 /// Step to next (`reverse=false`) or previous (`reverse=true`) match.
@@ -191,24 +70,13 @@ pub fn close(app: &mut App) {
 /// the widget is currently `active` — as long as `matches` is non-empty
 /// and the target is set, navigation is meaningful.
 pub fn step(app: &mut App, reverse: bool) {
-    let state = &mut app.find_widget;
-    if state.matches.is_empty() {
-        return;
-    }
-    let n = state.matches.len();
-    let cur = state.current.unwrap_or(0);
-    let next = if reverse {
-        if cur == 0 { n - 1 } else { cur - 1 }
-    } else if cur + 1 >= n {
-        0
-    } else {
-        cur + 1
-    };
-    state.current = Some(next);
-    jump_to_current(app);
+    app.engine.dispatch(AppCommand::StepFindWidget {
+        reverse,
+        viewport: viewport(app),
+    });
 }
 
-/// Owned-input dispatch while `app.find_widget.active`. Mirrors the
+/// Owned-input dispatch while the find widget is active. Mirrors the
 /// pattern in `search::handle_key_in_search_mode` — every key landing
 /// here either edits one of the inputs, navigates matches, toggles an
 /// option, or closes the widget.
@@ -219,16 +87,16 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
 
     // In-widget leader chord: a second `Space+F` toggles the widget off
     // when the query is empty (palette-style isolation).
-    let allow_arm = app.find_widget.query.is_empty();
+    let allow_arm = app.engine.find_widget().query.is_empty();
     match input::leader_decision(
         &key,
         allow_arm,
-        app.find_widget.space_leader_at,
+        app.find_widget_ui.space_leader_at,
         Instant::now(),
         input::LEADER_TIMEOUT,
     ) {
         input::LeaderVerdict::Arm => {
-            app.find_widget.space_leader_at = Some(Instant::now());
+            app.find_widget_ui.space_leader_at = Some(Instant::now());
             return;
         }
         input::LeaderVerdict::Fire => {
@@ -239,7 +107,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             // typed into an empty query just vanished). Treat them as
             // Consume instead so the literal char falls through to the
             // input-dispatch arm and appends to the query buffer.
-            app.find_widget.space_leader_at = None;
+            app.find_widget_ui.space_leader_at = None;
             if key.code == KeyCode::Char('f') && !ctrl && !alt {
                 close(app);
                 return;
@@ -247,7 +115,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             // Fall through — non-F chord lands in the input handler.
         }
         input::LeaderVerdict::Consume => {
-            app.find_widget.space_leader_at = None;
+            app.find_widget_ui.space_leader_at = None;
         }
         input::LeaderVerdict::None => {}
     }
@@ -259,7 +127,7 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         }
         Some(Command::Confirm) => {
             // Enter = next match (Shift+Enter = previous), VSCode-style.
-            if !app.find_widget.matches.is_empty() {
+            if !app.engine.find_widget().matches.is_empty() {
                 step(app, /*reverse=*/ shift);
             }
             return;
@@ -276,30 +144,23 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         // before `input_edit::dispatch_key`, which binds Alt+B / Alt+F /
         // Alt+D and would otherwise eat them as word-motion / delete.
         Some(Command::ToggleCase) => {
-            app.find_widget.match_case = !app.find_widget.match_case;
-            recompute(app);
+            toggle_option(app, FindWidgetToggle::MatchCase);
             return;
         }
         Some(Command::ToggleWholeWord) => {
-            app.find_widget.whole_word = !app.find_widget.whole_word;
-            recompute(app);
+            toggle_option(app, FindWidgetToggle::WholeWord);
             return;
         }
         Some(Command::ToggleRegex) => {
-            app.find_widget.regex = !app.find_widget.regex;
-            recompute(app);
+            toggle_option(app, FindWidgetToggle::Regex);
             return;
         }
         _ => {}
     }
 
-    let outcome = input_edit::dispatch_key(
-        &key,
-        &mut app.find_widget.query,
-        &mut app.find_widget.cursor,
-    );
-    if outcome == input_edit::Outcome::Edited {
-        recompute(app);
+    if let Some(op) = crate::input_edit::op_for_key(&key) {
+        app.engine.dispatch(AppCommand::EditFindWidgetInput(op));
+        app.drain_engine_runtime_events();
     }
 }
 
@@ -310,27 +171,35 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
 /// landed. Called from `input::handle_paste` after the drop-path parser
 /// has declined the payload.
 pub fn handle_paste(s: &str, app: &mut App) {
-    if input_edit::paste_single_line(s, &mut app.find_widget.query, &mut app.find_widget.cursor) {
-        recompute(app);
+    app.engine
+        .dispatch(AppCommand::PasteFindWidgetInput(s.to_string()));
+    app.drain_engine_runtime_events();
+}
+
+pub fn toggle_option(app: &mut App, option: FindWidgetToggle) {
+    if app.engine.find_widget().active {
+        app.engine
+            .dispatch(AppCommand::ToggleFindWidgetOption(option));
+        app.drain_engine_runtime_events();
     }
 }
 
 // ─── Internals ───────────────────────────────────────────────────────────────
 
 fn resolve_target(app: &App) -> Option<FindTarget> {
-    use crate::app::{Panel, Tab};
+    use reef_app::{AppPanel as Panel, AppTab as Tab};
 
-    match (app.active_tab, app.active_panel) {
+    match (app.engine.active_tab(), app.engine.active_panel()) {
         (Tab::Files, Panel::Diff) | (Tab::Search, Panel::Diff) => Some(FindTarget::FilePreview),
-        (Tab::Git, Panel::Diff) => Some(diff_target_from_layout(
-            app.diff_layout,
+        (Tab::Git, Panel::Diff) => Some(reef_app::diff_target_from_layout(
+            app.engine.diff_layout(),
             app.diff_selection.map(|s| s.side),
             /*graph=*/ false,
         )),
         (Tab::Graph, Panel::Diff) => {
             if app.graph_uses_three_col() {
-                Some(diff_target_from_layout(
-                    app.diff_layout,
+                Some(reef_app::diff_target_from_layout(
+                    app.engine.diff_layout(),
                     app.diff_selection.map(|s| s.side),
                     /*graph=*/ true,
                 ))
@@ -344,150 +213,67 @@ fn resolve_target(app: &App) -> Option<FindTarget> {
     }
 }
 
-fn diff_target_from_layout(
-    layout: DiffLayout,
-    selection_side: Option<DiffSide>,
-    graph: bool,
-) -> FindTarget {
-    match layout {
-        DiffLayout::Unified => {
-            if graph {
-                FindTarget::GraphDiffUnified
-            } else {
-                FindTarget::DiffUnified
-            }
-        }
-        DiffLayout::SideBySide => match selection_side {
-            Some(DiffSide::SbsLeft) => {
-                if graph {
-                    FindTarget::GraphDiffSbsLeft
-                } else {
-                    FindTarget::DiffSbsLeft
-                }
-            }
-            Some(DiffSide::SbsRight) | Some(DiffSide::Unified) | None => {
-                // No selection / unified-side hint in SBS layout → default
-                // to the right (new code) side. Matches VSCode's "Find in
-                // selection" default of the modified side.
-                if graph {
-                    FindTarget::GraphDiffSbsRight
-                } else {
-                    FindTarget::DiffSbsRight
-                }
-            }
-        },
-    }
-}
-
-/// Returns a row vec where each entry borrows from `app` (`Cow::Borrowed(&str)`)
-/// when possible — the diff paths read directly from the precomputed
-/// `display.unified_row_texts` / `display.sbs_row_texts` rather than
-/// re-flattening the diff on every keystroke.
-fn collect_rows(app: &App, target: FindTarget) -> Vec<std::borrow::Cow<'_, str>> {
+fn collect_rows(app: &App, target: FindTarget) -> Vec<String> {
     match target {
-        FindTarget::FilePreview => match app.preview_content.as_ref().map(|p| &p.body) {
-            Some(body) => body.display_text_rows(),
+        FindTarget::FilePreview => match app.engine.preview_content_ref().map(|p| &p.body) {
+            Some(body) => body
+                .display_text_rows()
+                .into_iter()
+                .map(|row| row.into_owned())
+                .collect(),
             _ => Vec::new(),
         },
-        FindTarget::DiffUnified => match &app.diff_content {
-            Some(d) => row_texts_to_cows(&d.display.unified_row_texts),
+        FindTarget::DiffUnified => match app.engine.diff_content() {
+            Some(d) => row_texts_to_strings(&d.display.unified_row_texts),
             None => Vec::new(),
         },
-        FindTarget::GraphDiffUnified => match &app.commit_detail.file_diff {
-            Some(d) => row_texts_to_cows(&d.display.unified_row_texts),
+        FindTarget::GraphDiffUnified => match app.engine.commit_detail().file_diff.as_ref() {
+            Some(d) => row_texts_to_strings(&d.display.unified_row_texts),
             None => Vec::new(),
         },
-        FindTarget::DiffSbsLeft => match &app.diff_content {
-            Some(d) => sbs_side_cows(&d.display.sbs_row_texts, DiffSide::SbsLeft),
+        FindTarget::DiffSbsLeft => match app.engine.diff_content() {
+            Some(d) => sbs_side_strings(&d.display.sbs_row_texts, DiffSide::SbsLeft),
             None => Vec::new(),
         },
-        FindTarget::DiffSbsRight => match &app.diff_content {
-            Some(d) => sbs_side_cows(&d.display.sbs_row_texts, DiffSide::SbsRight),
+        FindTarget::DiffSbsRight => match app.engine.diff_content() {
+            Some(d) => sbs_side_strings(&d.display.sbs_row_texts, DiffSide::SbsRight),
             None => Vec::new(),
         },
-        FindTarget::GraphDiffSbsLeft => match &app.commit_detail.file_diff {
-            Some(d) => sbs_side_cows(&d.display.sbs_row_texts, DiffSide::SbsLeft),
+        FindTarget::GraphDiffSbsLeft => match app.engine.commit_detail().file_diff.as_ref() {
+            Some(d) => sbs_side_strings(&d.display.sbs_row_texts, DiffSide::SbsLeft),
             None => Vec::new(),
         },
-        FindTarget::GraphDiffSbsRight => match &app.commit_detail.file_diff {
-            Some(d) => sbs_side_cows(&d.display.sbs_row_texts, DiffSide::SbsRight),
+        FindTarget::GraphDiffSbsRight => match app.engine.commit_detail().file_diff.as_ref() {
+            Some(d) => sbs_side_strings(&d.display.sbs_row_texts, DiffSide::SbsRight),
             None => Vec::new(),
         },
     }
 }
 
-fn row_texts_to_cows(rows: &[DiffRowText]) -> Vec<std::borrow::Cow<'_, str>> {
-    use std::borrow::Cow;
+fn row_texts_to_strings(rows: &[DiffRowText]) -> Vec<String> {
     rows.iter()
         .map(|r| match r {
-            DiffRowText::Separator => Cow::Borrowed(""),
-            DiffRowText::Header(s) => Cow::Borrowed(s.as_ref()),
-            DiffRowText::Unified(s) => Cow::Borrowed(s.as_ref()),
-            DiffRowText::Sbs { .. } => Cow::Borrowed(""),
+            DiffRowText::Separator => String::new(),
+            DiffRowText::Header(s) => s.to_string(),
+            DiffRowText::Unified(s) => s.to_string(),
+            DiffRowText::Sbs { .. } => String::new(),
         })
         .collect()
 }
 
-/// Project the precomputed `Arc<Vec<DiffRowText>>` from `DiffDisplay::build`
-/// onto the requested SBS side. Previously this re-ran the SBS pairing state
-/// machine on every keystroke; now it's an O(N) walk over already-shared
-/// `Arc<str>` rows, with zero per-row allocation (each output `Cow::Borrowed`
-/// points into the cached Arc).
-fn sbs_side_cows(rows: &[DiffRowText], side: DiffSide) -> Vec<std::borrow::Cow<'_, str>> {
-    use std::borrow::Cow;
+fn sbs_side_strings(rows: &[DiffRowText], side: DiffSide) -> Vec<String> {
     rows.iter()
         .map(|r| match r {
-            DiffRowText::Separator => Cow::Borrowed(""),
-            DiffRowText::Header(h) => Cow::Borrowed(h.as_ref()),
-            DiffRowText::Unified(s) => Cow::Borrowed(s.as_ref()),
+            DiffRowText::Separator => String::new(),
+            DiffRowText::Header(h) => h.to_string(),
+            DiffRowText::Unified(s) => s.to_string(),
             DiffRowText::Sbs { left, right } => match side {
-                DiffSide::SbsLeft => Cow::Borrowed(left.as_ref()),
-                DiffSide::SbsRight => Cow::Borrowed(right.as_ref()),
-                DiffSide::Unified => Cow::Borrowed(""),
+                DiffSide::SbsLeft => left.to_string(),
+                DiffSide::SbsRight => right.to_string(),
+                DiffSide::Unified => String::new(),
             },
         })
         .collect()
-}
-
-fn baseline_row(app: &App, target: FindTarget) -> usize {
-    let snap = app.find_widget.snapshot.clone().unwrap_or_default();
-    match target {
-        FindTarget::FilePreview => snap.preview_scroll,
-        FindTarget::DiffUnified | FindTarget::DiffSbsLeft | FindTarget::DiffSbsRight => {
-            snap.diff_scroll
-        }
-        FindTarget::GraphDiffUnified
-        | FindTarget::GraphDiffSbsLeft
-        | FindTarget::GraphDiffSbsRight => snap.graph_diff_scroll,
-    }
-}
-
-fn jump_to_current(app: &mut App) {
-    let Some(cur) = app.find_widget.current else {
-        return;
-    };
-    let Some(m) = app.find_widget.matches.get(cur).cloned() else {
-        return;
-    };
-    let Some(target) = app.find_widget.target else {
-        return;
-    };
-    match target {
-        FindTarget::FilePreview => {
-            let view_h = app.last_preview_view_h as usize;
-            app.preview_scroll = center_scroll(m.row, view_h);
-        }
-        FindTarget::DiffUnified | FindTarget::DiffSbsLeft | FindTarget::DiffSbsRight => {
-            let view_h = app.last_diff_view_h as usize;
-            app.diff_scroll = center_scroll(m.row, view_h);
-        }
-        FindTarget::GraphDiffUnified
-        | FindTarget::GraphDiffSbsLeft
-        | FindTarget::GraphDiffSbsRight => {
-            let view_h = app.last_diff_view_h as usize;
-            app.commit_detail.file_diff_scroll = center_scroll(m.row, view_h);
-        }
-    }
 }
 
 /// Recompute matches for the current query + toggles. Called from:
@@ -496,68 +282,23 @@ fn jump_to_current(app: &mut App) {
 ///   - Integration tests that poke `query` directly and need the match
 ///     set rebuilt to reflect the change
 pub fn recompute(app: &mut App) {
-    let Some(target) = app.find_widget.target else {
+    let Some(target) = app.engine.find_widget().target else {
         return;
     };
-    let query = app.find_widget.query.clone();
-
-    if query.is_empty() {
-        // `clear_matches` already nulls `regex_error` — see its doc.
-        app.find_widget.clear_matches();
-        // Re-apply snapshot scroll so the view rests at the starting
-        // position while the user is mid-edit. Matches the legacy
-        // `/`-prompt feel where deleting back to empty undoes the jump.
-        if let Some(snap) = app.find_widget.snapshot.clone() {
-            restore_snapshot(app, &snap);
-        }
-        return;
-    }
-
-    let opts = SearchOptions {
-        case_sensitive: app.find_widget.match_case,
-        whole_word: app.find_widget.whole_word,
-        regex: app.find_widget.regex,
-    };
-
     let rows = collect_rows(app, target);
-    let mut matches: Vec<MatchLoc> = Vec::new();
-    let mut regex_error: Option<String> = None;
-    for (idx, text) in rows.iter().enumerate() {
-        match reef_core::search::find_all_with_options(text, &query, &opts) {
-            Ok(rs) => {
-                for r in rs {
-                    matches.push(MatchLoc {
-                        row: idx,
-                        byte_range: r,
-                    });
-                }
-            }
-            Err(e) => {
-                // Regex compile error: surface once and bail — no
-                // partial matches across rows would be useful.
-                regex_error = Some(e.to_string());
-                matches.clear();
-                break;
-            }
-        }
-    }
-
-    app.find_widget.set_matches(matches);
-    app.find_widget.regex_error = regex_error;
-    app.find_widget.current = pick_current(app, target);
-    jump_to_current(app);
+    app.engine.dispatch(AppCommand::RecomputeFindWidget {
+        rows,
+        dark: app.theme.is_dark,
+        viewport: viewport(app),
+    });
 }
 
-fn pick_current(app: &App, target: FindTarget) -> Option<usize> {
-    if app.find_widget.matches.is_empty() {
-        return None;
+fn viewport(app: &App) -> SearchViewport {
+    SearchViewport {
+        preview_view_h: app.layout.last_preview_view_h as usize,
+        diff_view_h: app.layout.last_diff_view_h as usize,
+        commit_detail_view_h: app.layout.last_commit_detail_view_h as usize,
     }
-    let base = baseline_row(app, target);
-    app.find_widget
-        .matches
-        .iter()
-        .position(|m| m.row >= base)
-        .or(Some(0))
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

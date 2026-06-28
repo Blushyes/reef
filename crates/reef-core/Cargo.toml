@@ -2,6 +2,7 @@
 name = "reef-core"
 version = "0.41.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 publish = false
 
 [lints]
@@ -9,7 +10,6 @@ workspace = true
 
 [dependencies]
 git2 = { version = "0.21.0", default-features = false }
-ignore = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 infer = { version = "0.16", default-features = false }
 pulldown-cmark = { version = "0.13.4", default-features = false }
@@ -29,5 +29,7 @@ url = "2"
 nucleo-matcher = "0.3"
 
 [dev-dependencies]
+proptest = "1"
 rusqlite = { version = "0.32", default-features = false, features = ["bundled"] }
+test-support = { path = "../test-support" }
 tempfile = "3"

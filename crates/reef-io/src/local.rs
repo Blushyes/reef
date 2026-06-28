@@ -1,11 +1,9 @@
-//! Local backend — wraps the existing `GitRepo`, `file_tree`, `fs_watcher`
-//! and `editor` helpers. Phase 0 is additive: this impl forwards to the
-//! current code unchanged so TUI behaviour stays byte-identical with main.
+//! Local backend — wraps the shared `GitRepo`, file-tree, fs-watcher,
+//! preview, and editor helpers behind the `Backend` trait.
 //!
 //! Every git operation re-opens `git2::Repository::discover(workdir)` rather
-//! than caching a handle — matches what the background workers in
-//! `crates/reef-tui/src/tasks.rs` already do and keeps `LocalBackend` `Send + Sync` without
-//! any `Mutex` dance around `Repository` (which is non-Send).
+//! than caching a handle. That keeps `LocalBackend` `Send + Sync` without
+//! any `Mutex` around `Repository` (which is non-Send).
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -369,6 +367,26 @@ impl Backend for LocalBackend {
         Some(fresh)
     }
 
+    fn list_dir(&self, rel_path: &Path) -> Result<Vec<crate::DirEntry>, BackendError> {
+        let abs = canonical_child_within(self.canonical_workdir()?, rel_path)?;
+        if !abs.is_dir() {
+            return Err(BackendError::NotFound);
+        }
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(&abs).map_err(|e| BackendError::Io(e.to_string()))? {
+            let entry = entry.map_err(|e| BackendError::Io(e.to_string()))?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            let is_dir = entry.path().is_dir();
+            entries.push(crate::DirEntry { name, is_dir });
+        }
+        entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        });
+        Ok(entries)
+    }
+
     fn file_size(&self, rel_path: &Path) -> Result<u64, BackendError> {
         let full = canonical_child_within(self.canonical_workdir()?, rel_path)?;
         let meta = std::fs::metadata(&full).map_err(|e| match e.kind() {
@@ -487,12 +505,10 @@ impl Backend for LocalBackend {
     }
 
     fn revert_path(&self, path: &str, is_staged: bool) -> Result<(), BackendError> {
-        // Staged-path revert = unstage → restore-workdir. Unstaged-path
-        // revert = just restore-workdir. Mirrors the free `revert_path`
-        // helper in `app.rs` (removed in M4 Track A-0.1) — errors on
-        // either side are swallowed the same way the UI did before,
-        // except we surface the *last* error so the backend contract
-        // stays `Result<(), _>`.
+        // Staged-path revert = unstage -> restore-workdir. Unstaged-path
+        // revert = just restore-workdir. Preserve the existing UI semantics:
+        // unstage errors do not stop the workdir restore, while restore errors
+        // surface through the backend contract.
         let repo = self.repo()?;
         if is_staged {
             let _ = repo.unstage_file(path);
@@ -569,9 +585,9 @@ impl Backend for LocalBackend {
         // The host loop in `main.rs` owns the terminal and still calls
         // `editor::launch` directly against the shared `Terminal<B>` so it
         // can tear down / restore raw-mode around the spawn. This hook is
-        // kept to round out the trait surface — LocalBackend returns Ok(())
-        // so callers that route through the backend get a no-op, and
-        // remote's implementation can return Unimplemented until Phase 6.
+        // kept to round out the trait surface. LocalBackend returns Ok(())
+        // so callers that route through the backend get a no-op; remote
+        // backends can report that editor launch is unsupported.
         Ok(())
     }
 
@@ -645,8 +661,8 @@ impl Backend for LocalBackend {
     ) -> Result<(), BackendError> {
         // For LocalBackend the "remote" is just the workdir, so upload
         // degenerates to a plain copy. Keeping the shape identical to the
-        // remote implementation means `tasks::copy_sources` can call the
-        // same method on either backend and forget about the split.
+        // remote implementation lets higher layers ignore the local-vs-remote
+        // split.
         let to = self.resolve_rel(remote_dst_rel)?;
         if local_src.is_dir() {
             copy_dir_recursive_inner(local_src, &to).map_err(|e| BackendError::Io(e.to_string()))
@@ -815,6 +831,10 @@ pub(crate) fn walk_paths(root: &Path, opts: &WalkOpts) -> WalkResponse {
         .git_ignore(opts.respect_gitignore)
         .git_exclude(opts.respect_gitignore)
         .git_global(opts.respect_gitignore)
+        // Honor `.gitignore` even outside a git checkout; Reef works on
+        // plain directories too, and callers expect the same ignore
+        // semantics for quick-open and nav indexing.
+        .require_git(false)
         .filter_entry(|dent| dent.file_name() != ".git")
         .build();
 

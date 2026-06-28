@@ -5,8 +5,8 @@
 //! The worker runs in a background thread so each test polls `try_recv`
 //! with a timeout rather than busy-waiting.
 
-use reef::global_search::{MAX_RESULTS, MatchHit};
-use reef::tasks::{TaskCoordinator, WorkerResult};
+use reef_app::{GLOBAL_SEARCH_MAX_RESULTS as MAX_RESULTS, MatchHit};
+use reef_app::{TaskCoordinator, WorkerResult};
 use reef_io::{Backend, LocalBackend};
 use std::path::Path;
 use std::sync::Arc;
@@ -261,7 +261,7 @@ fn collect_replace(
     coord: &TaskCoordinator,
     generation: u64,
     deadline: Duration,
-) -> reef::tasks::ReplaceSummary {
+) -> reef_app::ReplaceSummary {
     let start = Instant::now();
     while start.elapsed() < deadline {
         match coord.try_recv() {
@@ -301,7 +301,7 @@ fn end_to_end_search_then_replace_with_per_match_exclusion() {
     // Build replace items skipping the hit in `b.txt` (simulates the
     // user unchecking that row in the UI).
     use std::collections::BTreeMap;
-    let mut buckets: BTreeMap<std::path::PathBuf, Vec<reef::tasks::ReplaceLine>> = BTreeMap::new();
+    let mut buckets: BTreeMap<std::path::PathBuf, Vec<reef_app::ReplaceLine>> = BTreeMap::new();
     let excluded_path = std::path::PathBuf::from("b.txt");
     for hit in &hits {
         if hit.path == excluded_path {
@@ -310,14 +310,14 @@ fn end_to_end_search_then_replace_with_per_match_exclusion() {
         buckets
             .entry(hit.path.clone())
             .or_default()
-            .push(reef::tasks::ReplaceLine {
+            .push(reef_app::ReplaceLine {
                 line_no: hit.line,
                 expected_text: hit.line_text.clone(),
             });
     }
-    let items: Vec<reef::tasks::ReplaceItem> = buckets
+    let items: Vec<reef_app::ReplaceItem> = buckets
         .into_iter()
-        .map(|(path, lines)| reef::tasks::ReplaceItem { path, lines })
+        .map(|(path, lines)| reef_app::ReplaceItem { path, lines })
         .collect();
 
     coord.replace_in_files(

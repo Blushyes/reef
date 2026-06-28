@@ -1,6 +1,4 @@
-use crate::find_widget::{FindTarget, FindWidgetState};
 use crate::i18n::{Msg, t};
-use crate::search::{SearchState, SearchTarget};
 use crate::ui::selection::{DiffHit, DiffHover, DiffSelection};
 use crate::ui::text::{
     clip_spans, overlay_ctrl_hover_underline, overlay_match_highlight, overlay_selection_highlight,
@@ -12,6 +10,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding};
+use reef_app::{FindTarget, FindWidgetState, SearchState, SearchTarget};
 use reef_core::diff::{
     DiffContent, DiffDisplay as CoreDiffDisplay, DiffLayout, DiffSide, LineTag,
     SbsDisplayLine as CoreSbsDisplayLine, SbsRow as CoreSbsRow, UnifiedLine as CoreUnifiedLine,
@@ -21,7 +20,8 @@ use std::ops::Range;
 use std::sync::Arc;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, DiffMode, LineTokens};
+use crate::TuiApp as App;
+use reef_app::{DiffMode, LineTokens};
 
 type DiffDisplay = CoreDiffDisplay<LineTokens>;
 type UnifiedLine = CoreUnifiedLine<LineTokens>;
@@ -42,8 +42,8 @@ pub struct DiffView<'a> {
 }
 
 /// Git-tab entry point. Thin wrapper around `render_diff` that sources
-/// everything from `App`. Graph tab will call `render_diff` directly
-/// with its own scroll fields once the 3-column layout lands.
+/// everything from `App`. Graph's diff column calls `render_diff`
+/// directly with its own scroll fields.
 pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default().padding(Padding::new(1, 1, 0, 0));
     let inner = block.inner(area);
@@ -55,72 +55,61 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     // both since at most one tab renders Diff at a time.
     app.last_diff_rect = Some(inner);
 
-    // RAII guard around the `take()`+restore pattern: the diff is moved
-    // out for the duration of `render_diff` (to break the aliasing with
-    // `&mut app.diff_scroll` etc), and put back from `Drop` so a panic
-    // inside `render_diff` doesn't permanently strand the loaded diff.
-    // Pre-fix, an unwind skipped the restore and the panel rendered
-    // empty until the user re-triggered a load.
-    struct DiffSlotGuard<'a> {
-        slot: &'a mut Option<crate::app::HighlightedDiff>,
-        held: Option<crate::app::HighlightedDiff>,
-    }
-    impl<'a> Drop for DiffSlotGuard<'a> {
-        fn drop(&mut self) {
-            if let Some(d) = self.held.take() {
-                *self.slot = Some(d);
-            }
-        }
-    }
-
-    let Some(taken) = app.diff_content.take() else {
+    let Some(diff_content) = app.engine.diff_content() else {
         render_empty(f, inner, &app.theme);
         return;
     };
-    let guard = DiffSlotGuard {
-        slot: &mut app.diff_content,
-        held: Some(taken),
-    };
-    let d = guard.held.as_ref().expect("just took it");
 
     let selection = app.diff_selection;
     let ctrl_hover = app.diff_ctrl_hover.clone();
+    let layout = app.engine.diff_layout();
+    let mode = app.engine.diff_mode();
+    let theme = app.theme;
+    let search = app.engine.search();
+    let find_widget = app.engine.find_widget();
+    let mut last_diff_view_h = app.layout.last_diff_view_h;
+    let (mut scroll, mut h_scroll, mut sbs_left_h_scroll, mut sbs_right_h_scroll) =
+        app.engine.diff_scroll_state();
     render_diff(
         f,
         inner,
-        &d.diff,
-        &d.display,
-        app.diff_layout,
-        app.diff_mode,
-        app.theme,
-        &app.search,
+        &diff_content.diff,
+        &diff_content.display,
+        layout,
+        mode,
+        theme,
+        search,
         SearchTarget::Diff,
-        &app.find_widget,
+        find_widget,
         FindTarget::DiffUnified,
         selection.as_ref(),
         ctrl_hover.as_ref(),
         &mut DiffView {
-            scroll: &mut app.diff_scroll,
-            h_scroll: &mut app.diff_h_scroll,
-            sbs_left_h_scroll: &mut app.sbs_left_h_scroll,
-            sbs_right_h_scroll: &mut app.sbs_right_h_scroll,
-            last_view_h: &mut app.last_diff_view_h,
+            scroll: &mut scroll,
+            h_scroll: &mut h_scroll,
+            sbs_left_h_scroll: &mut sbs_left_h_scroll,
+            sbs_right_h_scroll: &mut sbs_right_h_scroll,
+            last_view_h: &mut last_diff_view_h,
         },
         &mut app.last_diff_hit,
     );
-    // Drop fires here on the happy path; on unwind it fires implicitly
-    // from the panic propagation — either way `app.diff_content` is
-    // restored. Explicit drop for clarity.
-    drop(guard);
+    app.engine
+        .dispatch(reef_app::AppCommand::SetDiffScrollState {
+            scroll,
+            h_scroll,
+            sbs_left_h_scroll,
+            sbs_right_h_scroll,
+        });
+    app.layout.last_diff_view_h = last_diff_view_h;
 }
 
 /// Pure diff renderer — no `App` dependency. Callers own the scroll state
 /// and pass search + theme by reference. Both Git tab (via `render`) and
-/// Graph tab's future 3-col right column use this.
+/// Graph's diff column use this.
 ///
 /// `search_target` decides which of the caller's `/` matches the renderer
 /// will overlay on the content; pass `SearchTarget::Diff` for the Git tab
-/// and `SearchTarget::GraphDiff` once that variant lands.
+/// and `SearchTarget::GraphDiff` for Graph's diff column.
 #[allow(clippy::too_many_arguments)]
 pub fn render_diff(
     f: &mut Frame,
@@ -427,7 +416,12 @@ fn render_unified_line(
             let base_tokens: Vec<(Style, Cow<'_, str>)> = match syntax_tokens {
                 Some(toks) if !toks.is_empty() => toks
                     .iter()
-                    .map(|(s, t)| (s.bg(bg), Cow::Borrowed(t.as_str())))
+                    .map(|token| {
+                        (
+                            crate::ui::highlight::to_ratatui_style(token.style).bg(bg),
+                            Cow::Borrowed(token.text.as_str()),
+                        )
+                    })
                     .collect(),
                 _ => vec![(body_style, Cow::Borrowed(text.as_ref()))],
             };
@@ -513,9 +507,8 @@ fn render_side_by_side(
     // rows. The find widget *does*, via its `DiffSbsLeft` / `DiffSbsRight`
     // targets, and the two state machines are mutually exclusive (open
     // either side and the other clears). So SBS highlights flow only
-    // through `find_widget` here; `search` stays bound to keep the
-    // signature symmetric with `render_unified` for future work that
-    // wires `/` into SBS.
+    // through `find_widget` here; `search` stays bound so the call shape
+    // remains parallel with `render_unified`.
     let _ = search;
     let (widget_left_target, widget_right_target) = sbs_side_targets(widget_unified_target);
 
@@ -846,7 +839,12 @@ fn build_sbs_body_tokens<'a>(
     match tokens {
         Some(toks) if !toks.is_empty() => toks
             .iter()
-            .map(|(s, t)| (s.bg(bg), Cow::Borrowed(t.as_str())))
+            .map(|token| {
+                (
+                    crate::ui::highlight::to_ratatui_style(token.style).bg(bg),
+                    Cow::Borrowed(token.text.as_str()),
+                )
+            })
             .collect(),
         _ => vec![(Style::default().fg(fg).bg(bg), Cow::Borrowed(text))],
     }

@@ -1,19 +1,7 @@
-//! `b` branch picker for the Graph tab.
-//!
-//! Overlay that lets the user restrict the commit graph to a single
-//! local or remote-tracking branch. Modeled on `hosts_picker` — a
-//! filter input on top of a scrolling list, plus a `[ All refs ]`
-//! sentinel row that resets the scope to the default and a "recent"
-//! section seeded from `GitGraphState::recent_branches`.
-
+use crate::PickerState;
 use reef_core::git::{GraphScope, RefLabel};
 use std::collections::HashMap;
 
-/// Soft cap for how many branches we render below the recents list.
-/// Big monorepos can have thousands of remote branches and the picker
-/// only loses signal at that scale — the filter input narrows things
-/// fast enough that a cap on the rendered list keeps us out of the
-/// "10,000-row Vec" trap on every redraw.
 pub const MAX_BRANCH_ROWS: usize = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,20 +10,14 @@ pub enum BranchKind {
     Remote,
 }
 
-/// One selectable branch row.
 #[derive(Debug, Clone)]
 pub struct BranchEntry {
-    /// Fully-qualified ref name (`refs/heads/main`).
     pub full_ref: String,
-    /// User-facing label (`main`, `origin/feature/x`).
     pub display: String,
     pub kind: BranchKind,
-    /// Whether HEAD currently points at this branch.
     pub is_head: bool,
 }
 
-/// Picker-list row in render order. `AllRefs` is the sentinel; recents
-/// come from MRU prefs; locals / remotes are alphabetised.
 #[derive(Debug, Clone)]
 pub enum BranchPickerRow {
     AllRefs,
@@ -44,7 +26,6 @@ pub enum BranchPickerRow {
 }
 
 impl BranchPickerRow {
-    /// What scope this row selects when the user presses Enter.
     pub fn to_scope(&self) -> GraphScope {
         match self {
             BranchPickerRow::AllRefs => GraphScope::AllRefs,
@@ -57,52 +38,16 @@ impl BranchPickerRow {
 
 #[derive(Debug, Default)]
 pub struct GraphBranchPickerState {
-    /// Shared overlay scaffolding (`active`, `filter`, `cursor`,
-    /// `selected_idx`, `last_popup_area`). Edits route through
-    /// [`crate::picker_core::PickerCore::dispatch_key`]; see
-    /// `input::handle_key_graph_branch_picker` for the call site.
-    pub core: crate::picker_core::PickerCore,
-    /// All branches derived once from `git_graph.ref_map` when the
-    /// picker opens. Stored sorted (locals first, then remotes,
-    /// alphabetised within each group).
+    pub core: PickerState,
     pub all_branches: Vec<BranchEntry>,
-    /// Recents as fully-qualified refs (newest first). Filtered against
-    /// `all_branches` so a deleted recent silently disappears from the
-    /// rendered list.
     pub recent: Vec<String>,
-    /// First visible row in the list — read by the panel renderer to
-    /// scroll the viewport when `selected_idx` leaves the window.
-    /// Without this, big monorepos (hundreds of branches > visible
-    /// list_h) leave the user's selection rendered off-screen on
-    /// Down-key autorepeat. Reset to 0 by `open()` / `close()`.
     pub scroll: usize,
-    /// Memoised result of [`visible_rows`].
-    ///
-    /// Cache key is `(lowercased_filter, all_branches.len(),
-    /// recent.len())`. The two length fields guard against the case
-    /// where a future caller mutates `all_branches` or `recent` in
-    /// place without going through `open()` / `close()` — any
-    /// push/pop changes the length and forces a recompute. Identical
-    /// length but different content (e.g. swap one entry for another
-    /// of the same kind) would still hit a stale cache, but that
-    /// scenario has no current writer in the codebase.
-    ///
-    /// `RefCell` so `visible_rows(&self)` can populate it lazily
-    /// without forcing every caller to a `&mut` receiver. The
-    /// alternative — recomputing N keystrokes/second on a 2k-branch
-    /// monorepo — would allocate ~60k Strings per second of held
-    /// autorepeat.
     cache: std::cell::RefCell<Option<(CacheKey, Vec<BranchPickerRow>)>>,
 }
 
-/// Composite key for [`GraphBranchPickerState::cache`].
 type CacheKey = (String, usize, usize);
 
 impl GraphBranchPickerState {
-    /// Prep state from the cached `ref_map` and recents and activate
-    /// the overlay. Idempotent — re-opening just resets filter +
-    /// selection so the user always lands at the top with no leftover
-    /// query.
     pub fn open(
         &mut self,
         ref_map: &HashMap<String, Vec<RefLabel>>,
@@ -111,13 +56,9 @@ impl GraphBranchPickerState {
     ) {
         self.all_branches = collect_branches(ref_map);
         self.recent = recent;
-        self.cache.get_mut().take(); // ref_map / recent changed — drop cache
+        self.cache.get_mut().take();
         self.scroll = 0;
         self.core.open();
-        // Land on whatever row matches the active scope so the picker
-        // is "where you are" by default — pressing Esc cancels with no
-        // surprise, and Enter is a no-op rebuild rather than an
-        // accidental change.
         self.core.selected_idx = self
             .visible_rows()
             .iter()
@@ -136,48 +77,19 @@ impl GraphBranchPickerState {
         self.core.close();
     }
 
-    /// Bracketed-paste arrival while the picker is active. Folds the
-    /// payload into `core.filter` (CR/LF dropped — branch refs are
-    /// single-line) and snaps selection back to the top, mirroring the
-    /// `InputOutcome::Edited` path in `handle_key_graph_branch_picker`.
-    ///
-    /// Does NOT touch `self.scroll` — the keystroke `Edited` arm
-    /// leaves scroll alone and relies on the renderer to pull
-    /// `selected_idx` back into view. Resetting it here would diverge
-    /// from the typing path that this function is meant to mirror.
-    ///
-    /// The memoised [`visible_rows`] cache keys on the lowercased filter
-    /// string, so the paste automatically invalidates it; no
-    /// `mark_dirty` call is needed.
     pub fn handle_paste(&mut self, s: &str) {
-        if crate::input_edit::paste_single_line(s, &mut self.core.filter, &mut self.core.cursor) {
+        if crate::text_input::paste_single_line(s, &mut self.core.filter, &mut self.core.cursor) {
             self.core.selected_idx = 0;
         }
     }
 
-    /// Drop the memoised [`visible_rows`] result. Call this if any
-    /// future writer mutates `all_branches` or `recent` IN PLACE
-    /// (e.g. swapping one entry for another of the same kind, or
-    /// editing a `BranchEntry` field). Push/pop changes are already
-    /// covered by the `.len()` components of the cache key, but
-    /// content-only mutations would otherwise return stale rows.
     pub fn mark_dirty(&mut self) {
         self.cache.get_mut().take();
     }
 
-    /// Apply the current filter against AllRefs + recents + branches.
-    /// `AllRefs` always renders when the filter is empty.
-    ///
-    /// Memoised via [`Self::cache`] keyed on the lowercased filter
-    /// string — autorepeat on j/k holding 30Hz used to reallocate a
-    /// HashSet + N String::to_ascii_lowercase + up to MAX_BRANCH_ROWS
-    /// `BranchEntry` clones per tick. The cache is invalidated on
-    /// `open` / `close` (data inputs change) and inside this method
-    /// whenever the filter shifts.
     pub fn visible_rows(&self) -> Vec<BranchPickerRow> {
         let f = self.core.filter.to_ascii_lowercase();
         let key: CacheKey = (f, self.all_branches.len(), self.recent.len());
-        // Cache hit?
         if let Some((cached_key, cached_rows)) = self.cache.borrow().as_ref() {
             if cached_key == &key {
                 return cached_rows.clone();
@@ -186,15 +98,6 @@ impl GraphBranchPickerState {
         let f: &str = key.0.as_str();
         let mut out: Vec<BranchPickerRow> = Vec::new();
 
-        // Sentinel is shown ONLY on the empty filter. Substring /
-        // prefix matching against literal labels turned out to be a
-        // footgun: common letters (`r`, `e`, `f`, `s`, space) keep
-        // AllRefs visible at row 0 while every keystroke also resets
-        // `selected_idx` to 0 — pressing Enter mid-typing would
-        // commit AllRefs instead of the branch the user was
-        // filtering toward. Once the user has typed anything, they
-        // can clearly only be looking for a branch; cancel out with
-        // Backspace or Esc to get back to AllRefs.
         if f.is_empty() {
             out.push(BranchPickerRow::AllRefs);
         }
@@ -203,9 +106,6 @@ impl GraphBranchPickerState {
             self.recent.iter().map(String::as_str).collect();
 
         for full in &self.recent {
-            // Drop recents that point at a branch no longer in the
-            // ref_map (deleted upstream). They'll silently fall off
-            // the list rather than waste a row.
             let Some(entry) = self
                 .all_branches
                 .iter()
@@ -234,8 +134,6 @@ impl GraphBranchPickerState {
             }
         }
 
-        // Populate cache. Borrow is short-lived; `Vec::clone` is a
-        // single heap-block memcpy of small enums (~24 bytes each).
         *self.cache.borrow_mut() = Some((key, out.clone()));
         out
     }
@@ -246,21 +144,12 @@ impl GraphBranchPickerState {
             .map(BranchPickerRow::to_scope)
     }
 
-    /// Move the row cursor by `delta`, clamped against the current
-    /// `visible_rows()` count. Thin wrapper around the shared
-    /// [`crate::picker_core::PickerCore::move_selection`] that handles
-    /// the row-count lookup so callers (mouse wheel, etc.) don't have
-    /// to recompute `visible_rows()` themselves.
     pub fn move_selection(&mut self, delta: i32) {
         let visible_count = self.visible_rows().len();
         self.core.move_selection(visible_count, delta);
     }
 }
 
-/// Flatten a ref_map (OID → labels) into the picker's branch list.
-/// Local branches first (alphabetised), then remote-tracking branches
-/// (alphabetised). Tags + HEAD don't get rows — HEAD is annotated on
-/// whichever local row matches.
 pub fn collect_branches(ref_map: &HashMap<String, Vec<RefLabel>>) -> Vec<BranchEntry> {
     let mut locals: Vec<BranchEntry> = Vec::new();
     let mut remotes: Vec<BranchEntry> = Vec::new();
@@ -335,7 +224,6 @@ mod tests {
             ),
         ]);
         let branches = collect_branches(&map);
-        // Locals alphabetised, then remotes. HEAD points at "main".
         assert_eq!(
             branches
                 .iter()
@@ -382,8 +270,6 @@ mod tests {
 
     #[test]
     fn open_resets_cursor_to_zero() {
-        // Make sure re-opening the picker after a previous filter
-        // leaves the cursor at the start, matching the cleared filter.
         let mut s = GraphBranchPickerState::default();
         s.core.cursor = 7;
         s.core.filter = "stale-from-last-time".into();
@@ -394,55 +280,6 @@ mod tests {
         );
         assert_eq!(s.core.cursor, 0);
         assert!(s.core.filter.is_empty());
-    }
-
-    #[test]
-    fn dispatch_key_drives_filter_via_input_edit() {
-        // Sanity that the shared input_edit primitives operate on the
-        // picker's filter + cursor pair. We don't exhaustively test
-        // editor keys here (input_edit::tests already covers those) —
-        // just confirm the wiring round-trips for an insert + Ctrl+U
-        // clear, and that the cursor advances past UTF-8 chars cleanly.
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let mut s = GraphBranchPickerState::default();
-        s.open(
-            &ref_map(&[("a", &[RefLabel::Branch("main".into())])]),
-            vec![],
-            &GraphScope::AllRefs,
-        );
-
-        // Insert "ab"
-        for c in ['a', 'b'] {
-            let outcome = crate::input_edit::dispatch_key(
-                &KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
-                &mut s.core.filter,
-                &mut s.core.cursor,
-            );
-            assert_eq!(outcome, crate::input_edit::Outcome::Edited);
-        }
-        assert_eq!(s.core.filter, "ab");
-        assert_eq!(s.core.cursor, 2);
-
-        // Ctrl+U wipes the line via input_edit's editor vocabulary.
-        let outcome = crate::input_edit::dispatch_key(
-            &KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
-            &mut s.core.filter,
-            &mut s.core.cursor,
-        );
-        assert_eq!(outcome, crate::input_edit::Outcome::Edited);
-        assert!(s.core.filter.is_empty());
-        assert_eq!(s.core.cursor, 0);
-
-        // Insert a CJK codepoint, then confirm the cursor lands on a
-        // valid char boundary (3-byte char advances cursor by 3).
-        let outcome = crate::input_edit::dispatch_key(
-            &KeyEvent::new(KeyCode::Char('你'), KeyModifiers::NONE),
-            &mut s.core.filter,
-            &mut s.core.cursor,
-        );
-        assert_eq!(outcome, crate::input_edit::Outcome::Edited);
-        assert_eq!(s.core.filter, "你");
-        assert_eq!(s.core.cursor, 3);
     }
 
     #[test]
@@ -462,37 +299,22 @@ mod tests {
         s.handle_paste("feat");
         assert_eq!(s.core.filter, "feat");
         assert_eq!(s.core.cursor, 4);
-        // Edited path snaps selection back to the top so the user
-        // sees the row matching the just-pasted filter.
         assert_eq!(s.core.selected_idx, 0);
-        // Scroll is NOT reset — keystroke path doesn't touch it
-        // either; the renderer pulls selected_idx back into view.
         assert_eq!(s.scroll, 5);
-        // Cache key includes the filter, so the next visible_rows()
-        // call must reflect the paste rather than returning a stale
-        // pre-paste row set.
         let rows = s.visible_rows();
         assert!(
             rows.iter()
-                .any(|r| matches!(r, BranchPickerRow::Branch(b) if b.display == "feature/x")),
-            "post-paste rows must include the filtered branch"
+                .any(|r| matches!(r, BranchPickerRow::Branch(b) if b.display == "feature/x"))
         );
         assert!(
             !rows
                 .iter()
-                .any(|r| matches!(r, BranchPickerRow::Branch(b) if b.display == "main")),
-            "post-paste rows must drop branches that don't match the filter"
+                .any(|r| matches!(r, BranchPickerRow::Branch(b) if b.display == "main"))
         );
     }
 
     #[test]
     fn sentinel_hidden_once_user_starts_typing() {
-        // Regression: previously the sentinel used substring matching
-        // against literal labels ("all refs"), so common letters like
-        // 'r', 'e', 'f', 's', space kept it at row 0 even mid-typing.
-        // Combined with `selected_idx` resetting to 0 on each
-        // keystroke, that meant Enter mid-typing committed AllRefs
-        // instead of the branch the user was filtering toward.
         let mut s = GraphBranchPickerState::default();
         s.open(
             &ref_map(&[
@@ -502,11 +324,8 @@ mod tests {
             vec![],
             &GraphScope::AllRefs,
         );
-        // Empty filter: sentinel visible at top.
         assert!(matches!(s.visible_rows()[0], BranchPickerRow::AllRefs));
 
-        // Any non-empty filter, even a single letter that "happens to
-        // be in 'all refs'", must drop the sentinel.
         for f in ["a", "r", "e", "f", "s", " ", "all"] {
             s.core.filter = f.to_string();
             let rows = s.visible_rows();
@@ -529,7 +348,6 @@ mod tests {
             &GraphScope::AllRefs,
         );
         let rows = s.visible_rows();
-        // [AllRefs, Recent(main), Branch(feature)]
         assert!(matches!(rows[0], BranchPickerRow::AllRefs));
         assert!(matches!(&rows[1], BranchPickerRow::Recent(e) if e.display == "main"));
         assert!(matches!(&rows[2], BranchPickerRow::Branch(e) if e.display == "feature"));
@@ -543,7 +361,6 @@ mod tests {
             vec![],
             &GraphScope::AllRefs,
         );
-        // Row 0 is AllRefs, row 1 is "main".
         s.core.selected_idx = 1;
         assert_eq!(
             s.confirm(),
@@ -562,7 +379,6 @@ mod tests {
             &GraphScope::AllRefs,
         );
         let rows = s.visible_rows();
-        // Only AllRefs + main; ghost dropped.
         assert_eq!(rows.len(), 2);
     }
 }

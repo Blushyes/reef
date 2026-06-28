@@ -1,7 +1,5 @@
-use crate::app::App;
+use crate::TuiApp as App;
 use crate::i18n::{Msg, t};
-use crate::search::SearchTarget;
-use crate::tree_edit::TreeEditMode;
 use crate::ui::mouse::ClickAction;
 use crate::ui::text::overlay_match_highlight;
 use ratatui::Frame;
@@ -9,9 +7,11 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders};
+use reef_app::SearchTarget;
+use reef_app::TreeEditMode;
 
 pub fn render(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
-    if app.place_mode.active {
+    if app.engine.place_mode_active() {
         render_place_mode(f, app, area, focused);
     } else {
         render_normal(f, app, area, focused);
@@ -49,8 +49,8 @@ fn render_normal(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         padded.height.saturating_sub(1),
     );
 
-    let entries_len = app.file_tree.entries.len();
-    if entries_len == 0 && !app.tree_edit.active {
+    let entries_len = app.engine.file_tree_entries().len();
+    if entries_len == 0 && !app.engine.tree_edit().active {
         let msg = Line::from(Span::styled(
             t(Msg::EmptyDir),
             Style::default().fg(th.fg_secondary),
@@ -59,30 +59,20 @@ fn render_normal(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         return;
     }
 
-    // Clamp scroll to valid range (entry-index space — the edit row
-    // injection can briefly push the last entries off-screen, which
-    // is fine).
-    let max_scroll = entries_len.saturating_sub(tree_area.height as usize);
-    app.tree_scroll = app.tree_scroll.min(max_scroll);
-
     // Keep the selection visible, but only when the selection actually moved
     // since the last render. Running this every frame meant mouse-wheel scroll
     // (which only changes tree_scroll, not selected) got snapped back to the
     // opened file on the next tick. Also skip when the selection has been
     // cleared (sentinel = entries.len()) — without this guard, the `>=`
     // branch below would slam scroll all the way to the end.
-    let selection_changed = app.last_rendered_tree_selected != Some(app.file_tree.selected);
-    if selection_changed && !app.file_tree.selected_cleared() {
-        if app.file_tree.selected < app.tree_scroll {
-            app.tree_scroll = app.file_tree.selected;
-        } else if app.file_tree.selected >= app.tree_scroll + tree_area.height as usize {
-            app.tree_scroll = app
-                .file_tree
-                .selected
-                .saturating_sub(tree_area.height as usize - 1);
-        }
-    }
-    app.last_rendered_tree_selected = Some(app.file_tree.selected);
+    let selection_changed =
+        app.layout.last_rendered_tree_selected != Some(app.engine.selected_file_tree_idx());
+    app.engine
+        .dispatch(reef_app::AppCommand::ReconcileFileTreeScroll {
+            visible_rows: tree_area.height as usize,
+            selection_changed,
+        });
+    app.layout.last_rendered_tree_selected = Some(app.engine.selected_file_tree_idx());
 
     // Register a panel-wide "clear selection" click zone BEFORE rows,
     // so per-row `TreeClick` registrations shadow it via the late-wins
@@ -97,7 +87,7 @@ fn render_normal(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         );
     }
 
-    let scroll = app.tree_scroll;
+    let scroll = app.engine.tree_scroll();
     let max_y = tree_area.y + tree_area.height;
     let mut visual_y = tree_area.y;
 
@@ -109,10 +99,10 @@ fn render_normal(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     // treats it identically to an explicit depth-0 hover. Per-row
     // styling pulls "is this a root hover?" off this same value, so
     // we don't pass it as a separate flag.
-    let drag_hover_target = if app.tree_drag.active {
-        Some(match app.tree_drag.hover_idx {
-            Some(idx) => crate::place_mode::resolve_hover_target(&app.file_tree.entries, idx),
-            None => crate::place_mode::HoverTarget::Root,
+    let drag_hover_target = if app.engine.tree_drag().active {
+        Some(match app.engine.tree_drag().hover_idx {
+            Some(idx) => reef_app::resolve_hover_target(app.engine.file_tree_entries(), idx),
+            None => reef_app::HoverTarget::Root,
         })
     } else {
         None
@@ -124,10 +114,7 @@ fn render_normal(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     // here lands files at the project root rather than guessing
     // which row will absorb the drop. Rendered BEFORE rows so per-
     // row bg styling layers on top.
-    if matches!(
-        drag_hover_target,
-        Some(crate::place_mode::HoverTarget::Root)
-    ) {
+    if matches!(drag_hover_target, Some(reef_app::HoverTarget::Root)) {
         f.render_widget(
             Block::default().style(Style::default().bg(th.selection_bg)),
             tree_area,
@@ -137,9 +124,9 @@ fn render_normal(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     // VSCode-style "create at root" injection: when the user clicks
     // the toolbar `+ File` with no folder selected, anchor_idx is None
     // and we render the editable row right at the top of the tree.
-    let edit_active = app.tree_edit.active;
-    let edit_mode = app.tree_edit.mode;
-    let edit_anchor = app.tree_edit.anchor_idx;
+    let edit_active = app.engine.tree_edit().active;
+    let edit_mode = app.engine.tree_edit().mode;
+    let edit_anchor = app.engine.tree_edit().anchor_idx;
     let is_create_mode = matches!(
         edit_mode,
         Some(TreeEditMode::NewFile) | Some(TreeEditMode::NewFolder)
@@ -148,7 +135,7 @@ fn render_normal(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     if edit_active && is_create_mode && edit_anchor.is_none() && visual_y < max_y {
         render_edit_row(f, app, tree_area.x, visual_y, tree_area.width, 0);
         visual_y = visual_y.saturating_add(1);
-        if app.tree_edit.has_error() && visual_y < max_y {
+        if app.engine.tree_edit().has_error() && visual_y < max_y {
             render_edit_error(f, app, tree_area.x, visual_y, tree_area.width);
             visual_y = visual_y.saturating_add(1);
         }
@@ -163,7 +150,7 @@ fn render_normal(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
             break;
         }
         let global_idx = scroll + visual_i;
-        let Some(entry) = app.file_tree.entries.get(global_idx).cloned() else {
+        let Some(entry) = app.engine.file_tree_entries().get(global_idx).cloned() else {
             break;
         };
 
@@ -175,7 +162,7 @@ fn render_normal(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
             let rename_depth = entry.depth;
             render_edit_row(f, app, tree_area.x, visual_y, tree_area.width, rename_depth);
             visual_y = visual_y.saturating_add(1);
-            if app.tree_edit.has_error() && visual_y < max_y {
+            if app.engine.tree_edit().has_error() && visual_y < max_y {
                 render_edit_error(f, app, tree_area.x, visual_y, tree_area.width);
                 visual_y = visual_y.saturating_add(1);
             }
@@ -200,7 +187,7 @@ fn render_normal(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
             let inject_depth = entry.depth + if entry.is_dir { 1 } else { 0 };
             render_edit_row(f, app, tree_area.x, visual_y, tree_area.width, inject_depth);
             visual_y = visual_y.saturating_add(1);
-            if app.tree_edit.has_error() && visual_y < max_y {
+            if app.engine.tree_edit().has_error() && visual_y < max_y {
                 render_edit_error(f, app, tree_area.x, visual_y, tree_area.width);
                 visual_y = visual_y.saturating_add(1);
             }
@@ -208,16 +195,14 @@ fn render_normal(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     }
 }
 
-/// Render the 4-button Files-tab toolbar. Icons sit at fixed cell
+/// Render the Files-tab toolbar. Icons sit at fixed cell
 /// offsets from the panel's left edge; each button registers its
 /// ClickAction with the hit registry so the main mouse pipeline
 /// dispatches through the normal handle_action path.
 ///
-/// Layout: `[+ File] [+ Folder]  [↻]  [⊟]` — icons with abbreviated
+/// Layout: `[+ File] [+ Folder]  [⊟]` — icons with abbreviated
 /// labels; the labels get dropped first when the panel is narrow so
-/// only icons show on cramped widths. The right-side pair (refresh /
-/// collapse) sit flush-left-of-border so the visual weight stays
-/// balanced.
+/// only icons show on cramped widths.
 fn render_toolbar(f: &mut Frame, app: &mut App, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -242,11 +227,10 @@ fn render_toolbar(f: &mut Frame, app: &mut App, area: Rect) {
         format!(" + {} ", crate::i18n::tree_toolbar_new_file())
     };
     let btn_new_folder = if compact {
-        " 📁 ".to_string()
+        " + ".to_string()
     } else {
-        format!(" 📁 {} ", crate::i18n::tree_toolbar_new_folder())
+        format!(" + {} ", crate::i18n::tree_toolbar_new_folder())
     };
-    let btn_refresh = " ↻ ".to_string();
     let btn_collapse = " ⊟ ".to_string();
 
     let style_btn = Style::default()
@@ -255,10 +239,9 @@ fn render_toolbar(f: &mut Frame, app: &mut App, area: Rect) {
         .add_modifier(Modifier::BOLD);
     let style_sep = Style::default().fg(th.chrome_muted_fg).bg(th.chrome_bg);
 
-    let buttons: [(String, ClickAction); 4] = [
+    let buttons: [(String, ClickAction); 3] = [
         (btn_new_file, ClickAction::FileTreeToolbarNewFile),
         (btn_new_folder, ClickAction::FileTreeToolbarNewFolder),
-        (btn_refresh, ClickAction::FileTreeToolbarRefresh),
         (btn_collapse, ClickAction::FileTreeToolbarCollapse),
     ];
 
@@ -272,7 +255,7 @@ fn render_toolbar(f: &mut Frame, app: &mut App, area: Rect) {
         }
         // Hover highlight: bump the background on the button under the
         // cursor so the user can tell what's clickable.
-        let is_hovered = !app.tree_context_menu.active
+        let is_hovered = !app.engine.tree_context_menu_active()
             && app.hover_row == Some(area.y)
             && app.hover_col.map(|c| c >= x && c < x + w).unwrap_or(false);
         let bg = if is_hovered {
@@ -316,17 +299,17 @@ fn render_entry_row(
     y: u16,
     width: u16,
     panel_area: Rect,
-    drag_hover_target: Option<&crate::place_mode::HoverTarget>,
+    drag_hover_target: Option<&reef_app::HoverTarget>,
 ) {
     let th = app.theme;
-    let is_selected = global_idx == app.file_tree.selected;
-    let in_multi_selection = app.file_selection.contains(&entry.path);
+    let is_selected = global_idx == app.engine.selected_file_tree_idx();
+    let in_multi_selection = app.engine.file_selection().contains(&entry.path);
     // Suppress hover on tree rows while a context menu overlay is open.
     // The menu sits ABOVE the tree but narrower, and `hover_row` is a
     // single global coord — without this guard the tree row underneath
     // the currently-hovered menu item ends up painting `hover_bg` on
     // the strips the popup doesn't cover.
-    let is_hovered = !app.tree_context_menu.active
+    let is_hovered = !app.engine.tree_context_menu_active()
         && app.hover_row == Some(y)
         && app
             .hover_col
@@ -342,10 +325,7 @@ fn render_entry_row(
     // `drag_hover_target == Some(Root)` means the drop will land at
     // the workspace root; idle rows paint `selection_bg` so the
     // whole panel reads as a single armed surface.
-    let drag_root_hover = matches!(
-        drag_hover_target,
-        Some(crate::place_mode::HoverTarget::Root)
-    );
+    let drag_root_hover = matches!(drag_hover_target, Some(reef_app::HoverTarget::Root));
 
     let indent = "  ".repeat(entry.depth);
     let icon = if entry.is_dir {
@@ -365,7 +345,7 @@ fn render_entry_row(
     // clipboard rather than stamped onto entries up front; for the
     // ~50 rows visible at a time × small clipboards this stays a
     // few hundred path comparisons per frame.
-    if app.file_clipboard.is_cut() && app.file_clipboard.contains(&entry.path) {
+    if app.engine.file_clipboard().is_cut() && app.engine.file_clipboard().contains(&entry.path) {
         name_style = name_style.add_modifier(Modifier::DIM);
     }
 
@@ -396,7 +376,10 @@ fn render_entry_row(
         } else {
             name_style
         };
-    let (ranges, cur) = app.search.ranges_on_row(SearchTarget::FileTree, global_idx);
+    let (ranges, cur) = app
+        .engine
+        .search()
+        .ranges_on_row(SearchTarget::FileTree, global_idx);
     if ranges.is_empty() {
         spans.push(Span::styled(entry.name.clone(), name_base_style));
     } else {
@@ -456,7 +439,7 @@ fn render_entry_row(
 /// the buffer's current insertion point.
 fn render_edit_row(f: &mut Frame, app: &mut App, x: u16, y: u16, width: u16, depth: usize) {
     let th = app.theme;
-    let mode = app.tree_edit.mode.unwrap_or(TreeEditMode::Rename);
+    let mode = app.engine.tree_edit().mode.unwrap_or(TreeEditMode::Rename);
     let icon = match mode {
         TreeEditMode::NewFolder => "▸ ",
         // NewFile / Rename both use the plain-file icon. Rename keeps
@@ -465,8 +448,8 @@ fn render_edit_row(f: &mut Frame, app: &mut App, x: u16, y: u16, width: u16, dep
         _ => "  ",
     };
     let indent = "  ".repeat(depth);
-    let buffer = &app.tree_edit.buffer;
-    let cursor = app.tree_edit.cursor.min(buffer.len());
+    let buffer = &app.engine.tree_edit().buffer;
+    let cursor = app.engine.tree_edit().cursor.min(buffer.len());
     let placeholder = crate::i18n::tree_edit_placeholder(mode);
 
     // Row background — the edit row stands out from the rest of the
@@ -533,7 +516,7 @@ fn render_edit_row(f: &mut Frame, app: &mut App, x: u16, y: u16, width: u16, dep
 /// user reads it as "something went wrong, fix and retry" without the
 /// alarm level of an error toast.
 fn render_edit_error(f: &mut Frame, app: &App, x: u16, y: u16, width: u16) {
-    let Some(err) = app.tree_edit.error.clone() else {
+    let Some(err) = app.engine.tree_edit().error.clone() else {
         return;
     };
     let th = app.theme;
@@ -553,7 +536,7 @@ fn render_edit_error(f: &mut Frame, app: &App, x: u16, y: u16, width: u16) {
 // ─── Place-mode rendering ────────────────────────────────────────────────────
 //
 // Renders the file tree as a VSCode-style drag-and-drop destination picker.
-// Hard-swapped from `render_normal` when `app.place_mode.active`. Shares the
+// Hard-swapped from `render_normal` when `app.engine.place_mode_active()`. Shares the
 // same rect layout so the panel slot doesn't shift mid-interaction.
 //
 // Visual contract:
@@ -573,7 +556,7 @@ fn render_edit_error(f: &mut Frame, app: &App, x: u16, y: u16, width: u16) {
 // cleanly.
 
 fn render_place_mode(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
-    use crate::place_mode::{HoverTarget, resolve_hover_target};
+    use reef_app::{HoverTarget, resolve_hover_target};
     let th = app.theme;
 
     let block = Block::default()
@@ -588,10 +571,13 @@ fn render_place_mode(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
             .register_row(area.x, y, area.width, ClickAction::PlaceModeRoot);
     }
 
-    let banner_text = if app.file_copy_load.loading {
+    let banner_text = if app.engine.file_copy_loading() {
         crate::i18n::place_mode_copying_banner()
     } else {
-        crate::i18n::place_mode_banner(&app.place_mode.primary_name(), app.place_mode.count())
+        crate::i18n::place_mode_banner(
+            &app.engine.place_mode().primary_name(),
+            app.engine.place_mode().count(),
+        )
     };
     let banner_style = Style::default()
         .fg(th.chrome_bg)
@@ -631,16 +617,12 @@ fn render_place_mode(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
         .map(|(a, b)| a && b)
         .unwrap_or(false);
 
-    let scroll = {
-        let max_scroll = app
-            .file_tree
-            .entries
-            .len()
-            .saturating_sub(padded.height as usize);
-        let s = app.tree_scroll.min(max_scroll);
-        app.tree_scroll = s;
-        s
-    };
+    app.engine
+        .dispatch(reef_app::AppCommand::ReconcileFileTreeScroll {
+            visible_rows: padded.height as usize,
+            selection_changed: false,
+        });
+    let scroll = app.engine.tree_scroll();
     let max_y = padded.y + padded.height;
 
     let hovered_entry_idx = if cursor_in_panel {
@@ -648,7 +630,7 @@ fn render_place_mode(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
             if r >= padded.y && r < max_y {
                 let visual = (r - padded.y) as usize;
                 let idx = scroll + visual;
-                if idx < app.file_tree.entries.len() {
+                if idx < app.engine.file_tree_entries().len() {
                     Some(idx)
                 } else {
                     None
@@ -662,7 +644,7 @@ fn render_place_mode(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
     };
 
     let hover_target = match hovered_entry_idx {
-        Some(idx) => resolve_hover_target(&app.file_tree.entries, idx),
+        Some(idx) => resolve_hover_target(app.engine.file_tree_entries(), idx),
         None if cursor_in_panel => HoverTarget::Root,
         None => HoverTarget::Root,
     };
@@ -671,7 +653,10 @@ fn render_place_mode(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
         HoverTarget::Folder { folder_idx, .. } if cursor_in_panel => Some(*folder_idx),
         _ => None,
     };
-    app.place_mode.update_hover(active_folder_idx);
+    app.engine
+        .dispatch(reef_app::AppCommand::UpdatePlaceModeHover(
+            active_folder_idx,
+        ));
 
     let root_hover = cursor_in_panel && matches!(hover_target, HoverTarget::Root);
     if root_hover {
@@ -685,7 +670,7 @@ fn render_place_mode(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
         );
     }
 
-    let entries = &app.file_tree.entries;
+    let entries = app.engine.file_tree_entries();
     if entries.is_empty() {
         let msg = Line::from(Span::styled(
             t(Msg::EmptyDir),

@@ -1,5 +1,5 @@
-use crate::app::Tab;
 use ratatui::layout::Rect;
+use reef_app::AppTab as Tab;
 use serde_json;
 
 #[derive(Debug, Clone)]
@@ -83,12 +83,11 @@ pub enum ClickAction {
     /// Click on one of the Files-tab tree toolbar buttons.
     FileTreeToolbarNewFile,
     FileTreeToolbarNewFolder,
-    FileTreeToolbarRefresh,
     FileTreeToolbarCollapse,
     /// Pick from an open right-click context menu. Dispatched when
     /// the user left-clicks a menu row; keyboard picks go through
     /// `App::dispatch_context_menu_item` directly from `input`.
-    TreeContextMenuItem(crate::tree_context_menu::ContextMenuItem),
+    TreeContextMenuItem(reef_app::ContextMenuItem),
     /// Registered panel-wide underneath an open context menu — any
     /// left-click that misses a menu row falls through to this and
     /// just closes the menu.
@@ -138,11 +137,10 @@ pub enum ClickAction {
     SettingsRow(usize),
     /// Click on the primary (e.g. "Delete") button of the generic
     /// `ConfirmModal`. Dispatched to `App::fire_confirm_primary`,
-    /// which `take()`s the modal and fires its `on_confirm` closure.
+    /// which consumes the pending renderer-neutral confirm request.
     ConfirmModalPrimary,
     /// Click on the Cancel button, or anywhere outside the
-    /// `ConfirmModal`. Fires `on_cancel` (usually a no-op) and clears
-    /// the modal.
+    /// `ConfirmModal`. Clears the pending confirm request.
     ConfirmModalCancel,
 
     // ── FocusedPreview floating file picker ──

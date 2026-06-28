@@ -4,8 +4,8 @@
 //! across 20 hunks of 50 lines each.
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use reef::app::HighlightedDiff;
-use reef::search::{MatchLoc, SearchState, SearchTarget};
+use reef_app::HighlightedDiff;
+use reef_app::{MatchLoc, SearchState, SearchTarget};
 use reef_core::diff::{DiffContent, DiffHunk, DiffLine, LineTag, unified_display_rows};
 use std::sync::Arc;
 
@@ -131,7 +131,7 @@ fn bench_find_widget_keystroke(c: &mut Criterion) {
 fn bench_highlight_diff_miss(c: &mut Criterion) {
     let diff = synth_diff(20, 50);
     let mut iter_count = 0u64;
-    reef::tasks::_reset_highlight_cache();
+    reef_app::_reset_highlight_cache();
     c.bench_function("highlight_diff/miss_1k_lines", |b| {
         b.iter(|| {
             // Mutate path each iteration so the cache misses every time —
@@ -139,7 +139,7 @@ fn bench_highlight_diff_miss(c: &mut Criterion) {
             // hit, not actual syntect cost.
             iter_count += 1;
             let path = format!("src/bench_{}.rs", iter_count);
-            let r = reef::tasks::highlight_diff(black_box(&path), black_box(&diff), true);
+            let r = reef_app::highlight_diff(black_box(&path), black_box(&diff), true);
             black_box(r);
         });
     });
@@ -151,12 +151,12 @@ fn bench_highlight_diff_miss(c: &mut Criterion) {
 /// is reproducible regardless of prior bench state.
 fn bench_highlight_diff_hit(c: &mut Criterion) {
     let diff = synth_diff(20, 50);
-    reef::tasks::_reset_highlight_cache();
+    reef_app::_reset_highlight_cache();
     // Warm the cache once outside the timing loop.
-    let _ = reef::tasks::highlight_diff("src/cached.rs", &diff, true);
+    let _ = reef_app::highlight_diff("src/cached.rs", &diff, true);
     c.bench_function("highlight_diff/cache_hit_1k_lines", |b| {
         b.iter(|| {
-            let r = reef::tasks::highlight_diff(
+            let r = reef_app::highlight_diff(
                 black_box("src/cached.rs"),
                 black_box(&diff),
                 black_box(true),

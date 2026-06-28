@@ -10,6 +10,7 @@ members = [
     "crates/reef-sqlite-preview",
     "crates/reef-core",
     "crates/reef-io",
+    "crates/reef-app",
     "crates/reef-tui",
 ]
 default-members = ["crates/reef-tui"]

@@ -2,10 +2,9 @@
 //!
 //! Strategy: spawn `reef-agent --stdio --workdir <tempdir>` in-process,
 //! drive it through `RemoteBackend`, and verify the results line up with
-//! what `LocalBackend` returns on the exact same tempdir. This is the M1
-//! smoke test — a full contract suite belongs in a later milestone, but
-//! even this catches the biggest classes of regressions (protocol drift,
-//! DTO mis-mapping, path normalization mismatches).
+//! what `LocalBackend` returns on the exact same tempdir. This pins the
+//! backend contract against the biggest classes of regressions: protocol
+//! drift, DTO mis-mapping, and path normalization mismatches.
 
 use std::sync::Mutex;
 
@@ -114,4 +113,23 @@ fn remote_read_file_respects_cap() {
         .read_file(std::path::Path::new("big.txt"), 4)
         .expect("remote read_file");
     assert_eq!(bytes, b"abcd");
+}
+
+#[test]
+fn remote_list_dir_matches_local() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "README.md", "# hi\n", "init");
+    std::fs::create_dir(tmp.path().join("src")).unwrap();
+    write_file(&raw, "src/main.rs", "fn main() {}\n");
+
+    let local = LocalBackend::open_at(tmp.path().to_path_buf());
+    let remote = spawn_remote(tmp.path());
+
+    let mut local_entries = local.list_dir(std::path::Path::new("")).unwrap();
+    let mut remote_entries = remote.list_dir(std::path::Path::new("")).unwrap();
+    local_entries.retain(|entry| entry.name != ".git");
+    remote_entries.retain(|entry| entry.name != ".git");
+
+    assert_eq!(local_entries, remote_entries);
 }

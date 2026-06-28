@@ -1,12 +1,11 @@
 //! VSCode-style drag-and-drop destination picker.
 //!
-//! The OS-level drag session ends at the terminal boundary — crossterm only
-//! sees the dropped paths as a bracketed-paste payload, with no way to
-//! observe drag-over or hover position during the drag itself. We sidestep
-//! that by splitting the interaction in two:
+//! Some hosts only deliver dropped paths after the drag completes, with no
+//! drag-over or hover positions during the drag itself. We sidestep that by
+//! splitting the interaction in two:
 //!
-//! 1. Detect the drop (`input::handle_paste` parses the paste, and if every
-//!    segment resolves to an existing path we call `App::enter_place_mode`).
+//! 1. Detect the drop (the input adapter parses the payload, and if every
+//!    segment resolves to an existing path it enters place mode).
 //! 2. Hand control to this modal picker: the file tree sprouts a dashed
 //!    root drop-zone border, hovered folder rows highlight, a banner pins
 //!    to the top reminding the user what's about to land, and a click on a
@@ -28,7 +27,7 @@ pub const HOVER_EXPAND_DELAY: Duration = Duration::from_millis(600);
 #[derive(Debug, Default)]
 pub struct PlaceModeState {
     /// `true` while the modal picker owns input. When set, `input::handle_key`
-    /// and `input::handle_mouse` short-circuit: Esc / right-click cancel,
+    /// and mouse input short-circuits: Esc / secondary click cancel,
     /// clicks on folder rows or the root drop-zone confirm, everything else
     /// is either scroll (to reach deep folders) or ignored.
     pub active: bool,

@@ -4,11 +4,12 @@
 //! selection, runs the search, and leaves the prompt focused so the
 //! user can refine the query or just navigate with `Space+G`.
 
-use reef::app::{App, Panel, Tab};
+use reef::TuiApp as App;
 use reef::find_widget;
-use reef::find_widget::FindTarget;
 use reef::ui::selection::PreviewSelection;
 use reef::ui::theme::Theme;
+use reef_app::FindTarget;
+use reef_app::{AppPanel as Panel, AppTab as Tab};
 use reef_core::preview::{PreviewBody, PreviewDocument as PreviewContent, TextPreview};
 use std::sync::Mutex;
 use tempfile::TempDir;
@@ -21,20 +22,23 @@ fn fresh_app() -> (App, TempDir, CwdGuard) {
     let g = CwdGuard::enter(tmp.path());
     let mut app = App::new(Theme::dark(), None);
     // Preview pane is hosted under `Panel::Diff` in the Files tab.
-    app.active_tab = Tab::Files;
-    app.active_panel = Panel::Diff;
+    app.engine.state.active_tab = Tab::Files;
+    app.engine.state.active_panel = Panel::Diff;
     (app, tmp, g)
 }
 
 fn install_text_preview(app: &mut App, lines: &[&str]) {
-    app.preview_content = Some(PreviewContent {
-        path: "scratch.txt".to_string(),
-        body: PreviewBody::Text(TextPreview {
-            lines: lines.iter().map(|s| s.to_string()).collect(),
-            highlighted: None,
-            parsed: None,
-        }),
-    });
+    app.engine.state.preview_content = Some(
+        PreviewContent {
+            path: "scratch.txt".to_string(),
+            body: PreviewBody::Text(TextPreview {
+                lines: lines.iter().map(|s| s.to_string()).collect(),
+                highlighted: None,
+                parsed: None,
+            }),
+        }
+        .into(),
+    );
 }
 
 fn select_byte_range(app: &mut App, start: (usize, usize), end: (usize, usize)) {
@@ -56,12 +60,15 @@ fn seeds_query_and_runs_match_from_preview_selection() {
 
     find_widget::begin_with_selection(&mut app);
 
-    assert!(app.find_widget.active);
-    assert_eq!(app.find_widget.query, "bar");
-    assert_eq!(app.find_widget.cursor, "bar".len());
-    assert_eq!(app.find_widget.target, Some(FindTarget::FilePreview));
-    assert_eq!(app.find_widget.matches.len(), 3);
-    assert_eq!(app.find_widget.current, Some(0));
+    assert!(app.engine.find_widget().active);
+    assert_eq!(app.engine.find_widget().query, "bar");
+    assert_eq!(app.engine.find_widget().cursor, "bar".len());
+    assert_eq!(
+        app.engine.find_widget().target,
+        Some(FindTarget::FilePreview)
+    );
+    assert_eq!(app.engine.find_widget().matches.len(), 3);
+    assert_eq!(app.engine.find_widget().current, Some(0));
 }
 
 #[test]
@@ -73,8 +80,8 @@ fn trims_indentation_when_selection_grabs_full_line() {
 
     find_widget::begin_with_selection(&mut app);
 
-    assert_eq!(app.find_widget.query, "bar();");
-    assert!(!app.find_widget.matches.is_empty());
+    assert_eq!(app.engine.find_widget().query, "bar();");
+    assert!(!app.engine.find_widget().matches.is_empty());
 }
 
 #[test]
@@ -85,10 +92,13 @@ fn no_selection_opens_empty_widget() {
 
     find_widget::begin_with_selection(&mut app);
 
-    assert!(app.find_widget.active);
-    assert!(app.find_widget.query.is_empty());
-    assert_eq!(app.find_widget.target, Some(FindTarget::FilePreview));
-    assert!(app.find_widget.matches.is_empty());
+    assert!(app.engine.find_widget().active);
+    assert!(app.engine.find_widget().query.is_empty());
+    assert_eq!(
+        app.engine.find_widget().target,
+        Some(FindTarget::FilePreview)
+    );
+    assert!(app.engine.find_widget().matches.is_empty());
 }
 
 #[test]
@@ -100,8 +110,8 @@ fn collapsed_selection_falls_back_to_empty_widget() {
 
     find_widget::begin_with_selection(&mut app);
 
-    assert!(app.find_widget.active);
-    assert!(app.find_widget.query.is_empty());
+    assert!(app.engine.find_widget().active);
+    assert!(app.engine.find_widget().query.is_empty());
 }
 
 #[test]
@@ -112,18 +122,18 @@ fn step_after_seed_advances_current() {
     select_byte_range(&mut app, (0, 0), (0, 3));
 
     find_widget::begin_with_selection(&mut app);
-    assert_eq!(app.find_widget.current, Some(0));
+    assert_eq!(app.engine.find_widget().current, Some(0));
 
     find_widget::step(&mut app, /*reverse=*/ false);
-    assert_eq!(app.find_widget.current, Some(1));
+    assert_eq!(app.engine.find_widget().current, Some(1));
     find_widget::step(&mut app, /*reverse=*/ false);
-    assert_eq!(app.find_widget.current, Some(2));
+    assert_eq!(app.engine.find_widget().current, Some(2));
     // Wraps back to start.
     find_widget::step(&mut app, /*reverse=*/ false);
-    assert_eq!(app.find_widget.current, Some(0));
+    assert_eq!(app.engine.find_widget().current, Some(0));
     // Reverse wraps to last.
     find_widget::step(&mut app, /*reverse=*/ true);
-    assert_eq!(app.find_widget.current, Some(2));
+    assert_eq!(app.engine.find_widget().current, Some(2));
 }
 
 #[test]
@@ -137,19 +147,22 @@ fn close_restores_pre_find_scroll_and_clears_state() {
             "line 8", "line 9",
         ],
     );
-    app.preview_scroll = 0;
-    app.last_preview_view_h = 4;
+    app.engine.state.preview_scroll = 0;
+    app.layout.last_preview_view_h = 4;
     select_byte_range(&mut app, (3, 0), (3, 3));
 
     find_widget::begin_with_selection(&mut app);
     // Match landed on row 3 — center-scroll pushes preview_scroll
     // away from 0.
-    assert!(app.find_widget.active);
+    assert!(app.engine.find_widget().active);
 
     find_widget::close(&mut app);
-    assert!(!app.find_widget.active);
-    assert_eq!(app.find_widget.query, "");
-    assert_eq!(app.preview_scroll, 0, "snapshot should restore scroll");
+    assert!(!app.engine.find_widget().active);
+    assert_eq!(app.engine.find_widget().query, "");
+    assert_eq!(
+        app.engine.state.preview_scroll, 0,
+        "snapshot should restore scroll"
+    );
 }
 
 #[test]
@@ -166,21 +179,21 @@ fn tab_switch_closes_widget_and_restores_scroll() {
             "line 8", "line 9",
         ],
     );
-    app.preview_scroll = 0;
-    app.last_preview_view_h = 4;
+    app.engine.state.preview_scroll = 0;
+    app.layout.last_preview_view_h = 4;
     select_byte_range(&mut app, (3, 0), (3, 3));
 
     find_widget::begin_with_selection(&mut app);
-    assert!(app.find_widget.active);
+    assert!(app.engine.find_widget().active);
 
     // Switch away — should auto-close.
     app.set_active_tab(Tab::Git);
 
-    assert!(!app.find_widget.active);
-    assert_eq!(app.find_widget.query, "");
-    assert_eq!(app.find_widget.target, None);
+    assert!(!app.engine.find_widget().active);
+    assert_eq!(app.engine.find_widget().query, "");
+    assert_eq!(app.engine.find_widget().target, None);
     assert_eq!(
-        app.preview_scroll, 0,
+        app.engine.state.preview_scroll, 0,
         "tab switch must restore pre-find scroll via the same snapshot path as Esc",
     );
 }
@@ -200,8 +213,8 @@ fn step_after_close_is_a_noop_not_a_panic() {
     // Must not panic; current stays None.
     find_widget::step(&mut app, false);
     find_widget::step(&mut app, true);
-    assert_eq!(app.find_widget.current, None);
-    assert!(app.find_widget.matches.is_empty());
+    assert_eq!(app.engine.find_widget().current, None);
+    assert!(app.engine.find_widget().matches.is_empty());
 }
 
 #[test]
@@ -209,12 +222,12 @@ fn no_target_panel_is_a_noop() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp, _g) = fresh_app();
     // Tab::Search left panel has no in-panel find target.
-    app.active_tab = Tab::Search;
-    app.active_panel = Panel::Files;
+    app.engine.state.active_tab = Tab::Search;
+    app.engine.state.active_panel = Panel::Files;
 
     find_widget::begin_with_selection(&mut app);
 
-    assert!(!app.find_widget.active);
-    assert!(app.find_widget.query.is_empty());
-    assert_eq!(app.find_widget.target, None);
+    assert!(!app.engine.find_widget().active);
+    assert!(app.engine.find_widget().query.is_empty());
+    assert_eq!(app.engine.find_widget().target, None);
 }

@@ -10,7 +10,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui_image::picker::Picker;
-use reef::app::App;
+use reef::TuiApp as App;
 use reef::ui;
 use reef::ui::theme::Theme;
 use std::sync::Mutex;
@@ -53,7 +53,7 @@ fn wait_for_git_status(app: &mut App) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         app.tick();
-        if !app.git_status_load.loading {
+        if !app.engine.state.git_status_load.loading {
             return;
         }
         thread::sleep(Duration::from_millis(10));
@@ -65,7 +65,7 @@ fn wait_for_file_tree(app: &mut App) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         app.tick();
-        if !app.file_tree_load.loading && !app.file_tree_load.stale {
+        if !app.engine.state.file_tree_load.loading && !app.engine.state.file_tree_load.stale {
             return;
         }
         thread::sleep(Duration::from_millis(10));
@@ -118,7 +118,7 @@ fn snapshot_with_staged_and_unstaged() {
 
     let mut app = App::new(Theme::dark(), None);
     // Switch to Git tab to show staged/unstaged sections
-    app.set_active_tab(reef::app::Tab::Git);
+    app.set_active_tab(reef_app::AppTab::Git);
     app.refresh_status();
     wait_for_git_status(&mut app);
     let output = render_app(&mut app, 80, 20);
@@ -181,16 +181,12 @@ fn snapshot_tree_edit_row_new_file() {
     let mut app = App::new(Theme::dark(), None);
     app.refresh_file_tree();
     wait_for_file_tree(&mut app);
+    wait_for_git_status(&mut app);
 
     // Kick off a NewFile edit anchored on the first top-level folder so
     // the editable row renders indented one deeper than the folder.
-    let parent_dir = tmp.path().join("src");
-    app.begin_tree_edit(
-        reef::tree_edit::TreeEditMode::NewFile,
-        parent_dir,
-        None,
-        Some(0),
-    );
+    let parent_dir = std::path::PathBuf::from("src");
+    app.begin_tree_edit(reef_app::TreeEditMode::NewFile, parent_dir, None, Some(0));
 
     let output = render_app(&mut app, 80, 20);
     with_filters(&[], || {
@@ -216,6 +212,7 @@ fn snapshot_tree_context_menu() {
     let mut app = App::new(Theme::dark(), None);
     app.refresh_file_tree();
     wait_for_file_tree(&mut app);
+    wait_for_git_status(&mut app);
 
     // Open menu anchored at column 4, row 5 — arbitrary coords that
     // leave room for the popup to render inline without getting
@@ -234,8 +231,9 @@ fn wait_for_graph_ready(app: &mut App) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         app.tick();
-        let graph_ready = !app.graph_load.loading && !app.git_graph.rows.is_empty();
-        let detail_ready = !app.commit_detail_load.loading;
+        let graph_ready =
+            !app.engine.state.graph_load.loading && !app.engine.state.git_graph.rows.is_empty();
+        let detail_ready = !app.engine.state.commit_detail_load.loading;
         if graph_ready && detail_ready {
             return;
         }
@@ -264,7 +262,7 @@ fn snapshot_graph_range_mode() {
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new(Theme::dark(), None);
-    app.set_active_tab(reef::app::Tab::Graph);
+    app.set_active_tab(reef_app::AppTab::Graph);
     wait_for_graph_ready(&mut app);
     // Extend by 2 → range of 3 (newest + 2 older). `rows` is newest-first,
     // so `selected_idx=0` starts on "third"; extending downward (+delta)
@@ -275,12 +273,14 @@ fn snapshot_graph_range_mode() {
     while Instant::now() < deadline {
         app.tick();
         let has_files = app
+            .engine
+            .state
             .commit_detail
             .range_detail
             .as_ref()
             .map(|r| !r.files.is_empty())
             .unwrap_or(false);
-        if has_files && !app.commit_detail_load.loading {
+        if has_files && !app.engine.state.commit_detail_load.loading {
             break;
         }
         thread::sleep(Duration::from_millis(10));
@@ -308,7 +308,7 @@ fn snapshot_hosts_picker_empty() {
 
     let mut app = App::new(Theme::dark(), None);
     wait_for_file_tree(&mut app);
-    app.hosts_picker.open(vec![], vec![]);
+    app.engine.state.hosts_picker.open(vec![], vec![]);
     let output = render_app(&mut app, 80, 20);
     with_filters(&[], || {
         insta::assert_snapshot!("hosts_picker_empty", output)
@@ -322,7 +322,7 @@ fn snapshot_hosts_picker_empty() {
 /// and the two-column alias/hostname layout.
 #[test]
 fn snapshot_hosts_picker_populated() {
-    use reef::hosts_picker::SshTarget;
+    use reef_app::SshTarget;
     use reef_core::hosts::HostEntry;
 
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -355,7 +355,7 @@ fn snapshot_hosts_picker_populated() {
         path: "/srv/app".into(),
     }];
     wait_for_file_tree(&mut app);
-    app.hosts_picker.open(hosts, recent);
+    app.engine.state.hosts_picker.open(hosts, recent);
     let output = render_app(&mut app, 80, 20);
     with_filters(&[], || {
         insta::assert_snapshot!("hosts_picker_populated", output)
@@ -377,7 +377,7 @@ fn snapshot_hosts_picker_path_mode() {
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new(Theme::dark(), None);
-    app.hosts_picker.open(
+    app.engine.state.hosts_picker.open(
         vec![HostEntry {
             alias: "hongxuan".into(),
             hostname: Some("47.101.167.85".into()),
@@ -386,8 +386,8 @@ fn snapshot_hosts_picker_path_mode() {
         vec![],
     );
     wait_for_file_tree(&mut app);
-    app.hosts_picker.enter_path_mode();
-    app.hosts_picker.path_buffer = "root@47.101.167.85:/tmp/work".into();
+    app.engine.state.hosts_picker.enter_path_mode();
+    app.engine.state.hosts_picker.path_buffer = "root@47.101.167.85:/tmp/work".into();
     let output = render_app(&mut app, 80, 20);
     with_filters(&[], || {
         insta::assert_snapshot!("hosts_picker_path_mode", output)
@@ -412,7 +412,7 @@ fn snapshot_with_staged_and_unstaged_light_theme() {
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new(Theme::light(), None);
-    app.set_active_tab(reef::app::Tab::Git);
+    app.set_active_tab(reef_app::AppTab::Git);
     app.refresh_status();
     wait_for_git_status(&mut app);
     let output = render_app(&mut app, 80, 20);
@@ -428,18 +428,38 @@ fn wait_for_preview(app: &mut App) {
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
         app.tick();
-        if !app.preview_load.loading
-            && app.preview_content.is_some()
-            && !app.preview_load.stale
-            && app.preview_schedule.is_none()
-            && !app.file_tree_load.loading
-            && !app.file_tree_load.stale
+        if !app.engine.state.preview_load.loading
+            && app.engine.state.preview_content.is_some()
+            && !app.engine.state.preview_load.stale
+            && app.engine.state.preview_schedule.is_none()
+            && !app.engine.state.file_tree_load.loading
+            && !app.engine.state.file_tree_load.stale
         {
             return;
         }
         thread::sleep(Duration::from_millis(10));
     }
     panic!("timed out waiting for preview worker");
+}
+
+fn wait_for_db_detail(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        app.tick();
+        if !app.engine.state.db_detail_load.loading
+            && app
+                .engine
+                .state
+                .db_preview
+                .as_ref()
+                .and_then(|state| state.detail.as_ref())
+                .is_some()
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for sqlite detail worker");
 }
 
 #[test]
@@ -472,12 +492,14 @@ fn snapshot_image_preview_halfblocks() {
     wait_for_file_tree(&mut app);
     // Seed `selected_file` on whichever row is "striped.png".
     let idx = app
+        .engine
+        .state
         .file_tree
         .entries
         .iter()
         .position(|e| e.name == "striped.png")
         .expect("striped.png in tree");
-    app.file_tree.selected = idx;
+    app.engine.state.file_tree.selected = idx;
     app.load_preview();
     wait_for_preview(&mut app);
 
@@ -535,12 +557,14 @@ fn snapshot_binary_info_pdf() {
     app.refresh_file_tree();
     wait_for_file_tree(&mut app);
     let idx = app
+        .engine
+        .state
         .file_tree
         .entries
         .iter()
         .position(|e| e.name == "doc.pdf")
         .expect("doc.pdf in tree");
-    app.file_tree.selected = idx;
+    app.engine.state.file_tree.selected = idx;
     app.load_preview();
     wait_for_preview(&mut app);
 
@@ -566,12 +590,14 @@ fn snapshot_markdown_preview() {
     app.refresh_file_tree();
     wait_for_file_tree(&mut app);
     let idx = app
+        .engine
+        .state
         .file_tree
         .entries
         .iter()
         .position(|e| e.name == "README.md")
         .expect("README.md in tree");
-    app.file_tree.selected = idx;
+    app.engine.state.file_tree.selected = idx;
     app.load_preview();
     wait_for_preview(&mut app);
 
@@ -600,24 +626,32 @@ fn snapshot_search_tab_replace_open_with_excluded_row() {
 
     let mut app = App::new(Theme::dark(), None);
     wait_for_file_tree(&mut app);
-    app.set_active_tab(reef::app::Tab::Search);
-    app.global_search.core.filter = "needle".to_string();
-    app.global_search.core.cursor = "needle".len();
-    app.global_search.replace_text = "thread".to_string();
-    app.global_search.replace_cursor = "thread".len();
-    app.global_search.replace_open = true;
-    app.global_search.focus = reef::global_search::SearchPanelFocus::List;
+    // This snapshot is about the Search tab's replace panel, not the Files
+    // tab's startup preview. File-tree loading can legitimately schedule the
+    // first file preview, so reset that unrelated async state before seeding
+    // synthetic search hits.
+    app.engine.state.preview_load.invalidate();
+    app.engine.state.preview_schedule = None;
+    app.engine.state.preview_in_flight_path = None;
+    app.engine.state.preview_content = None;
+    app.set_active_tab(reef_app::AppTab::Search);
+    app.engine.state.global_search.core.filter = "needle".to_string();
+    app.engine.state.global_search.core.cursor = "needle".len();
+    app.engine.state.global_search.replace_text = "thread".to_string();
+    app.engine.state.global_search.replace_cursor = "thread".len();
+    app.engine.state.global_search.replace_open = true;
+    app.engine.state.global_search.focus = reef_app::SearchPanelFocus::List;
     // Seed two synthetic hits — going through the actual ripgrep
     // worker would couple the snapshot to walker timing on CI.
-    app.global_search.results = vec![
-        reef::global_search::MatchHit {
+    app.engine.state.global_search.results = vec![
+        reef_app::MatchHit {
             path: std::path::PathBuf::from("alpha.txt"),
             display: "alpha.txt".to_string(),
             line: 0,
             line_text: "needle in alpha".to_string(),
             byte_range: 0..6,
         },
-        reef::global_search::MatchHit {
+        reef_app::MatchHit {
             path: std::path::PathBuf::from("beta.txt"),
             display: "beta.txt".to_string(),
             line: 0,
@@ -626,7 +660,7 @@ fn snapshot_search_tab_replace_open_with_excluded_row() {
         },
     ];
     // Exclude the second row — strikethrough + dim styling should show.
-    app.global_search.toggle_match_excluded(1);
+    app.engine.state.global_search.toggle_match_excluded(1);
 
     let output = render_app(&mut app, 100, 16);
     with_filters(&[], || {
@@ -646,7 +680,7 @@ fn snapshot_settings_page_default() {
     let mut app = App::new(Theme::dark(), None);
     wait_for_file_tree(&mut app);
     app.open_settings();
-    app.lsp_installed.clear();
+    app.engine.state.lsp_installed.clear();
     let output = render_app(&mut app, 80, 24);
     with_filters(&[], || {
         insta::assert_snapshot!("settings_page_default", output)
@@ -665,17 +699,19 @@ fn snapshot_settings_page_editing_editor_command() {
     let mut app = App::new(Theme::dark(), None);
     wait_for_file_tree(&mut app);
     app.open_settings();
-    app.lsp_installed.clear();
+    app.engine.state.lsp_installed.clear();
     let editor_idx = reef::settings::SettingItem::ALL
         .iter()
         .position(|i| matches!(i, reef::settings::SettingItem::EditorCommand))
         .unwrap();
-    app.settings.select(editor_idx);
-    reef::settings::begin_edit_editor_command(&mut app.settings);
-    if let Some(edit) = app.settings.editor_edit.as_mut() {
-        edit.buffer = "nvim --clean".to_string();
-        edit.cursor = edit.buffer.len();
-    }
+    app.engine
+        .dispatch(reef_app::AppCommand::SelectSettingsRow(editor_idx));
+    app.engine
+        .dispatch(reef_app::AppCommand::BeginSettingsEditorCommandEdit);
+    app.engine
+        .dispatch(reef_app::AppCommand::PasteSettingsEditorCommand(
+            "nvim --clean".to_string(),
+        ));
     let output = render_app(&mut app, 80, 24);
     with_filters(&[], || {
         insta::assert_snapshot!("settings_page_editing_editor_command", output)
@@ -709,19 +745,21 @@ fn snapshot_find_widget_on_preview() {
     // worker to land the body, then drop a selection on row 1 so
     // `begin_with_selection` has something to seed from.
     if let Some(idx) = app
+        .engine
+        .state
         .file_tree
         .entries
         .iter()
         .position(|e| e.name == "scratch.txt")
     {
-        app.file_tree.selected = idx;
+        app.engine.state.file_tree.selected = idx;
         app.load_preview();
         wait_for_preview(&mut app);
     } else {
         panic!("scratch.txt missing from tree");
     }
-    app.set_active_tab(reef::app::Tab::Files);
-    app.active_panel = reef::app::Panel::Diff;
+    app.set_active_tab(reef_app::AppTab::Files);
+    app.engine.state.active_panel = reef_app::AppPanel::Diff;
     // Run a frame so `last_preview_rect` lands — `find_widget_panel`
     // reads it to anchor the popup. With no rect cached, the widget
     // skips rendering.
@@ -801,12 +839,14 @@ fn snapshot_db_preview_grouped_sidebar() {
     wait_for_file_tree(&mut app);
 
     let idx = app
+        .engine
+        .state
         .file_tree
         .entries
         .iter()
         .position(|e| e.name == "fixture.db")
         .expect("fixture.db in tree");
-    app.file_tree.selected = idx;
+    app.engine.state.file_tree.selected = idx;
     app.load_preview();
     wait_for_preview(&mut app);
 
@@ -834,12 +874,14 @@ fn snapshot_db_preview_index_detail() {
     wait_for_file_tree(&mut app);
 
     let idx = app
+        .engine
+        .state
         .file_tree
         .entries
         .iter()
         .position(|e| e.name == "fixture.db")
         .expect("fixture.db in tree");
-    app.file_tree.selected = idx;
+    app.engine.state.file_tree.selected = idx;
     app.load_preview();
     wait_for_preview(&mut app);
 
@@ -851,6 +893,7 @@ fn snapshot_db_preview_index_detail() {
         name: "users_named_idx".to_string(),
         kind: reef_sqlite_preview::DbObjectKind::Index,
     });
+    wait_for_db_detail(&mut app);
 
     let output = render_app(&mut app, 110, 24);
     with_filters(&[], || {

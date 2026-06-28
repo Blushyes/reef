@@ -1,5 +1,5 @@
 ---
-source: tests/ui_snapshots.rs
+source: crates/reef-tui/tests/ui_snapshots.rs
 assertion_line: 126
 expression: output
 ---
@@ -22,4 +22,4 @@ expression: output
                        │
                        │
                        │
- 🔗  SSH        ⚙  q:quit Tab:switch s:stage u:unstage r:refresh h:help  [Files]
+ SSH           ⚙  q:quit Tab:switch s:stage u:unstage r:refresh h:help  [Files]

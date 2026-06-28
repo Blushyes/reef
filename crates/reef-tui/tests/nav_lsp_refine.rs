@@ -4,12 +4,13 @@
 //! `LspLocation` for a `(lang, identifier)` makes the next `gd` on the
 //! same identifier prefer the LSP answer over the tree-sitter result.
 
-use reef::app::nav::{
-    CursorPosition, LocationSnapshot, LocationSurface, NavAnchor, NavPendingJump, ScrollPosition,
-};
-use reef::app::{App, Panel, Tab};
+use reef::TuiApp as App;
 use reef::ui::selection::PreviewSelection;
 use reef::ui::theme::Theme;
+use reef_app::{
+    AppPanel as Panel, AppTab as Tab, CursorPosition, LocationSnapshot, LocationSurface, NavAnchor,
+    NavPendingJump, ScrollPosition,
+};
 use reef_core::nav::{LspBadge, LspLocation, NavLang, parse_file_if_supported};
 use reef_core::preview::{PreviewBody, PreviewDocument as PreviewContent, TextPreview};
 use std::sync::{Arc, Mutex};
@@ -34,23 +35,26 @@ fn fresh_app() -> (App, TempDir, CwdGuard) {
     let tmp = TempDir::new().unwrap();
     let g = CwdGuard::enter(tmp.path());
     let mut app = App::new(Theme::dark(), None);
-    app.active_tab = Tab::Files;
-    app.active_panel = Panel::Diff;
-    app.last_preview_view_h = 20;
+    app.engine.state.active_tab = Tab::Files;
+    app.engine.state.active_panel = Panel::Diff;
+    app.layout.last_preview_view_h = 20;
     (app, tmp, g)
 }
 
 fn install_rust_preview(app: &mut App, path: &str, src: &str) {
     let bytes: Arc<[u8]> = Arc::from(src.as_bytes().to_vec().into_boxed_slice());
     let parsed = parse_file_if_supported(NavLang::Rust, bytes).map(Arc::new);
-    app.preview_content = Some(PreviewContent {
-        path: path.to_string(),
-        body: PreviewBody::Text(TextPreview {
-            lines: src.lines().map(|s| s.to_string()).collect(),
-            highlighted: None,
-            parsed,
-        }),
-    });
+    app.engine.state.preview_content = Some(
+        PreviewContent {
+            path: path.to_string(),
+            body: PreviewBody::Text(TextPreview {
+                lines: src.lines().map(|s| s.to_string()).collect(),
+                highlighted: None,
+                parsed,
+            }),
+        }
+        .into(),
+    );
 }
 
 fn set_keyboard_cursor(app: &mut App, line: usize, byte_col: usize) {
@@ -99,7 +103,7 @@ fn main() { let _ = helper(); }
     // cached path is workdir-relative (the production handler converts
     // before storing).
     let key = reef_core::nav::refine_key(std::path::Path::new("scratch.rs"), cursor);
-    app.nav_refine_cache.insert(
+    app.engine.state.nav_refine_cache.insert(
         (NavLang::Rust, key),
         LspLocation {
             path: std::path::PathBuf::from("scratch.rs"),
@@ -114,6 +118,8 @@ fn main() { let _ = helper(); }
     // The refine cache hit should make the jump go to the cached
     // line (5) instead of tree-sitter's intra-file find (line 0).
     let hl = app
+        .engine
+        .state
         .preview_highlight
         .as_ref()
         .expect("highlight after refine-cache hit");
@@ -129,13 +135,18 @@ fn refine_cache_empty_falls_back_to_tree_sitter() {
     let (mut app, _tmp, _g) = fresh_app();
     let src = "fn helper() {}\nfn main() { helper(); }\n";
     install_rust_preview(&mut app, "scratch.rs", src);
-    assert!(app.nav_refine_cache.is_empty());
+    assert!(app.engine.state.nav_refine_cache.is_empty());
 
     let cursor = cursor_at_nth(src, "helper", 1);
     set_keyboard_cursor(&mut app, cursor.0, cursor.1);
     app.goto_definition_at_cursor(NavAnchor::Keyboard);
 
-    let hl = app.preview_highlight.as_ref().expect("tree-sitter jump");
+    let hl = app
+        .engine
+        .state
+        .preview_highlight
+        .as_ref()
+        .expect("tree-sitter jump");
     assert_eq!(hl.row, 0, "fell back to the tree-sitter definition");
 }
 
@@ -219,9 +230,9 @@ fn vue_goto_registers_pending_jump_and_uses_cache_on_repeat() {
     let _g = CwdGuard::enter(tmp.path());
 
     let mut app = App::new(Theme::dark(), None);
-    app.active_tab = Tab::Files;
-    app.active_panel = Panel::Diff;
-    app.last_preview_view_h = 20;
+    app.engine.state.active_tab = Tab::Files;
+    app.engine.state.active_panel = Panel::Diff;
+    app.layout.last_preview_view_h = 20;
 
     let src = "<template>\n  <h1>{{ msg }}</h1>\n</template>\n\
                <script setup>\nconst msg = 'hi'\n</script>\n";
@@ -231,14 +242,17 @@ fn vue_goto_registers_pending_jump_and_uses_cache_on_repeat() {
         parsed.is_some(),
         "tree-sitter-vue parses SFCs even though queries are empty"
     );
-    app.preview_content = Some(PreviewContent {
-        path: "App.vue".to_string(),
-        body: PreviewBody::Text(TextPreview {
-            lines: src.lines().map(|s| s.to_string()).collect(),
-            highlighted: None,
-            parsed,
-        }),
-    });
+    app.engine.state.preview_content = Some(
+        PreviewContent {
+            path: "App.vue".to_string(),
+            body: PreviewBody::Text(TextPreview {
+                lines: src.lines().map(|s| s.to_string()).collect(),
+                highlighted: None,
+                parsed,
+            }),
+        }
+        .into(),
+    );
     // Cursor anywhere in `<script>` — the raw_text region.
     let mut sel = PreviewSelection::new((4, 6));
     sel.active = (4, 6);
@@ -250,6 +264,8 @@ fn vue_goto_registers_pending_jump_and_uses_cache_on_repeat() {
     // The LSP-only path registers a pending jump rather than
     // attempting tree-sitter resolution.
     let pending = app
+        .engine
+        .state
         .nav_pending_lsp_jump
         .as_ref()
         .expect("Vue should route to LSP-only pending-jump path");
@@ -264,8 +280,8 @@ fn vue_goto_registers_pending_jump_and_uses_cache_on_repeat() {
     // Pre-seed the refine cache with what an LSP response would have
     // written. Next click at the same (line, col) must take the cache
     // fast-path: no new pending jump.
-    app.nav_pending_lsp_jump = None;
-    app.nav_refine_cache.insert(
+    app.engine.state.nav_pending_lsp_jump = None;
+    app.engine.state.nav_refine_cache.insert(
         (NavLang::Vue, cache_key_first.clone()),
         reef_core::nav::LspLocation {
             path: std::path::PathBuf::from("App.vue"),
@@ -276,11 +292,11 @@ fn vue_goto_registers_pending_jump_and_uses_cache_on_repeat() {
     );
     app.goto_definition_at_cursor(NavAnchor::Keyboard);
     assert!(
-        app.nav_pending_lsp_jump.is_none(),
+        app.engine.state.nav_pending_lsp_jump.is_none(),
         "cache hit shouldn't issue a fresh LSP request"
     );
     assert!(
-        app.preview_highlight.is_some(),
+        app.engine.state.preview_highlight.is_some(),
         "cache hit should jump to the cached location"
     );
 }
@@ -297,7 +313,7 @@ fn lsp_state_crashed_drops_pending_jump() {
     let _g = CwdGuard::enter(tmp.path());
     let mut app = App::new(Theme::dark(), None);
 
-    app.nav_pending_lsp_jump = Some(NavPendingJump {
+    app.engine.state.nav_pending_lsp_jump = Some(NavPendingJump {
         lang: NavLang::Vue,
         cache_key: "App.vue:1:1".to_string(),
         origin: file_preview_snapshot("App.vue", 1, 1),
@@ -307,10 +323,13 @@ fn lsp_state_crashed_drops_pending_jump() {
     // A Crashed state for the SAME language clears the pending jump.
     app.handle_lsp_state_change(NavLang::Vue, LspBadge::Crashed);
     assert!(
-        app.nav_pending_lsp_jump.is_none(),
+        app.engine.state.nav_pending_lsp_jump.is_none(),
         "Crashed supervisor must drop the waiting pending jump"
     );
-    assert_eq!(app.lsp_states.get(&NavLang::Vue), Some(&LspBadge::Crashed));
+    assert_eq!(
+        app.engine.state.lsp_states.get(&NavLang::Vue),
+        Some(&LspBadge::Crashed)
+    );
 }
 
 /// A state change for a DIFFERENT language must NOT clear an unrelated
@@ -322,7 +341,7 @@ fn lsp_state_change_for_other_lang_keeps_pending() {
     let _g = CwdGuard::enter(tmp.path());
     let mut app = App::new(Theme::dark(), None);
 
-    app.nav_pending_lsp_jump = Some(NavPendingJump {
+    app.engine.state.nav_pending_lsp_jump = Some(NavPendingJump {
         lang: NavLang::Vue,
         cache_key: "App.vue:1:1".to_string(),
         origin: file_preview_snapshot("App.vue", 1, 1),
@@ -331,7 +350,7 @@ fn lsp_state_change_for_other_lang_keeps_pending() {
 
     app.handle_lsp_state_change(NavLang::Rust, LspBadge::Crashed);
     assert!(
-        app.nav_pending_lsp_jump.is_some(),
+        app.engine.state.nav_pending_lsp_jump.is_some(),
         "an unrelated language's crash must not drop a Vue pending jump"
     );
 }
@@ -342,12 +361,24 @@ fn lsp_state_map_updates_when_supervisor_changes() {
     let (mut app, _tmp, _g) = fresh_app();
     // The state map is empty by default — missing keys are interpreted
     // as `LspBadge::Off` by `nav_lsp_badge_text`.
-    assert!(!app.lsp_states.contains_key(&NavLang::Rust));
+    assert!(!app.engine.state.lsp_states.contains_key(&NavLang::Rust));
 
     // Simulating what the worker would do on a state change.
-    app.lsp_states.insert(NavLang::Rust, LspBadge::Booting);
-    assert_eq!(app.lsp_states.get(&NavLang::Rust), Some(&LspBadge::Booting));
+    app.engine
+        .state
+        .lsp_states
+        .insert(NavLang::Rust, LspBadge::Booting);
+    assert_eq!(
+        app.engine.state.lsp_states.get(&NavLang::Rust),
+        Some(&LspBadge::Booting)
+    );
 
-    app.lsp_states.insert(NavLang::Rust, LspBadge::Ready);
-    assert_eq!(app.lsp_states.get(&NavLang::Rust), Some(&LspBadge::Ready));
+    app.engine
+        .state
+        .lsp_states
+        .insert(NavLang::Rust, LspBadge::Ready);
+    assert_eq!(
+        app.engine.state.lsp_states.get(&NavLang::Rust),
+        Some(&LspBadge::Ready)
+    );
 }

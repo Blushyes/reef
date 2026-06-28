@@ -8,7 +8,7 @@
 //! mouse. Same panel-wide fallthrough close zone keeps stray clicks
 //! from leaking through to the preview underneath.
 
-use crate::app::App;
+use crate::TuiApp as App;
 use crate::ui::mouse::ClickAction;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -23,7 +23,7 @@ use unicode_width::UnicodeWidthStr;
 const MAX_ROW_TEXT_W: u16 = 80;
 
 pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
-    let Some(popup) = app.nav_candidates.as_ref() else {
+    let Some(popup) = app.engine.nav_candidates() else {
         return;
     };
     if popup.candidates.is_empty() {

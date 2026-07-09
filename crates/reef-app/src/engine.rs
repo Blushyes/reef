@@ -3,8 +3,8 @@ use std::time::Instant;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::TryRecvError;
 
+use crossbeam_channel::TryRecvError;
 use reef_core::diff::DiffLayout;
 use reef_core::git::{FileEntry, GraphScope};
 use reef_core::preview::PreviewDocument;
@@ -30,6 +30,13 @@ pub struct ReefApp {
     state: AppState,
     effects: Vec<AppEffect>,
     runtime_events: Vec<AppRuntimeEvent>,
+}
+
+#[derive(Debug, Default)]
+pub struct AppStepOutcome {
+    pub changed: bool,
+    pub runtime_events: Vec<AppRuntimeEvent>,
+    pub next_deadline: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -429,6 +436,9 @@ impl ReefApp {
             }
             AppCommand::ToggleFileTreeExpand(idx) => {
                 self.state.toggle_file_tree_expand_and_refresh(idx);
+            }
+            AppCommand::ToggleFileTreeExpandPath(path) => {
+                self.state.toggle_file_tree_expand_path_and_refresh(&path);
             }
             AppCommand::ActivateFileTreeEntryAtIndex(idx) => {
                 self.state.activate_file_tree_entry_at_index(idx);
@@ -1256,51 +1266,68 @@ impl ReefApp {
         dispatch_outcome
     }
 
-    pub fn tick(&mut self, now: Instant, options: TickOptions) {
+    pub fn step(&mut self, now: Instant, options: TickOptions) -> AppStepOutcome {
+        let mut changed = self.state.has_step_work_due(now) || !self.runtime_events.is_empty();
         loop {
             match self.state.tasks.try_recv() {
-                Ok(result) => match result {
-                    WorkerResult::Preview { generation, result } => {
-                        self.runtime_events
-                            .push(AppRuntimeEvent::PreviewResultForAdapter { generation, result });
-                    }
-                    WorkerResult::LspRefineDone {
-                        generation,
-                        epoch,
-                        lang,
-                        identifier,
-                        rel_location,
-                        server_returned_location,
-                    } => {
-                        if let Some(outcome) = self.apply_lsp_refine_done_command(
+                Ok(result) => {
+                    changed = true;
+                    match result {
+                        WorkerResult::Preview { generation, result } => {
+                            self.runtime_events
+                                .push(AppRuntimeEvent::PreviewResultForAdapter {
+                                    generation,
+                                    result,
+                                });
+                        }
+                        WorkerResult::LspRefineDone {
                             generation,
                             epoch,
                             lang,
                             identifier,
                             rel_location,
                             server_returned_location,
-                        ) {
-                            self.runtime_events
-                                .push(AppRuntimeEvent::LspRefineJump(outcome));
+                        } => {
+                            if let Some(outcome) = self.apply_lsp_refine_done_command(
+                                generation,
+                                epoch,
+                                lang,
+                                identifier,
+                                rel_location,
+                                server_returned_location,
+                            ) {
+                                self.runtime_events
+                                    .push(AppRuntimeEvent::LspRefineJump(outcome));
+                            }
+                        }
+                        result => {
+                            let events = self.state.apply_worker_result_core(result, now);
+                            self.runtime_events.extend(events);
                         }
                     }
-                    result => {
-                        let events = self.state.apply_worker_result_core(result, now);
-                        self.runtime_events.extend(events);
-                    }
-                },
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
             }
         }
         self.state.maybe_kick_global_search(now);
-        self.state.drain_fs_watcher_events();
+        if self.state.drain_fs_watcher_events() {
+            changed = true;
+        }
         if self.state.nav_workspace_load.should_request() {
+            changed = true;
             self.state.dispatch_nav_workspace_build();
         }
         self.state.drain_preview_schedule(now, options);
         self.state.drain_prefetch_schedule(now, options);
         self.state.kick_active_tab_work(now, options);
+        let runtime_events = std::mem::take(&mut self.runtime_events);
+        changed |= !runtime_events.is_empty();
+        AppStepOutcome {
+            changed,
+            runtime_events,
+            next_deadline: self.state.next_deadline(),
+        }
     }
 
     pub fn snapshot(&self) -> AppSnapshot {
@@ -1364,6 +1391,14 @@ impl ReefApp {
         Arc::clone(&self.state.backend)
     }
 
+    pub fn worker_wake_receiver(&self) -> crossbeam_channel::Receiver<()> {
+        self.state.tasks.worker_wake_receiver()
+    }
+
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.state.next_deadline()
+    }
+
     pub fn confirm_request(&self) -> Option<&ConfirmRequest> {
         self.state.pending_confirm.as_ref()
     }
@@ -1376,6 +1411,7 @@ impl ReefApp {
         let matched = self.state.quick_open.matches.get(match_idx)?;
         let candidate = self.state.quick_open.index.get(matched.idx)?;
         Some(QuickOpenRowSnapshot {
+            path: candidate.rel_path.clone(),
             display: candidate.display.clone(),
             indices: matched.indices.clone(),
         })

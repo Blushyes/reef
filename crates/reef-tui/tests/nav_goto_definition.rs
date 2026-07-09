@@ -39,6 +39,9 @@ fn install_rust_preview(app: &mut App, path: &str, src: &str) {
     app.engine.state.preview_content = Some(
         PreviewContent {
             path: path.to_string(),
+            local_path: None,
+            bytes_on_disk: src.len() as u64,
+            mime: Some("text/plain".into()),
             body: PreviewBody::Text(TextPreview {
                 lines: src.lines().map(|s| s.to_string()).collect(),
                 highlighted: None,
@@ -218,6 +221,9 @@ fn goto_definition_on_unknown_extension_is_noop() {
     app.engine.state.preview_content = Some(
         PreviewContent {
             path: "scratch.txt".to_string(),
+            local_path: None,
+            bytes_on_disk: 14,
+            mime: Some("text/plain".into()),
             body: PreviewBody::Text(TextPreview {
                 lines: vec!["fn helper() {}".to_string()],
                 highlighted: None,

@@ -215,6 +215,7 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
                     .map(|entry| DirEntryDto {
                         name: entry.name,
                         is_dir: entry.is_dir,
+                        has_children: entry.has_children,
                     })
                     .collect::<Vec<_>>(),
             )

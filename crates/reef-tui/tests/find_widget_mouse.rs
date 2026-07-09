@@ -33,6 +33,9 @@ fn fresh_app() -> (App, TempDir, CwdGuard) {
     app.engine.state.preview_content = Some(
         PreviewContent {
             path: "scratch.txt".to_string(),
+            local_path: None,
+            bytes_on_disk: 35,
+            mime: Some("text/plain".into()),
             body: PreviewBody::Text(TextPreview {
                 lines: vec![
                     "foo bar baz".to_string(),
@@ -143,6 +146,9 @@ fn match_case_toggle_flips_and_rematches() {
     app.engine.state.preview_content = Some(
         PreviewContent {
             path: "scratch.txt".to_string(),
+            local_path: None,
+            bytes_on_disk: 11,
+            mime: Some("text/plain".into()),
             body: PreviewBody::Text(TextPreview {
                 lines: vec!["Bar bar BAR".to_string()],
                 highlighted: None,
@@ -174,6 +180,9 @@ fn whole_word_toggle_flips_and_filters_matches() {
     app.engine.state.preview_content = Some(
         PreviewContent {
             path: "scratch.txt".to_string(),
+            local_path: None,
+            bytes_on_disk: 21,
+            mime: Some("text/plain".into()),
             body: PreviewBody::Text(TextPreview {
                 lines: vec!["foo food foobar foo!".to_string()],
                 highlighted: None,
@@ -207,6 +216,9 @@ fn regex_toggle_reinterprets_query() {
     app.engine.state.preview_content = Some(
         PreviewContent {
             path: "scratch.txt".to_string(),
+            local_path: None,
+            bytes_on_disk: 13,
+            mime: Some("text/plain".into()),
             body: PreviewBody::Text(TextPreview {
                 lines: vec!["abc 12 d345 ef".to_string()],
                 highlighted: None,

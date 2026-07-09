@@ -503,6 +503,9 @@ impl Backend for RemoteBackend {
         {
             return Some(PreviewContent {
                 path: rel_str,
+                local_path: None,
+                bytes_on_disk: dto.bytes_on_disk,
+                mime: Some("application/vnd.sqlite3".into()),
                 body: PreviewBody::Database(database_info_v2_from_dto(dto)),
             });
         }
@@ -521,6 +524,9 @@ impl Backend for RemoteBackend {
         if raw.is_empty() {
             return Some(PreviewContent {
                 path: rel_str,
+                local_path: None,
+                bytes_on_disk,
+                mime: None,
                 body: PreviewBody::Binary(BinaryInfo::new(0, None, BinaryReason::Empty)),
             });
         }
@@ -529,10 +535,14 @@ impl Backend for RemoteBackend {
         if raw[..check_len].contains(&0) {
             return Some(PreviewContent {
                 path: rel_str,
-                body: PreviewBody::Binary(BinaryInfo::new(
+                local_path: None,
+                bytes_on_disk,
+                mime: None,
+                body: PreviewBody::Binary(BinaryInfo::with_head_bytes(
                     bytes_on_disk,
                     None,
                     BinaryReason::NullBytes,
+                    &raw,
                 )),
             });
         }
@@ -552,6 +562,9 @@ impl Backend for RemoteBackend {
         {
             return Some(PreviewContent {
                 path: rel_str,
+                local_path: None,
+                bytes_on_disk,
+                mime: Some("text/markdown".into()),
                 body: PreviewBody::Markdown(markdown),
             });
         }
@@ -579,6 +592,9 @@ impl Backend for RemoteBackend {
 
         Some(PreviewContent {
             path: rel_str,
+            local_path: None,
+            bytes_on_disk,
+            mime: None,
             body: PreviewBody::Text(TextPreview {
                 lines,
                 highlighted,
@@ -596,6 +612,7 @@ impl Backend for RemoteBackend {
             .map(|entry| crate::DirEntry {
                 name: entry.name,
                 is_dir: entry.is_dir,
+                has_children: entry.has_children,
             })
             .collect())
     }
@@ -1188,6 +1205,7 @@ fn walk_remote(
             name: entry.name,
             depth,
             is_dir: entry.is_dir,
+            has_children: entry.has_children,
             is_expanded,
             git_status,
         });

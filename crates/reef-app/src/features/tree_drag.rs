@@ -134,6 +134,13 @@ impl TreeDragState {
         }
     }
 
+    pub fn auto_expand_deadline(&self) -> Option<Instant> {
+        match (self.hover_idx, self.hover_since) {
+            (Some(_), Some(t)) => Some(t + HOVER_EXPAND_DELAY),
+            _ => None,
+        }
+    }
+
     pub fn clear_hover_timer(&mut self) {
         self.hover_since = None;
     }

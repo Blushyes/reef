@@ -15,6 +15,7 @@ infer = { version = "0.16", default-features = false }
 pulldown-cmark = { version = "0.13.4", default-features = false }
 reef-sqlite-preview = { path = "../reef-sqlite-preview" }
 regex = "1"
+serde = { workspace = true }
 serde_json = { workspace = true }
 syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
 tree-sitter = "0.26"

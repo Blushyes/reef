@@ -1,6 +1,71 @@
 use super::*;
 
 impl AppState {
+    pub fn next_deadline(&self) -> Option<Instant> {
+        let mut next: Option<Instant> = None;
+        push_min_deadline(&mut next, self.preview_schedule.as_ref().map(|(_, t)| *t));
+        push_min_deadline(&mut next, self.prefetch_schedule);
+        push_min_deadline(
+            &mut next,
+            self.global_search
+                .last_keystroke_at
+                .map(|t| t + GLOBAL_SEARCH_DEBOUNCE),
+        );
+        push_min_deadline(&mut next, self.global_search.preview_sync_at);
+
+        if self.active_tab == AppTab::Git
+            && self.backend.has_repo()
+            && !self.git_status_load.loading
+        {
+            push_min_deadline(&mut next, Some(self.next_git_revalidate_at));
+        }
+        if self.active_tab == AppTab::Graph && self.backend.has_repo() && !self.graph_load.loading {
+            push_min_deadline(&mut next, Some(self.next_graph_revalidate_at));
+        }
+        if self.tree_drag.active {
+            push_min_deadline(&mut next, self.tree_drag.auto_expand_deadline());
+        }
+        if self.place_mode.active && !self.file_tree_load.loading {
+            push_min_deadline(&mut next, self.place_mode.auto_expand_deadline());
+        }
+        next
+    }
+
+    pub fn has_step_work_due(&self, now: Instant) -> bool {
+        if self.next_deadline().is_some_and(|deadline| deadline <= now) {
+            return true;
+        }
+        if self.file_tree_load.should_request() || self.nav_workspace_load.should_request() {
+            return true;
+        }
+        match self.active_tab {
+            AppTab::Files => self.preview_load.should_request() && self.preview_schedule.is_none(),
+            AppTab::Git => {
+                self.git_status_load.should_request()
+                    || self.diff_load.should_request()
+                    || (self.backend.has_repo()
+                        && now >= self.next_git_revalidate_at
+                        && !self.git_status_load.loading)
+            }
+            AppTab::Graph => {
+                self.commit_detail_load.should_request()
+                    || self.commit_file_diff_load.should_request()
+                    || (!self.graph_load.loading
+                        && ((self.graph_load.stale && self.graph_load.error.is_none())
+                            || (self.backend.has_repo() && now >= self.next_graph_revalidate_at)))
+            }
+            AppTab::Search => {
+                self.preview_load.should_request()
+                    && self.preview_schedule.is_none()
+                    && self
+                        .global_search
+                        .results
+                        .get(self.global_search.core.selected_idx)
+                        .is_some()
+            }
+        }
+    }
+
     pub fn kick_active_tab_work(&mut self, now: Instant, options: TickOptions) {
         if self.file_tree_load.should_request() {
             self.refresh_file_tree();
@@ -55,7 +120,7 @@ impl AppState {
         }
     }
 
-    pub fn drain_fs_watcher_events(&mut self) {
+    pub fn drain_fs_watcher_events(&mut self) -> bool {
         let mut fs_dirty = false;
         if let Some(rx) = self.fs_watcher_rx.as_ref() {
             while rx.try_recv().is_ok() {
@@ -63,7 +128,7 @@ impl AppState {
             }
         }
         if !fs_dirty {
-            return;
+            return false;
         }
 
         self.file_tree_load.mark_stale();
@@ -74,6 +139,7 @@ impl AppState {
         self.nav_workspace_load.mark_stale();
         self.nav_refine_cache.clear();
         self.nav_refine_epoch = self.nav_refine_epoch.wrapping_add(1);
+        true
     }
 
     pub fn apply_worker_result_core(
@@ -387,5 +453,15 @@ impl AppState {
             WorkerResult::Preview { .. } | WorkerResult::LspRefineDone { .. } => {}
         }
         events
+    }
+}
+
+fn push_min_deadline(target: &mut Option<Instant>, candidate: Option<Instant>) {
+    let Some(candidate) = candidate else {
+        return;
+    };
+    match target {
+        Some(current) if *current <= candidate => {}
+        _ => *target = Some(candidate),
     }
 }

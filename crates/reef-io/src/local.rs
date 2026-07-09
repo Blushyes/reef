@@ -322,13 +322,13 @@ impl Backend for LocalBackend {
         dark: bool,
         wants_decoded_image: bool,
     ) -> Option<PreviewContent> {
-        // Build the cache key from a single `metadata()` call — cheaper
-        // than `file_tree::load_preview`'s full `File::open + read
-        // header + decode` path, so the lookup is effectively free on
-        // hits. On cache miss (fresh file or changed mtime/size) we
-        // fall through to the decoder.
-        let full = self.workdir.join(rel_path);
-        let meta = std::fs::metadata(&full).ok();
+        let canon_root = self.canonical_workdir().ok()?;
+        let canon_target = canonical_child_within(canon_root, rel_path).ok()?;
+
+        // Build the cache key from the canonical target metadata. This keeps
+        // cache identity and native-renderer resource paths on the same
+        // symlink-safe boundary as the actual preview read.
+        let meta = std::fs::metadata(&canon_target).ok();
         let key = PreviewCacheKey {
             rel_path: rel_path.to_path_buf(),
             mtime_ns: meta.as_ref().and_then(|m| {
@@ -349,17 +349,13 @@ impl Backend for LocalBackend {
             }
         }
 
-        // Symlink-escape gate only fires on cache miss — hits return
-        // content we already validated on a prior read, so no fresh
-        // filesystem traversal is about to happen. `file_tree::load_preview`
-        // below does a raw `File::open` that follows symlinks without
-        // any boundary check, so without this gate a workdir-relative
-        // symlink could exfiltrate arbitrary files.
-        let canon_root = self.canonical_workdir().ok()?;
-        canonical_child_within(canon_root, rel_path).ok()?;
-
-        let fresh =
-            reef_core::preview::load_preview(&self.workdir, rel_path, dark, wants_decoded_image)?;
+        let mut fresh = reef_core::preview::load_preview_from_path(
+            &canon_target,
+            rel_path,
+            dark,
+            wants_decoded_image,
+        )?;
+        fresh.local_path = Some(canon_target);
 
         if let Ok(mut cache) = self.preview_cache.lock() {
             cache.put(key, fresh.clone());
@@ -376,8 +372,14 @@ impl Backend for LocalBackend {
         for entry in std::fs::read_dir(&abs).map_err(|e| BackendError::Io(e.to_string()))? {
             let entry = entry.map_err(|e| BackendError::Io(e.to_string()))?;
             let name = entry.file_name().to_string_lossy().to_string();
-            let is_dir = entry.path().is_dir();
-            entries.push(crate::DirEntry { name, is_dir });
+            let path = entry.path();
+            let is_dir = path.is_dir();
+            let has_children = is_dir && dir_has_visible_child(&path);
+            entries.push(crate::DirEntry {
+                name,
+                is_dir,
+                has_children,
+            });
         }
         entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
             (true, false) => std::cmp::Ordering::Less,
@@ -743,7 +745,7 @@ fn walk_dir(
     out: &mut Vec<TreeEntry>,
     depth: usize,
 ) {
-    let mut children: Vec<(String, PathBuf, bool)> = Vec::new();
+    let mut children: Vec<(String, PathBuf, bool, bool)> = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => return,
@@ -756,7 +758,8 @@ fn walk_dir(
         }
         let path = entry.path();
         let is_dir = path.is_dir();
-        children.push((name, path, is_dir));
+        let has_children = is_dir && dir_has_visible_child(&path);
+        children.push((name, path, is_dir, has_children));
     }
 
     children.sort_by(|a, b| match (a.2, b.2) {
@@ -765,7 +768,7 @@ fn walk_dir(
         _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
     });
 
-    for (name, full_path, is_dir) in children {
+    for (name, full_path, is_dir, has_children) in children {
         let rel = full_path
             .strip_prefix(root)
             .unwrap_or(&full_path)
@@ -779,6 +782,7 @@ fn walk_dir(
             name,
             depth,
             is_dir,
+            has_children,
             is_expanded,
             git_status,
         });
@@ -787,6 +791,16 @@ fn walk_dir(
             walk_dir(root, &full_path, expanded, git_statuses, out, depth + 1);
         }
     }
+}
+
+fn dir_has_visible_child(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy() != ".git")
+        })
+        .unwrap_or(false)
 }
 
 /// Recursive directory copy, DFS walk. Mirrors the legacy helper in
@@ -1074,4 +1088,30 @@ fn clip_range(range: std::ops::Range<usize>, max_end: usize) -> Option<std::ops:
     }
     let end = range.end.min(max_end);
     Some(range.start..end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn build_entries_marks_only_non_empty_dirs_as_having_children() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("empty")).unwrap();
+        std::fs::create_dir_all(temp.path().join("non-empty")).unwrap();
+        std::fs::write(temp.path().join("non-empty").join("child.txt"), "x").unwrap();
+
+        let entries = build_entries(temp.path(), &HashSet::new(), &HashMap::new());
+        let empty = entries.iter().find(|entry| entry.name == "empty").unwrap();
+        let non_empty = entries
+            .iter()
+            .find(|entry| entry.name == "non-empty")
+            .unwrap();
+
+        assert!(empty.is_dir);
+        assert!(!empty.has_children);
+        assert!(non_empty.is_dir);
+        assert!(non_empty.has_children);
+    }
 }

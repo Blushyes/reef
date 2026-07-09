@@ -2353,6 +2353,7 @@ dependencies = [
 name = "reef-app"
 version = "0.41.0"
 dependencies = [
+ "crossbeam-channel",
  "grep-matcher",
  "grep-regex",
  "reef-core",
@@ -2377,6 +2378,7 @@ dependencies = [
  "reef-sqlite-preview",
  "regex",
  "rusqlite",
+ "serde",
  "serde_json",
  "syntect",
  "tempfile",

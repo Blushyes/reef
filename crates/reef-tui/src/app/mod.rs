@@ -2455,9 +2455,8 @@ impl App {
     /// mouse drag autoscroll.
     pub fn tick(&mut self) {
         let now = Instant::now();
-        self.engine.tick(now, self.tick_options());
-        let events = self.engine.drain_runtime_events();
-        self.apply_runtime_events(events);
+        let outcome = self.engine.step(now, self.tick_options());
+        self.apply_runtime_events(outcome.runtime_events);
 
         // VSCode "Reveal" fade — clear `preview_highlight` after
         // `PREVIEW_HIGHLIGHT_TTL` so the highlight doesn't linger
@@ -2721,9 +2720,13 @@ mod tests {
     #[test]
     fn markdown_link_targets_resolve_from_preview_directory() {
         let mut fx = make_scope_fixture();
+        fx.app.engine.state.preview_content_generation = 1;
         fx.app.engine.state.preview_content = Some(
             PreviewContent {
                 path: "docs/guide/index.md".into(),
+                local_path: None,
+                bytes_on_disk: 0,
+                mime: Some("text/markdown".into()),
                 body: PreviewBody::Text(reef_core::preview::TextPreview {
                     lines: vec![],
                     highlighted: None,

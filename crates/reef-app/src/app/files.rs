@@ -24,6 +24,12 @@ impl AppState {
         self.refresh_file_tree_with_target(self.file_tree.selected_path());
     }
 
+    pub fn toggle_file_tree_expand_path_and_refresh(&mut self, path: &Path) {
+        if self.file_tree.toggle_expand_by_path(path) {
+            self.refresh_file_tree_with_target(self.file_tree.selected_path());
+        }
+    }
+
     pub fn activate_selected_file_tree_entry(&mut self) {
         let idx = self.file_tree.selected;
         let Some(entry) = self.file_tree.entries.get(idx).cloned() else {

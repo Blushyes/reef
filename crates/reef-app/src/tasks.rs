@@ -2,7 +2,7 @@
 //!
 //! UI code should render cached snapshots only. Anything that can touch git,
 //! the filesystem, diff generation, or syntax highlighting is routed through
-//! these workers and merged back into `App` from `tick()`.
+//! these workers and merged back into `ReefApp` from `step()`.
 
 use crate::app::{
     CommitFileDiff, DiffHighlighted, GLOBAL_SEARCH_MAX_LINE_CHARS, GLOBAL_SEARCH_MAX_RESULTS,
@@ -20,8 +20,9 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::thread;
+
+use crossbeam_channel as mpsc;
 
 #[derive(Debug)]
 pub struct GitStatusPayload {
@@ -688,16 +689,36 @@ pub struct TaskCoordinator {
     git_tx: mpsc::Sender<GitTask>,
     graph_tx: mpsc::Sender<GraphTask>,
     global_search_tx: mpsc::Sender<GlobalSearchTask>,
-    result_tx: mpsc::Sender<WorkerResult>,
+    result_tx: WorkerResultSender,
     /// LSP worker. Holds the per-language `LspClient`s +
     /// spawn-failure backoff.
     lsp_tx: mpsc::Sender<LspTask>,
     result_rx: mpsc::Receiver<WorkerResult>,
+    worker_wake_rx: mpsc::Receiver<()>,
+}
+
+#[derive(Clone)]
+struct WorkerResultSender {
+    result_tx: mpsc::Sender<WorkerResult>,
+    worker_wake_tx: mpsc::Sender<()>,
+}
+
+impl WorkerResultSender {
+    fn send(&self, result: WorkerResult) -> Result<(), ()> {
+        self.result_tx.send(result).map_err(|_| ())?;
+        let _ = self.worker_wake_tx.try_send(());
+        Ok(())
+    }
 }
 
 impl TaskCoordinator {
     pub fn new() -> Self {
-        let (result_tx, result_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::unbounded();
+        let (worker_wake_tx, worker_wake_rx) = mpsc::bounded(1);
+        let result_tx = WorkerResultSender {
+            result_tx,
+            worker_wake_tx,
+        };
         Self {
             files_tx: spawn_files_worker(result_tx.clone()),
             preview_tx: spawn_preview_worker(result_tx.clone()),
@@ -707,6 +728,7 @@ impl TaskCoordinator {
             lsp_tx: spawn_lsp_worker(result_tx.clone()),
             result_tx,
             result_rx,
+            worker_wake_rx,
         }
     }
 
@@ -751,6 +773,10 @@ impl TaskCoordinator {
 
     pub fn try_recv(&self) -> Result<WorkerResult, mpsc::TryRecvError> {
         self.result_rx.try_recv()
+    }
+
+    pub fn worker_wake_receiver(&self) -> mpsc::Receiver<()> {
+        self.worker_wake_rx.clone()
     }
 
     pub fn rebuild_tree(
@@ -1003,7 +1029,7 @@ impl TaskCoordinator {
     /// Dispatch a global replace batch to the files worker. The caller
     /// owns generation bookkeeping — see `App::commit_replace_in_files`
     /// for the canonical pattern: `replace_load.begin()` produces the
-    /// generation, `complete_ok` consumes it, and `App::tick` drops
+    /// generation, `complete_ok` consumes it, and `ReefApp::step` drops
     /// stale results whose `generation` no longer matches.
     pub fn replace_in_files(
         &self,
@@ -1174,8 +1200,8 @@ impl TaskCoordinator {
     }
 }
 
-fn spawn_files_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<FilesTask> {
-    let (tx, rx) = mpsc::channel();
+fn spawn_files_worker(result_tx: WorkerResultSender) -> mpsc::Sender<FilesTask> {
+    let (tx, rx) = mpsc::unbounded();
     let _ = thread::Builder::new()
         .name("reef-files-worker".into())
         .spawn(move || {
@@ -1730,8 +1756,8 @@ where
         .map_err(|_| format!("preview decoder panicked on {}", rel_path.display()))
 }
 
-fn spawn_preview_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<FilesTask> {
-    let (tx, rx) = mpsc::channel();
+fn spawn_preview_worker(result_tx: WorkerResultSender) -> mpsc::Sender<FilesTask> {
+    let (tx, rx) = mpsc::unbounded();
     let _ = thread::Builder::new()
         .name("reef-preview-worker".into())
         .spawn(move || {
@@ -1805,8 +1831,8 @@ fn spawn_preview_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<F
     tx
 }
 
-fn spawn_git_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<GitTask> {
-    let (tx, rx) = mpsc::channel();
+fn spawn_git_worker(result_tx: WorkerResultSender) -> mpsc::Sender<GitTask> {
+    let (tx, rx) = mpsc::unbounded();
     let _ = thread::Builder::new()
         .name("reef-git-worker".into())
         .spawn(move || {
@@ -1924,8 +1950,8 @@ fn run_git_mutation(
     })
 }
 
-fn spawn_graph_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<GraphTask> {
-    let (tx, rx) = mpsc::channel();
+fn spawn_graph_worker(result_tx: WorkerResultSender) -> mpsc::Sender<GraphTask> {
+    let (tx, rx) = mpsc::unbounded();
     let _ = thread::Builder::new()
         .name("reef-graph-worker".into())
         .spawn(move || {
@@ -2640,15 +2666,13 @@ fn hash_ref_map(map: &HashMap<String, Vec<RefLabel>>) -> u64 {
 
 // ─── Global-search worker ───────────────────────────────────────────────────
 
-fn spawn_global_search_worker(
-    result_tx: mpsc::Sender<WorkerResult>,
-) -> mpsc::Sender<GlobalSearchTask> {
-    let (tx, rx) = mpsc::channel();
+fn spawn_global_search_worker(result_tx: WorkerResultSender) -> mpsc::Sender<GlobalSearchTask> {
+    let (tx, rx) = mpsc::unbounded();
     let _ = thread::Builder::new()
         .name("reef-global-search-worker".into())
         .spawn(move || {
             // Drain new tasks as they arrive. A task starting while the previous
-            // one is still running won't happen in practice (App::tick only
+            // one is still running won't happen in practice (`ReefApp::step` only
             // kicks off a new task after flipping the old `cancel` flag), but
             // if it did, the previous search would finish and then this one
             // would run — the old `generation` keeps its chunks from leaking.
@@ -2684,8 +2708,8 @@ fn spawn_global_search_worker(
 /// Dedicated LSP worker thread. Owns the per-language `LspClient`s
 /// and a spawn-failure backoff so a missing/broken server isn't
 /// re-spawned (with its 15s init handshake) on every single click.
-fn spawn_lsp_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<LspTask> {
-    let (tx, rx) = mpsc::channel();
+fn spawn_lsp_worker(result_tx: WorkerResultSender) -> mpsc::Sender<LspTask> {
+    let (tx, rx) = mpsc::unbounded();
     let _ = thread::Builder::new()
         .name("reef-lsp-worker".into())
         .spawn(move || {
@@ -2812,7 +2836,7 @@ fn run_global_search_via_backend(
     cancel: Arc<AtomicBool>,
     backend: &dyn Backend,
     query: &str,
-    result_tx: &mpsc::Sender<WorkerResult>,
+    result_tx: &WorkerResultSender,
 ) -> bool {
     if query.is_empty() {
         return false;
@@ -2924,7 +2948,7 @@ fn run_replace_in_files(
     query: &str,
     replace_text: &str,
     items: &[ReplaceItem],
-    result_tx: &mpsc::Sender<WorkerResult>,
+    result_tx: &WorkerResultSender,
 ) {
     let mut summary = ReplaceSummary::default();
     let total = items.len();
@@ -3542,8 +3566,8 @@ mod replace_tests {
     //! Worker-level tests for `run_replace_in_files` / `replace_one_file`.
     //! Drive `LocalBackend` against a tempdir so the same code path the
     //! UI hits in production is exercised end-to-end (read → match →
-    //! rewrite → atomic write). Uses a plain `mpsc` to capture progress
-    //! / done frames the way the App's `tick` would.
+    //! rewrite → atomic write). Uses the same worker-result sender shape
+    //! that `ReefApp::step` drains in production.
     use super::*;
     use reef_io::LocalBackend;
     use std::fs;
@@ -3556,7 +3580,12 @@ mod replace_tests {
         replace_text: &str,
         items: Vec<ReplaceItem>,
     ) -> ReplaceSummary {
-        let (tx, rx) = mpsc::channel();
+        let (result_tx, rx) = mpsc::unbounded();
+        let (worker_wake_tx, _worker_wake_rx) = mpsc::bounded(1);
+        let tx = WorkerResultSender {
+            result_tx,
+            worker_wake_tx,
+        };
         run_replace_in_files(0, backend.as_ref(), query, replace_text, &items, &tx);
         // Drain the channel — `Done` is the last frame.
         let mut summary = None;
@@ -3849,6 +3878,9 @@ mod preview_panic_guard_tests {
     fn run_preview_with_panic_guard_passes_through_some() {
         let preview = PreviewContent {
             path: "x.txt".into(),
+            local_path: None,
+            bytes_on_disk: 2,
+            mime: Some("text/plain".into()),
             body: reef_core::preview::PreviewBody::Text(reef_core::preview::TextPreview {
                 lines: vec!["hi".into()],
                 highlighted: None,

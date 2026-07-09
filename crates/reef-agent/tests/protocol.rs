@@ -154,6 +154,7 @@ fn read_dir_lists_workdir_entries() {
     commit_file(&raw, "alpha.txt", "", "init");
     write_file(&raw, "beta.txt", "");
     std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
+    std::fs::write(tmp.path().join("sub").join("child.txt"), "").unwrap();
 
     let mut agent = Agent::spawn(tmp.path());
     let resp = agent.request(Request::ReadDir { path: "".into() });
@@ -168,6 +169,12 @@ fn read_dir_lists_workdir_entries() {
     assert!(names.contains("sub"), "got names: {names:?}");
     let sub_is_dir = entries.iter().find(|e| e.name == "sub").unwrap().is_dir;
     assert!(sub_is_dir);
+    let sub_has_children = entries
+        .iter()
+        .find(|e| e.name == "sub")
+        .unwrap()
+        .has_children;
+    assert!(sub_has_children);
 
     agent.shutdown();
 }

@@ -87,7 +87,10 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 ///       AllRefs-only on whichever side ignored the field. The
 ///       install path is expected to redeploy the agent on version
 ///       mismatch so this case should be transient.
-pub const PROTOCOL_VERSION: u32 = 10;
+/// - v11: `DirEntryDto` includes `has_children` so renderer row providers
+///       can show disclosure controls only for directories that actually
+///       contain visible children.
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Encode a single envelope-level value to `writer` using the
 /// length-prefixed framing. The caller is expected to flush.
@@ -508,6 +511,7 @@ pub struct HandshakeResponse {
 pub struct DirEntryDto {
     pub name: String,
     pub is_dir: bool,
+    pub has_children: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

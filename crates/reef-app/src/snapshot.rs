@@ -1,6 +1,6 @@
 use crate::{
     AppPanel, AppState, AppTab, ConfirmRequest, ConfirmTone, GitGraphState, MatchHit, SelectedFile,
-    ViewMode, features::hosts_picker::InputMode,
+    ViewMode, features::hosts_picker::InputMode, preview_snapshot::PreviewDocumentSnapshot,
 };
 use reef_core::git::GraphScope;
 use std::path::PathBuf;
@@ -76,6 +76,7 @@ pub struct FilesPanelSnapshot {
     pub selected_path: Option<PathBuf>,
     pub preview_path: Option<String>,
     pub preview_kind: Option<PreviewKindSnapshot>,
+    pub preview: Option<PreviewDocumentSnapshot>,
     pub preview_scroll: usize,
     pub preview_h_scroll: usize,
     pub tree_load: AsyncSnapshot,
@@ -158,10 +159,12 @@ pub struct QuickOpenSnapshot {
     pub match_count: usize,
     pub recent: bool,
     pub scroll: usize,
+    pub load: AsyncSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuickOpenRowSnapshot {
+    pub path: PathBuf,
     pub display: String,
     pub indices: Vec<u32>,
 }
@@ -258,6 +261,9 @@ impl FilesPanelSnapshot {
                 .preview_content
                 .as_ref()
                 .map(|p| PreviewKindSnapshot::from_body(&p.body)),
+            preview: state.preview_content.as_ref().map(|preview| {
+                PreviewDocumentSnapshot::from_document(preview, state.preview_content_generation)
+            }),
             preview_scroll: state.preview_scroll,
             preview_h_scroll: state.preview_h_scroll,
             tree_load: AsyncSnapshot::from_state(&state.file_tree_load),
@@ -354,6 +360,7 @@ impl QuickOpenSnapshot {
             match_count: state.quick_open.matches.len(),
             recent: state.quick_open.core.filter.is_empty() && !state.quick_open.mru.is_empty(),
             scroll: state.quick_open.scroll,
+            load: AsyncSnapshot::from_state(&state.quick_open_load),
         }
     }
 }
@@ -390,6 +397,56 @@ impl GraphBranchPickerSnapshot {
             selected_idx: state.graph_branch_picker.core.selected_idx,
             row_count: state.graph_branch_picker.visible_rows().len(),
             scroll: state.graph_branch_picker.scroll,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::PathBuf, sync::Arc, time::Instant};
+
+    use reef_core::preview::{PreviewBody, PreviewDocument, TextPreview};
+    use reef_io::LocalBackend;
+
+    use super::AppSnapshot;
+    use crate::{AppPrefs, AppState, AppStateConfig};
+
+    #[test]
+    fn preview_snapshot_revision_tracks_accepted_content_generation() {
+        let backend = Arc::new(LocalBackend::open_at(PathBuf::from(".")));
+        let mut state = AppState::new(AppStateConfig {
+            backend,
+            prefs: AppPrefs::default(),
+            now: Instant::now(),
+            subscribe_fs_events: false,
+        });
+
+        let accepted_generation = state.preview_load.begin();
+        state.apply_preview_content(accepted_generation, Some(text_preview("src/main.rs")), 20);
+        let loading_generation = state.preview_load.begin();
+
+        assert_ne!(accepted_generation, loading_generation);
+        assert_eq!(
+            AppSnapshot::from_state(&state)
+                .files
+                .preview
+                .as_ref()
+                .map(|preview| preview.revision),
+            Some(accepted_generation)
+        );
+    }
+
+    fn text_preview(path: &str) -> PreviewDocument {
+        PreviewDocument {
+            path: path.to_string(),
+            local_path: None,
+            bytes_on_disk: 0,
+            mime: Some("text/rust".to_string()),
+            body: PreviewBody::Text(TextPreview {
+                lines: vec!["fn main() {}".to_string()],
+                highlighted: None,
+                parsed: None,
+            }),
         }
     }
 }

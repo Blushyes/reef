@@ -31,6 +31,9 @@ fn install_text_preview(app: &mut App, lines: &[&str]) {
     app.engine.state.preview_content = Some(
         PreviewContent {
             path: "scratch.txt".to_string(),
+            local_path: None,
+            bytes_on_disk: lines.iter().map(|line| line.len() as u64).sum(),
+            mime: Some("text/plain".into()),
             body: PreviewBody::Text(TextPreview {
                 lines: lines.iter().map(|s| s.to_string()).collect(),
                 highlighted: None,

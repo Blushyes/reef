@@ -230,6 +230,7 @@ pub struct WalkResponse {
 pub struct DirEntry {
     pub name: String,
     pub is_dir: bool,
+    pub has_children: bool,
 }
 
 /// One content-search hit, backend-side. Mirrors `global_search::MatchHit`

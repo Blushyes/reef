@@ -11,17 +11,40 @@ const MAX_TEXT_PROBE_BYTES: u64 = 10 * 1024 * 1024;
 
 pub const INITIAL_DB_PAGE_ROWS: u32 = 50;
 
+fn preview_document(
+    path: &str,
+    bytes_on_disk: u64,
+    mime: Option<&str>,
+    body: PreviewBody,
+) -> PreviewDocument {
+    PreviewDocument {
+        path: path.to_string(),
+        local_path: None,
+        bytes_on_disk,
+        mime: mime.map(str::to_string),
+        body,
+    }
+}
+
 pub fn load_preview(
     root: &Path,
     rel_path: &Path,
     dark: bool,
     wants_decoded_image: bool,
 ) -> Option<PreviewDocument> {
+    load_preview_from_path(&root.join(rel_path), rel_path, dark, wants_decoded_image)
+}
+
+pub fn load_preview_from_path(
+    full: &Path,
+    rel_path: &Path,
+    dark: bool,
+    wants_decoded_image: bool,
+) -> Option<PreviewDocument> {
     use std::io::Read;
 
-    let full = root.join(rel_path);
     let rel_str = rel_path.to_string_lossy().to_string();
-    let mut file = std::fs::File::open(&full).ok()?;
+    let mut file = std::fs::File::open(full).ok()?;
     let meta = file.metadata().ok()?;
     if !meta.is_file() {
         return None;
@@ -29,10 +52,12 @@ pub fn load_preview(
     let file_size = meta.len();
 
     if file_size == 0 {
-        return Some(PreviewDocument {
-            path: rel_str,
-            body: PreviewBody::Binary(BinaryInfo::new(0, None, BinaryReason::Empty)),
-        });
+        return Some(preview_document(
+            &rel_str,
+            file_size,
+            None,
+            PreviewBody::Binary(BinaryInfo::new(0, None, BinaryReason::Empty)),
+        ));
     }
 
     let probe_len = (file_size as usize).min(PROBE_BYTES);
@@ -46,32 +71,40 @@ pub fn load_preview(
         && reef_sqlite_preview::has_sqlite_magic(&probe)
     {
         use reef_sqlite_preview::PreviewError as SqlitePreviewError;
-        match reef_sqlite_preview::read_initial_v2(&full, INITIAL_DB_PAGE_ROWS) {
+        match reef_sqlite_preview::read_initial_v2(full, INITIAL_DB_PAGE_ROWS) {
             Ok(info) => {
-                return Some(PreviewDocument {
-                    path: rel_str,
-                    body: PreviewBody::Database(info),
-                });
+                return Some(preview_document(
+                    &rel_str,
+                    file_size,
+                    Some(SQLITE_MIME),
+                    PreviewBody::Database(info),
+                ));
             }
             Err(SqlitePreviewError::TooLarge { .. }) => {
-                return Some(PreviewDocument {
-                    path: rel_str,
-                    body: PreviewBody::Binary(BinaryInfo::new(
+                return Some(preview_document(
+                    &rel_str,
+                    file_size,
+                    Some(SQLITE_MIME),
+                    PreviewBody::Binary(BinaryInfo::with_head_bytes(
                         file_size,
                         Some(SQLITE_MIME),
                         BinaryReason::TooLarge,
+                        &probe,
                     )),
-                });
+                ));
             }
             Err(e) => {
-                return Some(PreviewDocument {
-                    path: rel_str,
-                    body: PreviewBody::Binary(BinaryInfo::new(
+                return Some(preview_document(
+                    &rel_str,
+                    file_size,
+                    Some(SQLITE_MIME),
+                    PreviewBody::Binary(BinaryInfo::with_head_bytes(
                         file_size,
                         Some(SQLITE_MIME),
                         decode_error(format!("sqlite: {e}")),
+                        &probe,
                     )),
-                });
+                ));
             }
         }
     }
@@ -80,7 +113,7 @@ pub fn load_preview(
         && mime.starts_with("image/")
     {
         return Some(load_image_preview(
-            &full,
+            full,
             &rel_str,
             file_size,
             mime,
@@ -91,28 +124,45 @@ pub fn load_preview(
     if let Some(mime) = mime
         && !mime.starts_with("text/")
     {
-        return Some(PreviewDocument {
-            path: rel_str,
-            body: PreviewBody::Binary(BinaryInfo::new(
+        return Some(preview_document(
+            &rel_str,
+            file_size,
+            Some(mime),
+            PreviewBody::Binary(BinaryInfo::with_head_bytes(
                 file_size,
                 Some(mime),
                 BinaryReason::NonImage,
+                &probe,
             )),
-        });
+        ));
     }
 
     if file_size > MAX_TEXT_PROBE_BYTES {
-        return Some(PreviewDocument {
-            path: rel_str,
-            body: PreviewBody::Binary(BinaryInfo::new(file_size, None, BinaryReason::NullBytes)),
-        });
+        return Some(preview_document(
+            &rel_str,
+            file_size,
+            mime,
+            PreviewBody::Binary(BinaryInfo::with_head_bytes(
+                file_size,
+                mime,
+                BinaryReason::TooLarge,
+                &probe,
+            )),
+        ));
     }
 
     if probe.contains(&0) {
-        return Some(PreviewDocument {
-            path: rel_str,
-            body: PreviewBody::Binary(BinaryInfo::new(file_size, None, BinaryReason::NullBytes)),
-        });
+        return Some(preview_document(
+            &rel_str,
+            file_size,
+            mime,
+            PreviewBody::Binary(BinaryInfo::with_head_bytes(
+                file_size,
+                mime,
+                BinaryReason::NullBytes,
+                &probe,
+            )),
+        ));
     }
 
     let mut raw = probe;
@@ -133,10 +183,12 @@ pub fn load_preview(
     if within_cap
         && let Some(markdown) = crate::markdown::build_markdown_preview(&rel_str, &content, dark)
     {
-        return Some(PreviewDocument {
-            path: rel_str,
-            body: PreviewBody::Markdown(markdown),
-        });
+        return Some(preview_document(
+            &rel_str,
+            file_size,
+            mime,
+            PreviewBody::Markdown(markdown),
+        ));
     }
 
     let highlighted = if within_cap {
@@ -155,14 +207,16 @@ pub fn load_preview(
         None
     };
 
-    Some(PreviewDocument {
-        path: rel_str,
-        body: PreviewBody::Text(TextPreview {
+    Some(preview_document(
+        &rel_str,
+        file_size,
+        mime,
+        PreviewBody::Text(TextPreview {
             lines,
             highlighted,
             parsed,
         }),
-    })
+    ))
 }
 
 #[cfg(test)]
@@ -427,10 +481,10 @@ mod tests {
 
         match content.body {
             PreviewBody::Binary(info) => {
-                assert!(matches!(info.reason, BinaryReason::NullBytes));
+                assert!(matches!(info.reason, BinaryReason::TooLarge));
                 assert_eq!(info.bytes_on_disk, big_size);
             }
-            other => panic!("expected Binary(NullBytes), got {other:?}"),
+            other => panic!("expected Binary(TooLarge), got {other:?}"),
         }
     }
 

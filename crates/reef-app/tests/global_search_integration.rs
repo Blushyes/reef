@@ -43,7 +43,7 @@ fn collect(coord: &TaskCoordinator, generation: u64, deadline: Duration) -> (Vec
             Ok(_) => {
                 // Other worker results from unrelated workers — ignore.
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
+            Err(crossbeam_channel::TryRecvError::Empty) => {
                 thread::sleep(Duration::from_millis(10));
             }
             Err(_) => break,
@@ -272,7 +272,7 @@ fn collect_replace(
                 return result.expect("replace failed");
             }
             Ok(_) => {}
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
+            Err(crossbeam_channel::TryRecvError::Empty) => {
                 thread::sleep(Duration::from_millis(10));
             }
             Err(_) => break,

@@ -8,6 +8,7 @@ mod effect;
 mod engine;
 mod features;
 mod location;
+mod preview_snapshot;
 mod runtime;
 mod snapshot;
 mod tab;
@@ -29,7 +30,7 @@ pub use app::{
 };
 pub use command::AppCommand;
 pub use effect::{AppEffect, Toast, ToastLevel};
-pub use engine::{AppCommandOutcome, AppConfig, ReefApp};
+pub use engine::{AppCommandOutcome, AppConfig, AppStepOutcome, ReefApp};
 pub use features::confirm::{ConfirmRequest, ConfirmTone, TreeDeleteConfirm};
 pub use features::db_preview::{DbNav, DbPreviewState, max_page_for_object};
 pub use features::file_clipboard::FileClipboard;
@@ -60,6 +61,13 @@ pub use features::tree_context_menu::{ContextMenuItem, ContextMenuState};
 pub use features::tree_drag::{DragPress, InputModifiers, TreeDragState};
 pub use features::tree_edit::{TreeEditMode, TreeEditState};
 pub use location::{CursorPosition, LocationSnapshot, LocationSurface, ScrollPosition};
+pub use preview_snapshot::{
+    DatabaseColumnSnapshot, DatabaseObjectKeySnapshot, DatabaseObjectSnapshot,
+    DatabasePageSnapshot, DatabaseSchemaSnapshot, MarkdownRoleSnapshot, MarkdownSpanSnapshot,
+    MarkdownStyleSnapshot, PreviewBodySnapshot, PreviewDetectedKindSnapshot,
+    PreviewDocumentSnapshot, PreviewSourceSnapshot, RgbSnapshot, StructuredDataFormatSnapshot,
+    StyledTokenSnapshot, TextStyleSnapshot,
+};
 pub use runtime::{AppRuntimeEvent, AsyncState, FileActionNotice};
 pub use snapshot::{
     AppSnapshot, AsyncSnapshot, FilesPanelSnapshot, GitPanelSnapshot, GlobalSearchPanelSnapshot,

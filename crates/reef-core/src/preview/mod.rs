@@ -3,15 +3,19 @@ pub mod image;
 pub mod loader;
 
 use std::borrow::Cow;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub use binary::{BinaryInfo, BinaryReason};
 pub use image::ImagePreview;
-pub use loader::{INITIAL_DB_PAGE_ROWS, load_preview};
+pub use loader::{INITIAL_DB_PAGE_ROWS, load_preview, load_preview_from_path};
 
 #[derive(Debug, Clone)]
 pub struct PreviewDocument {
     pub path: String,
+    pub local_path: Option<PathBuf>,
+    pub bytes_on_disk: u64,
+    pub mime: Option<String>,
     pub body: PreviewBody,
 }
 

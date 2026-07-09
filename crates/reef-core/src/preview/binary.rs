@@ -4,6 +4,7 @@ pub struct BinaryInfo {
     pub mime: Option<&'static str>,
     pub reason: BinaryReason,
     pub meta_line: String,
+    pub head_hex: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -23,6 +24,22 @@ impl BinaryInfo {
             mime,
             reason,
             meta_line: binary_meta_line(mime, bytes_on_disk),
+            head_hex: Vec::new(),
+        }
+    }
+
+    pub fn with_head_bytes(
+        bytes_on_disk: u64,
+        mime: Option<&'static str>,
+        reason: BinaryReason,
+        bytes: &[u8],
+    ) -> Self {
+        Self {
+            bytes_on_disk,
+            mime,
+            reason,
+            meta_line: binary_meta_line(mime, bytes_on_disk),
+            head_hex: head_hex(bytes),
         }
     }
 }
@@ -61,6 +78,23 @@ fn binary_meta_line(mime: Option<&'static str>, bytes_on_disk: u64) -> String {
     }
 }
 
+fn head_hex(bytes: &[u8]) -> Vec<String> {
+    const MAX_HEAD_BYTES: usize = 256;
+    bytes
+        .iter()
+        .take(MAX_HEAD_BYTES)
+        .collect::<Vec<_>>()
+        .chunks(16)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .map(|byte| format!("{:02x}", byte))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +109,19 @@ mod tests {
 
         assert!(message.chars().count() <= 101);
         assert!(message.ends_with('…'));
+    }
+
+    #[test]
+    fn head_hex_formats_binary_preview_in_rows() {
+        let bytes: Vec<u8> = (0..18).collect();
+        let info = BinaryInfo::with_head_bytes(18, None, BinaryReason::NonImage, &bytes);
+
+        assert_eq!(
+            info.head_hex,
+            vec![
+                "00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f".to_string(),
+                "10 11".to_string()
+            ]
+        );
     }
 }

@@ -8,6 +8,7 @@ use crate::text::TextStyle;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownPreview {
+    pub source: String,
     pub rows: Vec<Vec<MarkdownSpan>>,
     pub text_rows: Vec<String>,
 }
@@ -373,7 +374,11 @@ pub fn build_markdown_preview(path: &str, source: &str, dark: bool) -> Option<Ma
     trim_trailing_blanks(&mut rows);
 
     let text_rows = rows.iter().map(|row| row_text(row)).collect();
-    Some(MarkdownPreview { rows, text_rows })
+    Some(MarkdownPreview {
+        source: source.to_string(),
+        rows,
+        text_rows,
+    })
 }
 
 pub fn is_url_link(target: &str) -> bool {
@@ -660,6 +665,14 @@ mod tests {
         assert!(is_markdown_path("README.md"));
         assert!(is_markdown_path("notes.Markdown"));
         assert!(!is_markdown_path("notes.txt"));
+    }
+
+    #[test]
+    fn preview_keeps_raw_source() {
+        let source = "# Title\n\n<span>inline html</span>\n";
+        let md = build_markdown_preview("README.md", source, true).unwrap();
+
+        assert_eq!(md.source, source);
     }
 
     #[test]

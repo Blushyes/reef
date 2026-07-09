@@ -136,7 +136,6 @@ impl AppState {
             Err(error) => {
                 if self.preview_load.complete_err(generation, error) {
                     self.preview_load.stale = false;
-                    self.preview_load.error = None;
                     self.preview_in_flight_path = None;
                 }
                 PreviewMergeOutcome::default()
@@ -159,6 +158,7 @@ impl AppState {
             (Some(old), Some(new)) if old.path == new.path
         );
         self.preview_content = content.map(Arc::new);
+        self.preview_content_generation = generation;
         if !same_file {
             self.preview_scroll = 0;
             self.preview_h_scroll = 0;
@@ -216,6 +216,65 @@ impl AppState {
                 options.dark,
                 options.wants_decoded_image,
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::PathBuf, sync::Arc, time::Instant};
+
+    use reef_core::preview::{PreviewBody, PreviewDocument, TextPreview};
+    use reef_io::LocalBackend;
+
+    use crate::{AppPrefs, AppState, AppStateConfig};
+
+    #[test]
+    fn preview_error_keeps_previous_content_and_exposes_error() {
+        let backend = Arc::new(LocalBackend::open_at(PathBuf::from(".")));
+        let mut state = AppState::new(AppStateConfig {
+            backend,
+            prefs: AppPrefs::default(),
+            now: Instant::now(),
+            subscribe_fs_events: false,
+        });
+
+        let accepted_generation = state.preview_load.begin();
+        let outcome =
+            state.apply_preview_content(accepted_generation, Some(text_preview("src/main.rs")), 20);
+        assert!(outcome.accepted);
+
+        let failing_generation = state.preview_load.begin();
+        state.preview_in_flight_path = Some(PathBuf::from("src/broken.rs"));
+
+        let outcome =
+            state.apply_preview_result(failing_generation, Err("decoder failed".to_string()), 20);
+
+        assert!(!outcome.accepted);
+        assert_eq!(
+            state
+                .preview_content
+                .as_ref()
+                .map(|preview| preview.path.as_str()),
+            Some("src/main.rs")
+        );
+        assert_eq!(state.preview_load.error.as_deref(), Some("decoder failed"));
+        assert!(!state.preview_load.loading);
+        assert!(!state.preview_load.stale);
+        assert!(state.preview_in_flight_path.is_none());
+    }
+
+    fn text_preview(path: &str) -> PreviewDocument {
+        PreviewDocument {
+            path: path.to_string(),
+            local_path: None,
+            bytes_on_disk: 0,
+            mime: Some("text/rust".to_string()),
+            body: PreviewBody::Text(TextPreview {
+                lines: vec!["fn main() {}".to_string()],
+                highlighted: None,
+                parsed: None,
+            }),
         }
     }
 }

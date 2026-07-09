@@ -97,6 +97,7 @@ pub enum AppCommand {
         selection_changed: bool,
     },
     ToggleFileTreeExpand(usize),
+    ToggleFileTreeExpandPath(PathBuf),
     ActivateFileTreeEntryAtIndex(usize),
     ActivateSelectedFileTreeEntry,
     RequestEditSelectedFileTreeEntry,

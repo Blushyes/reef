@@ -19,6 +19,10 @@ impl FileTree {
         self.state.toggle_expand(index);
     }
 
+    pub fn toggle_expand_by_path(&mut self, path: &Path) -> bool {
+        self.state.toggle_expand_by_path(path)
+    }
+
     pub fn collapse_all(&mut self) {
         self.state.collapse_all();
     }

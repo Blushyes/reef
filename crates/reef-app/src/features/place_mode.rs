@@ -93,6 +93,13 @@ impl PlaceModeState {
             _ => None,
         }
     }
+
+    pub fn auto_expand_deadline(&self) -> Option<Instant> {
+        match (self.hover_folder_idx, self.hover_since) {
+            (Some(_), Some(t)) => Some(t + HOVER_EXPAND_DELAY),
+            _ => None,
+        }
+    }
 }
 
 /// Replace ASCII / Unicode control characters (except space) in a
@@ -204,6 +211,7 @@ mod tests {
             name: path.rsplit('/').next().unwrap_or(path).to_string(),
             depth,
             is_dir: true,
+            has_children: true,
             is_expanded: true,
             git_status: None,
         }
@@ -215,6 +223,7 @@ mod tests {
             name: path.rsplit('/').next().unwrap_or(path).to_string(),
             depth,
             is_dir: false,
+            has_children: false,
             is_expanded: false,
             git_status: None,
         }
@@ -279,6 +288,7 @@ mod tests {
                 name: "ui".into(),
                 depth: 1,
                 is_dir: true,
+                has_children: true,
                 is_expanded: false,
                 git_status: None,
             },

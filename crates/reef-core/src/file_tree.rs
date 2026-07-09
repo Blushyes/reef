@@ -9,6 +9,7 @@ pub struct TreeEntry {
     pub name: String,
     pub depth: usize,
     pub is_dir: bool,
+    pub has_children: bool,
     pub is_expanded: bool,
     pub git_status: Option<char>,
 }
@@ -50,6 +51,18 @@ impl FileTreeState {
                 self.expanded.insert(path);
             }
         }
+    }
+
+    pub fn toggle_expand_by_path(&mut self, path: &Path) -> bool {
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.path.as_path() == path && entry.is_dir)
+        else {
+            return false;
+        };
+        self.toggle_expand(index);
+        true
     }
 
     pub fn collapse_all(&mut self) {
@@ -173,9 +186,17 @@ mod tests {
             name: name.to_string(),
             depth: 0,
             is_dir: false,
+            has_children: false,
             is_expanded: false,
             git_status: None,
         }
+    }
+
+    fn dummy_dir(path: &str) -> TreeEntry {
+        let mut entry = dummy_entry(path);
+        entry.is_dir = true;
+        entry.has_children = true;
+        entry
     }
 
     #[test]
@@ -195,12 +216,29 @@ mod tests {
             name: "main.rs".into(),
             depth: 1,
             is_dir: false,
+            has_children: false,
             is_expanded: false,
             git_status: None,
         }]);
         tree.reveal(Path::new("src/main.rs"));
         assert_eq!(tree.selected, 0);
         assert!(tree.expanded.contains(&PathBuf::from("src")));
+    }
+
+    #[test]
+    fn toggle_expand_by_path_only_toggles_visible_directories() {
+        let mut tree = FileTreeState::with_entries(vec![
+            dummy_dir("src"),
+            dummy_entry("src/main.rs"),
+            dummy_entry("README.md"),
+        ]);
+
+        assert!(tree.toggle_expand_by_path(Path::new("src")));
+        assert!(tree.expanded.contains(&PathBuf::from("src")));
+        assert!(tree.toggle_expand_by_path(Path::new("src")));
+        assert!(!tree.expanded.contains(&PathBuf::from("src")));
+        assert!(!tree.toggle_expand_by_path(Path::new("README.md")));
+        assert!(!tree.toggle_expand_by_path(Path::new("missing")));
     }
 
     #[test]

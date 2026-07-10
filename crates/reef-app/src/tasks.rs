@@ -15,7 +15,7 @@ use reef_core::git::{CommitDetail, FileEntry, GraphScope, RefLabel};
 use reef_core::preview::PreviewDocument as PreviewContent;
 use reef_io::TreeEntry;
 use reef_io::{Backend, BackendError, WalkOpts};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1729,11 +1729,11 @@ fn run_paste_batch(
     (kind, result)
 }
 
-/// Dedicated worker thread for `FilesTask::LoadPreview`. Same task
-/// shape as the main files worker, but sitting on its own channel so
-/// slow preview decodes can't queue behind a big tree rebuild or a
-/// long-running copy. Non-preview tasks arriving here are silently
-/// ignored — they're never routed to `preview_tx` in practice.
+/// Dedicated worker thread for preview-adjacent file work. Keeping
+/// previews on their own channel means slow tree rebuilds or copies
+/// cannot queue in front of the file the user just selected. The worker
+/// also owns SQLite preview paging/detail tasks, so fresh `LoadPreview`
+/// requests are allowed to jump ahead of queued paging work.
 /// Run a preview decode under `catch_unwind`. A panic anywhere inside
 /// the backend codepath (image crate on a malformed PNG, syntect on a
 /// pathological file, sqlite reader on a corrupt DB, ...) becomes an
@@ -1756,12 +1756,74 @@ where
         .map_err(|_| format!("preview decoder panicked on {}", rel_path.display()))
 }
 
+fn recv_preview_worker_task(
+    rx: &mpsc::Receiver<FilesTask>,
+    backlog: &mut VecDeque<FilesTask>,
+) -> Result<FilesTask, mpsc::RecvError> {
+    let task = match backlog.pop_front() {
+        Some(task) => task,
+        None => rx.recv()?,
+    };
+    if !matches!(
+        task,
+        FilesTask::LoadPreview { .. } | FilesTask::PrefetchPreview { .. }
+    ) {
+        if let Some(load_preview) = take_pending_load_preview(rx, backlog) {
+            backlog.push_front(task);
+            return Ok(load_preview);
+        }
+    }
+    Ok(coalesce_preview_worker_task(task, rx, backlog))
+}
+
+fn take_pending_load_preview(
+    rx: &mpsc::Receiver<FilesTask>,
+    backlog: &mut VecDeque<FilesTask>,
+) -> Option<FilesTask> {
+    let mut selected = None;
+    while let Ok(task) = rx.try_recv() {
+        match task {
+            FilesTask::LoadPreview { .. } => selected = Some(task),
+            other => backlog.push_back(other),
+        }
+    }
+    selected
+}
+
+fn coalesce_preview_worker_task(
+    first: FilesTask,
+    rx: &mpsc::Receiver<FilesTask>,
+    backlog: &mut VecDeque<FilesTask>,
+) -> FilesTask {
+    let mut selected = match first {
+        FilesTask::LoadPreview { .. } | FilesTask::PrefetchPreview { .. } => first,
+        other => return other,
+    };
+
+    while let Ok(task) = rx.try_recv() {
+        match task {
+            FilesTask::LoadPreview { .. } => {
+                selected = task;
+            }
+            FilesTask::PrefetchPreview { .. } => {
+                if matches!(selected, FilesTask::PrefetchPreview { .. }) {
+                    selected = task;
+                }
+            }
+            other => backlog.push_back(other),
+        }
+    }
+
+    selected
+}
+
 fn spawn_preview_worker(result_tx: WorkerResultSender) -> mpsc::Sender<FilesTask> {
     let (tx, rx) = mpsc::unbounded();
     let _ = thread::Builder::new()
         .name("reef-preview-worker".into())
         .spawn(move || {
-            while let Ok(task) = rx.recv() {
+            let mut backlog = VecDeque::new();
+            while let Ok(task) = recv_preview_worker_task(&rx, &mut backlog) {
                 match task {
                     FilesTask::LoadPreview {
                         generation,
@@ -3890,6 +3952,141 @@ mod preview_panic_guard_tests {
         let result = run_preview_with_panic_guard(Path::new("x.txt"), move || Some(preview));
         let got = result.expect("Ok").expect("Some");
         assert_eq!(got.path, "x.txt");
+    }
+}
+
+#[cfg(test)]
+mod preview_worker_coalescing_tests {
+    use super::*;
+
+    fn backend() -> Arc<dyn Backend> {
+        Arc::new(reef_io::LocalBackend::open_at(std::env::temp_dir()))
+    }
+
+    fn load_preview(generation: u64, path: &str) -> FilesTask {
+        FilesTask::LoadPreview {
+            generation,
+            backend: backend(),
+            rel_path: PathBuf::from(path),
+            dark: false,
+            wants_decoded_image: false,
+        }
+    }
+
+    fn prefetch_preview(path: &str) -> FilesTask {
+        FilesTask::PrefetchPreview {
+            backend: backend(),
+            rel_path: PathBuf::from(path),
+            dark: false,
+            wants_decoded_image: false,
+        }
+    }
+
+    fn rebuild_tree(generation: u64) -> FilesTask {
+        FilesTask::RebuildTree {
+            generation,
+            backend: backend(),
+            expanded: Vec::new(),
+            git_statuses: HashMap::new(),
+            selected_path: None,
+            fallback_selected: 0,
+        }
+    }
+
+    fn load_db_page(generation: u64) -> FilesTask {
+        FilesTask::LoadDbPage {
+            generation,
+            backend: backend(),
+            request: DbPageRequest {
+                path: PathBuf::from("data.sqlite"),
+                key: reef_sqlite_preview::DbObjectKey {
+                    schema: "main".to_string(),
+                    name: "items".to_string(),
+                    kind: reef_sqlite_preview::DbObjectKind::Table,
+                },
+                page: 0,
+                rows_per_page: 100,
+                reset_h_scroll: false,
+            },
+        }
+    }
+
+    fn assert_load_preview(task: FilesTask, generation: u64, path: &str) {
+        match task {
+            FilesTask::LoadPreview {
+                generation: got_generation,
+                rel_path,
+                ..
+            } => {
+                assert_eq!(got_generation, generation);
+                assert_eq!(rel_path, PathBuf::from(path));
+            }
+            _ => panic!("expected LoadPreview"),
+        }
+    }
+
+    #[test]
+    fn coalescing_keeps_latest_load_preview_and_backlogs_other_work() {
+        let (tx, rx) = mpsc::unbounded();
+        let mut backlog = VecDeque::new();
+        tx.send(prefetch_preview("prefetched.md")).unwrap();
+        tx.send(load_preview(2, "latest.html")).unwrap();
+        tx.send(rebuild_tree(9)).unwrap();
+
+        let selected = coalesce_preview_worker_task(load_preview(1, "old.html"), &rx, &mut backlog);
+
+        assert_load_preview(selected, 2, "latest.html");
+        assert_eq!(backlog.len(), 1);
+        match backlog.pop_front().unwrap() {
+            FilesTask::RebuildTree { generation, .. } => assert_eq!(generation, 9),
+            _ => panic!("expected backlogged RebuildTree"),
+        }
+    }
+
+    #[test]
+    fn prefetch_does_not_replace_selected_load_preview() {
+        let (tx, rx) = mpsc::unbounded();
+        let mut backlog = VecDeque::new();
+        tx.send(prefetch_preview("neighbor.md")).unwrap();
+
+        let selected =
+            coalesce_preview_worker_task(load_preview(3, "selected.md"), &rx, &mut backlog);
+
+        assert_load_preview(selected, 3, "selected.md");
+        assert!(backlog.is_empty());
+    }
+
+    #[test]
+    fn pending_load_preview_jumps_ahead_of_backlogged_non_preview_work() {
+        let (tx, rx) = mpsc::unbounded();
+        let mut backlog = VecDeque::from([rebuild_tree(11)]);
+        tx.send(load_preview(4, "clicked.html")).unwrap();
+
+        let selected = recv_preview_worker_task(&rx, &mut backlog).unwrap();
+
+        assert_load_preview(selected, 4, "clicked.html");
+        assert_eq!(backlog.len(), 1);
+        match backlog.pop_front().unwrap() {
+            FilesTask::RebuildTree { generation, .. } => assert_eq!(generation, 11),
+            _ => panic!("expected RebuildTree to stay queued"),
+        }
+    }
+
+    #[test]
+    fn pending_load_preview_jumps_ahead_of_received_db_page() {
+        let (tx, rx) = mpsc::unbounded();
+        let mut backlog = VecDeque::new();
+        tx.send(load_db_page(12)).unwrap();
+        tx.send(load_preview(5, "clicked.html")).unwrap();
+
+        let selected = recv_preview_worker_task(&rx, &mut backlog).unwrap();
+
+        assert_load_preview(selected, 5, "clicked.html");
+        assert_eq!(backlog.len(), 1);
+        match backlog.pop_front().unwrap() {
+            FilesTask::LoadDbPage { generation, .. } => assert_eq!(generation, 12),
+            _ => panic!("expected LoadDbPage to stay queued"),
+        }
     }
 }
 

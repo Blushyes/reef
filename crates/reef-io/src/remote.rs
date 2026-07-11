@@ -471,12 +471,7 @@ impl Backend for RemoteBackend {
         Ok(out)
     }
 
-    fn load_preview(
-        &self,
-        rel_path: &Path,
-        dark: bool,
-        _wants_decoded_image: bool,
-    ) -> Option<PreviewContent> {
+    fn load_preview(&self, rel_path: &Path, _wants_decoded_image: bool) -> Option<PreviewContent> {
         // Fetch bytes over RPC and rebuild a `PreviewContent`. `PreviewBody`'s
         // `Image` variant carries a decoded `DynamicImage` that isn't serde-
         // shippable, so for now we surface every binary (image or otherwise)
@@ -557,8 +552,7 @@ impl Backend for RemoteBackend {
 
         let within_cap = raw.len() <= 512 * 1024 && lines.len() <= 5_000;
         if within_cap
-            && let Some(markdown) =
-                reef_core::markdown::build_markdown_preview(&rel_str, &content, dark)
+            && let Some(markdown) = reef_core::markdown::build_markdown_preview(&rel_str, &content)
         {
             return Some(PreviewContent {
                 path: rel_str,
@@ -569,27 +563,6 @@ impl Backend for RemoteBackend {
             });
         }
 
-        let highlighted = if within_cap {
-            reef_core::highlight::highlight_file(&rel_str, &lines, dark)
-        } else {
-            None
-        };
-
-        // SSH mode: tree-sitter still runs locally because file bytes have
-        // already crossed the SSH boundary into `raw`. The result is
-        // intra-file `gd` parity with local mode. Cross-file workspace index
-        // and LSP remain local-only and gate on `Backend::is_remote()`.
-        let parsed = if within_cap {
-            let path_buf = std::path::PathBuf::from(&rel_str);
-            reef_core::nav::NavLang::from_path(&path_buf).and_then(|lang| {
-                let source: std::sync::Arc<[u8]> =
-                    std::sync::Arc::from(raw.clone().into_boxed_slice());
-                reef_core::nav::parse_file_if_supported(lang, source).map(std::sync::Arc::new)
-            })
-        } else {
-            None
-        };
-
         Some(PreviewContent {
             path: rel_str,
             local_path: None,
@@ -597,8 +570,8 @@ impl Backend for RemoteBackend {
             mime: None,
             body: PreviewBody::Text(TextPreview {
                 lines,
-                highlighted,
-                parsed,
+                highlighted: None,
+                parsed: None,
             }),
         })
     }

@@ -42,7 +42,7 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
 
 - Tree structure changes (expand/collapse/reveal/fs events) may rebuild the tree through the files worker.
 - Git decorations update visible entries in place; they must not rebuild the tree by themselves.
-- Preview loads run through the `reef-app` task coordinator because they read files and may syntax-highlight.
+- Preview loads run through the `reef-app` task coordinator. The preview worker publishes the base document first; only after that result is accepted does a separate enrichment worker add syntax highlighting and tree-sitter data. Renderers must accept the plain snapshot immediately and treat enrichment as an in-place revision update. Adapter actions that need enrichment, such as TUI code navigation or deferred UTF-16 highlights, must retain a generation/path-bound intent and retry it from `RetryDeferredPreviewActions`; they must not discard the input while the enrichment request is pending.
 
 ### Git
 

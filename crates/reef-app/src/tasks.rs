@@ -12,7 +12,7 @@ use reef_core::diff::DiffContent;
 use reef_core::file_ops::Resolution;
 use reef_core::git::graph::GraphRow;
 use reef_core::git::{CommitDetail, FileEntry, GraphScope, RefLabel};
-use reef_core::preview::PreviewDocument as PreviewContent;
+use reef_core::preview::{PreviewBody, PreviewDocument as PreviewContent, PreviewEnrichment};
 use reef_io::TreeEntry;
 use reef_io::{Backend, BackendError, WalkOpts};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -156,6 +156,11 @@ pub enum WorkerResult {
     Preview {
         generation: u64,
         result: Result<Option<PreviewContent>, String>,
+    },
+    PreviewEnrichmentFinished {
+        generation: u64,
+        path: String,
+        enrichment: Option<PreviewEnrichment>,
     },
     DbPage {
         generation: u64,
@@ -415,7 +420,6 @@ enum FilesTask {
         generation: u64,
         backend: Arc<dyn Backend>,
         rel_path: PathBuf,
-        dark: bool,
         wants_decoded_image: bool,
     },
     LoadDbPage {
@@ -442,7 +446,6 @@ enum FilesTask {
     PrefetchPreview {
         backend: Arc<dyn Backend>,
         rel_path: PathBuf,
-        dark: bool,
         wants_decoded_image: bool,
     },
     PlanTreeEdit {
@@ -559,6 +562,23 @@ enum FilesTask {
         /// Replacement string. Empty allowed (deletes the matched span).
         replace_text: String,
         items: Vec<ReplaceItem>,
+    },
+}
+
+struct PreviewEnrichmentTask {
+    generation: u64,
+    path: String,
+    input: PreviewEnrichmentInput,
+    dark: bool,
+}
+
+enum PreviewEnrichmentInput {
+    Text {
+        bytes_on_disk: u64,
+        lines: Vec<String>,
+    },
+    Markdown {
+        source: String,
     },
 }
 
@@ -686,6 +706,7 @@ pub struct TaskCoordinator {
     /// clicked. Both threads can hit the `LocalBackend` preview cache
     /// safely via the internal `Mutex`.
     preview_tx: mpsc::Sender<FilesTask>,
+    preview_enrichment_tx: mpsc::Sender<PreviewEnrichmentTask>,
     git_tx: mpsc::Sender<GitTask>,
     graph_tx: mpsc::Sender<GraphTask>,
     global_search_tx: mpsc::Sender<GlobalSearchTask>,
@@ -722,6 +743,7 @@ impl TaskCoordinator {
         Self {
             files_tx: spawn_files_worker(result_tx.clone()),
             preview_tx: spawn_preview_worker(result_tx.clone()),
+            preview_enrichment_tx: spawn_preview_enrichment_worker(result_tx.clone()),
             git_tx: spawn_git_worker(result_tx.clone()),
             graph_tx: spawn_graph_worker(result_tx.clone()),
             global_search_tx: spawn_global_search_worker(result_tx.clone()),
@@ -803,7 +825,6 @@ impl TaskCoordinator {
         generation: u64,
         backend: Arc<dyn Backend>,
         rel_path: PathBuf,
-        dark: bool,
         wants_decoded_image: bool,
     ) {
         // Route to the dedicated preview worker so an in-flight tree
@@ -813,7 +834,6 @@ impl TaskCoordinator {
             generation,
             backend,
             rel_path,
-            dark,
             wants_decoded_image,
         });
     }
@@ -855,15 +875,20 @@ impl TaskCoordinator {
         &self,
         backend: Arc<dyn Backend>,
         rel_path: PathBuf,
-        dark: bool,
         wants_decoded_image: bool,
     ) {
         let _ = self.preview_tx.send(FilesTask::PrefetchPreview {
             backend,
             rel_path,
-            dark,
             wants_decoded_image,
         });
+    }
+
+    pub fn enrich_preview(&self, generation: u64, content: &PreviewContent, dark: bool) -> bool {
+        let Some(task) = preview_enrichment_task(generation, content, dark) else {
+            return false;
+        };
+        self.preview_enrichment_tx.send(task).is_ok()
     }
 
     pub fn copy_files(
@@ -1201,7 +1226,7 @@ impl TaskCoordinator {
 }
 
 fn spawn_files_worker(result_tx: WorkerResultSender) -> mpsc::Sender<FilesTask> {
-    let (tx, rx) = mpsc::unbounded();
+    let (tx, rx) = mpsc::unbounded::<FilesTask>();
     let _ = thread::Builder::new()
         .name("reef-files-worker".into())
         .spawn(move || {
@@ -1238,10 +1263,9 @@ fn spawn_files_worker(result_tx: WorkerResultSender) -> mpsc::Sender<FilesTask> 
                         generation,
                         backend,
                         rel_path,
-                        dark,
                         wants_decoded_image,
                     } => {
-                        let result = Ok(backend.load_preview(&rel_path, dark, wants_decoded_image));
+                        let result = Ok(backend.load_preview(&rel_path, wants_decoded_image));
                         let _ = result_tx.send(WorkerResult::Preview { generation, result });
                     }
                     FilesTask::CopyFiles {
@@ -1817,6 +1841,80 @@ fn coalesce_preview_worker_task(
     selected
 }
 
+fn preview_enrichment_task(
+    generation: u64,
+    content: &PreviewContent,
+    dark: bool,
+) -> Option<PreviewEnrichmentTask> {
+    let input = match &content.body {
+        PreviewBody::Text(text) => {
+            if !reef_core::preview::text_preview_can_be_enriched(
+                content.bytes_on_disk,
+                text.lines.len(),
+            ) {
+                return None;
+            }
+            PreviewEnrichmentInput::Text {
+                bytes_on_disk: content.bytes_on_disk,
+                lines: text.lines.clone(),
+            }
+        }
+        PreviewBody::Markdown(markdown) => PreviewEnrichmentInput::Markdown {
+            source: markdown.source.clone(),
+        },
+        _ => return None,
+    };
+    Some(PreviewEnrichmentTask {
+        generation,
+        path: content.path.clone(),
+        input,
+        dark,
+    })
+}
+
+fn spawn_preview_enrichment_worker(
+    result_tx: WorkerResultSender,
+) -> mpsc::Sender<PreviewEnrichmentTask> {
+    let (tx, rx) = mpsc::unbounded::<PreviewEnrichmentTask>();
+    let _ = thread::Builder::new()
+        .name("reef-preview-enrichment".into())
+        .spawn(move || {
+            reef_core::highlight::warm_up_common_syntaxes();
+            while let Ok(mut task) = rx.recv() {
+                while let Ok(newer) = rx.try_recv() {
+                    task = newer;
+                }
+                let enrichment =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match task.input {
+                        PreviewEnrichmentInput::Text {
+                            bytes_on_disk,
+                            ref lines,
+                        } => reef_core::preview::build_text_preview_enrichment(
+                            &task.path,
+                            bytes_on_disk,
+                            lines,
+                            task.dark,
+                        )
+                        .map(PreviewEnrichment::Text),
+                        PreviewEnrichmentInput::Markdown { ref source } => {
+                            reef_core::markdown::build_markdown_preview_with_syntax(
+                                &task.path, source, task.dark,
+                            )
+                            .map(PreviewEnrichment::Markdown)
+                        }
+                    }))
+                    .ok()
+                    .flatten();
+                let _ = result_tx.send(WorkerResult::PreviewEnrichmentFinished {
+                    generation: task.generation,
+                    path: task.path,
+                    enrichment,
+                });
+            }
+        });
+    tx
+}
+
 fn spawn_preview_worker(result_tx: WorkerResultSender) -> mpsc::Sender<FilesTask> {
     let (tx, rx) = mpsc::unbounded();
     let _ = thread::Builder::new()
@@ -1829,11 +1927,10 @@ fn spawn_preview_worker(result_tx: WorkerResultSender) -> mpsc::Sender<FilesTask
                         generation,
                         backend,
                         rel_path,
-                        dark,
                         wants_decoded_image,
                     } => {
                         let result = run_preview_with_panic_guard(&rel_path, || {
-                            backend.load_preview(&rel_path, dark, wants_decoded_image)
+                            backend.load_preview(&rel_path, wants_decoded_image)
                         });
                         let _ = result_tx.send(WorkerResult::Preview { generation, result });
                     }
@@ -1875,7 +1972,6 @@ fn spawn_preview_worker(result_tx: WorkerResultSender) -> mpsc::Sender<FilesTask
                     FilesTask::PrefetchPreview {
                         backend,
                         rel_path,
-                        dark,
                         wants_decoded_image,
                     } => {
                         // Fire-and-forget: the backend's LRU cache
@@ -1883,7 +1979,7 @@ fn spawn_preview_worker(result_tx: WorkerResultSender) -> mpsc::Sender<FilesTask
                         // `LoadPreview` arm — a bad neighbor on
                         // prefetch must not take the worker down.
                         let _ = run_preview_with_panic_guard(&rel_path, || {
-                            backend.load_preview(&rel_path, dark, wants_decoded_image)
+                            backend.load_preview(&rel_path, wants_decoded_image)
                         });
                     }
                     _ => {}
@@ -3958,6 +4054,7 @@ mod preview_panic_guard_tests {
 #[cfg(test)]
 mod preview_worker_coalescing_tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     fn backend() -> Arc<dyn Backend> {
         Arc::new(reef_io::LocalBackend::open_at(std::env::temp_dir()))
@@ -3968,7 +4065,6 @@ mod preview_worker_coalescing_tests {
             generation,
             backend: backend(),
             rel_path: PathBuf::from(path),
-            dark: false,
             wants_decoded_image: false,
         }
     }
@@ -3977,7 +4073,6 @@ mod preview_worker_coalescing_tests {
         FilesTask::PrefetchPreview {
             backend: backend(),
             rel_path: PathBuf::from(path),
-            dark: false,
             wants_decoded_image: false,
         }
     }
@@ -4086,6 +4181,123 @@ mod preview_worker_coalescing_tests {
         match backlog.pop_front().unwrap() {
             FilesTask::LoadDbPage { generation, .. } => assert_eq!(generation, 12),
             _ => panic!("expected LoadDbPage to stay queued"),
+        }
+    }
+
+    #[test]
+    fn preview_worker_publishes_plain_content_before_enrichment_is_requested() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let tasks = TaskCoordinator::new();
+        let wake = tasks.worker_wake_receiver();
+        tasks.load_preview(
+            1,
+            Arc::new(reef_io::LocalBackend::open_at(tmp.path().to_path_buf())),
+            PathBuf::from("main.rs"),
+            false,
+        );
+
+        let first = recv_worker_result(&tasks, &wake);
+        let WorkerResult::Preview {
+            generation,
+            result: Ok(Some(content)),
+        } = first
+        else {
+            panic!("base preview must be published first");
+        };
+        assert_eq!(generation, 1);
+        let PreviewBody::Text(text) = &content.body else {
+            panic!("expected text preview");
+        };
+        assert!(text.highlighted.is_none());
+        assert!(text.parsed.is_none());
+
+        assert!(tasks.enrich_preview(generation, &content, false));
+        let second = recv_worker_result(&tasks, &wake);
+        let WorkerResult::PreviewEnrichmentFinished {
+            generation,
+            path,
+            enrichment,
+        } = second
+        else {
+            panic!("preview enrichment must follow base content");
+        };
+        assert_eq!(generation, 1);
+        assert_eq!(path, "main.rs");
+        let Some(PreviewEnrichment::Text(enrichment)) = enrichment else {
+            panic!("expected text enrichment");
+        };
+        assert!(enrichment.highlighted.is_some());
+        assert!(enrichment.parsed.is_some());
+    }
+
+    #[test]
+    fn markdown_preview_worker_publishes_unstyled_base_before_syntax_enrichment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = "```rs\nfn main() {}\n```\n";
+        std::fs::write(tmp.path().join("README.md"), source).unwrap();
+        let tasks = TaskCoordinator::new();
+        let wake = tasks.worker_wake_receiver();
+        tasks.load_preview(
+            7,
+            Arc::new(reef_io::LocalBackend::open_at(tmp.path().to_path_buf())),
+            PathBuf::from("README.md"),
+            false,
+        );
+
+        let first = recv_worker_result(&tasks, &wake);
+        let WorkerResult::Preview {
+            generation,
+            result: Ok(Some(content)),
+        } = first
+        else {
+            panic!("base markdown preview must be published first");
+        };
+        let PreviewBody::Markdown(markdown) = &content.body else {
+            panic!("expected markdown preview");
+        };
+        assert!(
+            markdown
+                .rows
+                .iter()
+                .flatten()
+                .all(|span| span.syntax.is_none())
+        );
+
+        assert!(tasks.enrich_preview(generation, &content, false));
+        let second = recv_worker_result(&tasks, &wake);
+        let WorkerResult::PreviewEnrichmentFinished {
+            generation,
+            path,
+            enrichment,
+        } = second
+        else {
+            panic!("markdown syntax enrichment must follow base content");
+        };
+        assert_eq!(generation, 7);
+        assert_eq!(path, "README.md");
+        let Some(PreviewEnrichment::Markdown(markdown)) = enrichment else {
+            panic!("expected markdown enrichment");
+        };
+        assert_eq!(markdown.source, source);
+        assert!(
+            markdown
+                .rows
+                .iter()
+                .flatten()
+                .any(|span| span.syntax.is_some())
+        );
+    }
+
+    fn recv_worker_result(tasks: &TaskCoordinator, wake: &mpsc::Receiver<()>) -> WorkerResult {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(result) = tasks.try_recv() {
+                return result;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "timed out waiting for worker result");
+            let _ = wake.recv_timeout(remaining);
         }
     }
 }

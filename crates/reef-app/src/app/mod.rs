@@ -401,6 +401,12 @@ pub struct MatchHit {
     pub byte_range: Range<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingPreviewEnrichment {
+    generation: u64,
+    path: String,
+}
+
 pub struct AppState {
     pub backend: Arc<dyn Backend>,
     pub workdir_name: String,
@@ -429,7 +435,9 @@ pub struct AppState {
 
     pub file_tree: FileTree,
     pub preview_content: Option<Arc<PreviewContent>>,
-    pub preview_content_generation: u64,
+    pub preview_content_revision: u64,
+    pub preview_enrichment_dark: bool,
+    preview_enrichment_pending: Option<PendingPreviewEnrichment>,
     pub preview_schedule: Option<(PathBuf, Instant)>,
     pub prefetch_schedule: Option<Instant>,
     pub preview_in_flight_path: Option<PathBuf>,
@@ -598,7 +606,6 @@ pub struct PreviewMergeOutcome {
     pub accepted: bool,
     pub same_file: bool,
     pub clear_preview_selection: bool,
-    pub resolve_pending_highlight: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -648,7 +655,9 @@ impl AppState {
             sbs_right_h_scroll: 0,
             file_tree,
             preview_content: None,
-            preview_content_generation: 0,
+            preview_content_revision: 0,
+            preview_enrichment_dark: false,
+            preview_enrichment_pending: None,
             preview_schedule: None,
             prefetch_schedule: None,
             preview_in_flight_path: None,

@@ -232,16 +232,14 @@ impl App {
         let Some(cursor) = self.resolve_nav_cursor(anchor) else {
             return;
         };
-        let Some(preview) = self.engine.preview_content_ref() else {
+        self.goto_definition_at(anchor, cursor);
+    }
+
+    fn goto_definition_at(&mut self, anchor: NavAnchor, cursor: (usize, usize)) {
+        let Some((current_path, parsed)) =
+            self.parsed_preview_or_defer(PendingPreviewNavAction::GotoDefinition, anchor, cursor)
+        else {
             return;
-        };
-        let current_path = std::path::PathBuf::from(&preview.path);
-        let parsed = match &preview.body {
-            reef_core::preview::PreviewBody::Text(text) => match text.parsed.as_ref() {
-                Some(p) => std::sync::Arc::clone(p),
-                None => return,
-            },
-            _ => return,
         };
 
         // LSP-only languages (Vue) — tree-sitter has no semantic
@@ -356,7 +354,7 @@ impl App {
                 // fired off feeds the cache, and the next click
                 // hits the LSP answer.
                 if needle.is_some() && parsed.language.has_semantic_queries() {
-                    self.find_references_at_cursor(anchor);
+                    self.find_references_at(anchor, cursor);
                 }
             }
             1 => {
@@ -386,6 +384,63 @@ impl App {
                         opened_by_ctrl_click: matches!(anchor, NavAnchor::Mouse { .. }),
                         max_row_width,
                     }));
+            }
+        }
+    }
+
+    fn parsed_preview_or_defer(
+        &mut self,
+        action: PendingPreviewNavAction,
+        anchor: NavAnchor,
+        cursor: (usize, usize),
+    ) -> Option<(
+        std::path::PathBuf,
+        std::sync::Arc<reef_core::nav::FileParse>,
+    )> {
+        let (path, parsed) = {
+            let preview = self.engine.preview_content_ref()?;
+            let path = std::path::PathBuf::from(&preview.path);
+            let parsed = match &preview.body {
+                reef_core::preview::PreviewBody::Text(text) => text.parsed.clone(),
+                _ => return None,
+            };
+            (path, parsed)
+        };
+        if let Some(parsed) = parsed {
+            return Some((path, parsed));
+        }
+        if self.engine.preview_enrichment_pending() {
+            self.pending_preview_nav = Some(PendingPreviewNav {
+                action,
+                anchor,
+                cursor,
+                path,
+                generation: self.engine.preview_generation(),
+            });
+        }
+        None
+    }
+
+    pub(super) fn retry_pending_preview_nav(&mut self) {
+        let Some(pending) = self.pending_preview_nav.take() else {
+            return;
+        };
+        if self.engine.nav_busy()
+            || pending.generation != self.engine.preview_generation()
+            || self
+                .engine
+                .preview_content_ref()
+                .is_none_or(|preview| std::path::Path::new(&preview.path) != pending.path)
+            || self.resolve_nav_cursor(pending.anchor) != Some(pending.cursor)
+        {
+            return;
+        }
+        match pending.action {
+            PendingPreviewNavAction::GotoDefinition => {
+                self.goto_definition_at(pending.anchor, pending.cursor);
+            }
+            PendingPreviewNavAction::FindReferences => {
+                self.find_references_at(pending.anchor, pending.cursor);
             }
         }
     }
@@ -850,16 +905,14 @@ impl App {
         let Some(cursor) = self.resolve_nav_cursor(anchor) else {
             return;
         };
-        let Some(preview) = self.engine.preview_content_ref() else {
+        self.find_references_at(anchor, cursor);
+    }
+
+    fn find_references_at(&mut self, anchor: NavAnchor, cursor: (usize, usize)) {
+        let Some((current_path, parsed)) =
+            self.parsed_preview_or_defer(PendingPreviewNavAction::FindReferences, anchor, cursor)
+        else {
             return;
-        };
-        let current_path = std::path::PathBuf::from(&preview.path);
-        let parsed = match &preview.body {
-            reef_core::preview::PreviewBody::Text(text) => match text.parsed.as_ref() {
-                Some(p) => std::sync::Arc::clone(p),
-                None => return,
-            },
-            _ => return,
         };
         let Some(needle) = reef_core::nav::identifier_at(&parsed, cursor) else {
             return;

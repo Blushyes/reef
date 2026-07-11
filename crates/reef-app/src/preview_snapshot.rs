@@ -2,7 +2,7 @@ use std::path::Path;
 
 use reef_core::markdown::{MarkdownPreview, MarkdownRole, MarkdownSpan, MarkdownStyle};
 use reef_core::preview::{BinaryInfo, BinaryReason, PreviewBody, PreviewDocument, TextPreview};
-use reef_core::text::{Rgb, StyledToken, TextStyle};
+use reef_core::text::{Rgb, TextStyle};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -49,13 +49,13 @@ pub enum PreviewDetectedKindSnapshot {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum PreviewBodySnapshot {
     Text {
-        lines: Vec<String>,
-        highlighted: Option<Vec<Vec<StyledTokenSnapshot>>>,
+        text: String,
+        style_spans: Vec<TextStyleSpanSnapshot>,
     },
     Code {
         language: Option<String>,
-        lines: Vec<String>,
-        highlighted: Option<Vec<Vec<StyledTokenSnapshot>>>,
+        text: String,
+        style_spans: Vec<TextStyleSpanSnapshot>,
     },
     Markdown {
         source: String,
@@ -118,8 +118,9 @@ pub enum StructuredDataFormatSnapshot {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct StyledTokenSnapshot {
-    pub text: String,
+pub struct TextStyleSpanSnapshot {
+    pub utf16_start: u32,
+    pub utf16_length: u32,
     pub style: TextStyleSnapshot,
 }
 
@@ -312,18 +313,15 @@ fn text_body_snapshot(
     text: &TextPreview,
     detected_kind: PreviewDetectedKindSnapshot,
 ) -> PreviewBodySnapshot {
-    let highlighted = text.highlighted.as_ref().map(|lines| {
-        lines
-            .iter()
-            .map(|line| line.iter().map(StyledTokenSnapshot::from).collect())
-            .collect()
-    });
     match detected_kind {
-        PreviewDetectedKindSnapshot::Code => PreviewBodySnapshot::Code {
-            language: language_for_path(path),
-            lines: text.lines.clone(),
-            highlighted,
-        },
+        PreviewDetectedKindSnapshot::Code => {
+            let (source, style_spans) = text_and_style_spans(text);
+            PreviewBodySnapshot::Code {
+                language: language_for_path(path),
+                text: source,
+                style_spans,
+            }
+        }
         PreviewDetectedKindSnapshot::StructuredData | PreviewDetectedKindSnapshot::ApiSchema => {
             PreviewBodySnapshot::StructuredData {
                 format: structured_format_for_path(path),
@@ -338,11 +336,75 @@ fn text_body_snapshot(
         PreviewDetectedKindSnapshot::Log => PreviewBodySnapshot::Log {
             lines: text.lines.clone(),
         },
-        _ => PreviewBodySnapshot::Text {
-            lines: text.lines.clone(),
-            highlighted,
-        },
+        _ => {
+            let (source, style_spans) = text_and_style_spans(text);
+            PreviewBodySnapshot::Text {
+                text: source,
+                style_spans,
+            }
+        }
     }
+}
+
+fn text_and_style_spans(text: &TextPreview) -> (String, Vec<TextStyleSpanSnapshot>) {
+    let source = text.lines.join("\n");
+    let Some(highlighted) = text.highlighted.as_ref() else {
+        return (source, Vec::new());
+    };
+    if highlighted.len() != text.lines.len() {
+        return (source, Vec::new());
+    }
+
+    let mut spans: Vec<TextStyleSpanSnapshot> = Vec::new();
+    let mut utf16_offset = 0_u32;
+    for (line_index, (line, tokens)) in text.lines.iter().zip(highlighted).enumerate() {
+        let mut byte_offset: usize = 0;
+        for token in tokens {
+            let token_end = byte_offset.saturating_add(token.text.len());
+            if line.as_bytes().get(byte_offset..token_end) != Some(token.text.as_bytes()) {
+                return (source, Vec::new());
+            }
+            let Ok(utf16_length) = u32::try_from(token.text.encode_utf16().count()) else {
+                return (source, Vec::new());
+            };
+            if utf16_length > 0 {
+                push_style_span(
+                    &mut spans,
+                    TextStyleSpanSnapshot {
+                        utf16_start: utf16_offset,
+                        utf16_length,
+                        style: TextStyleSnapshot::from(token.style),
+                    },
+                );
+                let Some(next_offset) = utf16_offset.checked_add(utf16_length) else {
+                    return (source, Vec::new());
+                };
+                utf16_offset = next_offset;
+            }
+            byte_offset = token_end;
+        }
+        if byte_offset != line.len() {
+            return (source, Vec::new());
+        }
+        if line_index + 1 < text.lines.len() {
+            let Some(next_offset) = utf16_offset.checked_add(1) else {
+                return (source, Vec::new());
+            };
+            utf16_offset = next_offset;
+        }
+    }
+    (source, spans)
+}
+
+fn push_style_span(spans: &mut Vec<TextStyleSpanSnapshot>, span: TextStyleSpanSnapshot) {
+    if let Some(previous) = spans.last_mut()
+        && previous.style == span.style
+        && previous.utf16_start.checked_add(previous.utf16_length) == Some(span.utf16_start)
+    {
+        previous.utf16_length = previous.utf16_length.saturating_add(span.utf16_length);
+        return;
+    }
+    spans.push(span);
 }
 
 fn binary_body_snapshot(info: &BinaryInfo) -> PreviewBodySnapshot {
@@ -512,15 +574,6 @@ fn markdown_rows(markdown: &MarkdownPreview) -> Vec<Vec<MarkdownSpanSnapshot>> {
         .collect()
 }
 
-impl From<&StyledToken> for StyledTokenSnapshot {
-    fn from(token: &StyledToken) -> Self {
-        Self {
-            text: token.text.clone(),
-            style: TextStyleSnapshot::from(token.style),
-        }
-    }
-}
-
 impl From<TextStyle> for TextStyleSnapshot {
     fn from(style: TextStyle) -> Self {
         Self {
@@ -603,6 +656,7 @@ impl From<&reef_sqlite_preview::ColumnInfo> for DatabaseColumnSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reef_core::text::StyledToken;
     use std::path::PathBuf;
 
     fn text_doc(path: &str, lines: &[&str]) -> PreviewDocument {
@@ -700,9 +754,51 @@ mod tests {
     }
 
     #[test]
+    fn code_snapshot_uses_one_source_and_utf16_style_spans() {
+        let style = TextStyle {
+            fg: Some(Rgb {
+                r: 120,
+                g: 80,
+                b: 200,
+            }),
+            bold: true,
+            italic: false,
+            underlined: false,
+        };
+        let doc = PreviewDocument {
+            path: "src/main.rs".to_string(),
+            local_path: None,
+            bytes_on_disk: 16,
+            mime: Some("text/plain".into()),
+            body: PreviewBody::Text(TextPreview {
+                lines: vec!["let icon = \"🪸\";".to_string()],
+                highlighted: Some(vec![vec![
+                    StyledToken::new(style, "let icon = \""),
+                    StyledToken::new(style, "🪸"),
+                    StyledToken::new(style, "\";"),
+                ]]),
+                parsed: None,
+            }),
+        };
+
+        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 7);
+
+        let PreviewBodySnapshot::Code {
+            text, style_spans, ..
+        } = snapshot.body
+        else {
+            panic!("expected code snapshot");
+        };
+        assert_eq!(text, "let icon = \"🪸\";");
+        assert_eq!(style_spans.len(), 1, "adjacent equal styles should merge");
+        assert_eq!(style_spans[0].utf16_start, 0);
+        assert_eq!(style_spans[0].utf16_length, 16);
+    }
+
+    #[test]
     fn markdown_snapshot_exposes_raw_source_for_native_renderers() {
         let source = "# Title\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n";
-        let markdown = reef_core::markdown::build_markdown_preview("README.md", source, false)
+        let markdown = reef_core::markdown::build_markdown_preview("README.md", source)
             .expect("markdown preview");
         let doc = PreviewDocument {
             path: "README.md".to_string(),

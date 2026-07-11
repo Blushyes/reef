@@ -98,6 +98,21 @@ pub struct TuiLayoutCache {
     pub global_search_last_view_h: u16,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PendingPreviewNavAction {
+    GotoDefinition,
+    FindReferences,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPreviewNav {
+    action: PendingPreviewNavAction,
+    anchor: reef_app::NavAnchor,
+    cursor: (usize, usize),
+    path: PathBuf,
+    generation: u64,
+}
+
 pub struct TuiApp {
     pub engine: reef_app::ReefApp,
 
@@ -115,6 +130,7 @@ pub struct TuiApp {
     pub preview_image_protocol_builds: u64,
 
     pub preview_selection: Option<crate::ui::selection::PreviewSelection>,
+    pending_preview_nav: Option<PendingPreviewNav>,
     pub last_preview_rect: Option<ratatui::layout::Rect>,
     pub db_preview_layout: Option<DbPreviewLayoutCache>,
     pub vertical_scroll_lock: crate::input::AxisLock,
@@ -255,6 +271,7 @@ impl App {
             preview_build_rx,
             preview_image_protocol_builds: 0,
             preview_selection: None,
+            pending_preview_nav: None,
             last_preview_rect: None,
             db_preview_layout: None,
             vertical_scroll_lock: crate::input::AxisLock::new(),
@@ -1591,6 +1608,7 @@ impl App {
                 }
                 reef_app::AppRuntimeEvent::ClearPreviewSelection => {
                     self.preview_selection = None;
+                    self.pending_preview_nav = None;
                     self.preview_click_state = None;
                     self.db_preview_layout = None;
                 }
@@ -1598,8 +1616,9 @@ impl App {
                     self.nav_push_back(outcome.pending_jump.origin);
                     self.nav_jump_to_lsp(&outcome.location);
                 }
-                reef_app::AppRuntimeEvent::ResolvePendingHighlight => {
+                reef_app::AppRuntimeEvent::RetryDeferredPreviewActions => {
                     self.resolve_pending_highlight();
+                    self.retry_pending_preview_nav();
                 }
                 reef_app::AppRuntimeEvent::ClearCommitDetailSelection => {
                     self.clear_commit_detail_selection();
@@ -2720,7 +2739,7 @@ mod tests {
     #[test]
     fn markdown_link_targets_resolve_from_preview_directory() {
         let mut fx = make_scope_fixture();
-        fx.app.engine.state.preview_content_generation = 1;
+        fx.app.engine.state.preview_content_revision = 1;
         fx.app.engine.state.preview_content = Some(
             PreviewContent {
                 path: "docs/guide/index.md".into(),

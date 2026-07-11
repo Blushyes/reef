@@ -8,6 +8,8 @@ use super::{PreviewBody, PreviewDocument, TextPreview};
 const PROBE_BYTES: usize = 8192;
 const SQLITE_MIME: &str = "application/vnd.sqlite3";
 const MAX_TEXT_PROBE_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_ENRICHMENT_BYTES: u64 = 512 * 1024;
+const MAX_ENRICHMENT_LINES: usize = 5_000;
 
 pub const INITIAL_DB_PAGE_ROWS: u32 = 50;
 
@@ -29,16 +31,14 @@ fn preview_document(
 pub fn load_preview(
     root: &Path,
     rel_path: &Path,
-    dark: bool,
     wants_decoded_image: bool,
 ) -> Option<PreviewDocument> {
-    load_preview_from_path(&root.join(rel_path), rel_path, dark, wants_decoded_image)
+    load_preview_from_path(&root.join(rel_path), rel_path, wants_decoded_image)
 }
 
 pub fn load_preview_from_path(
     full: &Path,
     rel_path: &Path,
-    dark: bool,
     wants_decoded_image: bool,
 ) -> Option<PreviewDocument> {
     use std::io::Read;
@@ -179,9 +179,10 @@ pub fn load_preview_from_path(
         lines
     };
 
-    let within_cap = raw.len() <= 512 * 1024 && lines.len() <= 5_000;
+    let within_cap =
+        raw.len() <= MAX_ENRICHMENT_BYTES as usize && lines.len() <= MAX_ENRICHMENT_LINES;
     if within_cap
-        && let Some(markdown) = crate::markdown::build_markdown_preview(&rel_str, &content, dark)
+        && let Some(markdown) = crate::markdown::build_markdown_preview(&rel_str, &content)
     {
         return Some(preview_document(
             &rel_str,
@@ -191,32 +192,43 @@ pub fn load_preview_from_path(
         ));
     }
 
-    let highlighted = if within_cap {
-        crate::highlight::highlight_file(&rel_str, &lines, dark)
-    } else {
-        None
-    };
-
-    let parsed = if within_cap {
-        let path_buf = std::path::PathBuf::from(&rel_str);
-        crate::nav::NavLang::from_path(&path_buf).and_then(|lang| {
-            let source: Arc<[u8]> = Arc::from(raw.clone().into_boxed_slice());
-            crate::nav::parse_file_if_supported(lang, source).map(Arc::new)
-        })
-    } else {
-        None
-    };
-
     Some(preview_document(
         &rel_str,
         file_size,
         mime,
         PreviewBody::Text(TextPreview {
             lines,
-            highlighted,
-            parsed,
+            highlighted: None,
+            parsed: None,
         }),
     ))
+}
+
+pub fn build_text_preview_enrichment(
+    path: &str,
+    bytes_on_disk: u64,
+    lines: &[String],
+    dark: bool,
+) -> Option<super::TextPreviewEnrichment> {
+    if !text_preview_can_be_enriched(bytes_on_disk, lines.len()) {
+        return None;
+    }
+    let highlighted = crate::highlight::highlight_file(path, lines, dark);
+    let parsed = crate::nav::NavLang::from_path(std::path::Path::new(path)).and_then(|lang| {
+        let source: Arc<[u8]> = Arc::from(lines.join("\n").into_bytes().into_boxed_slice());
+        crate::nav::parse_file_if_supported(lang, source).map(Arc::new)
+    });
+    if highlighted.is_none() && parsed.is_none() {
+        return None;
+    }
+    Some(super::TextPreviewEnrichment {
+        highlighted,
+        parsed,
+    })
+}
+
+pub fn text_preview_can_be_enriched(bytes_on_disk: u64, line_count: usize) -> bool {
+    bytes_on_disk <= MAX_ENRICHMENT_BYTES && line_count <= MAX_ENRICHMENT_LINES
 }
 
 #[cfg(test)]
@@ -255,7 +267,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_bytes(tmp.path(), "red.png", &tiny_png(4, 4));
 
-        let content = load_preview(tmp.path(), Path::new("red.png"), true, true).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("red.png"), true).expect("preview");
 
         match content.body {
             PreviewBody::Image(img) => {
@@ -273,7 +285,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_bytes(tmp.path(), "shot.jpg", &tiny_png(2, 2));
 
-        let content = load_preview(tmp.path(), Path::new("shot.jpg"), true, true).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("shot.jpg"), true).expect("preview");
 
         match content.body {
             PreviewBody::Image(img) => assert_eq!(img.format, image::ImageFormat::Png),
@@ -295,7 +307,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_bytes(tmp.path(), "huge.png", &png);
 
-        let content = load_preview(tmp.path(), Path::new("huge.png"), true, true).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("huge.png"), true).expect("preview");
 
         match content.body {
             PreviewBody::Binary(info) => {
@@ -314,17 +326,27 @@ mod tests {
     }
 
     #[test]
-    fn load_preview_text_attaches_highlight_and_parse() {
+    fn load_preview_text_returns_plain_content_before_enrichment() {
         let tmp = tempfile::tempdir().unwrap();
         write_bytes(tmp.path(), "src.rs", b"fn main() {}\n");
 
-        let content = load_preview(tmp.path(), Path::new("src.rs"), true, true).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("src.rs"), true).expect("preview");
 
         match content.body {
             PreviewBody::Text(text) => {
                 assert_eq!(text.lines, vec!["fn main() {}".to_string()]);
-                assert!(text.highlighted.is_some());
-                assert!(text.parsed.is_some());
+                assert!(text.highlighted.is_none());
+                assert!(text.parsed.is_none());
+
+                let enrichment = build_text_preview_enrichment(
+                    "src.rs",
+                    content.bytes_on_disk,
+                    &text.lines,
+                    true,
+                )
+                .expect("small rust preview should enrich");
+                assert!(enrichment.highlighted.is_some());
+                assert!(enrichment.parsed.is_some());
             }
             other => panic!("expected Text body, got {other:?}"),
         }
@@ -339,8 +361,7 @@ mod tests {
             b"# Title\n\n| Name | Count |\n|:---|---:|\n| reef | 1 |\n",
         );
 
-        let content =
-            load_preview(tmp.path(), Path::new("README.md"), true, true).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("README.md"), true).expect("preview");
 
         match content.body {
             PreviewBody::Markdown(markdown) => {
@@ -361,8 +382,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_bytes(tmp.path(), "notes.txt", b"# not markdown here\n");
 
-        let content =
-            load_preview(tmp.path(), Path::new("notes.txt"), true, true).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("notes.txt"), true).expect("preview");
 
         match content.body {
             PreviewBody::Text(text) => assert_eq!(text.lines, vec!["# not markdown here"]),
@@ -375,8 +395,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_bytes(tmp.path(), "empty.bin", b"");
 
-        let content =
-            load_preview(tmp.path(), Path::new("empty.bin"), true, true).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("empty.bin"), true).expect("preview");
 
         match content.body {
             PreviewBody::Binary(info) => {
@@ -392,7 +411,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_bytes(tmp.path(), "red.png", &tiny_png(8, 8));
 
-        let content = load_preview(tmp.path(), Path::new("red.png"), true, false).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("red.png"), false).expect("preview");
 
         match content.body {
             PreviewBody::Image(img) => {
@@ -410,7 +429,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_bytes(tmp.path(), "doc.pdf", b"%PDF-1.4\n%bogus content\n");
 
-        let content = load_preview(tmp.path(), Path::new("doc.pdf"), true, true).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("doc.pdf"), true).expect("preview");
 
         match content.body {
             PreviewBody::Binary(info) => {
@@ -430,8 +449,7 @@ mod tests {
             b"<template>\n  <div>hello</div>\n</template>\n",
         );
 
-        let content =
-            load_preview(tmp.path(), Path::new("General.vue"), true, true).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("General.vue"), true).expect("preview");
 
         match content.body {
             PreviewBody::Text(text) => {
@@ -450,8 +468,7 @@ mod tests {
         data[512] = 0;
         write_bytes(tmp.path(), "weird.dat", &data);
 
-        let content =
-            load_preview(tmp.path(), Path::new("weird.dat"), true, true).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("weird.dat"), true).expect("preview");
 
         match content.body {
             PreviewBody::Binary(info) => assert!(matches!(info.reason, BinaryReason::NullBytes)),
@@ -477,7 +494,7 @@ mod tests {
             }
         }
 
-        let content = load_preview(tmp.path(), Path::new("big.dat"), true, true).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("big.dat"), true).expect("preview");
 
         match content.body {
             PreviewBody::Binary(info) => {
@@ -494,8 +511,7 @@ mod tests {
         let path = tmp.path().join("fixture.db");
         seed_sqlite(&path);
 
-        let content =
-            load_preview(tmp.path(), Path::new("fixture.db"), true, true).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("fixture.db"), true).expect("preview");
 
         match content.body {
             PreviewBody::Database(info) => {

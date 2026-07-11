@@ -66,7 +66,7 @@ pub use preview_snapshot::{
     DatabasePageSnapshot, DatabaseSchemaSnapshot, MarkdownRoleSnapshot, MarkdownSpanSnapshot,
     MarkdownStyleSnapshot, PreviewBodySnapshot, PreviewDetectedKindSnapshot,
     PreviewDocumentSnapshot, PreviewSourceSnapshot, RgbSnapshot, StructuredDataFormatSnapshot,
-    StyledTokenSnapshot, TextStyleSnapshot,
+    TextStyleSnapshot, TextStyleSpanSnapshot,
 };
 pub use runtime::{AppRuntimeEvent, AsyncState, FileActionNotice};
 pub use snapshot::{

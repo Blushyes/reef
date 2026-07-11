@@ -8,7 +8,10 @@ use std::sync::Arc;
 
 pub use binary::{BinaryInfo, BinaryReason};
 pub use image::ImagePreview;
-pub use loader::{INITIAL_DB_PAGE_ROWS, load_preview, load_preview_from_path};
+pub use loader::{
+    INITIAL_DB_PAGE_ROWS, build_text_preview_enrichment, load_preview, load_preview_from_path,
+    text_preview_can_be_enriched,
+};
 
 #[derive(Debug, Clone)]
 pub struct PreviewDocument {
@@ -33,6 +36,18 @@ pub struct TextPreview {
     pub lines: Vec<String>,
     pub highlighted: Option<Vec<Vec<crate::text::StyledToken>>>,
     pub parsed: Option<Arc<crate::nav::FileParse>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TextPreviewEnrichment {
+    pub highlighted: Option<Vec<Vec<crate::text::StyledToken>>>,
+    pub parsed: Option<Arc<crate::nav::FileParse>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum PreviewEnrichment {
+    Text(TextPreviewEnrichment),
+    Markdown(crate::markdown::MarkdownPreview),
 }
 
 impl PreviewDocument {

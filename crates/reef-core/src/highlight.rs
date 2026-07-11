@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Theme};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
@@ -20,6 +20,8 @@ static THEME_LIGHT: LazyLock<Theme> = LazyLock::new(|| {
         .get(EmbeddedThemeName::OneHalfLight)
         .clone()
 });
+
+static COMMON_SYNTAX_WARMUP: OnceLock<()> = OnceLock::new();
 
 fn resolve_syntax(path: &str, lines: &[String]) -> Option<&'static SyntaxReference> {
     let p = Path::new(path);
@@ -106,6 +108,31 @@ fn highlight_lines(
         out.push(tokens);
     }
     out
+}
+
+/// Initialize the embedded syntax data and compile the common Rust and
+/// TypeScript parsing paths before the first interactive highlight request.
+/// Callers should run this on a background worker.
+pub fn warm_up_common_syntaxes() {
+    COMMON_SYNTAX_WARMUP.get_or_init(|| {
+        for dark in [false, true] {
+            let _ = highlight_file(
+                "warmup.rs",
+                &["fn warmup(value: &str) -> usize { value.len() }".to_string()],
+                dark,
+            );
+            let _ = highlight_file(
+                "warmup.ts",
+                &["const warmup = (value: string): number => value.length;".to_string()],
+                dark,
+            );
+            let _ = highlight_file(
+                "warmup.tsx",
+                &["export const Warmup = () => <span>reef</span>;".to_string()],
+                dark,
+            );
+        }
+    });
 }
 
 fn convert_style(s: syntect::highlighting::Style) -> TextStyle {
@@ -235,5 +262,11 @@ mod tests {
         let lines = vec!["fn main() {}".to_string()];
         let out = highlight_code_block("rust", &lines, true).expect("rust fence highlights");
         assert!(out[0].len() > 1);
+    }
+
+    #[test]
+    fn common_syntax_warmup_is_idempotent() {
+        warm_up_common_syntaxes();
+        warm_up_common_syntaxes();
     }
 }

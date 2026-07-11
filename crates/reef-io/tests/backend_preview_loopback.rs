@@ -83,10 +83,10 @@ fn load_preview_parity_for_text_empty_and_nullbyte() {
 
     for name in ["text.txt", "empty.txt", "garbage.bin"] {
         let l = local
-            .load_preview(Path::new(name), true, true)
+            .load_preview(Path::new(name), true)
             .unwrap_or_else(|| panic!("local preview None for {name}"));
         let r = remote
-            .load_preview(Path::new(name), true, true)
+            .load_preview(Path::new(name), true)
             .unwrap_or_else(|| panic!("remote preview None for {name}"));
         assert_eq!(l.path, r.path, "file_path for {name}");
         assert_eq!(
@@ -110,8 +110,8 @@ fn load_preview_text_lines_match() {
     let local = LocalBackend::open_at(tmp.path().to_path_buf());
     let remote = spawn_remote(tmp.path());
 
-    let l = local.load_preview(Path::new("a.txt"), true, true).unwrap();
-    let r = remote.load_preview(Path::new("a.txt"), true, true).unwrap();
+    let l = local.load_preview(Path::new("a.txt"), true).unwrap();
+    let r = remote.load_preview(Path::new("a.txt"), true).unwrap();
     let (PreviewBody::Text(lt), PreviewBody::Text(rt)) = (&l.body, &r.body) else {
         panic!("expected both Text, got {:?} / {:?}", l.body, r.body);
     };
@@ -128,12 +128,8 @@ fn load_preview_markdown_model_matches_on_local_and_remote() {
     let local = LocalBackend::open_at(tmp.path().to_path_buf());
     let remote = spawn_remote(tmp.path());
 
-    let l = local
-        .load_preview(Path::new("README.md"), true, true)
-        .unwrap();
-    let r = remote
-        .load_preview(Path::new("README.md"), true, true)
-        .unwrap();
+    let l = local.load_preview(Path::new("README.md"), true).unwrap();
+    let r = remote.load_preview(Path::new("README.md"), true).unwrap();
     let (PreviewBody::Markdown(lm), PreviewBody::Markdown(rm)) = (&l.body, &r.body) else {
         panic!(
             "expected both Markdown previews, got {:?} / {:?}",
@@ -179,10 +175,10 @@ fn load_preview_parity_for_sqlite_database() {
     let remote = spawn_remote(tmp.path());
 
     let l = local
-        .load_preview(Path::new("fixture.db"), true, true)
+        .load_preview(Path::new("fixture.db"), true)
         .expect("local preview None for fixture.db");
     let r = remote
-        .load_preview(Path::new("fixture.db"), true, true)
+        .load_preview(Path::new("fixture.db"), true)
         .expect("remote preview None for fixture.db");
 
     assert_eq!(shape_of(&l.body), BodyShape::Database, "local shape");
@@ -288,14 +284,10 @@ fn load_preview_missing_file_returns_none_on_both() {
     let local = LocalBackend::open_at(tmp.path().to_path_buf());
     let remote = spawn_remote(tmp.path());
 
-    assert!(
-        local
-            .load_preview(Path::new("no-such.txt"), true, true)
-            .is_none()
-    );
+    assert!(local.load_preview(Path::new("no-such.txt"), true).is_none());
     assert!(
         remote
-            .load_preview(Path::new("no-such.txt"), true, true)
+            .load_preview(Path::new("no-such.txt"), true)
             .is_none()
     );
 }

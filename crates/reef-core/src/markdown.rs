@@ -130,7 +130,23 @@ struct CodeBlockBuild {
     lines: Vec<String>,
 }
 
-pub fn build_markdown_preview(path: &str, source: &str, dark: bool) -> Option<MarkdownPreview> {
+pub fn build_markdown_preview(path: &str, source: &str) -> Option<MarkdownPreview> {
+    build_markdown_preview_inner(path, source, None)
+}
+
+pub fn build_markdown_preview_with_syntax(
+    path: &str,
+    source: &str,
+    dark: bool,
+) -> Option<MarkdownPreview> {
+    build_markdown_preview_inner(path, source, Some(dark))
+}
+
+fn build_markdown_preview_inner(
+    path: &str,
+    source: &str,
+    syntax_dark: Option<bool>,
+) -> Option<MarkdownPreview> {
     if !is_markdown_path(path) {
         return None;
     }
@@ -256,7 +272,7 @@ pub fn build_markdown_preview(path: &str, source: &str, dark: bool) -> Option<Ma
                 }
                 TagEnd::CodeBlock => {
                     if let Some(code) = code_block.take() {
-                        rows.extend(render_code_block_lines(code, dark));
+                        rows.extend(render_code_block_lines(code, syntax_dark));
                     }
                     rows.push(code_block_padding_row());
                     push_blank(&mut rows);
@@ -488,11 +504,15 @@ fn code_block_padding_row() -> Vec<MarkdownSpan> {
     }]
 }
 
-fn render_code_block_lines(code: CodeBlockBuild, dark: bool) -> Vec<Vec<MarkdownSpan>> {
-    let highlighted = code
-        .label
-        .as_deref()
-        .and_then(|lang| crate::highlight::highlight_code_block(lang, &code.lines, dark));
+fn render_code_block_lines(
+    code: CodeBlockBuild,
+    syntax_dark: Option<bool>,
+) -> Vec<Vec<MarkdownSpan>> {
+    let highlighted = syntax_dark.and_then(|dark| {
+        code.label
+            .as_deref()
+            .and_then(|lang| crate::highlight::highlight_code_block(lang, &code.lines, dark))
+    });
 
     code.lines
         .iter()
@@ -670,7 +690,7 @@ mod tests {
     #[test]
     fn preview_keeps_raw_source() {
         let source = "# Title\n\n<span>inline html</span>\n";
-        let md = build_markdown_preview("README.md", source, true).unwrap();
+        let md = build_markdown_preview("README.md", source).unwrap();
 
         assert_eq!(md.source, source);
     }
@@ -716,7 +736,7 @@ mod tests {
     fn builds_headings_lists_quotes_links_and_code() {
         let source =
             "# Title\n\n- **bold** [site](https://x.test)\n> quote\n\n```rs\nfn main() {}\n```\n";
-        let md = build_markdown_preview("README.md", source, true).unwrap();
+        let md = build_markdown_preview_with_syntax("README.md", source, true).unwrap();
         let rendered = texts(&md);
         assert!(rendered.iter().any(|l| l == "Title"));
         assert!(rendered.iter().any(|l| l.contains("• bold site")));
@@ -745,8 +765,24 @@ mod tests {
     }
 
     #[test]
+    fn base_preview_leaves_fenced_code_syntax_unstyled() {
+        let source = "```rs\nfn main() {}\n```\n";
+        let base = build_markdown_preview("README.md", source).unwrap();
+        let enriched = build_markdown_preview_with_syntax("README.md", source, true).unwrap();
+
+        assert!(base.rows.iter().flatten().all(|span| span.syntax.is_none()));
+        assert!(
+            enriched
+                .rows
+                .iter()
+                .flatten()
+                .any(|span| span.syntax.is_some())
+        );
+    }
+
+    #[test]
     fn unlabeled_code_block_has_no_header() {
-        let md = build_markdown_preview("README.md", "```\nplain\n```\n", true).unwrap();
+        let md = build_markdown_preview("README.md", "```\nplain\n```\n").unwrap();
         let rendered = texts(&md);
 
         assert_eq!(rendered, vec!["", "  plain", ""]);
@@ -755,14 +791,14 @@ mod tests {
 
     #[test]
     fn consecutive_blockquote_lines_keep_quote_prefix() {
-        let md = build_markdown_preview("README.md", "> xxx\n> xxx\n", true).unwrap();
+        let md = build_markdown_preview("README.md", "> xxx\n> xxx\n").unwrap();
         assert_eq!(texts(&md), vec!["│ xxx", "│ xxx"]);
     }
 
     #[test]
     fn builds_integrated_table_with_cjk_width() {
         let source = "| 名称 | Count |\n|:---|---:|\n| 鲨鱼 | 12 |\n| ray | 3 |\n";
-        let md = build_markdown_preview("README.md", source, true).unwrap();
+        let md = build_markdown_preview("README.md", source).unwrap();
         let rendered = texts(&md);
         assert_eq!(md.text_rows, rendered);
         assert_eq!(rendered[0], "┏━━━━━━┳━━━━━━━┓");

@@ -44,8 +44,8 @@ fn install_text_preview(app: &mut App, lines: &[&str]) {
 }
 
 fn install_markdown_preview(app: &mut App, source: &str) {
-    let markdown = reef_core::markdown::build_markdown_preview("README.md", source, true)
-        .expect("markdown preview");
+    let markdown =
+        reef_core::markdown::build_markdown_preview("README.md", source).expect("markdown preview");
     app.engine.state.preview_content = Some(
         PreviewContent {
             path: "README.md".to_string(),

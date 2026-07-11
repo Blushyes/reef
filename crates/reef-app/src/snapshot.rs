@@ -262,7 +262,7 @@ impl FilesPanelSnapshot {
                 .as_ref()
                 .map(|p| PreviewKindSnapshot::from_body(&p.body)),
             preview: state.preview_content.as_ref().map(|preview| {
-                PreviewDocumentSnapshot::from_document(preview, state.preview_content_generation)
+                PreviewDocumentSnapshot::from_document(preview, state.preview_content_revision)
             }),
             preview_scroll: state.preview_scroll,
             preview_h_scroll: state.preview_h_scroll,

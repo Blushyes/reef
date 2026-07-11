@@ -39,7 +39,6 @@ struct PreviewCacheKey {
     rel_path: PathBuf,
     mtime_ns: Option<i128>,
     size: u64,
-    dark: bool,
     wants_decoded_image: bool,
 }
 
@@ -316,12 +315,7 @@ impl Backend for LocalBackend {
         Ok(build_entries(&self.workdir, expanded, git_statuses))
     }
 
-    fn load_preview(
-        &self,
-        rel_path: &Path,
-        dark: bool,
-        wants_decoded_image: bool,
-    ) -> Option<PreviewContent> {
+    fn load_preview(&self, rel_path: &Path, wants_decoded_image: bool) -> Option<PreviewContent> {
         let canon_root = self.canonical_workdir().ok()?;
         let canon_target = canonical_child_within(canon_root, rel_path).ok()?;
 
@@ -339,7 +333,6 @@ impl Backend for LocalBackend {
                 })
             }),
             size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
-            dark,
             wants_decoded_image,
         };
 
@@ -352,7 +345,6 @@ impl Backend for LocalBackend {
         let mut fresh = reef_core::preview::load_preview_from_path(
             &canon_target,
             rel_path,
-            dark,
             wants_decoded_image,
         )?;
         fresh.local_path = Some(canon_target);

@@ -320,8 +320,10 @@ pub trait Backend: Send + Sync {
         git_statuses: &HashMap<String, char>,
     ) -> Result<Vec<TreeEntry>, String>;
 
-    /// Load a file preview (relative path). Honours backend-internal size
-    /// caps (binary detection, 10k-line cap, 512KB highlight cap).
+    /// Load the base file preview (relative path). Honours backend-internal
+    /// size caps for binary detection and text rows. Syntax highlighting and
+    /// navigation parsing are attached later by the app enrichment worker so
+    /// they cannot delay the base preview.
     ///
     /// `wants_decoded_image` tells the backend whether the caller will be
     /// able to actually render pixels (i.e. a graphics protocol was
@@ -329,12 +331,7 @@ pub trait Backend: Send + Sync {
     /// return an `ImagePreview` with `image: None` for the friendly
     /// metadata card; skipping the full decode saves 50-200 ms on
     /// non-graphics terminals where the pixels would be thrown away.
-    fn load_preview(
-        &self,
-        rel_path: &Path,
-        dark: bool,
-        wants_decoded_image: bool,
-    ) -> Option<PreviewContent>;
+    fn load_preview(&self, rel_path: &Path, wants_decoded_image: bool) -> Option<PreviewContent>;
 
     /// List direct children of a directory under the backend workdir.
     /// Callers use this for collision checks and other small probes that

@@ -450,6 +450,15 @@ impl AppState {
             WorkerResult::LspStateChange { lang, state } => {
                 self.apply_lsp_state_change(lang, state);
             }
+            WorkerResult::PreviewEnrichmentFinished {
+                generation,
+                path,
+                enrichment,
+            } => {
+                if self.complete_preview_enrichment(generation, &path, enrichment) {
+                    events.push(AppRuntimeEvent::RetryDeferredPreviewActions);
+                }
+            }
             WorkerResult::Preview { .. } | WorkerResult::LspRefineDone { .. } => {}
         }
         events

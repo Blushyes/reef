@@ -78,7 +78,7 @@ fn local_load_preview_refuses_symlink_escape() {
     let (workdir, _secret_dir) = with_escape_layout();
     let b = LocalBackend::open_at(workdir.path().to_path_buf());
 
-    assert!(b.load_preview(Path::new("link"), false, false).is_none());
+    assert!(b.load_preview(Path::new("link"), false).is_none());
 }
 
 #[test]

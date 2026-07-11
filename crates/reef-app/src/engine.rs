@@ -182,10 +182,8 @@ impl ReefApp {
             self.runtime_events
                 .push(AppRuntimeEvent::ClearPreviewSelection);
         }
-        if outcome.resolve_pending_highlight {
-            self.runtime_events
-                .push(AppRuntimeEvent::ResolvePendingHighlight);
-        }
+        self.runtime_events
+            .push(AppRuntimeEvent::RetryDeferredPreviewActions);
     }
 
     fn push_location_jump_outcome(&mut self, outcome: crate::app::JumpToLocationOutcome) {
@@ -220,6 +218,9 @@ impl ReefApp {
         let outcome = self
             .state
             .apply_preview_result(generation, result, view_height);
+        if outcome.accepted {
+            self.state.request_current_preview_enrichment(generation);
+        }
         self.push_preview_merge_outcome(outcome);
     }
 
@@ -1811,6 +1812,10 @@ impl ReefApp {
         self.state.preview_content.as_deref()
     }
 
+    pub fn preview_enrichment_pending(&self) -> bool {
+        self.state.preview_enrichment_pending()
+    }
+
     pub fn preview_scheduled_path(&self) -> Option<PathBuf> {
         self.state
             .preview_schedule
@@ -2134,8 +2139,10 @@ pub struct AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reef_core::preview::{PreviewBody, TextPreview};
     use reef_io::LocalBackend;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     fn test_app() -> ReefApp {
         let backend = Arc::new(LocalBackend::open_at(PathBuf::from(".")));
@@ -2171,5 +2178,71 @@ mod tests {
         app.dispatch(AppCommand::SetActiveTab(AppTab::Files));
 
         assert!(app.drain_runtime_events().is_empty());
+    }
+
+    #[test]
+    fn accepted_preview_result_schedules_enrichment_after_base_merge() {
+        let mut app = test_app();
+        let wake = app.worker_wake_receiver();
+        let generation = app.state.preview_load.begin();
+        app.dispatch(AppCommand::ApplyPreviewResult {
+            generation,
+            result: Ok(Some(PreviewDocument {
+                path: "src/main.rs".to_string(),
+                local_path: None,
+                bytes_on_disk: 13,
+                mime: Some("text/plain".to_string()),
+                body: PreviewBody::Text(TextPreview {
+                    lines: vec!["fn main() {}".to_string()],
+                    highlighted: None,
+                    parsed: None,
+                }),
+            })),
+            preview_view_h: 20,
+        });
+
+        let Some(PreviewBody::Text(base)) = app
+            .state
+            .preview_content
+            .as_deref()
+            .map(|preview| &preview.body)
+        else {
+            panic!("expected merged base preview");
+        };
+        assert!(base.highlighted.is_none());
+        let base_events = app.drain_runtime_events();
+        assert!(
+            base_events
+                .iter()
+                .any(|event| matches!(event, AppRuntimeEvent::RetryDeferredPreviewActions))
+        );
+
+        wake.recv_timeout(Duration::from_secs(15))
+            .expect("enrichment worker should wake the app runtime");
+        let outcome = app.step(
+            Instant::now(),
+            TickOptions {
+                dark: false,
+                wants_decoded_image: false,
+                uses_three_col: false,
+            },
+        );
+        assert!(
+            outcome
+                .runtime_events
+                .iter()
+                .any(|event| matches!(event, AppRuntimeEvent::RetryDeferredPreviewActions))
+        );
+
+        let Some(PreviewBody::Text(enriched)) = app
+            .state
+            .preview_content
+            .as_deref()
+            .map(|preview| &preview.body)
+        else {
+            panic!("expected enriched preview");
+        };
+        assert!(enriched.highlighted.is_some());
+        assert!(enriched.parsed.is_some());
     }
 }

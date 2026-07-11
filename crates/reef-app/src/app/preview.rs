@@ -77,12 +77,13 @@ impl AppState {
         wants_decoded_image: bool,
     ) {
         let generation = self.preview_load.begin();
+        self.preview_enrichment_dark = dark;
+        self.preview_enrichment_pending = None;
         self.preview_in_flight_path = Some(rel_path.clone());
         self.tasks.load_preview(
             generation,
             Arc::clone(&self.backend),
             rel_path,
-            dark,
             wants_decoded_image,
         );
     }
@@ -136,6 +137,7 @@ impl AppState {
             Err(error) => {
                 if self.preview_load.complete_err(generation, error) {
                     self.preview_load.stale = false;
+                    self.preview_enrichment_pending = None;
                     self.preview_in_flight_path = None;
                 }
                 PreviewMergeOutcome::default()
@@ -152,13 +154,14 @@ impl AppState {
         if !self.preview_load.complete_ok(generation) {
             return PreviewMergeOutcome::default();
         }
+        self.preview_enrichment_pending = None;
         self.preview_in_flight_path = None;
         let same_file = matches!(
             (self.preview_content.as_deref(), content.as_ref()),
             (Some(old), Some(new)) if old.path == new.path
         );
         self.preview_content = content.map(Arc::new);
-        self.preview_content_generation = generation;
+        self.bump_preview_content_revision();
         if !same_file {
             self.preview_scroll = 0;
             self.preview_h_scroll = 0;
@@ -178,8 +181,75 @@ impl AppState {
             accepted: true,
             same_file,
             clear_preview_selection: !same_file,
-            resolve_pending_highlight: true,
         }
+    }
+
+    pub fn complete_preview_enrichment(
+        &mut self,
+        generation: u64,
+        path: &str,
+        enrichment: Option<reef_core::preview::PreviewEnrichment>,
+    ) -> bool {
+        let Some(pending) = self.preview_enrichment_pending.as_ref() else {
+            return false;
+        };
+        if pending.generation != generation || pending.path != path {
+            return false;
+        }
+        self.preview_enrichment_pending = None;
+
+        let Some(enrichment) = enrichment else {
+            return true;
+        };
+        let Some(content) = self.preview_content.as_mut() else {
+            return true;
+        };
+        if content.path != path {
+            return true;
+        }
+        let content = Arc::make_mut(content);
+        match (&mut content.body, enrichment) {
+            (
+                reef_core::preview::PreviewBody::Text(text),
+                reef_core::preview::PreviewEnrichment::Text(enrichment),
+            ) => {
+                text.highlighted = enrichment.highlighted;
+                text.parsed = enrichment.parsed;
+            }
+            (
+                reef_core::preview::PreviewBody::Markdown(markdown),
+                reef_core::preview::PreviewEnrichment::Markdown(enriched),
+            ) if markdown.source == enriched.source => {
+                *markdown = enriched;
+            }
+            _ => return true,
+        }
+        self.bump_preview_content_revision();
+        true
+    }
+
+    pub fn request_current_preview_enrichment(&mut self, generation: u64) -> bool {
+        if generation != self.preview_load.generation {
+            return false;
+        }
+        let Some(content) = self.preview_content.as_deref() else {
+            return false;
+        };
+        let path = content.path.clone();
+        let queued = self
+            .tasks
+            .enrich_preview(generation, content, self.preview_enrichment_dark);
+        self.preview_enrichment_pending =
+            queued.then_some(PendingPreviewEnrichment { generation, path });
+        queued
+    }
+
+    pub fn preview_enrichment_pending(&self) -> bool {
+        self.preview_enrichment_pending.is_some()
+    }
+
+    fn bump_preview_content_revision(&mut self) {
+        self.preview_content_revision = self.preview_content_revision.wrapping_add(1).max(1);
     }
 
     pub fn preview_is_for(&self, path: &Path) -> bool {
@@ -213,7 +283,6 @@ impl AppState {
             self.tasks.prefetch_preview(
                 Arc::clone(&self.backend),
                 entry.path.clone(),
-                options.dark,
                 options.wants_decoded_image,
             );
         }
@@ -224,7 +293,10 @@ impl AppState {
 mod tests {
     use std::{path::PathBuf, sync::Arc, time::Instant};
 
-    use reef_core::preview::{PreviewBody, PreviewDocument, TextPreview};
+    use reef_core::preview::{
+        PreviewBody, PreviewDocument, PreviewEnrichment, TextPreview, TextPreviewEnrichment,
+    };
+    use reef_core::text::{StyledToken, TextStyle};
     use reef_io::LocalBackend;
 
     use crate::{AppPrefs, AppState, AppStateConfig};
@@ -262,6 +334,125 @@ mod tests {
         assert!(!state.preview_load.loading);
         assert!(!state.preview_load.stale);
         assert!(state.preview_in_flight_path.is_none());
+    }
+
+    #[test]
+    fn preview_enrichment_updates_only_the_current_generation() {
+        let backend = Arc::new(LocalBackend::open_at(PathBuf::from(".")));
+        let mut state = AppState::new(AppStateConfig {
+            backend,
+            prefs: AppPrefs::default(),
+            now: Instant::now(),
+            subscribe_fs_events: false,
+        });
+        let generation = state.preview_load.begin();
+        state.apply_preview_content(generation, Some(text_preview("src/main.rs")), 20);
+        assert!(state.request_current_preview_enrichment(generation));
+        let base_revision = state.preview_content_revision;
+
+        let accepted = state.complete_preview_enrichment(
+            generation,
+            "src/main.rs",
+            Some(PreviewEnrichment::Text(TextPreviewEnrichment {
+                highlighted: Some(vec![vec![StyledToken::new(TextStyle::default(), "hello")]]),
+                parsed: None,
+            })),
+        );
+
+        assert!(accepted);
+        assert!(state.preview_content_revision > base_revision);
+        let Some(PreviewBody::Text(text)) = state
+            .preview_content
+            .as_deref()
+            .map(|preview| &preview.body)
+        else {
+            panic!("expected text preview");
+        };
+        assert!(text.highlighted.is_some());
+
+        let stale = state.complete_preview_enrichment(
+            generation.wrapping_add(1),
+            "src/main.rs",
+            Some(PreviewEnrichment::Text(TextPreviewEnrichment {
+                highlighted: None,
+                parsed: None,
+            })),
+        );
+        assert!(!stale);
+    }
+
+    #[test]
+    fn preview_enrichment_completion_without_payload_clears_pending_request() {
+        let backend = Arc::new(LocalBackend::open_at(PathBuf::from(".")));
+        let mut state = AppState::new(AppStateConfig {
+            backend,
+            prefs: AppPrefs::default(),
+            now: Instant::now(),
+            subscribe_fs_events: false,
+        });
+        let generation = state.preview_load.begin();
+        state.apply_preview_content(generation, Some(text_preview("src/main.rs")), 20);
+        assert!(state.request_current_preview_enrichment(generation));
+        let base_revision = state.preview_content_revision;
+
+        assert!(state.complete_preview_enrichment(generation, "src/main.rs", None));
+        assert!(!state.preview_enrichment_pending());
+        assert_eq!(state.preview_content_revision, base_revision);
+    }
+
+    #[test]
+    fn markdown_enrichment_replaces_the_matching_base_model() {
+        let backend = Arc::new(LocalBackend::open_at(PathBuf::from(".")));
+        let mut state = AppState::new(AppStateConfig {
+            backend,
+            prefs: AppPrefs::default(),
+            now: Instant::now(),
+            subscribe_fs_events: false,
+        });
+        let source = "```rs\nfn main() {}\n```\n";
+        let base = reef_core::markdown::build_markdown_preview("README.md", source)
+            .expect("base markdown preview");
+        assert!(base.rows.iter().flatten().all(|span| span.syntax.is_none()));
+
+        let generation = state.preview_load.begin();
+        state.apply_preview_content(
+            generation,
+            Some(PreviewDocument {
+                path: "README.md".to_string(),
+                local_path: None,
+                bytes_on_disk: source.len() as u64,
+                mime: Some("text/markdown".to_string()),
+                body: PreviewBody::Markdown(base),
+            }),
+            20,
+        );
+        assert!(state.request_current_preview_enrichment(generation));
+        let base_revision = state.preview_content_revision;
+        let enriched =
+            reef_core::markdown::build_markdown_preview_with_syntax("README.md", source, false)
+                .expect("enriched markdown preview");
+
+        assert!(state.complete_preview_enrichment(
+            generation,
+            "README.md",
+            Some(PreviewEnrichment::Markdown(enriched)),
+        ));
+        assert!(state.preview_content_revision > base_revision);
+        let Some(PreviewBody::Markdown(markdown)) = state
+            .preview_content
+            .as_deref()
+            .map(|preview| &preview.body)
+        else {
+            panic!("expected markdown preview");
+        };
+        assert_eq!(markdown.source, source);
+        assert!(
+            markdown
+                .rows
+                .iter()
+                .flatten()
+                .any(|span| span.syntax.is_some())
+        );
     }
 
     fn text_preview(path: &str) -> PreviewDocument {

@@ -9,6 +9,11 @@ use crate::text::TextStyle;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownPreview {
     pub source: String,
+    pub render_model: Option<MarkdownRenderModel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownRenderModel {
     pub rows: Vec<Vec<MarkdownSpan>>,
     pub text_rows: Vec<String>,
 }
@@ -42,12 +47,38 @@ pub enum MarkdownRole {
 }
 
 impl MarkdownPreview {
+    pub fn source_only(source: &str) -> Self {
+        Self {
+            source: source.to_string(),
+            render_model: None,
+        }
+    }
+
+    pub fn rows(&self) -> Option<&[Vec<MarkdownSpan>]> {
+        self.render_model
+            .as_ref()
+            .map(|model| model.rows.as_slice())
+    }
+
+    pub fn text_rows(&self) -> Option<&[String]> {
+        self.render_model
+            .as_ref()
+            .map(|model| model.text_rows.as_slice())
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.text_rows()
+            .map_or_else(|| self.source.lines().count(), <[String]>::len)
+    }
+
     pub fn spans_for_row(&self, row: usize) -> Option<&[MarkdownSpan]> {
-        self.rows.get(row).map(Vec::as_slice)
+        self.rows()?.get(row).map(Vec::as_slice)
     }
 
     pub fn text_for_row(&self, row: usize) -> Option<&str> {
-        self.text_rows.get(row).map(String::as_str)
+        self.text_rows()
+            .and_then(|rows| rows.get(row).map(String::as_str))
+            .or_else(|| self.source.lines().nth(row))
     }
 }
 
@@ -392,8 +423,7 @@ fn build_markdown_preview_inner(
     let text_rows = rows.iter().map(|row| row_text(row)).collect();
     Some(MarkdownPreview {
         source: source.to_string(),
-        rows,
-        text_rows,
+        render_model: Some(MarkdownRenderModel { rows, text_rows }),
     })
 }
 
@@ -673,8 +703,13 @@ fn normal_spaces(width: usize) -> MarkdownSpan {
 mod tests {
     use super::*;
 
+    fn model(md: &MarkdownPreview) -> &MarkdownRenderModel {
+        md.render_model.as_ref().expect("markdown render model")
+    }
+
     fn texts(md: &MarkdownPreview) -> Vec<String> {
-        md.rows
+        model(md)
+            .rows
             .iter()
             .map(|r| r.iter().map(|s| s.text.as_str()).collect())
             .collect()
@@ -741,6 +776,9 @@ mod tests {
         assert!(rendered.iter().any(|l| l == "Title"));
         assert!(rendered.iter().any(|l| l.contains("• bold site")));
         let link = md
+            .render_model
+            .as_ref()
+            .unwrap()
             .rows
             .iter()
             .flatten()
@@ -752,6 +790,9 @@ mod tests {
         assert!(rendered.iter().any(|l| l == " rs "));
         assert!(rendered.iter().any(|l| l == "  fn main() {}"));
         let code_row = md
+            .render_model
+            .as_ref()
+            .unwrap()
             .rows
             .iter()
             .find(|row| row_text(row) == "  fn main() {}")
@@ -770,9 +811,15 @@ mod tests {
         let base = build_markdown_preview("README.md", source).unwrap();
         let enriched = build_markdown_preview_with_syntax("README.md", source, true).unwrap();
 
-        assert!(base.rows.iter().flatten().all(|span| span.syntax.is_none()));
         assert!(
-            enriched
+            model(&base)
+                .rows
+                .iter()
+                .flatten()
+                .all(|span| span.syntax.is_none())
+        );
+        assert!(
+            model(&enriched)
                 .rows
                 .iter()
                 .flatten()
@@ -786,7 +833,13 @@ mod tests {
         let rendered = texts(&md);
 
         assert_eq!(rendered, vec!["", "  plain", ""]);
-        assert!(md.rows.iter().flatten().all(|span| span.syntax.is_none()));
+        assert!(
+            model(&md)
+                .rows
+                .iter()
+                .flatten()
+                .all(|span| span.syntax.is_none())
+        );
     }
 
     #[test]
@@ -800,7 +853,7 @@ mod tests {
         let source = "| 名称 | Count |\n|:---|---:|\n| 鲨鱼 | 12 |\n| ray | 3 |\n";
         let md = build_markdown_preview("README.md", source).unwrap();
         let rendered = texts(&md);
-        assert_eq!(md.text_rows, rendered);
+        assert_eq!(model(&md).text_rows, rendered);
         assert_eq!(rendered[0], "┏━━━━━━┳━━━━━━━┓");
         assert_eq!(rendered[1], "┃ 名称 ┃ Count ┃");
         assert_eq!(rendered[2], "┣━━━━━━╋━━━━━━━┫");

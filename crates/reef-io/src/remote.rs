@@ -478,7 +478,7 @@ impl Backend for RemoteBackend {
         // as the generic Binary metadata card regardless of the decode
         // hint. Image rendering over SSH would need raw bytes +
         // client-side decode; tracked in issue #31.
-        use reef_core::preview::{BinaryInfo, BinaryReason, PreviewBody, TextPreview};
+        use reef_core::preview::{BinaryInfo, BinaryReason, PreviewBody};
         let rel_str = rel_path.to_string_lossy().to_string();
 
         // SQLite branch — client-side extension check, agent does the
@@ -543,36 +543,15 @@ impl Backend for RemoteBackend {
         }
 
         let content = String::from_utf8_lossy(&raw);
-        let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-        let lines = if lines.len() > 10_000 {
-            lines[..10_000].to_vec()
-        } else {
-            lines
-        };
-
-        let within_cap = raw.len() <= 512 * 1024 && lines.len() <= 5_000;
-        if within_cap
-            && let Some(markdown) = reef_core::markdown::build_markdown_preview(&rel_str, &content)
-        {
-            return Some(PreviewContent {
-                path: rel_str,
-                local_path: None,
-                bytes_on_disk,
-                mime: Some("text/markdown".into()),
-                body: PreviewBody::Markdown(markdown),
-            });
-        }
+        let body = reef_core::preview::build_textual_preview_body(&rel_str, &content);
+        let mime = matches!(body, PreviewBody::Markdown(_)).then(|| "text/markdown".into());
 
         Some(PreviewContent {
             path: rel_str,
             local_path: None,
             bytes_on_disk,
-            mime: None,
-            body: PreviewBody::Text(TextPreview {
-                lines,
-                highlighted: None,
-                parsed: None,
-            }),
+            mime,
+            body,
         })
     }
 

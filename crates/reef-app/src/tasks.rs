@@ -1859,9 +1859,17 @@ fn preview_enrichment_task(
                 lines: text.lines.clone(),
             }
         }
-        PreviewBody::Markdown(markdown) => PreviewEnrichmentInput::Markdown {
-            source: markdown.source.clone(),
-        },
+        PreviewBody::Markdown(markdown) => {
+            if !reef_core::preview::text_preview_can_be_enriched(
+                content.bytes_on_disk,
+                markdown.line_count(),
+            ) {
+                return None;
+            }
+            PreviewEnrichmentInput::Markdown {
+                source: markdown.source.clone(),
+            }
+        }
         _ => return None,
     };
     Some(PreviewEnrichmentTask {
@@ -4258,7 +4266,8 @@ mod preview_worker_coalescing_tests {
         };
         assert!(
             markdown
-                .rows
+                .rows()
+                .expect("small markdown preview should include a render model")
                 .iter()
                 .flatten()
                 .all(|span| span.syntax.is_none())
@@ -4282,11 +4291,27 @@ mod preview_worker_coalescing_tests {
         assert_eq!(markdown.source, source);
         assert!(
             markdown
-                .rows
+                .rows()
+                .expect("enriched markdown preview should include a render model")
                 .iter()
                 .flatten()
                 .any(|span| span.syntax.is_some())
         );
+    }
+
+    #[test]
+    fn large_markdown_preview_skips_syntax_enrichment() {
+        let source = format!("# Title\n\n{}", "large markdown paragraph ".repeat(24_000));
+        let content = PreviewContent {
+            path: "README.md".into(),
+            local_path: None,
+            bytes_on_disk: source.len() as u64,
+            mime: Some("text/markdown".into()),
+            body: reef_core::preview::build_textual_preview_body("README.md", &source),
+        };
+
+        assert!(matches!(content.body, PreviewBody::Markdown(_)));
+        assert!(preview_enrichment_task(1, &content, false).is_none());
     }
 
     fn recv_worker_result(tasks: &TaskCoordinator, wake: &mpsc::Receiver<()>) -> WorkerResult {

@@ -139,6 +139,23 @@ fn load_preview_markdown_model_matches_on_local_and_remote() {
     assert_eq!(lm, rm);
 }
 
+#[test]
+fn load_preview_large_markdown_stays_markdown_locally_and_remotely() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, _repo) = tempdir_repo();
+    let body = format!("# Title\n\n{}", "large markdown paragraph ".repeat(24_000));
+    std::fs::write(tmp.path().join("README.md"), body.as_bytes()).unwrap();
+
+    let local = LocalBackend::open_at(tmp.path().to_path_buf());
+    let remote = spawn_remote(tmp.path());
+
+    let local_preview = local.load_preview(Path::new("README.md"), true).unwrap();
+    let remote_preview = remote.load_preview(Path::new("README.md"), true).unwrap();
+
+    assert_eq!(shape_of(&local_preview.body), BodyShape::Markdown);
+    assert_eq!(shape_of(&remote_preview.body), BodyShape::Markdown);
+}
+
 /// Build a tiny SQLite fixture at `path` with `SETUP_SQL` so both
 /// backends have something real to read. Bare-minimum schema —
 /// enough to exercise the table list, row count, and first-page

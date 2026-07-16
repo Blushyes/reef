@@ -158,7 +158,7 @@ fn begin_seeds_from_markdown_rendered_rows() {
     let (mut app, _tmp, _g) = fresh_app();
     install_markdown_preview(&mut app, "| Name | Count |\n|---|---:|\n| reef | 12 |\n");
     let rendered = match &app.engine.state.preview_content.as_ref().unwrap().body {
-        PreviewBody::Markdown(markdown) => markdown.text_rows[1].clone(),
+        PreviewBody::Markdown(markdown) => markdown.text_for_row(1).unwrap().to_string(),
         _ => panic!("markdown preview expected"),
     };
     assert_eq!(rendered, "┃ Name ┃ Count ┃");

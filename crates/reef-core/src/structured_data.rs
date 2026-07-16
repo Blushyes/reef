@@ -142,6 +142,10 @@ impl JsonOutline {
         self.content_width_columns
     }
 
+    pub fn rows(&self) -> &[JsonOutlineRow] {
+        &self.rows
+    }
+
     pub fn page(&self, start: usize, len: usize) -> JsonOutlineRows {
         let row_count = self.row_count();
         let row_offset = start.min(row_count);
@@ -165,6 +169,31 @@ impl JsonOutlineRow {
                 .map(|_| JSON_DISCLOSURE_COLUMNS + JSON_DISCLOSURE_GAP_COLUMNS)
                 .unwrap_or(0)
             + segments_width_columns(&self.suffix_segments)
+    }
+
+    pub fn selectable_text(&self) -> String {
+        let mut text = String::with_capacity(
+            self.prefix_segments
+                .iter()
+                .chain(&self.suffix_segments)
+                .map(|segment| segment.text.len())
+                .sum::<usize>()
+                + if self.disclosure.is_some() {
+                    JSON_DISCLOSURE_COLUMNS + JSON_DISCLOSURE_GAP_COLUMNS
+                } else {
+                    0
+                },
+        );
+        for segment in &self.prefix_segments {
+            text.push_str(&segment.text);
+        }
+        if self.disclosure.is_some() {
+            text.push_str("  ");
+        }
+        for segment in &self.suffix_segments {
+            text.push_str(&segment.text);
+        }
+        text
     }
 }
 
@@ -619,5 +648,18 @@ mod tests {
         assert_eq!(first.rows[0].line_number, 2);
         assert_eq!(second.row_offset, 3);
         assert_eq!(second.rows[0].line_number, 4);
+    }
+
+    #[test]
+    fn outline_row_selectable_text_matches_rendered_columns_without_indentation() {
+        let root = parse_json(r#"{"items":["reef"]}"#).unwrap();
+        let outline = json_outline(&root, &HashSet::new());
+        let items = outline
+            .rows()
+            .iter()
+            .find(|row| row.id == "root/items.open")
+            .unwrap();
+
+        assert_eq!(items.selectable_text(), "\"items\" :   [");
     }
 }

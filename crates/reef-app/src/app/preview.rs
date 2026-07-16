@@ -412,7 +412,13 @@ mod tests {
         let source = "```rs\nfn main() {}\n```\n";
         let base = reef_core::markdown::build_markdown_preview("README.md", source)
             .expect("base markdown preview");
-        assert!(base.rows.iter().flatten().all(|span| span.syntax.is_none()));
+        assert!(
+            base.rows()
+                .expect("base markdown render model")
+                .iter()
+                .flatten()
+                .all(|span| span.syntax.is_none())
+        );
 
         let generation = state.preview_load.begin();
         state.apply_preview_content(
@@ -448,7 +454,8 @@ mod tests {
         assert_eq!(markdown.source, source);
         assert!(
             markdown
-                .rows
+                .rows()
+                .expect("enriched markdown render model")
                 .iter()
                 .flatten()
                 .any(|span| span.syntax.is_some())

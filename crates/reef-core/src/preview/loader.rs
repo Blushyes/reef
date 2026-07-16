@@ -10,6 +10,7 @@ const SQLITE_MIME: &str = "application/vnd.sqlite3";
 const MAX_TEXT_PROBE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_ENRICHMENT_BYTES: u64 = 512 * 1024;
 const MAX_ENRICHMENT_LINES: usize = 5_000;
+const MAX_TEXT_PREVIEW_LINES: usize = 10_000;
 
 pub const INITIAL_DB_PAGE_ROWS: u32 = 50;
 
@@ -171,37 +172,35 @@ pub fn load_preview_from_path(
         file.read_to_end(&mut raw).ok()?;
     }
 
-    let content = String::from_utf8_lossy(&raw);
-    let lines: Vec<String> = content.lines().map(str::to_string).collect();
-    let lines = if lines.len() > 10_000 {
-        lines[..10_000].to_vec()
-    } else {
-        lines
-    };
-
-    let within_cap =
-        raw.len() <= MAX_ENRICHMENT_BYTES as usize && lines.len() <= MAX_ENRICHMENT_LINES;
-    if within_cap
-        && let Some(markdown) = crate::markdown::build_markdown_preview(&rel_str, &content)
-    {
-        return Some(preview_document(
-            &rel_str,
-            file_size,
-            mime,
-            PreviewBody::Markdown(markdown),
-        ));
-    }
-
     Some(preview_document(
         &rel_str,
         file_size,
         mime,
-        PreviewBody::Text(TextPreview {
-            lines,
-            highlighted: None,
-            parsed: None,
-        }),
+        build_textual_preview_body(&rel_str, &String::from_utf8_lossy(&raw)),
     ))
+}
+
+pub fn build_textual_preview_body(path: &str, content: &str) -> PreviewBody {
+    if crate::markdown::is_markdown_path(path) {
+        let line_count = content.lines().take(MAX_ENRICHMENT_LINES + 1).count();
+        let markdown = if text_preview_can_be_enriched(content.len() as u64, line_count) {
+            crate::markdown::build_markdown_preview(path, content)
+                .expect("markdown path must produce a markdown preview")
+        } else {
+            crate::markdown::MarkdownPreview::source_only(content)
+        };
+        return PreviewBody::Markdown(markdown);
+    }
+
+    PreviewBody::Text(TextPreview {
+        lines: content
+            .lines()
+            .take(MAX_TEXT_PREVIEW_LINES)
+            .map(str::to_string)
+            .collect(),
+        highlighted: None,
+        parsed: None,
+    })
 }
 
 pub fn build_text_preview_enrichment(
@@ -365,8 +364,12 @@ mod tests {
 
         match content.body {
             PreviewBody::Markdown(markdown) => {
-                assert_eq!(markdown.text_rows[0], "Title");
-                let rows: Vec<String> = markdown
+                let model = markdown
+                    .render_model
+                    .as_ref()
+                    .expect("small markdown render model");
+                assert_eq!(model.text_rows[0], "Title");
+                let rows: Vec<String> = model
                     .rows
                     .iter()
                     .map(|r| r.iter().map(|s| s.text.as_str()).collect())
@@ -375,6 +378,35 @@ mod tests {
             }
             other => panic!("expected Markdown body, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn load_preview_large_markdown_keeps_markdown_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = format!("# Title\n\n{}", "large markdown paragraph ".repeat(24_000));
+        assert!(source.len() > MAX_ENRICHMENT_BYTES as usize);
+        write_bytes(tmp.path(), "README.md", source.as_bytes());
+
+        let content = load_preview(tmp.path(), Path::new("README.md"), true).expect("preview");
+
+        let PreviewBody::Markdown(markdown) = content.body else {
+            panic!("large markdown must not be downgraded to text");
+        };
+        assert_eq!(markdown.source, source);
+        assert!(markdown.render_model.is_none());
+    }
+
+    #[test]
+    fn load_preview_many_line_markdown_keeps_markdown_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = (0..=MAX_ENRICHMENT_LINES)
+            .map(|line| format!("paragraph {line}\n\n"))
+            .collect::<String>();
+        write_bytes(tmp.path(), "notes.markdown", source.as_bytes());
+
+        let content = load_preview(tmp.path(), Path::new("notes.markdown"), true).expect("preview");
+
+        assert!(matches!(content.body, PreviewBody::Markdown(_)));
     }
 
     #[test]

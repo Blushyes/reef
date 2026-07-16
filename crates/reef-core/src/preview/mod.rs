@@ -9,8 +9,8 @@ use std::sync::Arc;
 pub use binary::{BinaryInfo, BinaryReason};
 pub use image::ImagePreview;
 pub use loader::{
-    INITIAL_DB_PAGE_ROWS, build_text_preview_enrichment, load_preview, load_preview_from_path,
-    text_preview_can_be_enriched,
+    INITIAL_DB_PAGE_ROWS, build_text_preview_enrichment, build_textual_preview_body, load_preview,
+    load_preview_from_path, text_preview_can_be_enriched,
 };
 
 #[derive(Debug, Clone)]
@@ -69,10 +69,13 @@ impl PreviewBody {
                 .map(|line| Cow::Borrowed(line.as_str()))
                 .collect(),
             PreviewBody::Markdown(markdown) => markdown
-                .text_rows
-                .iter()
-                .map(|line| Cow::Borrowed(line.as_str()))
-                .collect(),
+                .text_rows()
+                .map(|rows| {
+                    rows.iter()
+                        .map(|line| Cow::Borrowed(line.as_str()))
+                        .collect()
+                })
+                .unwrap_or_else(|| markdown.source.lines().map(Cow::Borrowed).collect()),
             _ => Vec::new(),
         }
     }

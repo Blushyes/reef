@@ -23,12 +23,16 @@ pub(in crate::ui) fn render(
     let y = render_card_header(f, area, &preview.path, &th, focused, None);
     let content_height = (max_y - y) as usize;
     app.layout.last_preview_view_h = content_height as u16;
-    let max_scroll = markdown.text_rows.len().saturating_sub(content_height);
+    let Some(model) = markdown.render_model.as_ref() else {
+        render_source_only(f, app, area, markdown, y, content_height);
+        return;
+    };
+    let max_scroll = model.text_rows.len().saturating_sub(content_height);
     app.engine
         .dispatch(AppCommand::ClampPreviewVerticalScroll(max_scroll));
 
     let content_w = area.width as usize;
-    let max_visible_w = markdown
+    let max_visible_w = model
         .rows
         .iter()
         .skip(app.engine.preview_scroll())
@@ -49,7 +53,7 @@ pub(in crate::ui) fn render(
     app.last_markdown_content_origin = Some((area.x, y));
     let selection = app.preview_selection;
 
-    for (i, row) in markdown
+    for (i, row) in model
         .rows
         .iter()
         .skip(app.engine.preview_scroll())
@@ -103,6 +107,88 @@ pub(in crate::ui) fn render(
         let mut spans = clip_spans(&tokens, h, content_w);
         pad_row_bg(&mut spans, content_w, row_bg(row, &th));
         register_links(app, row, area.x, cy, h, content_w);
+        f.render_widget(Line::from(spans), Rect::new(area.x, cy, area.width, 1));
+    }
+}
+
+fn render_source_only(
+    f: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    markdown: &reef_core::markdown::MarkdownPreview,
+    y: u16,
+    content_height: usize,
+) {
+    let th = app.theme;
+    let max_y = area.y + area.height;
+    let max_scroll = markdown.line_count().saturating_sub(content_height);
+    app.engine
+        .dispatch(AppCommand::ClampPreviewVerticalScroll(max_scroll));
+
+    let content_w = area.width as usize;
+    let max_visible_w = markdown
+        .source
+        .lines()
+        .skip(app.engine.preview_scroll())
+        .take(content_height)
+        .map(UnicodeWidthStr::width)
+        .max()
+        .unwrap_or(0);
+    app.engine
+        .dispatch(AppCommand::ClampPreviewHorizontalScroll(
+            max_visible_w.saturating_sub(content_w),
+        ));
+    let h = app.engine.preview_h_scroll();
+
+    app.last_preview_content_origin = None;
+    app.last_markdown_content_origin = Some((area.x, y));
+    let selection = app.preview_selection;
+
+    for (visible_row, text) in markdown
+        .source
+        .lines()
+        .skip(app.engine.preview_scroll())
+        .take(content_height)
+        .enumerate()
+    {
+        let cy = y + visible_row as u16;
+        if cy >= max_y {
+            break;
+        }
+        let row = app.engine.preview_scroll() + visible_row;
+        let base_tokens = vec![(
+            Style::default().fg(th.fg_primary),
+            std::borrow::Cow::Borrowed(text),
+        )];
+        let (ranges, current) = if app.engine.find_widget().target == Some(FindTarget::FilePreview)
+        {
+            app.engine
+                .find_widget()
+                .ranges_on_row(FindTarget::FilePreview, row)
+        } else {
+            app.engine
+                .search()
+                .ranges_on_row(SearchTarget::FilePreview, row)
+        };
+        let tokens = if ranges.is_empty() {
+            base_tokens
+        } else {
+            overlay_match_highlight(
+                base_tokens,
+                &ranges,
+                current,
+                th.search_match,
+                th.search_current,
+            )
+        };
+        let tokens = match selection
+            .as_ref()
+            .and_then(|selection| selection.line_byte_range(row, text))
+        {
+            Some(range) if range.start < range.end => overlay_selection_highlight(tokens, range),
+            _ => tokens,
+        };
+        let spans = clip_spans(&tokens, h, content_w);
         f.render_widget(Line::from(spans), Rect::new(area.x, cy, area.width, 1));
     }
 }

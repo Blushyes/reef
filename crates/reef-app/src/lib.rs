@@ -63,8 +63,8 @@ pub use features::tree_edit::{TreeEditMode, TreeEditState};
 pub use location::{CursorPosition, LocationSnapshot, LocationSurface, ScrollPosition};
 pub use preview_snapshot::{
     DatabaseColumnSnapshot, DatabaseObjectKeySnapshot, DatabaseObjectSnapshot,
-    DatabasePageSnapshot, DatabaseSchemaSnapshot, MarkdownRoleSnapshot, MarkdownSpanSnapshot,
-    MarkdownStyleSnapshot, PreviewBodySnapshot, PreviewDetectedKindSnapshot,
+    DatabasePageSnapshot, DatabaseSchemaSnapshot, MarkdownCodeHighlightSnapshot,
+    MarkdownCodeTokenSnapshot, PreviewBodySnapshot, PreviewDetectedKindSnapshot,
     PreviewDocumentSnapshot, PreviewSourceSnapshot, RgbSnapshot, StructuredDataFormatSnapshot,
     TextStyleSnapshot, TextStyleSpanSnapshot,
 };

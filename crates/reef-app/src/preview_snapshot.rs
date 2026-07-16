@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use reef_core::markdown::{MarkdownPreview, MarkdownRole, MarkdownSpan, MarkdownStyle};
+use reef_core::markdown::{MarkdownPreview, MarkdownRole};
 use reef_core::preview::{BinaryInfo, BinaryReason, PreviewBody, PreviewDocument, TextPreview};
 use reef_core::text::{Rgb, TextStyle};
 use serde::Serialize;
@@ -59,8 +59,7 @@ pub enum PreviewBodySnapshot {
     },
     Markdown {
         source: String,
-        rows: Vec<Vec<MarkdownSpanSnapshot>>,
-        text_rows: Vec<String>,
+        code_highlights: Vec<MarkdownCodeHighlightSnapshot>,
     },
     Image {
         width_px: u32,
@@ -143,33 +142,15 @@ pub struct RgbSnapshot {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct MarkdownSpanSnapshot {
+pub struct MarkdownCodeHighlightSnapshot {
+    pub rows: Vec<Vec<MarkdownCodeTokenSnapshot>>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MarkdownCodeTokenSnapshot {
     pub text: String,
-    pub style: MarkdownStyleSnapshot,
-    pub link: Option<String>,
-    pub syntax: Option<TextStyleSnapshot>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct MarkdownStyleSnapshot {
-    pub role: MarkdownRoleSnapshot,
-    pub bold: bool,
-    pub italic: bool,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum MarkdownRoleSnapshot {
-    Normal,
-    Heading,
-    Quote,
-    Code,
-    CodeBlockHeader,
-    CodeBlockText,
-    Link,
-    TableHeader,
-    Border,
+    pub style: TextStyleSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -277,8 +258,7 @@ impl PreviewBodySnapshot {
                 } else {
                     Self::Markdown {
                         source: markdown.source.clone(),
-                        rows: markdown_rows(markdown),
-                        text_rows: markdown.text_rows.clone(),
+                        code_highlights: markdown_code_highlights(markdown),
                     }
                 }
             }
@@ -566,12 +546,56 @@ fn binary_reason_label(reason: &BinaryReason) -> &'static str {
     }
 }
 
-fn markdown_rows(markdown: &MarkdownPreview) -> Vec<Vec<MarkdownSpanSnapshot>> {
-    markdown
-        .rows
-        .iter()
-        .map(|row| row.iter().map(MarkdownSpanSnapshot::from).collect())
-        .collect()
+fn markdown_code_highlights(markdown: &MarkdownPreview) -> Vec<MarkdownCodeHighlightSnapshot> {
+    let Some(rows) = markdown.rows() else {
+        return Vec::new();
+    };
+    let mut highlights = Vec::new();
+    let mut current_rows = Vec::new();
+
+    for row in rows {
+        let is_code_row = !row.is_empty()
+            && row
+                .iter()
+                .all(|span| span.style.role == MarkdownRole::CodeBlockText);
+        let is_padding = row.len() == 1 && row[0].text.is_empty();
+        if !is_code_row || is_padding {
+            flush_markdown_code_highlight(&mut highlights, &mut current_rows);
+            continue;
+        }
+
+        let spans = if row
+            .first()
+            .is_some_and(|span| span.text == "  " && span.link.is_none() && span.syntax.is_none())
+        {
+            &row[1..]
+        } else {
+            row.as_slice()
+        };
+        current_rows.push(
+            spans
+                .iter()
+                .map(|span| MarkdownCodeTokenSnapshot {
+                    text: span.text.clone(),
+                    style: TextStyleSnapshot::from(span.syntax.unwrap_or_default()),
+                })
+                .collect(),
+        );
+    }
+    flush_markdown_code_highlight(&mut highlights, &mut current_rows);
+    highlights
+}
+
+fn flush_markdown_code_highlight(
+    highlights: &mut Vec<MarkdownCodeHighlightSnapshot>,
+    rows: &mut Vec<Vec<MarkdownCodeTokenSnapshot>>,
+) {
+    if rows.is_empty() {
+        return;
+    }
+    highlights.push(MarkdownCodeHighlightSnapshot {
+        rows: std::mem::take(rows),
+    });
 }
 
 impl From<TextStyle> for TextStyleSnapshot {
@@ -591,43 +615,6 @@ impl From<Rgb> for RgbSnapshot {
             r: rgb.r,
             g: rgb.g,
             b: rgb.b,
-        }
-    }
-}
-
-impl From<&MarkdownSpan> for MarkdownSpanSnapshot {
-    fn from(span: &MarkdownSpan) -> Self {
-        Self {
-            text: span.text.clone(),
-            style: MarkdownStyleSnapshot::from(span.style),
-            link: span.link.clone(),
-            syntax: span.syntax.map(TextStyleSnapshot::from),
-        }
-    }
-}
-
-impl From<MarkdownStyle> for MarkdownStyleSnapshot {
-    fn from(style: MarkdownStyle) -> Self {
-        Self {
-            role: MarkdownRoleSnapshot::from(style.role),
-            bold: style.bold,
-            italic: style.italic,
-        }
-    }
-}
-
-impl From<MarkdownRole> for MarkdownRoleSnapshot {
-    fn from(role: MarkdownRole) -> Self {
-        match role {
-            MarkdownRole::Normal => Self::Normal,
-            MarkdownRole::Heading => Self::Heading,
-            MarkdownRole::Quote => Self::Quote,
-            MarkdownRole::Code => Self::Code,
-            MarkdownRole::CodeBlockHeader => Self::CodeBlockHeader,
-            MarkdownRole::CodeBlockText => Self::CodeBlockText,
-            MarkdownRole::Link => Self::Link,
-            MarkdownRole::TableHeader => Self::TableHeader,
-            MarkdownRole::Border => Self::Border,
         }
     }
 }
@@ -813,6 +800,63 @@ mod tests {
         assert!(matches!(
             snapshot.body,
             PreviewBodySnapshot::Markdown { ref source, .. } if source == "# Title\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n"
+        ));
+    }
+
+    #[test]
+    fn markdown_snapshot_only_exports_fenced_code_highlights() {
+        let source = "# Title\n\n```rs\nfn main() {}\n```\n";
+        let markdown =
+            reef_core::markdown::build_markdown_preview_with_syntax("README.md", source, true)
+                .expect("markdown preview");
+        let doc = PreviewDocument {
+            path: "README.md".to_string(),
+            local_path: None,
+            bytes_on_disk: source.len() as u64,
+            mime: Some("text/markdown".into()),
+            body: PreviewBody::Markdown(markdown),
+        };
+
+        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 1);
+
+        let PreviewBodySnapshot::Markdown {
+            source: snapshot_source,
+            code_highlights,
+        } = snapshot.body
+        else {
+            panic!("expected markdown snapshot");
+        };
+        assert_eq!(snapshot_source, source);
+        assert_eq!(code_highlights.len(), 1);
+        assert_eq!(code_highlights[0].rows.len(), 1);
+        assert_eq!(
+            code_highlights[0].rows[0]
+                .iter()
+                .map(|token| token.text.as_str())
+                .collect::<String>(),
+            "fn main() {}"
+        );
+    }
+
+    #[test]
+    fn source_only_markdown_snapshot_does_not_build_renderer_rows() {
+        let source = "# Large\n\nbody\n";
+        let doc = PreviewDocument {
+            path: "README.md".to_string(),
+            local_path: None,
+            bytes_on_disk: source.len() as u64,
+            mime: Some("text/markdown".into()),
+            body: PreviewBody::Markdown(reef_core::markdown::MarkdownPreview::source_only(source)),
+        };
+
+        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 1);
+
+        assert!(matches!(
+            snapshot.body,
+            PreviewBodySnapshot::Markdown {
+                ref source,
+                ref code_highlights,
+            } if source == "# Large\n\nbody\n" && code_highlights.is_empty()
         ));
     }
 

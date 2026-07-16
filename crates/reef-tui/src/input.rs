@@ -3250,16 +3250,16 @@ fn mouse_to_preview_coord(app: &App, col: u16, row: u16) -> Option<(usize, usize
     let preview = app.engine.preview_content_ref()?;
     match &preview.body {
         reef_core::preview::PreviewBody::Markdown(markdown) => {
-            if markdown.text_rows.is_empty() {
+            let line_count = markdown.line_count();
+            if line_count == 0 {
                 return None;
             }
             let (content_x, content_y) = app.last_markdown_content_origin?;
             let visible_row = row.saturating_sub(content_y) as usize;
-            let line_idx =
-                (app.engine.preview_scroll() + visible_row).min(markdown.text_rows.len() - 1);
+            let line_idx = (app.engine.preview_scroll() + visible_row).min(line_count - 1);
             let visible_col =
                 (col.saturating_sub(content_x) as usize) + app.engine.preview_h_scroll();
-            let byte_offset = col_to_byte_offset(&markdown.text_rows[line_idx], visible_col);
+            let byte_offset = col_to_byte_offset(markdown.text_for_row(line_idx)?, visible_col);
             Some((line_idx, byte_offset))
         }
         reef_core::preview::PreviewBody::Text(_) => {
@@ -3385,7 +3385,7 @@ fn tick_preview_drag_autoscroll(app: &mut App) {
         return;
     };
     let line_count = match &preview.body {
-        reef_core::preview::PreviewBody::Markdown(markdown) => markdown.text_rows.len(),
+        reef_core::preview::PreviewBody::Markdown(markdown) => markdown.line_count(),
         reef_core::preview::PreviewBody::Text(text) => text.lines.len(),
         _ => return,
     };

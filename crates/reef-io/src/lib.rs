@@ -41,6 +41,15 @@ pub use target::{
 
 pub type EditorResolver = fn() -> Option<(String, Vec<String>)>;
 
+/// A debounced filesystem change observed by a backend watcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FsChange {
+    /// Whether this event changed the workdir's Git-repository capability.
+    /// Consumers use this to invalidate graph state only for `git init` or
+    /// repository removal, rather than for every worktree write.
+    pub repo_presence_changed: bool,
+}
+
 static EDITOR_RESOLVER: OnceLock<Mutex<EditorResolver>> = OnceLock::new();
 
 pub fn set_editor_resolver(resolver: EditorResolver) {
@@ -445,7 +454,7 @@ pub trait Backend: Send + Sync {
     /// Subscribe to debounced fs-change events. Each backend decides whether
     /// to spawn a local watcher (LocalBackend) or relay notifications from
     /// the remote agent (RemoteBackend).
-    fn subscribe_fs_events(&self) -> mpsc::Receiver<()>;
+    fn subscribe_fs_events(&self) -> mpsc::Receiver<FsChange>;
 
     /// Best-effort editor launch hook. Remote backends may return
     /// `BackendError::Unimplemented`; callers can then use

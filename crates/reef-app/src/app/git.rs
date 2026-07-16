@@ -97,6 +97,35 @@ impl AppState {
         if !self.git_status.collapsed_dirs.remove(&key) {
             self.git_status.collapsed_dirs.insert(key);
         }
+        self.rebuild_git_status_tree_rows();
+    }
+
+    pub(super) fn rebuild_git_status_tree_rows(&mut self) {
+        if !self.git_status.tree_mode {
+            self.git_status.staged_tree_rows.clear();
+            self.git_status.unstaged_tree_rows.clear();
+            return;
+        }
+        self.git_status.staged_tree_rows = reef_core::git::tree::visible_rows(
+            &self.staged_files,
+            true,
+            &self.git_status.collapsed_dirs,
+        );
+        self.git_status.unstaged_tree_rows = reef_core::git::tree::visible_rows(
+            &self.unstaged_files,
+            false,
+            &self.git_status.collapsed_dirs,
+        );
+    }
+
+    pub(super) fn git_status_tree_needs_rebuild(
+        &self,
+        staged: &[FileEntry],
+        unstaged: &[FileEntry],
+    ) -> bool {
+        self.git_status.tree_mode
+            && (!same_git_tree_shape(&self.staged_files, staged)
+                || !same_git_tree_shape(&self.unstaged_files, unstaged))
     }
 
     pub fn prompt_discard_file(&mut self, is_staged: bool, path: String) {
@@ -207,6 +236,7 @@ impl AppState {
 
     pub fn toggle_status_tree_mode(&mut self) {
         self.git_status.tree_mode = !self.git_status.tree_mode;
+        self.rebuild_git_status_tree_rows();
     }
 
     pub fn toggle_commit_diff_layout(&mut self) {
@@ -830,4 +860,12 @@ impl AppState {
             }
         }
     }
+}
+
+fn same_git_tree_shape(current: &[FileEntry], next: &[FileEntry]) -> bool {
+    current.len() == next.len()
+        && current
+            .iter()
+            .zip(next)
+            .all(|(current, next)| current.path == next.path)
 }

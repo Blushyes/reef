@@ -122,9 +122,11 @@ impl AppState {
 
     pub fn drain_fs_watcher_events(&mut self) -> bool {
         let mut fs_dirty = false;
+        let mut repo_presence_changed = false;
         if let Some(rx) = self.fs_watcher_rx.as_ref() {
-            while rx.try_recv().is_ok() {
+            while let Ok(change) = rx.try_recv() {
                 fs_dirty = true;
+                repo_presence_changed |= change.repo_presence_changed;
             }
         }
         if !fs_dirty {
@@ -133,8 +135,45 @@ impl AppState {
 
         self.file_tree_load.mark_stale();
         self.preview_load.mark_stale();
-        self.diff_load.mark_stale();
-        self.git_status_load.mark_stale();
+        let has_repo = self.backend.has_repo();
+        if repo_presence_changed {
+            self.cancel_git_confirmations();
+            self.diff_load.invalidate();
+            self.git_status_load.invalidate();
+            self.git_mutation_load.invalidate();
+            self.commit_load.invalidate();
+            self.push_load.invalidate();
+            self.graph_load.invalidate();
+            self.commit_detail_load.invalidate();
+            self.commit_file_diff_load.invalidate();
+            self.staged_files.clear();
+            self.unstaged_files.clear();
+            self.rebuild_git_status_tree_rows();
+            self.selected_file = None;
+            self.diff_content = None;
+            self.git_status.ahead_behind = None;
+            self.branch_name.clear();
+            self.git_graph.rows.clear();
+            self.git_graph.ref_map.clear();
+            self.git_graph.cache_key = None;
+            self.git_graph.selected_idx = 0;
+            self.git_graph.selected_commit = None;
+            self.git_graph.selection_anchor = None;
+            self.commit_detail.detail = None;
+            self.commit_detail.range_detail = None;
+            self.commit_detail.file_diff = None;
+            if has_repo {
+                self.git_status_load.mark_stale();
+                self.graph_load.mark_stale();
+            }
+        } else if has_repo {
+            self.git_status_load.mark_stale();
+            if self.selected_file.is_some() {
+                self.diff_load.mark_stale();
+            } else {
+                self.diff_load.invalidate();
+            }
+        }
         crate::features::quick_open::mark_stale(&mut self.quick_open);
         self.nav_workspace_load.mark_stale();
         self.nav_refine_cache.clear();
@@ -168,14 +207,38 @@ impl AppState {
                     self.file_tree_load.complete_err(generation, error);
                 }
             },
+            WorkerResult::FileTreeSubtree { generation, result } => match result {
+                Ok(payload) => {
+                    if self.file_tree_load.complete_ok(generation) {
+                        let before = self.file_tree.selected_path();
+                        self.file_tree
+                            .replace_visible_descendants(&payload.parent_path, payload.entries);
+                        let staged = self.staged_files.clone();
+                        let unstaged = self.unstaged_files.clone();
+                        self.file_tree.refresh_git_statuses(&staged, &unstaged);
+                        self.revalidate_tree_edit_anchor();
+                        if before != self.file_tree.selected_path() {
+                            events.push(AppRuntimeEvent::LoadPreviewSelected);
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.file_tree_load.complete_err(generation, error);
+                }
+            },
             WorkerResult::GitStatus { generation, result } => match result {
                 Ok(payload) => {
                     if self.git_status_load.complete_ok(generation) {
                         let before = self.selected_file.clone();
+                        let tree_needs_rebuild =
+                            self.git_status_tree_needs_rebuild(&payload.staged, &payload.unstaged);
                         self.staged_files = payload.staged;
                         self.unstaged_files = payload.unstaged;
                         self.git_status.ahead_behind = payload.ahead_behind;
                         self.branch_name = payload.branch_name;
+                        if tree_needs_rebuild {
+                            self.rebuild_git_status_tree_rows();
+                        }
 
                         let staged = self.staged_files.clone();
                         let unstaged = self.unstaged_files.clone();

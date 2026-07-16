@@ -128,11 +128,14 @@ fn main() -> io::Result<()> {
     // want the channel drained from the moment the agent starts.
     let watcher_rx = backend.subscribe_fs_events();
     let watcher_stdout = Arc::clone(&stdout);
+    let watcher_backend = Arc::clone(&backend);
     let _watcher = thread::Builder::new()
         .name("reef-agent-watcher".into())
         .spawn(move || {
             while watcher_rx.recv().is_ok() {
-                let frame = Frame::Notification(Notification::FsChanged);
+                let frame = Frame::Notification(Notification::FsChanged {
+                    has_repo: watcher_backend.has_repo(),
+                });
                 if let Ok(mut w) = watcher_stdout.lock() {
                     if encode_frame(&mut *w, &frame).is_err() {
                         break;
@@ -199,6 +202,7 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
             workdir: workdir.display().to_string(),
             workdir_name: backend.workdir_name(),
             branch_name: backend.branch_name(),
+            has_repo: backend.has_repo(),
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             protocol_version: PROTOCOL_VERSION,
         })

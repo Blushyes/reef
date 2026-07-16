@@ -755,7 +755,7 @@ fn build_rows(app: &App, width: u16, display_w: u16, theme: &Theme) -> Vec<Row> 
 
     if cd.files_tree_mode {
         let nodes = gtree::build(files_source);
-        render_commit_file_tree(&nodes, 1, &ctx, &mut rows, theme);
+        render_commit_file_tree(&nodes, files_source, 1, &ctx, &mut rows, theme);
     } else {
         for file in files_source {
             rows.push(commit_file_row(file, &file.path, "  ", &ctx));
@@ -980,6 +980,7 @@ fn commit_file_row(
 
 fn render_commit_file_tree(
     nodes: &BTreeMap<String, Node>,
+    files: &[FileEntry],
     depth: usize,
     ctx: &CommitFilesCtx,
     rows: &mut Vec<Row>,
@@ -1019,10 +1020,13 @@ fn render_commit_file_tree(
                     .on_click("git.toggleCommitDir", serde_json::json!({ "path": path })),
                 );
                 if !is_collapsed {
-                    render_commit_file_tree(children, depth + 1, ctx, rows, theme);
+                    render_commit_file_tree(children, files, depth + 1, ctx, rows, theme);
                 }
             }
-            Node::File(entry) => {
+            Node::File { source_index } => {
+                let Some(entry) = files.get(*source_index) else {
+                    continue;
+                };
                 let basename = entry.path.rsplit('/').next().unwrap_or(&entry.path);
                 let indent = "  ".repeat(depth);
                 rows.push(commit_file_row(entry, basename, &indent, ctx));

@@ -1070,16 +1070,10 @@ impl App {
         self.drain_engine_runtime_events();
     }
 
-    /// Collapse every expanded folder and async-refresh the tree so
-    /// the render path picks up the shorter row list.
+    /// Collapse every expanded folder and shorten the cached flat tree.
     pub fn collapse_all_tree_entries(&mut self) {
-        let selected_path = self
-            .engine
-            .selected_file_tree_entry()
-            .map(|entry| entry.path);
         self.engine
             .dispatch(reef_app::AppCommand::CollapseAllTreeEntries);
-        self.refresh_file_tree_with_target(selected_path);
     }
 
     /// Rebuild the file tree from disk, applying git decorations when a repo is open.
@@ -1146,12 +1140,15 @@ impl App {
     /// stale responses whose id doesn't match (the `ThreadProtocol`
     /// bumps its id each time it dispatches, so a resize for an older
     /// selection arrives as a no-op after the user already switched).
-    fn drain_preview_resize_responses(&mut self) {
+    fn drain_preview_resize_responses(&mut self) -> bool {
+        let mut changed = false;
         while let Ok(resp) = self.preview_resize_rx.try_recv() {
             if let Some(proto) = self.preview_image_protocol.as_mut() {
                 proto.update_resized_protocol(resp);
+                changed = true;
             }
         }
+        changed
     }
 
     /// Pick up freshly-built `StatefulProtocol`s and slot them into the
@@ -1160,15 +1157,18 @@ impl App {
     /// the user switched files before the build completed, the build
     /// is stale and gets dropped; the next `BuiltProtocol` arriving
     /// with the new generation wins.
-    fn drain_preview_protocol_builds(&mut self) {
+    fn drain_preview_protocol_builds(&mut self) -> bool {
+        let mut changed = false;
         while let Ok(built) = self.preview_build_rx.try_recv() {
             if built.generation != self.engine.preview_generation() {
                 continue;
             }
             if let Some(proto) = self.preview_image_protocol.as_mut() {
                 proto.replace_protocol(built.protocol);
+                changed = true;
             }
         }
+        changed
     }
 
     pub fn select_file(&mut self, path: &str, is_staged: bool) {
@@ -2469,12 +2469,14 @@ impl App {
                 .is_some_and(|p| p.is_database())
     }
 
-    /// Called every frame: drive the renderer-neutral engine, then merge
-    /// terminal-local state such as image protocols, selection fades, and
-    /// mouse drag autoscroll.
-    pub fn tick(&mut self) {
+    /// Drive the renderer-neutral engine and merge terminal-local async state.
+    /// Returns whether the terminal needs another frame. The main loop still
+    /// polls at a short interval so worker results stay responsive, but an
+    /// idle poll no longer forces a full redraw.
+    pub fn tick(&mut self) -> bool {
         let now = Instant::now();
         let outcome = self.engine.step(now, self.tick_options());
+        let mut changed = outcome.changed;
         self.apply_runtime_events(outcome.runtime_events);
 
         // VSCode "Reveal" fade — clear `preview_highlight` after
@@ -2482,14 +2484,19 @@ impl App {
         // forever on the destination line. Set on the rising edge
         // (None → Some) and consumed on expiry. Cleared synchronously
         // here so the next render sees no highlight.
-        self.advance_preview_highlight_fade();
+        changed |= self.advance_preview_highlight_fade();
 
-        self.drain_preview_sync_debounce();
-        self.drain_preview_resize_responses();
-        self.drain_preview_protocol_builds();
+        changed |= self.drain_preview_sync_debounce();
+        changed |= self.drain_preview_resize_responses();
+        changed |= self.drain_preview_protocol_builds();
         self.tick_place_mode_auto_expand();
         self.tick_tree_drag_auto_expand();
         crate::input::tick_drag_autoscroll(self);
+
+        changed
+            || self.engine.place_mode_active()
+            || self.engine.tree_drag_active()
+            || self.last_drag_mouse.is_some()
     }
 
     fn tick_options(&self) -> reef_app::TickOptions {
@@ -2505,16 +2512,17 @@ impl App {
     /// navigation); coalesces bursts so holding ↓ doesn't spam the preview
     /// worker. Click / chunk-arrival / pin go through `navigate_to_selected`
     /// directly and bypass this.
-    fn drain_preview_sync_debounce(&mut self) {
+    fn drain_preview_sync_debounce(&mut self) -> bool {
         let outcome =
             self.engine
                 .dispatch(reef_app::AppCommand::DrainGlobalSearchPreviewSyncDebounce {
                     now: Instant::now(),
                 });
         if !outcome.global_search_preview_sync_due {
-            return;
+            return false;
         }
         crate::global_search::navigate_to_selected(self);
+        true
     }
 
     /// Reload the Search tab's right-side preview iff the currently-selected

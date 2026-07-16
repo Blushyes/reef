@@ -27,6 +27,15 @@ impl FileTree {
         self.state.collapse_all();
     }
 
+    pub fn collapse_visible_descendants(&mut self, index: usize) {
+        self.state.collapse_visible_descendants(index);
+    }
+
+    pub fn replace_visible_descendants(&mut self, parent_path: &Path, children: Vec<TreeEntry>) {
+        self.state
+            .replace_visible_descendants(parent_path, children);
+    }
+
     pub fn navigate(&mut self, delta: i32) {
         self.state.navigate(delta);
     }

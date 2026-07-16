@@ -8,11 +8,13 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 use super::{
     Backend, BackendError, ContentMatchHit, ContentSearchCompleted, ContentSearchRequest,
-    EditorLaunchSpec, SearchChunkSink, StatusSnapshot, TrashOutcome, WalkOpts, WalkResponse,
+    EditorLaunchSpec, FsChange, SearchChunkSink, StatusSnapshot, TrashOutcome, WalkOpts,
+    WalkResponse,
 };
 use crate::{TreeEntry, resolve_editor_command};
 use reef_core::diff::DiffContent;
@@ -70,6 +72,8 @@ impl PreviewCache {
 /// Local filesystem + libgit2 backend.
 pub struct LocalBackend {
     workdir: PathBuf,
+    has_repo: Arc<AtomicBool>,
+    repo_monitor_active: Arc<AtomicBool>,
     /// Cached `fs::canonicalize(workdir)`. Populated lazily on the first
     /// symlink-safe read because `workdir` is immutable after
     /// construction — without the cache every `read_file` / preview
@@ -91,8 +95,11 @@ impl LocalBackend {
     /// the cwd is not a git repo (the Files tab still works).
     pub fn open_cwd() -> std::io::Result<Self> {
         let workdir = std::env::current_dir()?;
+        let has_repo = GitRepo::open_at(&workdir).is_ok();
         Ok(Self {
             workdir,
+            has_repo: Arc::new(AtomicBool::new(has_repo)),
+            repo_monitor_active: Arc::new(AtomicBool::new(false)),
             canon_workdir: OnceLock::new(),
             preview_cache: Mutex::new(PreviewCache::default()),
         })
@@ -100,8 +107,11 @@ impl LocalBackend {
 
     /// Open at an explicit workdir. Used by `reef-agent --workdir`.
     pub fn open_at(workdir: PathBuf) -> Self {
+        let has_repo = GitRepo::open_at(&workdir).is_ok();
         Self {
             workdir,
+            has_repo: Arc::new(AtomicBool::new(has_repo)),
+            repo_monitor_active: Arc::new(AtomicBool::new(false)),
             canon_workdir: OnceLock::new(),
             preview_cache: Mutex::new(PreviewCache::default()),
         }
@@ -304,6 +314,9 @@ impl Backend for LocalBackend {
     }
 
     fn has_repo(&self) -> bool {
+        if self.repo_monitor_active.load(Ordering::Acquire) {
+            return self.has_repo.load(Ordering::Acquire);
+        }
         self.repo().is_ok()
     }
 
@@ -571,8 +584,12 @@ impl Backend for LocalBackend {
             .get_range_file_diff(oldest_oid, newest_oid, path, context_lines))
     }
 
-    fn subscribe_fs_events(&self) -> mpsc::Receiver<()> {
-        crate::fs_watcher::spawn(self.workdir.clone())
+    fn subscribe_fs_events(&self) -> mpsc::Receiver<FsChange> {
+        crate::fs_watcher::spawn_with_repo_state(
+            self.workdir.clone(),
+            Arc::clone(&self.has_repo),
+            Arc::clone(&self.repo_monitor_active),
+        )
     }
 
     fn launch_editor(&self, _rel_path: &Path) -> Result<(), BackendError> {

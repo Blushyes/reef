@@ -90,7 +90,10 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 /// - v11: `DirEntryDto` includes `has_children` so renderer row providers
 ///       can show disclosure controls only for directories that actually
 ///       contain visible children.
-pub const PROTOCOL_VERSION: u32 = 11;
+/// - v12: handshake and filesystem notifications carry `has_repo`, allowing
+///       remote clients to update repository capability after `git init` or
+///       repository removal without probing Git from the UI thread.
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// Encode a single envelope-level value to `writer` using the
 /// length-prefixed framing. The caller is expected to flush.
@@ -474,7 +477,9 @@ pub enum ErrorCode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Notification {
-    FsChanged,
+    FsChanged {
+        has_repo: bool,
+    },
     AgentLog {
         level: String,
         message: String,
@@ -499,6 +504,7 @@ pub struct HandshakeResponse {
     pub workdir: String,
     pub workdir_name: String,
     pub branch_name: String,
+    pub has_repo: bool,
     pub agent_version: String,
     /// Protocol version spoken by this agent binary. The client validates
     /// this against `PROTOCOL_VERSION` during handshake and rejects
@@ -1086,12 +1092,15 @@ mod tests {
 
     #[test]
     fn notification_frame_roundtrip() {
-        let note = Frame::Notification(Notification::FsChanged);
+        let note = Frame::Notification(Notification::FsChanged { has_repo: true });
         let mut buf = Vec::new();
         encode_frame(&mut buf, &note).unwrap();
         let mut cursor = Cursor::new(&buf);
         let got = decode_frame(&mut cursor).unwrap();
-        assert!(matches!(got, Frame::Notification(Notification::FsChanged)));
+        assert!(matches!(
+            got,
+            Frame::Notification(Notification::FsChanged { has_repo: true })
+        ));
     }
 
     #[test]

@@ -20,14 +20,41 @@ impl AppState {
     }
 
     pub fn toggle_file_tree_expand_and_refresh(&mut self, idx: usize) {
+        let Some(entry) = self.file_tree.entries.get(idx).cloned() else {
+            return;
+        };
+        if !entry.is_dir {
+            return;
+        }
+        let load_in_flight = self.file_tree_load.loading;
         self.file_tree.toggle_expand(idx);
-        self.refresh_file_tree_with_target(self.file_tree.selected_path());
+        if entry.is_expanded {
+            self.file_tree.collapse_visible_descendants(idx);
+            self.revalidate_tree_edit_anchor();
+            if load_in_flight {
+                self.refresh_file_tree_with_target(self.file_tree.selected_path());
+            }
+        } else if load_in_flight {
+            // The shared files worker may already be building either a full
+            // tree or another subtree. Supersede it with one full request that
+            // captures every currently-expanded path, so rapid expansion never
+            // leaves the earlier branch visually expanded but unpopulated.
+            self.refresh_file_tree_with_target(self.file_tree.selected_path());
+        } else {
+            self.load_file_tree_subtree(entry.path, entry.depth);
+        }
     }
 
     pub fn toggle_file_tree_expand_path_and_refresh(&mut self, path: &Path) {
-        if self.file_tree.toggle_expand_by_path(path) {
-            self.refresh_file_tree_with_target(self.file_tree.selected_path());
-        }
+        let Some(idx) = self
+            .file_tree
+            .entries
+            .iter()
+            .position(|entry| entry.path == path && entry.is_dir)
+        else {
+            return;
+        };
+        self.toggle_file_tree_expand_and_refresh(idx);
     }
 
     pub fn activate_selected_file_tree_entry(&mut self) {
@@ -36,8 +63,7 @@ impl AppState {
             return;
         };
         if entry.is_dir {
-            self.file_tree.toggle_expand(idx);
-            self.refresh_file_tree_with_target(self.file_tree.selected_path());
+            self.toggle_file_tree_expand_and_refresh(idx);
         } else {
             self.pending_edit = Some(self.file_tree.root.join(entry.path));
         }
@@ -49,8 +75,7 @@ impl AppState {
             return;
         };
         if entry.is_dir {
-            self.file_tree.toggle_expand(idx);
-            self.refresh_file_tree_with_target(self.file_tree.selected_path());
+            self.toggle_file_tree_expand_and_refresh(idx);
         } else {
             self.load_preview();
         }
@@ -158,8 +183,7 @@ impl AppState {
             && entry.is_dir
             && !entry.is_expanded
         {
-            self.file_tree.toggle_expand(idx);
-            self.refresh_file_tree_with_target(self.file_tree.selected_path());
+            self.toggle_file_tree_expand_and_refresh(idx);
         }
         self.tree_drag.clear_hover_timer();
     }
@@ -284,6 +308,28 @@ impl AppState {
             selected_path,
             self.file_tree.selected,
         );
+    }
+
+    fn load_file_tree_subtree(&mut self, parent_path: PathBuf, parent_depth: usize) {
+        let generation = self.file_tree_load.begin();
+        self.tasks.load_tree_subtree(
+            generation,
+            Arc::clone(&self.backend),
+            parent_path,
+            parent_depth,
+            self.file_tree.expanded_paths(),
+            self.file_tree.git_statuses(),
+        );
+    }
+
+    pub fn collapse_all_file_tree_entries(&mut self) {
+        let refresh_pending = self.file_tree_load.loading || self.file_tree_load.stale;
+        self.file_tree.collapse_all();
+        self.tree_scroll = 0;
+        self.revalidate_tree_edit_anchor();
+        if refresh_pending {
+            self.refresh_file_tree_with_target(self.file_tree.selected_path());
+        }
     }
 
     pub fn enter_place_mode(&mut self, sources: Vec<PathBuf>) -> Vec<AppRuntimeEvent> {

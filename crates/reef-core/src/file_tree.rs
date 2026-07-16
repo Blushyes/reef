@@ -41,14 +41,16 @@ impl FileTreeState {
     }
 
     pub fn toggle_expand(&mut self, index: usize) {
-        if let Some(entry) = self.entries.get(index)
+        if let Some(entry) = self.entries.get_mut(index)
             && entry.is_dir
         {
             let path = entry.path.clone();
             if self.expanded.contains(&path) {
                 self.expanded.remove(&path);
+                entry.is_expanded = false;
             } else {
                 self.expanded.insert(path);
+                entry.is_expanded = true;
             }
         }
     }
@@ -67,7 +69,54 @@ impl FileTreeState {
 
     pub fn collapse_all(&mut self) {
         self.expanded.clear();
+        self.entries.retain(|entry| entry.depth == 0);
+        for entry in &mut self.entries {
+            entry.is_expanded = false;
+        }
         self.selected = 0;
+    }
+
+    pub fn collapse_visible_descendants(&mut self, index: usize) {
+        let Some(parent) = self.entries.get(index) else {
+            return;
+        };
+        let parent_depth = parent.depth;
+        let end = self.entries[index + 1..]
+            .iter()
+            .position(|entry| entry.depth <= parent_depth)
+            .map(|offset| index + 1 + offset)
+            .unwrap_or(self.entries.len());
+        let removed = end.saturating_sub(index + 1);
+        if removed == 0 {
+            return;
+        }
+        if self.selected > index && self.selected < end {
+            self.selected = index;
+        } else if self.selected >= end {
+            self.selected -= removed;
+        }
+        self.entries.drain(index + 1..end);
+    }
+
+    pub fn replace_visible_descendants(&mut self, parent_path: &Path, children: Vec<TreeEntry>) {
+        let selected_path = self.selected_path();
+        let Some(parent_idx) = self
+            .entries
+            .iter()
+            .position(|entry| entry.path == parent_path && entry.is_dir)
+        else {
+            return;
+        };
+        if !self.expanded.contains(parent_path) {
+            return;
+        }
+        self.collapse_visible_descendants(parent_idx);
+        self.entries
+            .splice(parent_idx + 1..parent_idx + 1, children);
+        self.selected = selected_path
+            .as_ref()
+            .and_then(|path| self.entries.iter().position(|entry| &entry.path == path))
+            .unwrap_or(parent_idx);
     }
 
     pub fn navigate(&mut self, delta: i32) {
@@ -264,5 +313,61 @@ mod tests {
 
         assert_eq!(tree.entries[0].git_status, Some('●'));
         assert_eq!(tree.entries[1].git_status, Some('M'));
+    }
+
+    #[test]
+    fn collapse_visible_descendants_removes_only_parent_subtree() {
+        let mut src = dummy_dir("src");
+        src.is_expanded = true;
+        let mut nested = dummy_dir("src/nested");
+        nested.depth = 1;
+        let mut child = dummy_entry("src/nested/a.rs");
+        child.depth = 2;
+        let tail = dummy_entry("README.md");
+        let mut tree = FileTreeState::with_entries(vec![src, nested, child, tail]);
+        tree.selected = 3;
+
+        tree.collapse_visible_descendants(0);
+
+        assert_eq!(
+            tree.entries
+                .iter()
+                .map(|entry| entry.path.as_path())
+                .collect::<Vec<_>>(),
+            vec![Path::new("src"), Path::new("README.md")]
+        );
+        assert_eq!(tree.selected, 1);
+    }
+
+    #[test]
+    fn replace_visible_descendants_restores_selected_path() {
+        let mut src = dummy_dir("src");
+        src.is_expanded = true;
+        let mut old = dummy_entry("src/a.rs");
+        old.depth = 1;
+        let mut tree = FileTreeState::with_entries(vec![src, old]);
+        tree.expanded.insert(PathBuf::from("src"));
+        tree.selected = 1;
+        let mut refreshed = dummy_entry("src/a.rs");
+        refreshed.depth = 1;
+        let mut added = dummy_entry("src/b.rs");
+        added.depth = 1;
+
+        tree.replace_visible_descendants(Path::new("src"), vec![refreshed, added]);
+
+        assert_eq!(tree.selected_path().as_deref(), Some(Path::new("src/a.rs")));
+        assert_eq!(tree.entries.len(), 3);
+    }
+
+    #[test]
+    fn collapsed_parent_rejects_late_subtree_result() {
+        let src = dummy_dir("src");
+        let mut tree = FileTreeState::with_entries(vec![src]);
+        let mut child = dummy_entry("src/a.rs");
+        child.depth = 1;
+
+        tree.replace_visible_descendants(Path::new("src"), vec![child]);
+
+        assert_eq!(tree.entries.len(), 1);
     }
 }

@@ -250,6 +250,12 @@ impl AppState {
 
     fn bump_preview_content_revision(&mut self) {
         self.preview_content_revision = self.preview_content_revision.wrapping_add(1).max(1);
+        self.preview_snapshot = self.preview_content.as_deref().map(|preview| {
+            Arc::new(crate::PreviewDocumentSnapshot::from_document(
+                preview,
+                self.preview_content_revision,
+            ))
+        });
     }
 
     pub fn preview_is_for(&self, path: &Path) -> bool {

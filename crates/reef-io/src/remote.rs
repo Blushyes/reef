@@ -23,7 +23,8 @@ use reef_proto::{
 
 use super::{
     Backend, BackendError, ContentMatchHit, ContentSearchCompleted, ContentSearchRequest,
-    EditorLaunchSpec, SearchChunkSink, StatusSnapshot, TrashOutcome, WalkOpts, WalkResponse,
+    EditorLaunchSpec, FsChange, SearchChunkSink, StatusSnapshot, TrashOutcome, WalkOpts,
+    WalkResponse,
 };
 use crate::TreeEntry;
 use reef_core::diff::DiffContent;
@@ -47,6 +48,52 @@ type PendingMap = HashMap<u64, mpsc::Sender<Response>>;
 /// mutated by `search_content` around the RPC (register before send,
 /// drop after the final response is received or on error).
 type ChunkSinkMap = HashMap<u64, mpsc::Sender<Vec<MatchHitDto>>>;
+
+/// Repository presence observed from the remote agent.
+///
+/// The low bit stores the current value; the remaining bits form a generation
+/// that advances for every fs notification. Keeping both in one atomic lets
+/// the initial handshake update the value only when no newer notification was
+/// observed while that RPC was in flight.
+#[derive(Default)]
+struct RepoPresence {
+    state: AtomicU64,
+}
+
+impl RepoPresence {
+    const PRESENT_BIT: u64 = 1;
+
+    fn snapshot(&self) -> u64 {
+        self.state.load(Ordering::Acquire)
+    }
+
+    fn is_present(&self) -> bool {
+        self.snapshot() & Self::PRESENT_BIT != 0
+    }
+
+    fn initialize_if_unchanged(&self, snapshot: u64, present: bool) -> bool {
+        let next = (snapshot & !Self::PRESENT_BIT) | present as u64;
+        self.state
+            .compare_exchange(snapshot, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn update_from_notification(&self, present: bool) -> bool {
+        let mut current = self.snapshot();
+        loop {
+            let next = (current.wrapping_add(2) & !Self::PRESENT_BIT) | present as u64;
+            match self.state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return current & Self::PRESENT_BIT != present as u64,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
 
 /// RAII registration in a `request_id → sender` map. Drop removes the
 /// id; the read loop also removes on receipt, so Drop becomes a no-op
@@ -86,13 +133,14 @@ pub struct RemoteBackend {
     workdir: Mutex<PathBuf>,
     workdir_name: Mutex<String>,
     branch_name_cache: Mutex<String>,
+    repo_presence: Arc<RepoPresence>,
     tx: Mutex<BufWriter<ChildStdin>>,
     next_id: AtomicU64,
     pending: Arc<Mutex<PendingMap>>,
     /// See `ChunkSinkMap`. Shared with the read thread.
     search_chunks: Arc<Mutex<ChunkSinkMap>>,
-    fs_rx: Mutex<Option<mpsc::Receiver<()>>>,
-    _fs_tx: mpsc::Sender<()>,
+    fs_rx: Mutex<Option<mpsc::Receiver<FsChange>>>,
+    _fs_tx: mpsc::Sender<FsChange>,
     _reader: thread::JoinHandle<()>,
     _stderr_reader: thread::JoinHandle<()>,
     child: Mutex<Child>,
@@ -190,14 +238,24 @@ impl RemoteBackend {
 
         let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
         let search_chunks: Arc<Mutex<ChunkSinkMap>> = Arc::new(Mutex::new(HashMap::new()));
-        let (fs_tx, fs_rx) = mpsc::channel::<()>();
+        let (fs_tx, fs_rx) = mpsc::channel::<FsChange>();
+        let repo_presence = Arc::new(RepoPresence::default());
 
         let reader_pending = Arc::clone(&pending);
         let reader_chunks = Arc::clone(&search_chunks);
         let reader_fs_tx = fs_tx.clone();
+        let reader_repo_presence = Arc::clone(&repo_presence);
         let reader = thread::Builder::new()
             .name("reef-remote-reader".into())
-            .spawn(move || read_loop(stdout, reader_pending, reader_chunks, reader_fs_tx))
+            .spawn(move || {
+                read_loop(
+                    stdout,
+                    reader_pending,
+                    reader_chunks,
+                    reader_fs_tx,
+                    reader_repo_presence,
+                )
+            })
             .map_err(io::Error::other)?;
 
         let stderr_reader = thread::Builder::new()
@@ -209,6 +267,7 @@ impl RemoteBackend {
             workdir: Mutex::new(PathBuf::new()),
             workdir_name: Mutex::new(String::new()),
             branch_name_cache: Mutex::new(String::new()),
+            repo_presence: Arc::clone(&repo_presence),
             tx: Mutex::new(BufWriter::new(stdin)),
             next_id: AtomicU64::new(1),
             pending,
@@ -224,6 +283,7 @@ impl RemoteBackend {
         // Handshake: ask the agent for its workdir and name once so the UI
         // can render `workdir_name` / `branch_name` synchronously without
         // round-tripping on every call.
+        let repo_presence_snapshot = backend.repo_presence.snapshot();
         let info = backend
             .handshake()
             .map_err(|e| io::Error::other(format!("remote backend handshake failed: {e}")))?;
@@ -236,6 +296,9 @@ impl RemoteBackend {
         if let Ok(mut b) = backend.branch_name_cache.lock() {
             *b = info.branch_name;
         }
+        backend
+            .repo_presence
+            .initialize_if_unchanged(repo_presence_snapshot, info.has_repo);
 
         // Ask the agent to start streaming fs events. If the call fails we
         // still return the backend — fs-change polling simply won't fire.
@@ -365,7 +428,8 @@ fn read_loop(
     stdout: ChildStdout,
     pending: Arc<Mutex<PendingMap>>,
     search_chunks: Arc<Mutex<ChunkSinkMap>>,
-    fs_tx: mpsc::Sender<()>,
+    fs_tx: mpsc::Sender<FsChange>,
+    repo_presence: Arc<RepoPresence>,
 ) {
     let mut reader = BufReader::new(stdout);
     loop {
@@ -390,8 +454,13 @@ fn read_loop(
                 }
             }
             reef_proto::Frame::Notification(note) => match note {
-                Notification::FsChanged => {
-                    let _ = fs_tx.send(());
+                Notification::FsChanged {
+                    has_repo: current_has_repo,
+                } => {
+                    let _ = fs_tx.send(FsChange {
+                        repo_presence_changed: repo_presence
+                            .update_from_notification(current_has_repo),
+                    });
                 }
                 Notification::AgentLog { level, message } => {
                     eprintln!("[reef-agent:{level}] {message}");
@@ -458,7 +527,7 @@ impl Backend for RemoteBackend {
     }
 
     fn has_repo(&self) -> bool {
-        !self.branch_name().is_empty()
+        self.repo_presence.is_present()
     }
 
     fn build_file_tree(
@@ -773,7 +842,7 @@ impl Backend for RemoteBackend {
         Ok(resp.map(diff_content_from_dto))
     }
 
-    fn subscribe_fs_events(&self) -> mpsc::Receiver<()> {
+    fn subscribe_fs_events(&self) -> mpsc::Receiver<FsChange> {
         // First subscriber gets the channel created in `spawn`. Subsequent
         // calls would lose events — but the App only calls this once.
         // For safety we hand out a fresh disconnected receiver rather than
@@ -783,7 +852,7 @@ impl Backend for RemoteBackend {
                 return rx;
             }
         }
-        let (_tx, rx) = mpsc::channel::<()>();
+        let (_tx, rx) = mpsc::channel::<FsChange>();
         rx
     }
 
@@ -1423,5 +1492,39 @@ fn sqlite_value_from_dto(v: reef_proto::SqliteValueDto) -> reef_sqlite_preview::
         reef_proto::SqliteValueDto::Blob { len } => {
             reef_sqlite_preview::SqliteValue::Blob { len: len as usize }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RepoPresence;
+
+    #[test]
+    fn handshake_initializes_repo_presence_without_a_newer_notification() {
+        let repo_presence = RepoPresence::default();
+        let snapshot = repo_presence.snapshot();
+
+        assert!(repo_presence.initialize_if_unchanged(snapshot, true));
+        assert!(repo_presence.is_present());
+    }
+
+    #[test]
+    fn notification_prevents_a_stale_handshake_from_overwriting_repo_presence() {
+        let repo_presence = RepoPresence::default();
+        let snapshot = repo_presence.snapshot();
+
+        assert!(!repo_presence.update_from_notification(false));
+        assert!(!repo_presence.initialize_if_unchanged(snapshot, true));
+        assert!(!repo_presence.is_present());
+    }
+
+    #[test]
+    fn notifications_report_only_repo_presence_changes() {
+        let repo_presence = RepoPresence::default();
+
+        assert!(!repo_presence.update_from_notification(false));
+        assert!(repo_presence.update_from_notification(true));
+        assert!(!repo_presence.update_from_notification(true));
+        assert!(repo_presence.is_present());
     }
 }

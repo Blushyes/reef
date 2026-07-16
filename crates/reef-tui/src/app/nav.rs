@@ -155,7 +155,7 @@ impl App {
     /// fading highlight starts its TTL only once the target file is on
     /// screen, but is force-cleared after `PREVIEW_HIGHLIGHT_LOAD_GRACE`
     /// if the file never loads.
-    pub fn advance_preview_highlight_fade(&mut self) {
+    pub fn advance_preview_highlight_fade(&mut self) -> bool {
         enum FadeStep {
             Keep,
             StartCounting,
@@ -163,7 +163,7 @@ impl App {
         }
         let now = std::time::Instant::now();
         let Some(hl) = self.engine.preview_highlight_cloned() else {
-            return;
+            return false;
         };
         // Decide while holding only the immutable borrow, then apply a
         // single mutation after it ends — no double Option lookup.
@@ -191,13 +191,15 @@ impl App {
             }
         };
         match step {
-            FadeStep::Keep => {}
+            FadeStep::Keep => false,
             FadeStep::StartCounting => {
                 self.engine
                     .dispatch(AppCommand::StartPreviewHighlightCounting(now));
+                true
             }
             FadeStep::Clear => {
                 self.engine.dispatch(AppCommand::ClearPreviewHighlight);
+                true
             }
         }
     }

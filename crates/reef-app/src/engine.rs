@@ -1243,7 +1243,7 @@ impl ReefApp {
                 self.runtime_events.extend(events);
             }
             AppCommand::CollapseAllTreeEntries => {
-                self.state.file_tree.collapse_all();
+                self.state.collapse_all_file_tree_entries();
             }
             AppCommand::ExtendFileSelectionToIndex(idx) => {
                 self.state.extend_file_selection_to_index(idx);
@@ -1871,6 +1871,14 @@ impl ReefApp {
 
     pub fn git_status(&self) -> &GitStatusState {
         &self.state.git_status
+    }
+
+    pub fn git_status_tree_rows(&self, is_staged: bool) -> &[reef_core::git::tree::TreeRow] {
+        if is_staged {
+            &self.state.git_status.staged_tree_rows
+        } else {
+            &self.state.git_status.unstaged_tree_rows
+        }
     }
 
     pub fn git_graph(&self) -> &GitGraphState {

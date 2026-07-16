@@ -38,6 +38,12 @@ pub struct FileTreePayload {
     pub selected_idx: usize,
 }
 
+#[derive(Debug)]
+pub struct FileTreeSubtreePayload {
+    pub parent_path: PathBuf,
+    pub entries: Vec<TreeEntry>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitRevertPath {
     pub path: String,
@@ -152,6 +158,10 @@ pub enum WorkerResult {
     FileTree {
         generation: u64,
         result: Result<FileTreePayload, String>,
+    },
+    FileTreeSubtree {
+        generation: u64,
+        result: Result<FileTreeSubtreePayload, String>,
     },
     Preview {
         generation: u64,
@@ -415,6 +425,14 @@ enum FilesTask {
         git_statuses: HashMap<String, char>,
         selected_path: Option<PathBuf>,
         fallback_selected: usize,
+    },
+    LoadTreeSubtree {
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        parent_path: PathBuf,
+        parent_depth: usize,
+        expanded: Vec<PathBuf>,
+        git_statuses: HashMap<String, char>,
     },
     LoadPreview {
         generation: u64,
@@ -817,6 +835,25 @@ impl TaskCoordinator {
             git_statuses,
             selected_path,
             fallback_selected,
+        });
+    }
+
+    pub fn load_tree_subtree(
+        &self,
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        parent_path: PathBuf,
+        parent_depth: usize,
+        expanded: Vec<PathBuf>,
+        git_statuses: HashMap<String, char>,
+    ) {
+        let _ = self.files_tx.send(FilesTask::LoadTreeSubtree {
+            generation,
+            backend,
+            parent_path,
+            parent_depth,
+            expanded,
+            git_statuses,
         });
     }
 
@@ -1248,6 +1285,24 @@ fn spawn_files_worker(result_tx: WorkerResultSender) -> mpsc::Sender<FilesTask> 
                             fallback_selected,
                         );
                         let _ = result_tx.send(WorkerResult::FileTree { generation, result });
+                    }
+                    FilesTask::LoadTreeSubtree {
+                        generation,
+                        backend,
+                        parent_path,
+                        parent_depth,
+                        expanded,
+                        git_statuses,
+                    } => {
+                        let result = build_file_tree_subtree_payload(
+                            backend.as_ref(),
+                            parent_path,
+                            parent_depth,
+                            expanded,
+                            git_statuses,
+                        );
+                        let _ =
+                            result_tx.send(WorkerResult::FileTreeSubtree { generation, result });
                     }
                     FilesTask::BuildQuickOpenIndex {
                         generation,
@@ -2745,6 +2800,113 @@ fn build_file_tree_payload(
         entries,
         selected_idx,
     })
+}
+
+fn build_file_tree_subtree_payload(
+    backend: &dyn Backend,
+    parent_path: PathBuf,
+    parent_depth: usize,
+    expanded: Vec<PathBuf>,
+    git_statuses: HashMap<String, char>,
+) -> Result<FileTreeSubtreePayload, String> {
+    let expanded: HashSet<PathBuf> = expanded.into_iter().collect();
+    let mut entries = Vec::new();
+    collect_file_tree_subtree(
+        backend,
+        &parent_path,
+        parent_depth + 1,
+        &expanded,
+        &git_statuses,
+        &mut entries,
+    )?;
+    Ok(FileTreeSubtreePayload {
+        parent_path,
+        entries,
+    })
+}
+
+fn collect_file_tree_subtree(
+    backend: &dyn Backend,
+    parent_path: &Path,
+    depth: usize,
+    expanded: &HashSet<PathBuf>,
+    git_statuses: &HashMap<String, char>,
+    entries: &mut Vec<TreeEntry>,
+) -> Result<(), String> {
+    let mut children = backend
+        .list_dir(parent_path)
+        .map_err(|error| error.to_string())?;
+    children.retain(|entry| entry.name != ".git");
+    children.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+    });
+
+    for child in children {
+        let path = parent_path.join(&child.name);
+        let path_key = path.to_string_lossy();
+        let is_expanded = child.is_dir && expanded.contains(&path);
+        entries.push(TreeEntry {
+            path: path.clone(),
+            name: child.name,
+            depth,
+            is_dir: child.is_dir,
+            has_children: child.has_children,
+            is_expanded,
+            git_status: git_statuses.get(path_key.as_ref()).copied(),
+        });
+        if is_expanded {
+            collect_file_tree_subtree(backend, &path, depth + 1, expanded, git_statuses, entries)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod file_tree_subtree_tests {
+    use std::fs;
+
+    use reef_io::LocalBackend;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn subtree_load_reads_parent_and_preserves_nested_expansion() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src/nested")).unwrap();
+        fs::create_dir_all(tmp.path().join("outside")).unwrap();
+        fs::write(tmp.path().join("src/a.rs"), "a").unwrap();
+        fs::write(tmp.path().join("src/nested/b.rs"), "b").unwrap();
+        fs::write(tmp.path().join("outside/c.rs"), "c").unwrap();
+        let backend = LocalBackend::open_at(tmp.path().to_path_buf());
+        let statuses = HashMap::from([("src/a.rs".to_string(), 'M')]);
+
+        let payload = build_file_tree_subtree_payload(
+            &backend,
+            PathBuf::from("src"),
+            0,
+            vec![PathBuf::from("src"), PathBuf::from("src/nested")],
+            statuses,
+        )
+        .unwrap();
+
+        assert_eq!(payload.parent_path, Path::new("src"));
+        assert_eq!(
+            payload
+                .entries
+                .iter()
+                .map(|entry| (entry.path.as_path(), entry.depth, entry.is_expanded))
+                .collect::<Vec<_>>(),
+            vec![
+                (Path::new("src/nested"), 1, true),
+                (Path::new("src/nested/b.rs"), 2, false),
+                (Path::new("src/a.rs"), 1, false),
+            ]
+        );
+        assert_eq!(payload.entries[2].git_status, Some('M'));
+    }
 }
 
 fn build_nav_workspace_index(

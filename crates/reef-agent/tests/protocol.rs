@@ -114,6 +114,7 @@ fn handshake_returns_workdir_and_branch() {
     // Default branch on a freshly-init'd repo is master or main depending
     // on the host's git config — both are acceptable.
     assert!(info.branch_name == "master" || info.branch_name == "main");
+    assert!(info.has_repo);
 
     agent.shutdown();
 }

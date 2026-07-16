@@ -3,7 +3,7 @@ use crate::{
     ViewMode, features::hosts_picker::InputMode, preview_snapshot::PreviewDocumentSnapshot,
 };
 use reef_core::git::GraphScope;
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub struct AppSnapshot {
@@ -76,7 +76,7 @@ pub struct FilesPanelSnapshot {
     pub selected_path: Option<PathBuf>,
     pub preview_path: Option<String>,
     pub preview_kind: Option<PreviewKindSnapshot>,
-    pub preview: Option<PreviewDocumentSnapshot>,
+    pub preview: Option<Arc<PreviewDocumentSnapshot>>,
     pub preview_scroll: usize,
     pub preview_h_scroll: usize,
     pub tree_load: AsyncSnapshot,
@@ -261,9 +261,7 @@ impl FilesPanelSnapshot {
                 .preview_content
                 .as_ref()
                 .map(|p| PreviewKindSnapshot::from_body(&p.body)),
-            preview: state.preview_content.as_ref().map(|preview| {
-                PreviewDocumentSnapshot::from_document(preview, state.preview_content_revision)
-            }),
+            preview: state.preview_snapshot.clone(),
             preview_scroll: state.preview_scroll,
             preview_h_scroll: state.preview_h_scroll,
             tree_load: AsyncSnapshot::from_state(&state.file_tree_load),
@@ -424,16 +422,18 @@ mod tests {
         let accepted_generation = state.preview_load.begin();
         state.apply_preview_content(accepted_generation, Some(text_preview("src/main.rs")), 20);
         let loading_generation = state.preview_load.begin();
+        let first = AppSnapshot::from_state(&state)
+            .files
+            .preview
+            .expect("preview snapshot");
+        let second = AppSnapshot::from_state(&state)
+            .files
+            .preview
+            .expect("preview snapshot");
 
         assert_ne!(accepted_generation, loading_generation);
-        assert_eq!(
-            AppSnapshot::from_state(&state)
-                .files
-                .preview
-                .as_ref()
-                .map(|preview| preview.revision),
-            Some(accepted_generation)
-        );
+        assert_eq!(first.revision, accepted_generation);
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     fn text_preview(path: &str) -> PreviewDocument {

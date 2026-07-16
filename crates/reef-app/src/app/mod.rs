@@ -98,6 +98,8 @@ pub enum DiscardTarget {
 pub struct GitStatusState {
     pub tree_mode: bool,
     pub collapsed_dirs: HashSet<String>,
+    pub(crate) staged_tree_rows: Vec<reef_core::git::tree::TreeRow>,
+    pub(crate) unstaged_tree_rows: Vec<reef_core::git::tree::TreeRow>,
     pub confirm_discard: Option<DiscardTarget>,
     pub confirm_push: bool,
     pub confirm_force_push: bool,
@@ -436,6 +438,7 @@ pub struct AppState {
     pub file_tree: FileTree,
     pub preview_content: Option<Arc<PreviewContent>>,
     pub preview_content_revision: u64,
+    pub preview_snapshot: Option<Arc<crate::PreviewDocumentSnapshot>>,
     pub preview_enrichment_dark: bool,
     preview_enrichment_pending: Option<PendingPreviewEnrichment>,
     pub preview_schedule: Option<(PathBuf, Instant)>,
@@ -458,7 +461,7 @@ pub struct AppState {
     pub commit_detail: CommitDetailState,
     pub toasts: Vec<Toast>,
 
-    pub fs_watcher_rx: Option<mpsc::Receiver<()>>,
+    pub fs_watcher_rx: Option<mpsc::Receiver<reef_io::FsChange>>,
 
     pub show_help: bool,
     pub pending_edit: Option<PathBuf>,
@@ -656,6 +659,7 @@ impl AppState {
             file_tree,
             preview_content: None,
             preview_content_revision: 0,
+            preview_snapshot: None,
             preview_enrichment_dark: false,
             preview_enrichment_pending: None,
             preview_schedule: None,
@@ -777,17 +781,21 @@ fn folder_contains(folder_path: &str, file_path: &str) -> bool {
 fn navigable_git_files(
     staged_files: &[FileEntry],
     unstaged_files: &[FileEntry],
+    staged_tree_rows: &[reef_core::git::tree::TreeRow],
+    unstaged_tree_rows: &[reef_core::git::tree::TreeRow],
     staged_collapsed: bool,
     unstaged_collapsed: bool,
     tree_mode: bool,
-    collapsed_dirs: &HashSet<String>,
 ) -> Vec<(String, bool)> {
     let mut items = Vec::new();
     if !staged_files.is_empty() && !staged_collapsed {
         if tree_mode {
-            for path in reef_core::git::tree::visible_file_paths(staged_files, true, collapsed_dirs)
-            {
-                items.push((path, true));
+            for row in staged_tree_rows {
+                if let reef_core::git::tree::TreeRow::File { source_index, .. } = row
+                    && let Some(file) = staged_files.get(*source_index)
+                {
+                    items.push((file.path.clone(), true));
+                }
             }
         } else {
             for file in staged_files {
@@ -797,10 +805,12 @@ fn navigable_git_files(
     }
     if !unstaged_collapsed {
         if tree_mode {
-            for path in
-                reef_core::git::tree::visible_file_paths(unstaged_files, false, collapsed_dirs)
-            {
-                items.push((path, false));
+            for row in unstaged_tree_rows {
+                if let reef_core::git::tree::TreeRow::File { source_index, .. } = row
+                    && let Some(file) = unstaged_files.get(*source_index)
+                {
+                    items.push((file.path.clone(), false));
+                }
             }
         } else {
             for file in unstaged_files {
@@ -857,6 +867,18 @@ mod tests {
             status: FileStatus::Modified,
             additions: 0,
             deletions: 0,
+        }
+    }
+
+    fn tree_entry(path: &str, depth: usize, is_dir: bool) -> crate::TreeEntry {
+        crate::TreeEntry {
+            path: PathBuf::from(path),
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            depth,
+            is_dir,
+            has_children: is_dir,
+            is_expanded: false,
+            git_status: None,
         }
     }
 
@@ -950,9 +972,10 @@ mod tests {
             git_entry("src/a.rs"),
             git_entry("assets/logo.png"),
         ];
+        let rows = reef_core::git::tree::visible_rows(&unstaged, false, &HashSet::new());
 
         assert_eq!(
-            navigable_git_files(&[], &unstaged, false, false, true, &HashSet::new()),
+            navigable_git_files(&[], &unstaged, &[], &rows, false, false, true),
             vec![
                 ("assets/logo.png".to_string(), false),
                 ("src/a.rs".to_string(), false),
@@ -972,13 +995,109 @@ mod tests {
             git_entry("z.txt"),
         ];
         let collapsed = HashSet::from([reef_core::git::tree::collapsed_key(false, "src")]);
+        let rows = reef_core::git::tree::visible_rows(&unstaged, false, &collapsed);
 
         assert_eq!(
-            navigable_git_files(&[], &unstaged, false, false, true, &collapsed),
+            navigable_git_files(&[], &unstaged, &[], &rows, false, false, true),
             vec![
                 ("README.md".to_string(), false),
                 ("z.txt".to_string(), false)
             ]
+        );
+    }
+
+    #[test]
+    fn list_mode_does_not_request_git_tree_rebuilds() {
+        let app = minimal_app_state();
+
+        assert!(!app.git_status_tree_needs_rebuild(&[git_entry("src/a.rs")], &[]));
+    }
+
+    #[test]
+    fn unchanged_git_paths_keep_cached_tree_rows() {
+        let app = AppState {
+            staged_files: vec![git_entry("src/a.rs")],
+            git_status: GitStatusState {
+                tree_mode: true,
+                ..GitStatusState::default()
+            },
+            ..minimal_app_state()
+        };
+        let mut updated = git_entry("src/a.rs");
+        updated.status = FileStatus::Added;
+        updated.additions = 42;
+
+        assert!(!app.git_status_tree_needs_rebuild(&[updated], &[]));
+    }
+
+    #[test]
+    fn changed_git_paths_request_tree_rebuild() {
+        let app = AppState {
+            staged_files: vec![git_entry("src/a.rs")],
+            git_status: GitStatusState {
+                tree_mode: true,
+                ..GitStatusState::default()
+            },
+            ..minimal_app_state()
+        };
+
+        assert!(app.git_status_tree_needs_rebuild(&[git_entry("src/b.rs")], &[]));
+    }
+
+    #[test]
+    fn entering_git_tree_mode_builds_cached_rows() {
+        let mut app = AppState {
+            staged_files: vec![git_entry("src/a.rs")],
+            ..minimal_app_state()
+        };
+
+        app.toggle_status_tree_mode();
+
+        assert!(!app.git_status.staged_tree_rows.is_empty());
+    }
+
+    #[test]
+    fn leaving_git_tree_mode_releases_cached_rows() {
+        let mut app = AppState {
+            staged_files: vec![git_entry("src/a.rs")],
+            git_status: GitStatusState {
+                tree_mode: true,
+                ..GitStatusState::default()
+            },
+            ..minimal_app_state()
+        };
+        app.rebuild_git_status_tree_rows();
+
+        app.toggle_status_tree_mode();
+
+        assert!(app.git_status.staged_tree_rows.is_empty());
+    }
+
+    #[test]
+    fn repo_presence_change_cancels_git_confirmations() {
+        let mut app = minimal_app_state();
+        app.git_status.confirm_discard = Some(DiscardTarget::File {
+            is_staged: false,
+            path: "src/a.rs".to_string(),
+        });
+        app.git_status.confirm_push = true;
+        app.git_status.confirm_force_push = true;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        app.fs_watcher_rx = Some(rx);
+        tx.send(reef_io::FsChange {
+            repo_presence_changed: true,
+        })
+        .unwrap();
+
+        app.drain_fs_watcher_events();
+
+        assert_eq!(
+            (
+                app.git_status.confirm_discard.as_ref(),
+                app.git_status.confirm_push,
+                app.git_status.confirm_force_push,
+            ),
+            (None, false, false),
         );
     }
 
@@ -1007,6 +1126,7 @@ mod tests {
             },
             ..minimal_app_state()
         };
+        app.rebuild_git_status_tree_rows();
 
         app.navigate_files(2);
 
@@ -1020,6 +1140,110 @@ mod tests {
         assert_eq!(app.diff_h_scroll, 0);
         assert_eq!(app.sbs_left_h_scroll, 0);
         assert_eq!(app.sbs_right_h_scroll, 0);
+    }
+
+    #[test]
+    fn collapse_during_tree_load_rejects_pre_collapse_payload() {
+        use crate::FileTreeState;
+        use crate::tasks::FileTreePayload;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let backend = Arc::new(reef_io::LocalBackend::open_at(tmp.path().to_path_buf()));
+        let mut app = AppState::new(AppStateConfig {
+            backend,
+            prefs: AppPrefs::default(),
+            now: Instant::now(),
+            subscribe_fs_events: false,
+        });
+        let mut parent = tree_entry("src", 0, true);
+        parent.is_expanded = true;
+        app.file_tree.state =
+            FileTreeState::with_entries(vec![parent.clone(), tree_entry("src/a.rs", 1, false)]);
+        app.file_tree.toggle_expand(0);
+        let stale_generation = app.file_tree_load.begin();
+
+        app.toggle_file_tree_expand_and_refresh(0);
+        let current_generation = app.file_tree_load.generation;
+        app.apply_worker_result_core(
+            WorkerResult::FileTree {
+                generation: stale_generation,
+                result: Ok(FileTreePayload {
+                    entries: vec![parent, tree_entry("src/a.rs", 1, false)],
+                    selected_idx: 0,
+                }),
+            },
+            Instant::now(),
+        );
+
+        assert_ne!(stale_generation, current_generation);
+        assert_eq!(
+            app.file_tree
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_path())
+                .collect::<Vec<_>>(),
+            vec![Path::new("src")]
+        );
+        assert!(!app.file_tree.entries[0].is_expanded);
+    }
+
+    #[test]
+    fn collapse_all_during_tree_load_schedules_root_refresh() {
+        use crate::FileTreeState;
+
+        let mut app = minimal_app_state();
+        app.file_tree.state = FileTreeState::with_entries(vec![
+            tree_entry("src", 0, true),
+            tree_entry("src/a.rs", 1, false),
+        ]);
+        app.file_tree.toggle_expand(0);
+        let superseded_generation = app.file_tree_load.begin();
+
+        app.collapse_all_file_tree_entries();
+
+        assert!(app.file_tree_load.loading);
+        assert_ne!(app.file_tree_load.generation, superseded_generation);
+        assert_eq!(
+            app.file_tree
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_path())
+                .collect::<Vec<_>>(),
+            vec![Path::new("src")],
+        );
+    }
+
+    #[test]
+    fn subtree_result_uses_current_git_status_decorations() {
+        use crate::FileTreeState;
+        use crate::tasks::FileTreeSubtreePayload;
+
+        let mut app = minimal_app_state();
+        app.file_tree.state = FileTreeState::with_entries(vec![tree_entry("src", 0, true)]);
+        app.file_tree.toggle_expand(0);
+        app.unstaged_files = vec![FileEntry {
+            path: "src/a.rs".to_string(),
+            status: FileStatus::Added,
+            additions: 1,
+            deletions: 0,
+        }];
+        let generation = app.file_tree_load.begin();
+        let mut stale_child = tree_entry("src/a.rs", 1, false);
+        stale_child.git_status = Some('M');
+
+        app.apply_worker_result_core(
+            WorkerResult::FileTreeSubtree {
+                generation,
+                result: Ok(FileTreeSubtreePayload {
+                    parent_path: PathBuf::from("src"),
+                    entries: vec![stale_child],
+                }),
+            },
+            Instant::now(),
+        );
+
+        assert_eq!(app.file_tree.entries[1].git_status, Some('A'));
     }
 
     #[test]

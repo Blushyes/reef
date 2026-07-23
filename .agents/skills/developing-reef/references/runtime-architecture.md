@@ -21,12 +21,27 @@ input/action/search
   -> request method starts AsyncState generation
   -> TaskCoordinator sends worker request
   -> worker computes result
-  -> ReefApp::tick drains WorkerResult
+  -> worker sends WorkerResult and a coalesced wake notification
+  -> host calls ReefApp::step
+  -> step drains WorkerResult and reports runtime events + next_deadline
   -> generation match updates snapshot
   -> render displays cached snapshot
 ```
 
 Use this pattern for git status, diffs, file preview/highlighting, file-tree rebuilds, commit graph, commit detail, and commit-file diffs.
+
+## Runtime Progress Contract
+
+- `ReefApp` does not own a polling loop. The host owns waiting and calls `step` after user input,
+  worker wake notification, or the `next_deadline` returned by the previous step.
+- Worker wake notifications are coalesced signals only. `ReefApp::step` remains the only owner of
+  consuming and merging `WorkerResult`.
+- Scheduled work must contribute its earliest due time to `next_deadline`; do not add fixed-rate
+  polling to compensate for an omitted deadline.
+- `AppStepOutcome.changed` tells the host whether renderer-visible state may need refreshing.
+  `runtime_events` carry adapter work that cannot be completed inside renderer-neutral state.
+- Hosts may choose different waiting primitives, but they must preserve this command/wake/deadline
+  contract.
 
 ## AsyncState Rules
 
@@ -62,7 +77,8 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
 - Reading `repo.head_oid()` or `repo.ahead_behind()` in render is still a git call; cache it in worker payloads.
 - Rebuilding `FileTree` just to update status markers makes large repos slow.
 - Mutating `engine.state` directly skips command outcomes and stale marking; dispatch `AppCommand` or use the TUI adapter method.
-- Making tests assert immediately after an async request is flaky; drive `app.tick()` until the relevant `AsyncState` completes.
+- Making tests assert immediately after an async request is flaky; wait for the worker wake or due
+  deadline and drive `app.step(...)` until the relevant `AsyncState` completes.
 
 ## Adding a New Expensive Feature
 
@@ -73,7 +89,7 @@ Before coding, decide these names and locations:
 - `AsyncState` field.
 - Worker request and result variant in `crates/reef-app/src/tasks.rs`.
 - `AppCommand` dispatch branch / renderer-neutral request method.
-- `ReefApp::tick` result-merge branch.
+- `ReefApp::step` result-merge branch.
 - Active-tab work kickoff branch if it refreshes automatically.
 - Render fallback for empty/loading/stale/error.
 

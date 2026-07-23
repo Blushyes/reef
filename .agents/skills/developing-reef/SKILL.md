@@ -5,13 +5,16 @@ description: REQUIRED before any non-test code change in Reef. Load this skill b
 
 # Developing Reef
 
-Use this skill as the project onboarding guide for non-test Reef changes. Reef is a minimal single-process Rust TUI: UI must stay responsive, and expensive host work must not run from render.
+Use this skill as the project onboarding guide for non-test Reef changes. The workspace contains a
+renderer-neutral Rust app engine plus the Reef TUI frontend. Every host must stay responsive, and
+expensive work must not run from a renderer.
 
 ## Core Architecture Rules
 
 - Keep `ui::*::render` on cached state only. Do not call git, filesystem walks, diff generation, syntax highlighting, or long formatting from render.
 - Treat input handlers as intent dispatchers. They decode terminal input and dispatch `reef_app::AppCommand`; they must not directly own business state or do blocking host work.
-- Route expensive work through `reef-app`'s task coordinator; merge worker results from `ReefApp::tick`.
+- Route expensive work through `reef-app`'s task coordinator; merge worker results from
+  `ReefApp::step`.
 - Put UI-independent logic in `crates/reef-core`; keep ratatui/crossterm rendering and input orchestration in `crates/reef-tui`.
 - Put renderer-neutral app state, async scheduling, worker-result merge, settings state, nav/history, preview/search/git/graph orchestration in `crates/reef-app`.
 - Keep terminal-only state in `crates/reef-tui`: ratatui layout caches, hit-test registry, terminal image protocol, text-selection geometry, mouse row/column mapping, scroll pacing, leader/chord timers, popup rects, and the live TUI theme object.
@@ -25,8 +28,12 @@ Use this skill as the project onboarding guide for non-test Reef changes. Reef i
 2. `ReefApp::dispatch` mutates renderer-neutral state or requests work.
 3. The request method marks an `AsyncState`, increments its generation, and sends a worker request through `TaskCoordinator`.
 4. Workers do git/filesystem/diff/highlight work off the render path and send `WorkerResult`.
-5. `ReefApp::tick` drains results, accepts only matching generations, updates snapshots/state, and schedules follow-up work when needed.
-6. Render reads `AppSnapshot` plus explicit read-only accessors. It must never be required for progress beyond drawing.
+5. The host calls `ReefApp::step` after input, a coalesced worker wake notification, or the
+   reported `next_deadline`.
+6. `step` drains results, accepts only matching generations, updates state, emits runtime events,
+   and reports the next deadline.
+7. Render reads `AppSnapshot` plus explicit read-only accessors. It must never be required for
+   progress beyond drawing.
 
 Read `references/runtime-architecture.md` before changing `crates/reef-app/src/**`, `crates/reef-tui/src/app/mod.rs`, `crates/reef-tui/src/input.rs`, or any tab/panel render path.
 
@@ -73,7 +80,8 @@ discipline).
 
 - For a new tab or expensive panel, define: UI state, cached data snapshot, `AsyncState`, worker request/result, request method, result merge path, and render fallback for stale/loading/error.
 - For a cheap UI-only feature, keep it local and synchronous, but verify it never calls host I/O through helpers.
-- For actions that move HEAD/refs or change index/worktree, mark the affected snapshots stale and let `tick` refresh them.
+- For actions that move HEAD/refs or change index/worktree, mark the affected snapshots stale and
+  let the next `step` refresh them.
 - For selections that load content, request async work immediately and rely on generations to drop stale responses.
 - Keep user-facing behavior stable when possible; avoid broad rewrites of keybindings, file layout, or visual style while solving performance/architecture issues.
 
@@ -82,7 +90,21 @@ discipline).
 - Use `$testing-reef` before adding or modifying tests.
 - Add unit tests for pure helpers and state transitions when practical.
 - Update snapshot tests only when rendered text/layout intentionally changes.
-- For async UI behavior, tests should wait for `tick` to consume worker results instead of assuming synchronous state.
+- For async UI behavior, tests should drive `step` after worker wake notifications or due
+  deadlines instead of assuming synchronous state.
+
+## Architecture Documentation Contract
+
+- Treat this Skill and `references/runtime-architecture.md` as part of the architecture, not as
+  optional prose.
+- When a change alters crate ownership, the `ReefApp` public boundary, command/snapshot/event flow,
+  task scheduling, wake/deadline behavior, module responsibilities, validation commands, or a
+  documented invariant, update the affected Skill/reference in the same change.
+- When a public Reef change alters the contract consumed by another renderer or bridge, update the
+  renderer-facing contract here and notify the downstream repository in the same development
+  cycle.
+- Do not merge an architecture change with knowingly stale Skill guidance. The implementation,
+  architecture checks, tests, and Skills must describe one current path.
 
 ## Pre-PR Checks
 

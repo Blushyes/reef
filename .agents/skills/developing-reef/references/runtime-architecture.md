@@ -35,6 +35,10 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
 - `ReefApp` does not own a polling loop. The host owns waiting and calls `step` after user input,
   worker wake notification, filesystem watcher notification, or the `next_deadline` returned by
   the previous step.
+- A host adapter that consumes a concrete filesystem watcher event must forward its semantic
+  `repo_presence_changed` value through `AppCommand::ApplyFsChange`; it must not add a public
+  mutable `ReefApp` entry point. Hosts that leave the watcher receiver to the engine simply call
+  `step` after their wake notification.
 - Worker wake notifications are coalesced signals only. `ReefApp::step` remains the only owner of
   consuming and merging `WorkerResult`.
 - Scheduled work must contribute its earliest due time to `next_deadline`; do not add fixed-rate
@@ -81,8 +85,9 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
 
 ### Graph
 
-- Graph refresh walks commits/refs in the graph worker.
-- Commit detail and per-file commit diffs are separate async requests.
+- Graph refresh walks commits/refs in the graph-refresh worker.
+- Commit detail and per-file commit diffs run on the separate graph-content worker, so a periodic
+  commit walk never queues a user-selected file diff behind it.
 - Ref/head changes should invalidate graph state by marking it stale; do not rewalk commits on worktree-only fs events.
 
 ## Common Pitfalls

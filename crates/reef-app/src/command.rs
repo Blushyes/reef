@@ -85,6 +85,9 @@ pub enum AppCommand {
     },
     CommitReplaceInFiles,
     RefreshStatus,
+    ApplyFsChange {
+        repo_presence_changed: bool,
+    },
     RefreshFileTree,
     RefreshFileTreeWithTarget(Option<PathBuf>),
     RevealFileTreePath(PathBuf),

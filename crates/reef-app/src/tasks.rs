@@ -677,13 +677,16 @@ enum LspTask {
     },
 }
 
-enum GraphTask {
+enum GraphRefreshTask {
     RefreshGraph {
         generation: u64,
         backend: Arc<dyn Backend>,
         limit: usize,
         scope: GraphScope,
     },
+}
+
+enum GraphContentTask {
     LoadCommitDetail {
         generation: u64,
         backend: Arc<dyn Backend>,
@@ -726,7 +729,8 @@ pub struct TaskCoordinator {
     preview_tx: mpsc::Sender<FilesTask>,
     preview_enrichment_tx: mpsc::Sender<PreviewEnrichmentTask>,
     git_tx: mpsc::Sender<GitTask>,
-    graph_tx: mpsc::Sender<GraphTask>,
+    graph_refresh_tx: mpsc::Sender<GraphRefreshTask>,
+    graph_content_tx: mpsc::Sender<GraphContentTask>,
     global_search_tx: mpsc::Sender<GlobalSearchTask>,
     result_tx: WorkerResultSender,
     /// LSP worker. Holds the per-language `LspClient`s +
@@ -763,7 +767,8 @@ impl TaskCoordinator {
             preview_tx: spawn_preview_worker(result_tx.clone()),
             preview_enrichment_tx: spawn_preview_enrichment_worker(result_tx.clone()),
             git_tx: spawn_git_worker(result_tx.clone()),
-            graph_tx: spawn_graph_worker(result_tx.clone()),
+            graph_refresh_tx: spawn_graph_refresh_worker(result_tx.clone()),
+            graph_content_tx: spawn_graph_content_worker(result_tx.clone()),
             global_search_tx: spawn_global_search_worker(result_tx.clone()),
             lsp_tx: spawn_lsp_worker(result_tx.clone()),
             result_tx,
@@ -1167,7 +1172,7 @@ impl TaskCoordinator {
         limit: usize,
         scope: GraphScope,
     ) {
-        let _ = self.graph_tx.send(GraphTask::RefreshGraph {
+        let _ = self.graph_refresh_tx.send(GraphRefreshTask::RefreshGraph {
             generation,
             backend,
             limit,
@@ -1176,11 +1181,13 @@ impl TaskCoordinator {
     }
 
     pub fn load_commit_detail(&self, generation: u64, backend: Arc<dyn Backend>, oid: String) {
-        let _ = self.graph_tx.send(GraphTask::LoadCommitDetail {
-            generation,
-            backend,
-            oid,
-        });
+        let _ = self
+            .graph_content_tx
+            .send(GraphContentTask::LoadCommitDetail {
+                generation,
+                backend,
+                oid,
+            });
     }
 
     pub fn load_commit_file_diff(
@@ -1192,14 +1199,16 @@ impl TaskCoordinator {
         context_lines: u32,
         dark: bool,
     ) {
-        let _ = self.graph_tx.send(GraphTask::LoadCommitFileDiff {
-            generation,
-            backend,
-            oid,
-            path,
-            context_lines,
-            dark,
-        });
+        let _ = self
+            .graph_content_tx
+            .send(GraphContentTask::LoadCommitFileDiff {
+                generation,
+                backend,
+                oid,
+                path,
+                context_lines,
+                dark,
+            });
     }
 
     pub fn load_commit_range_detail(
@@ -1209,12 +1218,14 @@ impl TaskCoordinator {
         oldest_oid: String,
         newest_oid: String,
     ) {
-        let _ = self.graph_tx.send(GraphTask::LoadCommitRangeDetail {
-            generation,
-            backend,
-            oldest_oid,
-            newest_oid,
-        });
+        let _ = self
+            .graph_content_tx
+            .send(GraphContentTask::LoadCommitRangeDetail {
+                generation,
+                backend,
+                oldest_oid,
+                newest_oid,
+            });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1228,15 +1239,17 @@ impl TaskCoordinator {
         context_lines: u32,
         dark: bool,
     ) {
-        let _ = self.graph_tx.send(GraphTask::LoadRangeFileDiff {
-            generation,
-            backend,
-            oldest_oid,
-            newest_oid,
-            path,
-            context_lines,
-            dark,
-        });
+        let _ = self
+            .graph_content_tx
+            .send(GraphContentTask::LoadRangeFileDiff {
+                generation,
+                backend,
+                oldest_oid,
+                newest_oid,
+                path,
+                context_lines,
+                dark,
+            });
     }
 
     /// Kick off a workdir-wide content search. The worker walks `root`
@@ -2163,14 +2176,14 @@ fn run_git_mutation(
     })
 }
 
-fn spawn_graph_worker(result_tx: WorkerResultSender) -> mpsc::Sender<GraphTask> {
+fn spawn_graph_refresh_worker(result_tx: WorkerResultSender) -> mpsc::Sender<GraphRefreshTask> {
     let (tx, rx) = mpsc::unbounded();
     let _ = thread::Builder::new()
-        .name("reef-graph-worker".into())
+        .name("reef-graph-refresh-worker".into())
         .spawn(move || {
             while let Ok(task) = rx.recv() {
                 match task {
-                    GraphTask::RefreshGraph {
+                    GraphRefreshTask::RefreshGraph {
                         generation,
                         backend,
                         limit,
@@ -2217,7 +2230,20 @@ fn spawn_graph_worker(result_tx: WorkerResultSender) -> mpsc::Sender<GraphTask> 
                         })();
                         let _ = result_tx.send(WorkerResult::Graph { generation, result });
                     }
-                    GraphTask::LoadCommitDetail {
+                }
+            }
+        });
+    tx
+}
+
+fn spawn_graph_content_worker(result_tx: WorkerResultSender) -> mpsc::Sender<GraphContentTask> {
+    let (tx, rx) = mpsc::unbounded();
+    let _ = thread::Builder::new()
+        .name("reef-graph-content-worker".into())
+        .spawn(move || {
+            while let Ok(task) = rx.recv() {
+                match task {
+                    GraphContentTask::LoadCommitDetail {
                         generation,
                         backend,
                         oid,
@@ -2225,7 +2251,7 @@ fn spawn_graph_worker(result_tx: WorkerResultSender) -> mpsc::Sender<GraphTask> 
                         let result = backend.commit_detail(&oid).map_err(|e| e.to_string());
                         let _ = result_tx.send(WorkerResult::CommitDetail { generation, result });
                     }
-                    GraphTask::LoadCommitFileDiff {
+                    GraphContentTask::LoadCommitFileDiff {
                         generation,
                         backend,
                         oid,
@@ -2239,7 +2265,7 @@ fn spawn_graph_worker(result_tx: WorkerResultSender) -> mpsc::Sender<GraphTask> 
                             .map(|opt| opt.map(|diff| build_commit_file_diff(path, diff, dark)));
                         let _ = result_tx.send(WorkerResult::CommitFileDiff { generation, result });
                     }
-                    GraphTask::LoadCommitRangeDetail {
+                    GraphContentTask::LoadCommitRangeDetail {
                         generation,
                         backend,
                         oldest_oid,
@@ -2250,7 +2276,7 @@ fn spawn_graph_worker(result_tx: WorkerResultSender) -> mpsc::Sender<GraphTask> 
                             .map_err(|e| e.to_string());
                         let _ = result_tx.send(WorkerResult::RangeDetail { generation, result });
                     }
-                    GraphTask::LoadRangeFileDiff {
+                    GraphContentTask::LoadRangeFileDiff {
                         generation,
                         backend,
                         oldest_oid,

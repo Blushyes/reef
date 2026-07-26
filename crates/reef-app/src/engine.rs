@@ -451,6 +451,11 @@ impl ReefApp {
             }
             AppCommand::CommitReplaceInFiles => self.state.commit_replace_in_files(),
             AppCommand::RefreshStatus => self.state.refresh_status(),
+            AppCommand::ApplyFsChange {
+                repo_presence_changed,
+            } => {
+                self.state.apply_fs_change(repo_presence_changed);
+            }
             AppCommand::RefreshFileTree => self.state.refresh_file_tree(),
             AppCommand::RefreshFileTreeWithTarget(target) => {
                 self.state.refresh_file_tree_with_target(target);

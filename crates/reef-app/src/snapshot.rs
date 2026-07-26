@@ -3,7 +3,7 @@ use crate::{
     ViewMode, features::hosts_picker::InputMode, preview_snapshot::PreviewDocumentSnapshot,
 };
 use reef_core::git::GraphScope;
-use std::{path::PathBuf, sync::Arc};
+use std::{ops::Range, path::PathBuf, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub struct AppSnapshot {
@@ -110,6 +110,19 @@ pub struct GlobalSearchPanelSnapshot {
     pub load: AsyncSnapshot,
     pub replace_load: AsyncSnapshot,
     pub replace_progress: Option<(usize, usize)>,
+    pub preview_match: Option<GlobalSearchPreviewMatchSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalSearchPreviewMatchSnapshot {
+    pub path: PathBuf,
+    pub query: String,
+    pub occurrence_index: usize,
+    /// Zero-based source row of the selected search hit.
+    pub row: usize,
+    /// Source line containing the selected match.
+    pub line_text: String,
+    pub byte_range: Range<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -284,6 +297,23 @@ impl PreviewKindSnapshot {
 
 impl GlobalSearchPanelSnapshot {
     fn from_state(state: &AppState) -> Self {
+        let selected_index = state.global_search.core.selected_idx;
+        let preview_match = state
+            .global_search
+            .results
+            .get(selected_index)
+            .filter(|_| !state.global_search.core.filter.is_empty())
+            .map(|hit| GlobalSearchPreviewMatchSnapshot {
+                path: hit.path.clone(),
+                query: state.global_search.core.filter.clone(),
+                occurrence_index: state.global_search.results[..selected_index]
+                    .iter()
+                    .filter(|candidate| candidate.path == hit.path)
+                    .count(),
+                row: hit.line,
+                line_text: hit.line_text.clone(),
+                byte_range: hit.byte_range.clone(),
+            });
         Self {
             active: state.global_search.core.active,
             query: state.global_search.core.filter.clone(),
@@ -301,6 +331,7 @@ impl GlobalSearchPanelSnapshot {
             load: AsyncSnapshot::from_state(&state.global_search_load),
             replace_load: AsyncSnapshot::from_state(&state.replace_load),
             replace_progress: state.global_search.replace_progress,
+            preview_match,
         }
     }
 }
@@ -407,10 +438,10 @@ mod tests {
     use reef_io::LocalBackend;
 
     use super::AppSnapshot;
-    use crate::{AppPrefs, AppState, AppStateConfig};
+    use crate::{AppPrefs, AppState, AppStateConfig, MatchHit};
 
     #[test]
-    fn preview_snapshot_revision_tracks_accepted_content_generation() {
+    fn preview_snapshot_source_revision_tracks_accepted_content_generation() {
         let backend = Arc::new(LocalBackend::open_at(PathBuf::from(".")));
         let mut state = AppState::new(AppStateConfig {
             backend,
@@ -433,7 +464,38 @@ mod tests {
 
         assert_ne!(accepted_generation, loading_generation);
         assert_eq!(first.revision, accepted_generation);
+        assert_eq!(first.source_revision, accepted_generation);
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn global_search_preview_match_tracks_occurrence_within_selected_file() {
+        let backend = Arc::new(LocalBackend::open_at(PathBuf::from(".")));
+        let mut state = AppState::new(AppStateConfig {
+            backend,
+            prefs: AppPrefs::default(),
+            now: Instant::now(),
+            subscribe_fs_events: false,
+        });
+        state.global_search.core.filter = "reef".to_string();
+        state.global_search.results = vec![
+            search_hit("src/a.rs", 3, 0..4),
+            search_hit("src/b.rs", 1, 2..6),
+            search_hit("src/a.rs", 8, 5..9),
+        ];
+        state.global_search.core.selected_idx = 2;
+
+        let focus = AppSnapshot::from_state(&state)
+            .search
+            .preview_match
+            .expect("selected global-search preview match");
+
+        assert_eq!(focus.path, PathBuf::from("src/a.rs"));
+        assert_eq!(focus.query, "reef");
+        assert_eq!(focus.occurrence_index, 1);
+        assert_eq!(focus.row, 8);
+        assert_eq!(focus.line_text, "reef");
+        assert_eq!(focus.byte_range, 5..9);
     }
 
     fn text_preview(path: &str) -> PreviewDocument {
@@ -447,6 +509,16 @@ mod tests {
                 highlighted: None,
                 parsed: None,
             }),
+        }
+    }
+
+    fn search_hit(path: &str, line: usize, byte_range: std::ops::Range<usize>) -> MatchHit {
+        MatchHit {
+            path: PathBuf::from(path),
+            display: format!("{path}:{line}"),
+            line,
+            line_text: "reef".to_string(),
+            byte_range,
         }
     }
 }

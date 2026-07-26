@@ -112,17 +112,19 @@ pub fn handle_paste_search_tab(s: &str, app: &mut App) {
     });
 }
 
-/// Commit the selected hit: close the palette, switch to the Files tab,
-/// reveal the path, and stash a `PreviewHighlight` so the file preview
-/// panel highlights the matching row once it loads async.
+/// Validate the selected hit asynchronously, then commit the jump only if
+/// its file still exists. This keeps a stale streamed result from closing the
+/// palette or adding a dead location-history entry.
 pub fn accept(app: &mut App) {
     let Some(hit) = app.engine.selected_global_search_hit() else {
         app.engine.dispatch(AppCommand::CloseGlobalSearch);
         return;
     };
 
-    app.push_location_before_jump();
-    app.engine.dispatch(AppCommand::AcceptGlobalSearchHit(hit));
+    app.engine.dispatch(AppCommand::AcceptGlobalSearchHit {
+        hit,
+        origin: app.snapshot_location(),
+    });
     app.drain_engine_runtime_events();
 }
 
@@ -326,7 +328,9 @@ pub fn reload(app: &mut App) {
 /// nav is definitionally fresher than a scheduled one.
 pub fn navigate_to_selected(app: &mut App) {
     app.engine
-        .dispatch(AppCommand::SyncGlobalSearchPreviewToSelected);
+        .dispatch(AppCommand::SyncGlobalSearchPreviewToSelected {
+            preview_view_h: app.layout.last_preview_view_h as usize,
+        });
 }
 
 // ─── Line-text truncation helpers ────────────────────────────────────────────

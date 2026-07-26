@@ -53,11 +53,20 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
 
 ## Tab Responsibilities
 
+### Search
+
+- `reef-app` owns the global-search query, debounce deadline, generation, streaming result merge, selection, exclusions, replacement state, and selected-result preview synchronization.
+- Confirming a global-search hit validates the selected path through the preview worker before changing tabs or recording navigation history. A missing target keeps search open and removes that path's stale hits.
+- Renderers send full-value semantic commands for query and replacement edits. They do not mutate search cursors or result state directly.
+- Hosts pass a preview viewport height to `SyncGlobalSearchPreviewToSelected` and `SyncGlobalSearchPreviewIfStale`; `reef-app` keeps the target path and request generation aligned, then reveals the selected match even when the preview content is reused.
+- Large result sets are exposed through paged row snapshots. Renderers request visible windows and keep previously loaded rows visible while a newer generation is loading.
+
 ### Files
 
 - Tree structure changes (expand/collapse/reveal/fs events) may rebuild the tree through the files worker.
 - Git decorations update visible entries in place; they must not rebuild the tree by themselves.
 - Preview loads run through the `reef-app` task coordinator. The preview worker publishes the base document first; only after that result is accepted does a separate enrichment worker add syntax highlighting and tree-sitter data. Renderers must accept the plain snapshot immediately and treat enrichment as an in-place revision update. Adapter actions that need enrichment, such as TUI code navigation or deferred UTF-16 highlights, must retain a generation/path-bound intent and retry it from `RetryDeferredPreviewActions`; they must not discard the input while the enrichment request is pending.
+- Preview snapshots expose separate content and presentation revisions. `source_revision` changes only when accepted raw preview content changes; `revision` may also change when asynchronous enrichment arrives. Content-relative state such as find, selection, and navigation uses `source_revision`, while renderer caches that include styling use `revision`.
 
 ### Git
 
@@ -94,3 +103,10 @@ Before coding, decide these names and locations:
 - Render fallback for empty/loading/stale/error.
 
 If any of these feel unnecessary, the feature may be cheap enough to remain synchronous. Verify it does not touch host I/O or git.
+
+## Search preview projection
+
+- `reef-app` owns the selected global-search hit and projects its path, query, same-file
+  occurrence, row, and byte range into the renderer-neutral snapshot.
+- Renderer hosts consume that projection to reveal and highlight the exact preview match. They
+  must not reconstruct selection identity from rendered rows or maintain a second search state.

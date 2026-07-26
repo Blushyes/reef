@@ -77,6 +77,7 @@ impl AppState {
         wants_decoded_image: bool,
     ) {
         let generation = self.preview_load.begin();
+        self.bind_global_search_hit_accept_to_preview_generation(&rel_path, generation);
         self.preview_enrichment_dark = dark;
         self.preview_enrichment_pending = None;
         self.preview_in_flight_path = Some(rel_path.clone());
@@ -161,6 +162,7 @@ impl AppState {
             (Some(old), Some(new)) if old.path == new.path
         );
         self.preview_content = content.map(Arc::new);
+        self.preview_source_revision = generation;
         self.bump_preview_content_revision();
         if !same_file {
             self.preview_scroll = 0;
@@ -254,6 +256,7 @@ impl AppState {
             Arc::new(crate::PreviewDocumentSnapshot::from_document(
                 preview,
                 self.preview_content_revision,
+                self.preview_source_revision,
             ))
         });
     }
@@ -263,6 +266,53 @@ impl AppState {
             .as_ref()
             .map(|preview| preview.path == path.to_string_lossy())
             .unwrap_or(false)
+    }
+
+    /// Returns whether the accepted preview or every outstanding preview
+    /// request is for `path`. A matching pending request is sufficient while
+    /// the first result is still loading; a request for another path is not.
+    pub fn preview_target_matches(&self, path: &Path) -> bool {
+        let schedule_matches = self
+            .preview_schedule
+            .as_ref()
+            .is_none_or(|(scheduled, _)| scheduled == path);
+        let in_flight_matches = self
+            .preview_in_flight_path
+            .as_ref()
+            .is_none_or(|in_flight| in_flight == path);
+        schedule_matches
+            && in_flight_matches
+            && (self.preview_is_for(path)
+                || self
+                    .preview_schedule
+                    .as_ref()
+                    .is_some_and(|(scheduled, _)| scheduled == path)
+                || self
+                    .preview_in_flight_path
+                    .as_ref()
+                    .is_some_and(|in_flight| in_flight == path))
+    }
+
+    /// Discards preview work that would otherwise overwrite a newly selected
+    /// path. Worker requests cannot be interrupted, so invalidating their
+    /// generation is the cancellation boundary for late results.
+    pub fn cancel_preview_work_for_other_path(&mut self, path: &Path) {
+        if self
+            .preview_schedule
+            .as_ref()
+            .is_some_and(|(scheduled, _)| scheduled != path)
+        {
+            self.preview_schedule = None;
+        }
+        if self
+            .preview_in_flight_path
+            .as_ref()
+            .is_some_and(|in_flight| in_flight != path)
+        {
+            self.preview_load.invalidate();
+            self.preview_in_flight_path = None;
+            self.preview_enrichment_pending = None;
+        }
     }
 
     fn prefetch_preview_neighbors(&self, options: TickOptions) {
@@ -355,6 +405,7 @@ mod tests {
         state.apply_preview_content(generation, Some(text_preview("src/main.rs")), 20);
         assert!(state.request_current_preview_enrichment(generation));
         let base_revision = state.preview_content_revision;
+        let source_revision = state.preview_source_revision;
 
         let accepted = state.complete_preview_enrichment(
             generation,
@@ -367,6 +418,14 @@ mod tests {
 
         assert!(accepted);
         assert!(state.preview_content_revision > base_revision);
+        assert_eq!(state.preview_source_revision, source_revision);
+        assert_eq!(
+            state
+                .preview_snapshot
+                .as_deref()
+                .map(|preview| preview.source_revision),
+            Some(source_revision)
+        );
         let Some(PreviewBody::Text(text)) = state
             .preview_content
             .as_deref()
@@ -440,6 +499,7 @@ mod tests {
         );
         assert!(state.request_current_preview_enrichment(generation));
         let base_revision = state.preview_content_revision;
+        let source_revision = state.preview_source_revision;
         let enriched =
             reef_core::markdown::build_markdown_preview_with_syntax("README.md", source, false)
                 .expect("enriched markdown preview");
@@ -450,6 +510,14 @@ mod tests {
             Some(PreviewEnrichment::Markdown(enriched)),
         ));
         assert!(state.preview_content_revision > base_revision);
+        assert_eq!(state.preview_source_revision, source_revision);
+        assert_eq!(
+            state
+                .preview_snapshot
+                .as_deref()
+                .map(|preview| preview.source_revision),
+            Some(source_revision)
+        );
         let Some(PreviewBody::Markdown(markdown)) = state
             .preview_content
             .as_deref()

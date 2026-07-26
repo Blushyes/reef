@@ -71,9 +71,10 @@ pub use preview_snapshot::{
 pub use runtime::{AppRuntimeEvent, AsyncState, FileActionNotice};
 pub use snapshot::{
     AppSnapshot, AsyncSnapshot, FilesPanelSnapshot, GitPanelSnapshot, GlobalSearchPanelSnapshot,
-    GlobalSearchRowSnapshot, GraphBranchPickerRowSnapshot, GraphBranchPickerSnapshot,
-    GraphPanelSnapshot, HostsPickerRowSnapshot, HostsPickerSnapshot, OverlaySnapshot,
-    PendingConfirmSnapshot, PreviewKindSnapshot, QuickOpenRowSnapshot, QuickOpenSnapshot,
+    GlobalSearchPreviewMatchSnapshot, GlobalSearchRowSnapshot, GraphBranchPickerRowSnapshot,
+    GraphBranchPickerSnapshot, GraphPanelSnapshot, HostsPickerRowSnapshot, HostsPickerSnapshot,
+    OverlaySnapshot, PendingConfirmSnapshot, PreviewKindSnapshot, QuickOpenRowSnapshot,
+    QuickOpenSnapshot,
 };
 pub use tab::AppTab;
 pub use tasks::{

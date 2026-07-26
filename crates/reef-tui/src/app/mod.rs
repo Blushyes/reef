@@ -1502,13 +1502,21 @@ impl App {
         generation: u64,
         result: Result<Option<reef_core::preview::PreviewDocument>, String>,
     ) {
+        if generation != self.engine.preview_generation() {
+            return;
+        }
+        let validating_global_search_hit = self
+            .engine
+            .global_search_hit_accepting_generation(generation);
         match result {
             Ok(mut content) => {
                 let same_file = matches!(
                     (self.engine.preview_content_ref(), content.as_ref()),
                     (Some(old), Some(new)) if old.path == new.path
                 );
-                self.prepare_preview_image_protocol(generation, same_file, &mut content);
+                if !(validating_global_search_hit && content.is_none()) {
+                    self.prepare_preview_image_protocol(generation, same_file, &mut content);
+                }
                 self.engine
                     .dispatch(reef_app::AppCommand::ApplyPreviewResult {
                         generation,
@@ -1554,7 +1562,10 @@ impl App {
                 reef_app::AppRuntimeEvent::LoadPreviewSelected => self.load_preview(),
                 reef_app::AppRuntimeEvent::LoadDiffRequested => self.load_diff(),
                 reef_app::AppRuntimeEvent::SyncSearchPreviewIfStale => {
-                    self.sync_search_preview_if_stale();
+                    self.engine
+                        .dispatch(reef_app::AppCommand::SyncGlobalSearchPreviewIfStale {
+                            preview_view_h: self.layout.last_preview_view_h as usize,
+                        });
                 }
                 reef_app::AppRuntimeEvent::RecomputeVimSearch => {
                     crate::search::recompute_and_jump(self);
@@ -1972,7 +1983,10 @@ impl App {
             crate::find_widget::close(self);
         }
         if outcome.sync_search_preview {
-            self.sync_search_preview_if_stale();
+            self.engine
+                .dispatch(reef_app::AppCommand::SyncGlobalSearchPreviewIfStale {
+                    preview_view_h: self.layout.last_preview_view_h as usize,
+                });
         }
     }
 
@@ -2525,31 +2539,6 @@ impl App {
         true
     }
 
-    /// Reload the Search tab's right-side preview iff the currently-selected
-    /// hit no longer matches what `preview_highlight` is pointing at.
-    /// Called after every global-search chunk arrives — without this the
-    /// right panel goes stale between "user types new query" and "user
-    /// presses ↑↓ manually," which looks like a bug.
-    ///
-    /// Gated on `active_tab == Tab::Search` so the overlay (which doesn't
-    /// render a preview) doesn't waste preview-worker cycles. Cheap when a
-    /// burst of chunks all point at the same hit — the staleness check
-    /// short-circuits.
-    fn sync_search_preview_if_stale(&mut self) {
-        if self.engine.active_tab() != Tab::Search {
-            return;
-        }
-        if self
-            .engine
-            .selected_global_search_hit_if_preview_stale()
-            .is_none()
-        {
-            return;
-        }
-        self.engine
-            .dispatch(reef_app::AppCommand::SyncGlobalSearchPreviewToSelected);
-    }
-
     /// VSCode-style hover auto-expand. When the cursor rests on a
     /// collapsed folder for `HOVER_EXPAND_DELAY`, expand it so the user
     /// can keep drilling into deep targets without round-tripping through
@@ -2660,8 +2649,7 @@ mod tests {
         load_graph_scope_pref, persist_graph_scope,
     };
     use crate::ui::theme::Theme;
-    use reef_app::GitGraphState;
-    use reef_app::{GraphPayload, WorkerResult};
+    use reef_app::{AppCommand, GitGraphState, GraphPayload, MatchHit, WorkerResult};
     use reef_core::git::GraphScope;
     use reef_core::preview::{PreviewBody, PreviewDocument as PreviewContent};
     use reef_io::LocalBackend;
@@ -3246,6 +3234,61 @@ mod tests {
         );
         assert!(app.engine.state.preview_load.stale);
         assert!(!app.engine.state.preview_load.loading);
+    }
+
+    #[test]
+    fn stale_preview_result_keeps_terminal_image_protocol() {
+        let mut fx = make_scope_fixture();
+        let stale_generation = fx.app.engine.state.preview_load.begin();
+        let current_generation = fx.app.engine.state.preview_load.begin();
+        fx.app.preview_image_protocol = Some(ratatui_image::thread::ThreadProtocol::new(
+            fx.app.preview_resize_tx.clone(),
+            None,
+        ));
+
+        fx.app
+            .apply_preview_result_for_adapter(stale_generation, Ok(None));
+
+        assert_eq!(fx.app.engine.preview_generation(), current_generation);
+        assert!(fx.app.preview_image_protocol.is_some());
+    }
+
+    #[test]
+    fn missing_global_search_hit_keeps_terminal_image_protocol() {
+        let mut fx = make_scope_fixture();
+        let hit = MatchHit {
+            path: PathBuf::from("missing.png"),
+            display: "missing.png".to_string(),
+            line: 0,
+            line_text: "needle".to_string(),
+            byte_range: 0..6,
+        };
+        fx.app.engine.state.global_search.core.active = true;
+        fx.app.engine.dispatch(AppCommand::AcceptGlobalSearchHit {
+            hit: hit.clone(),
+            origin: None,
+        });
+        let (path, _) = fx
+            .app
+            .engine
+            .state
+            .preview_schedule
+            .take()
+            .expect("accepting a hit schedules validation");
+        fx.app
+            .engine
+            .state
+            .dispatch_preview_load(path, false, false);
+        let generation = fx.app.engine.preview_generation();
+        fx.app.preview_image_protocol = Some(ratatui_image::thread::ThreadProtocol::new(
+            fx.app.preview_resize_tx.clone(),
+            None,
+        ));
+
+        fx.app
+            .apply_preview_result_for_adapter(generation, Ok(None));
+
+        assert!(fx.app.preview_image_protocol.is_some());
     }
 
     // ── Graph layout math ────────────────────────────────────────────────

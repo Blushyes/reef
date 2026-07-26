@@ -409,6 +409,13 @@ struct PendingPreviewEnrichment {
     path: String,
 }
 
+#[derive(Debug, Clone)]
+struct PendingGlobalSearchAccept {
+    hit: MatchHit,
+    origin: Option<LocationSnapshot>,
+    generation: Option<u64>,
+}
+
 pub struct AppState {
     pub backend: Arc<dyn Backend>,
     pub workdir_name: String,
@@ -438,6 +445,7 @@ pub struct AppState {
     pub file_tree: FileTree,
     pub preview_content: Option<Arc<PreviewContent>>,
     pub preview_content_revision: u64,
+    pub preview_source_revision: u64,
     pub preview_snapshot: Option<Arc<crate::PreviewDocumentSnapshot>>,
     pub preview_enrichment_dark: bool,
     preview_enrichment_pending: Option<PendingPreviewEnrichment>,
@@ -469,6 +477,7 @@ pub struct AppState {
 
     pub quick_open: QuickOpenState,
     pub global_search: GlobalSearchState,
+    pending_global_search_accept: Option<PendingGlobalSearchAccept>,
     pub search: SearchState,
     pub find_widget: FindWidgetState,
     pub hosts_picker: HostsPickerState,
@@ -659,6 +668,7 @@ impl AppState {
             file_tree,
             preview_content: None,
             preview_content_revision: 0,
+            preview_source_revision: 0,
             preview_snapshot: None,
             preview_enrichment_dark: false,
             preview_enrichment_pending: None,
@@ -697,6 +707,7 @@ impl AppState {
             settings: SettingsState::default(),
             quick_open: prefs.quick_open,
             global_search: GlobalSearchState::default(),
+            pending_global_search_accept: None,
             search: SearchState::default(),
             find_widget: FindWidgetState::default(),
             hosts_picker: HostsPickerState::default(),
@@ -1323,6 +1334,153 @@ mod tests {
     }
 
     #[test]
+    fn set_global_search_query_atomically_updates_renderer_input_state() {
+        let mut app = minimal_app_state();
+        app.global_search.results = vec![dummy_hit("a"), dummy_hit("b")];
+        app.global_search.core.selected_idx = 1;
+        app.global_search.excluded.insert((PathBuf::from("a"), 0));
+        let now = Instant::now();
+
+        app.set_global_search_query("needle".to_string(), now);
+
+        assert_eq!(app.global_search.core.filter, "needle");
+        assert_eq!(app.global_search.core.cursor, "needle".len());
+        assert_eq!(app.global_search.core.selected_idx, 0);
+        assert!(app.global_search.excluded.is_empty());
+        assert_eq!(app.global_search.last_keystroke_at, Some(now));
+    }
+
+    #[test]
+    fn set_global_search_query_does_not_reschedule_unchanged_query() {
+        let mut app = minimal_app_state();
+        app.global_search.core.filter = "needle".to_string();
+        app.global_search.core.cursor = 0;
+        let excluded = (PathBuf::from("a"), 0);
+        app.global_search.excluded.insert(excluded.clone());
+
+        app.set_global_search_query("needle".to_string(), Instant::now());
+
+        assert_eq!(app.global_search.core.cursor, "needle".len());
+        assert_eq!(app.global_search.excluded.len(), 1);
+        assert!(app.global_search.excluded.contains(&excluded));
+        assert!(app.global_search.last_keystroke_at.is_none());
+    }
+
+    #[test]
+    fn set_global_search_replacement_updates_text_and_cursor_together() {
+        let mut app = minimal_app_state();
+
+        app.set_global_search_replacement("replacement".to_string());
+
+        assert_eq!(app.global_search.replace_text, "replacement");
+        assert_eq!(app.global_search.replace_cursor, "replacement".len());
+        assert!(app.global_search.last_keystroke_at.is_none());
+    }
+
+    #[test]
+    fn sync_global_search_preview_updates_a_different_match_on_the_same_line() {
+        use reef_core::preview::{PreviewBody, TextPreview};
+
+        let mut app = minimal_app_state();
+        let mut hit = dummy_hit("Cargo.toml");
+        hit.line_text = "needle and needle".to_string();
+        hit.byte_range = 11..17;
+        app.active_tab = AppTab::Search;
+        app.global_search.results = vec![hit];
+        app.preview_content = Some(Arc::new(PreviewContent {
+            path: "Cargo.toml".to_string(),
+            local_path: None,
+            bytes_on_disk: 0,
+            mime: Some("text/plain".to_string()),
+            body: PreviewBody::Text(TextPreview {
+                lines: vec!["needle and needle".to_string()],
+                highlighted: None,
+                parsed: None,
+            }),
+        }));
+        app.set_preview_highlight_persistent(PathBuf::from("Cargo.toml"), 0, 0..6);
+
+        assert!(app.sync_global_search_preview_if_stale(20));
+        assert_eq!(
+            app.preview_highlight
+                .as_ref()
+                .map(|highlight| highlight.byte_range.clone()),
+            Some(11..17)
+        );
+        assert!(app.preview_schedule.is_none());
+        assert!(!app.sync_global_search_preview_if_stale(20));
+    }
+
+    #[test]
+    fn sync_global_search_preview_recenters_reused_content() {
+        let mut app = minimal_app_state();
+        let mut hit = dummy_hit("Cargo.toml");
+        hit.line = 50;
+        hit.byte_range = 4..10;
+        app.active_tab = AppTab::Search;
+        app.global_search.results = vec![hit];
+        app.preview_content = Some(Arc::new(global_search_text_preview("Cargo.toml")));
+
+        assert!(app.sync_global_search_preview_to_selected(10));
+
+        assert_eq!(app.preview_scroll, 45);
+        assert!(app.preview_schedule.is_none());
+    }
+
+    #[test]
+    fn sync_global_search_preview_cancels_scheduled_other_path() {
+        let mut app = minimal_app_state();
+        let mut hit = dummy_hit("Cargo.toml");
+        hit.line = 50;
+        hit.byte_range = 4..10;
+        app.active_tab = AppTab::Search;
+        app.global_search.results = vec![hit.clone()];
+        app.preview_content = Some(Arc::new(global_search_text_preview("Cargo.toml")));
+        app.set_preview_highlight_persistent(hit.path, hit.line, hit.byte_range);
+        app.preview_schedule = Some((PathBuf::from("README.md"), Instant::now()));
+
+        assert!(app.sync_global_search_preview_if_stale(10));
+
+        assert!(app.preview_schedule.is_none());
+        assert_eq!(app.preview_scroll, 45);
+    }
+
+    #[test]
+    fn sync_global_search_preview_invalidates_in_flight_other_path() {
+        let mut app = minimal_app_state();
+        let mut hit = dummy_hit("Cargo.toml");
+        hit.line = 50;
+        hit.byte_range = 4..10;
+        app.active_tab = AppTab::Search;
+        app.global_search.results = vec![hit.clone()];
+        app.preview_content = Some(Arc::new(global_search_text_preview("Cargo.toml")));
+        app.set_preview_highlight_persistent(hit.path, hit.line, hit.byte_range);
+        let stale_generation = app.preview_load.begin();
+        app.preview_in_flight_path = Some(PathBuf::from("README.md"));
+
+        assert!(app.sync_global_search_preview_if_stale(10));
+        assert_ne!(app.preview_load.generation, stale_generation);
+        assert!(app.preview_in_flight_path.is_none());
+
+        let outcome = app.apply_preview_content(
+            stale_generation,
+            Some(global_search_text_preview("README.md")),
+            10,
+        );
+        assert!(!outcome.accepted);
+        assert!(app.preview_is_for(Path::new("Cargo.toml")));
+    }
+
+    #[test]
+    fn sync_global_search_preview_is_inactive_outside_search_tab() {
+        let mut app = minimal_app_state();
+        app.global_search.results = vec![dummy_hit("Cargo.toml")];
+
+        assert!(!app.sync_global_search_preview_if_stale(20));
+        assert!(app.preview_highlight.is_none());
+    }
+
+    #[test]
     fn paste_global_search_tab_routes_find_input_to_query() {
         let mut app = minimal_app_state();
         app.global_search.focus = SearchPanelFocus::FindInput;
@@ -1460,6 +1618,22 @@ mod tests {
             line: 0,
             line_text: String::new(),
             byte_range: 0..0,
+        }
+    }
+
+    fn global_search_text_preview(path: &str) -> PreviewContent {
+        use reef_core::preview::{PreviewBody, TextPreview};
+
+        PreviewContent {
+            path: path.to_string(),
+            local_path: None,
+            bytes_on_disk: 0,
+            mime: Some("text/plain".to_string()),
+            body: PreviewBody::Text(TextPreview {
+                lines: vec!["needle".to_string()],
+                highlighted: None,
+                parsed: None,
+            }),
         }
     }
 }

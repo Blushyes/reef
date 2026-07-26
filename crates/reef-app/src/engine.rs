@@ -215,13 +215,47 @@ impl ReefApp {
         result: Result<Option<PreviewDocument>, String>,
         view_height: usize,
     ) {
-        let outcome = self
+        if self
             .state
-            .apply_preview_result(generation, result, view_height);
-        if outcome.accepted {
-            self.state.request_current_preview_enrichment(generation);
+            .global_search_hit_accepting_generation(generation)
+        {
+            match result {
+                Ok(Some(content)) => {
+                    let outcome =
+                        self.state
+                            .apply_preview_content(generation, Some(content), view_height);
+                    if outcome.accepted {
+                        self.state.request_current_preview_enrichment(generation);
+                        let tab_change = self
+                            .state
+                            .complete_global_search_hit_accept(generation, view_height);
+                        self.push_preview_merge_outcome(outcome);
+                        if let Some(tab_change) = tab_change {
+                            self.push_tab_change_outcome(tab_change);
+                            return;
+                        }
+                    }
+                }
+                Ok(None) => {
+                    if self.state.reject_global_search_hit_accept(generation, None) {
+                        self.runtime_events
+                            .push(AppRuntimeEvent::SyncSearchPreviewIfStale);
+                    }
+                }
+                Err(error) => {
+                    self.state
+                        .reject_global_search_hit_accept(generation, Some(error));
+                }
+            }
+        } else {
+            let outcome = self
+                .state
+                .apply_preview_result(generation, result, view_height);
+            if outcome.accepted {
+                self.state.request_current_preview_enrichment(generation);
+            }
+            self.push_preview_merge_outcome(outcome);
         }
-        self.push_preview_merge_outcome(outcome);
     }
 
     fn apply_lsp_refine_done_command(
@@ -606,9 +640,8 @@ impl ReefApp {
                 let outcome = self.state.pin_global_search_to_tab();
                 self.push_tab_change_outcome(outcome);
             }
-            AppCommand::AcceptGlobalSearchHit(hit) => {
-                let outcome = self.state.accept_global_search_hit(hit);
-                self.push_tab_change_outcome(outcome);
+            AppCommand::AcceptGlobalSearchHit { hit, origin } => {
+                self.state.begin_global_search_hit_accept(hit, origin);
             }
             AppCommand::BeginVimSearch { target, backwards } => {
                 self.state.begin_vim_search(target, backwards);
@@ -719,16 +752,13 @@ impl ReefApp {
                 dispatch_outcome.global_search_preview_sync_due =
                     self.state.consume_global_search_preview_sync_due(now);
             }
-            AppCommand::SyncGlobalSearchPreviewToSelected => {
-                self.state.clear_global_search_preview_sync();
-                if let Some(hit) = self.state.selected_global_search_hit() {
-                    self.state.set_preview_highlight_persistent(
-                        hit.path.clone(),
-                        hit.line,
-                        hit.byte_range.clone(),
-                    );
-                    self.state.load_preview_for_path(hit.path);
-                }
+            AppCommand::SyncGlobalSearchPreviewToSelected { preview_view_h } => {
+                self.state
+                    .sync_global_search_preview_to_selected(preview_view_h);
+            }
+            AppCommand::SyncGlobalSearchPreviewIfStale { preview_view_h } => {
+                self.state
+                    .sync_global_search_preview_if_stale(preview_view_h);
             }
             AppCommand::FocusGlobalSearchFindInput => self.state.focus_global_search_find_input(),
             AppCommand::FocusGlobalSearchReplaceInput => {
@@ -759,6 +789,12 @@ impl ReefApp {
             AppCommand::SetGlobalSearchResultsHorizontalScroll(value) => {
                 self.state
                     .set_global_search_results_horizontal_scroll(value);
+            }
+            AppCommand::SetGlobalSearchQuery { query, now } => {
+                self.state.set_global_search_query(query, now);
+            }
+            AppCommand::SetGlobalSearchReplacement(replacement) => {
+                self.state.set_global_search_replacement(replacement);
             }
             AppCommand::EditGlobalSearchFindInput { op, now } => {
                 let _ = self.state.edit_global_search_find_input(op, now);
@@ -1441,15 +1477,6 @@ impl ReefApp {
         self.state.selected_global_search_hit()
     }
 
-    pub fn selected_global_search_hit_if_preview_stale(&self) -> Option<MatchHit> {
-        let hit = self.selected_global_search_hit()?;
-        let stale = match &self.state.preview_highlight {
-            Some(hl) => hl.path != hit.path || hl.row != hit.line,
-            None => true,
-        };
-        stale.then_some(hit)
-    }
-
     pub fn diff_layout(&self) -> DiffLayout {
         self.state.diff_layout
     }
@@ -1953,6 +1980,11 @@ impl ReefApp {
         self.state.preview_load.generation
     }
 
+    pub fn global_search_hit_accepting_generation(&self, generation: u64) -> bool {
+        self.state
+            .global_search_hit_accepting_generation(generation)
+    }
+
     pub fn preview_highlight_cloned(&self) -> Option<PreviewHighlight> {
         self.state.preview_highlight.clone()
     }
@@ -2163,6 +2195,51 @@ mod tests {
         ReefApp::new(AppConfig { state })
     }
 
+    fn global_search_hit(path: &str) -> MatchHit {
+        MatchHit {
+            path: PathBuf::from(path),
+            display: path.to_string(),
+            line: 3,
+            line_text: "needle".to_string(),
+            byte_range: 0..6,
+        }
+    }
+
+    fn global_search_origin() -> LocationSnapshot {
+        LocationSnapshot {
+            surface: crate::LocationSurface::GitDiff {
+                file_path: "src/origin.rs".to_string(),
+                is_staged: false,
+            },
+            path: PathBuf::from("src/origin.rs"),
+            cursor: crate::CursorPosition {
+                line: 4,
+                byte_col: 2,
+            },
+            scroll: crate::ScrollPosition {
+                vertical: 3,
+                horizontal: 1,
+            },
+        }
+    }
+
+    fn start_global_search_hit_validation(app: &mut ReefApp, hit: MatchHit) -> u64 {
+        app.dispatch(AppCommand::AcceptGlobalSearchHit {
+            hit,
+            origin: Some(global_search_origin()),
+        });
+        let (path, _) = app
+            .state
+            .preview_schedule
+            .take()
+            .expect("accepting a hit schedules validation");
+        let generation = app.state.preview_load.begin();
+        app.state
+            .bind_global_search_hit_accept_to_preview_generation(&path, generation);
+        app.state.preview_in_flight_path = Some(path);
+        generation
+    }
+
     #[test]
     fn dispatch_set_active_tab_emits_tab_changed_event() {
         let mut app = test_app();
@@ -2252,5 +2329,77 @@ mod tests {
         };
         assert!(enriched.highlighted.is_some());
         assert!(enriched.parsed.is_some());
+    }
+
+    #[test]
+    fn missing_global_search_hit_keeps_search_open_without_history_entry() {
+        let mut app = test_app();
+        app.state.active_tab = AppTab::Git;
+        app.state.global_search.core.active = true;
+        let hit = global_search_hit("deleted.rs");
+        app.state.global_search.results = vec![hit.clone()];
+        let generation = start_global_search_hit_validation(&mut app, hit);
+
+        app.dispatch(AppCommand::ApplyPreviewResult {
+            generation,
+            result: Ok(None),
+            preview_view_h: 20,
+        });
+
+        assert_eq!(app.state.active_tab, AppTab::Git);
+        assert!(app.state.global_search.core.active);
+        assert!(app.state.global_search.results.is_empty());
+        assert!(app.state.location_history.is_empty());
+        assert!(
+            app.drain_runtime_events()
+                .iter()
+                .all(|event| !matches!(event, AppRuntimeEvent::TabChanged(_)))
+        );
+    }
+
+    #[test]
+    fn existing_global_search_hit_commits_navigation_after_preview_validation() {
+        let mut app = test_app();
+        app.state.active_tab = AppTab::Git;
+        app.state.global_search.core.active = true;
+        let hit = global_search_hit("src/main.rs");
+        app.state.global_search.results = vec![hit.clone()];
+        let generation = start_global_search_hit_validation(&mut app, hit.clone());
+
+        app.dispatch(AppCommand::ApplyPreviewResult {
+            generation,
+            result: Ok(Some(PreviewDocument {
+                path: hit.path.to_string_lossy().to_string(),
+                local_path: None,
+                bytes_on_disk: 7,
+                mime: Some("text/plain".to_string()),
+                body: PreviewBody::Text(TextPreview {
+                    lines: vec!["needle".to_string()],
+                    highlighted: None,
+                    parsed: None,
+                }),
+            })),
+            preview_view_h: 20,
+        });
+
+        assert_eq!(app.state.active_tab, AppTab::Files);
+        assert!(!app.state.global_search.core.active);
+        assert_eq!(
+            app.state.location_history.back_items(),
+            &[global_search_origin()]
+        );
+        assert_eq!(
+            app.state
+                .preview_highlight
+                .as_ref()
+                .map(|highlight| (&highlight.path, highlight.row)),
+            Some((&hit.path, hit.line))
+        );
+        assert!(app.state.preview_enrichment_pending());
+        assert!(
+            app.drain_runtime_events().iter().any(
+                |event| matches!(event, AppRuntimeEvent::TabChanged(outcome) if outcome.changed)
+            )
+        );
     }
 }

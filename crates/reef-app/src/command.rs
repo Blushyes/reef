@@ -170,7 +170,10 @@ pub enum AppCommand {
     CloseGlobalSearch,
     OpenGlobalReplaceTab,
     PinGlobalSearchToTab,
-    AcceptGlobalSearchHit(MatchHit),
+    AcceptGlobalSearchHit {
+        hit: MatchHit,
+        origin: Option<LocationSnapshot>,
+    },
     BeginVimSearch {
         target: SearchTarget,
         backwards: bool,
@@ -239,7 +242,12 @@ pub enum AppCommand {
     DrainGlobalSearchPreviewSyncDebounce {
         now: Instant,
     },
-    SyncGlobalSearchPreviewToSelected,
+    SyncGlobalSearchPreviewToSelected {
+        preview_view_h: usize,
+    },
+    SyncGlobalSearchPreviewIfStale {
+        preview_view_h: usize,
+    },
     FocusGlobalSearchFindInput,
     FocusGlobalSearchReplaceInput,
     FocusGlobalSearchList,
@@ -254,6 +262,11 @@ pub enum AppCommand {
     },
     ScrollGlobalSearchResultsHorizontal(i32),
     SetGlobalSearchResultsHorizontalScroll(usize),
+    SetGlobalSearchQuery {
+        query: String,
+        now: Instant,
+    },
+    SetGlobalSearchReplacement(String),
     EditGlobalSearchFindInput {
         op: TextEditOp,
         now: Instant,

@@ -9,6 +9,7 @@ use serde::Serialize;
 #[serde(rename_all = "camelCase")]
 pub struct PreviewDocumentSnapshot {
     pub revision: u64,
+    pub source_revision: u64,
     pub source: PreviewSourceSnapshot,
     pub body: PreviewBodySnapshot,
 }
@@ -201,10 +202,11 @@ pub struct DatabasePageSnapshot {
 }
 
 impl PreviewDocumentSnapshot {
-    pub fn from_document(document: &PreviewDocument, revision: u64) -> Self {
+    pub fn from_document(document: &PreviewDocument, revision: u64, source_revision: u64) -> Self {
         let detected_kind = detected_kind(document);
         Self {
             revision,
+            source_revision,
             source: PreviewSourceSnapshot::from_document(document, detected_kind),
             body: PreviewBodySnapshot::from_document(document, detected_kind),
         }
@@ -664,7 +666,7 @@ mod tests {
     fn json_preview_becomes_structured_data() {
         let mut doc = text_doc("schema.json", &["{\"type\":\"object\"}"]);
         doc.local_path = Some(PathBuf::from("/tmp/ws/schema.json"));
-        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 1);
+        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 1, 1);
 
         assert_eq!(
             snapshot.source.detected_kind,
@@ -685,7 +687,7 @@ mod tests {
     #[test]
     fn source_snapshot_does_not_synthesize_local_path() {
         let doc = text_doc("../secret.json", &["{}"]);
-        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 1);
+        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 1, 1);
 
         assert!(!snapshot.source.local_file_available);
         assert_eq!(snapshot.source.local_path, None);
@@ -695,7 +697,7 @@ mod tests {
     fn source_snapshot_uses_backend_supplied_local_path() {
         let mut doc = text_doc("safe.json", &["{}"]);
         doc.local_path = Some(PathBuf::from("/tmp/ws/safe.json"));
-        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 1);
+        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 1, 1);
 
         assert!(snapshot.source.local_file_available);
         assert_eq!(
@@ -730,7 +732,7 @@ mod tests {
             }),
         };
 
-        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 1);
+        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 1, 1);
 
         assert!(matches!(
             snapshot.body,
@@ -768,7 +770,7 @@ mod tests {
             }),
         };
 
-        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 7);
+        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 7, 7);
 
         let PreviewBodySnapshot::Code {
             text, style_spans, ..
@@ -795,7 +797,7 @@ mod tests {
             body: PreviewBody::Markdown(markdown),
         };
 
-        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 1);
+        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 1, 1);
 
         assert!(matches!(
             snapshot.body,
@@ -817,7 +819,7 @@ mod tests {
             body: PreviewBody::Markdown(markdown),
         };
 
-        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 1);
+        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 1, 1);
 
         let PreviewBodySnapshot::Markdown {
             source: snapshot_source,
@@ -849,7 +851,7 @@ mod tests {
             body: PreviewBody::Markdown(reef_core::markdown::MarkdownPreview::source_only(source)),
         };
 
-        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 1);
+        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 1, 1);
 
         assert!(matches!(
             snapshot.body,
@@ -873,7 +875,7 @@ mod tests {
                 BinaryReason::NonImage,
             )),
         };
-        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 1);
+        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 1, 1);
 
         assert_eq!(
             snapshot.source.detected_kind,
@@ -897,7 +899,7 @@ mod tests {
             )),
         };
 
-        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 1);
+        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 1, 1);
 
         assert!(matches!(
             snapshot.body,

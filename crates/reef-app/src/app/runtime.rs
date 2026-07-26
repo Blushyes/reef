@@ -13,12 +13,6 @@ impl AppState {
         );
         push_min_deadline(&mut next, self.global_search.preview_sync_at);
 
-        if self.active_tab == AppTab::Git
-            && self.backend.has_repo()
-            && !self.git_status_load.loading
-        {
-            push_min_deadline(&mut next, Some(self.next_git_revalidate_at));
-        }
         if self.active_tab == AppTab::Graph && self.backend.has_repo() && !self.graph_load.loading {
             push_min_deadline(&mut next, Some(self.next_graph_revalidate_at));
         }
@@ -40,13 +34,7 @@ impl AppState {
         }
         match self.active_tab {
             AppTab::Files => self.preview_load.should_request() && self.preview_schedule.is_none(),
-            AppTab::Git => {
-                self.git_status_load.should_request()
-                    || self.diff_load.should_request()
-                    || (self.backend.has_repo()
-                        && now >= self.next_git_revalidate_at
-                        && !self.git_status_load.loading)
-            }
+            AppTab::Git => self.git_status_load.should_request() || self.diff_load.should_request(),
             AppTab::Graph => {
                 self.commit_detail_load.should_request()
                     || self.commit_file_diff_load.should_request()
@@ -78,13 +66,8 @@ impl AppState {
                 }
             }
             AppTab::Git => {
-                let has_repo = self.backend.has_repo();
-                let should_poll_git = has_repo && now >= self.next_git_revalidate_at;
-                if self.git_status_load.should_request()
-                    || (should_poll_git && !self.git_status_load.loading)
-                {
+                if self.git_status_load.should_request() {
                     self.refresh_status();
-                    self.next_git_revalidate_at = now + Duration::from_secs(2);
                 }
                 if self.diff_load.should_request() {
                     self.load_diff(options.dark);
@@ -133,6 +116,10 @@ impl AppState {
             return false;
         }
 
+        self.apply_fs_change(repo_presence_changed)
+    }
+
+    pub fn apply_fs_change(&mut self, repo_presence_changed: bool) -> bool {
         self.file_tree_load.mark_stale();
         self.preview_load.mark_stale();
         let has_repo = self.backend.has_repo();

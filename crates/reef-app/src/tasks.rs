@@ -2135,22 +2135,14 @@ fn run_git_mutation(
     let mut touched = Vec::new();
     let mut errors = Vec::new();
     match &mutation {
-        GitMutation::Stage(paths) => {
-            for path in paths {
-                match backend.stage(path) {
-                    Ok(()) => touched.push(path.clone()),
-                    Err(error) => errors.push(format!("{path}: {error}")),
-                }
-            }
-        }
-        GitMutation::Unstage(paths) => {
-            for path in paths {
-                match backend.unstage(path) {
-                    Ok(()) => touched.push(path.clone()),
-                    Err(error) => errors.push(format!("{path}: {error}")),
-                }
-            }
-        }
+        GitMutation::Stage(paths) => match backend.stage_paths(paths) {
+            Ok(()) => touched.extend(paths.iter().cloned()),
+            Err(error) => errors.push(error.to_string()),
+        },
+        GitMutation::Unstage(paths) => match backend.unstage_paths(paths) {
+            Ok(()) => touched.extend(paths.iter().cloned()),
+            Err(error) => errors.push(error.to_string()),
+        },
         GitMutation::Revert(paths) => {
             for item in paths {
                 match backend.revert_path(&item.path, item.is_staged) {

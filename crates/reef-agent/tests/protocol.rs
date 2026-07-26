@@ -200,31 +200,31 @@ fn read_file_returns_bytes_and_respects_cap() {
 }
 
 #[test]
-fn stage_unstage_reflects_in_status() {
+fn stage_unstage_many_reflects_in_status() {
     let _lock = AGENT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
     commit_file(&raw, "a.txt", "v1\n", "init");
     write_file(&raw, "a.txt", "v2\n");
+    write_file(&raw, "b.txt", "new\n");
 
     let mut agent = Agent::spawn(tmp.path());
 
-    // Stage
-    let _ = ok_result(agent.request(Request::Stage {
-        path: "a.txt".into(),
+    // Stage one batch.
+    let paths = vec!["a.txt".to_string(), "b.txt".to_string()];
+    let _ = ok_result(agent.request(Request::StageMany {
+        paths: paths.clone(),
     }));
     let snap: StatusSnapshotDto =
         serde_json::from_value(ok_result(agent.request(Request::GitStatus))).unwrap();
-    assert_eq!(snap.staged.len(), 1);
+    assert_eq!(snap.staged.len(), 2);
     assert!(snap.unstaged.is_empty());
 
-    // Unstage
-    let _ = ok_result(agent.request(Request::Unstage {
-        path: "a.txt".into(),
-    }));
+    // Unstage the same batch.
+    let _ = ok_result(agent.request(Request::UnstageMany { paths }));
     let snap: StatusSnapshotDto =
         serde_json::from_value(ok_result(agent.request(Request::GitStatus))).unwrap();
     assert!(snap.staged.is_empty());
-    assert_eq!(snap.unstaged.len(), 1);
+    assert_eq!(snap.unstaged.len(), 2);
 
     agent.shutdown();
 }

@@ -33,7 +33,8 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
 ## Runtime Progress Contract
 
 - `ReefApp` does not own a polling loop. The host owns waiting and calls `step` after user input,
-  worker wake notification, or the `next_deadline` returned by the previous step.
+  worker wake notification, filesystem watcher notification, or the `next_deadline` returned by
+  the previous step.
 - Worker wake notifications are coalesced signals only. `ReefApp::step` remains the only owner of
   consuming and merging `WorkerResult`.
 - Scheduled work must contribute its earliest due time to `next_deadline`; do not add fixed-rate
@@ -72,6 +73,10 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
 
 - Git status, ahead/behind, and branch label are cached from the git worker.
 - Selecting a file requests a diff asynchronously.
+- Stage and unstage submit the selected paths as one batch. Local backends use native Git pathspec
+  commands and remote backends send one matching batch RPC; neither path loops over individual files.
+- Status refresh classifies file state without computing repository-wide content line counts. Diff
+  statistics belong to explicit diff requests, not to rendering or status refresh.
 - Stage/unstage/discard/push may do command-side effects, then mark status/diff/graph state stale instead of forcing render-time refresh.
 
 ### Graph

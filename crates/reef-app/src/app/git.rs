@@ -348,7 +348,7 @@ impl AppState {
     }
 
     fn dispatch_git_mutation(&mut self, mutation: GitMutation) {
-        if !self.backend.has_repo() {
+        if self.git_mutation_load.loading || !self.backend.has_repo() {
             return;
         }
         let is_empty = match &mutation {

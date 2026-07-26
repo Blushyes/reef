@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::{
     Backend, BackendError, ContentMatchHit, ContentSearchCompleted, ContentSearchRequest,
@@ -493,16 +493,12 @@ impl Backend for LocalBackend {
         Ok(self.repo()?.get_diff(path, false, 3))
     }
 
-    fn stage(&self, path: &str) -> Result<(), BackendError> {
-        self.repo()?
-            .stage_file(path)
-            .map_err(|e| BackendError::Git(e.message().to_string()))
+    fn stage_paths(&self, paths: &[String]) -> Result<(), BackendError> {
+        reef_core::git::stage_paths_at(&self.workdir, paths).map_err(BackendError::Git)
     }
 
-    fn unstage(&self, path: &str) -> Result<(), BackendError> {
-        self.repo()?
-            .unstage_file(path)
-            .map_err(|e| BackendError::Git(e.message().to_string()))
+    fn unstage_paths(&self, paths: &[String]) -> Result<(), BackendError> {
+        reef_core::git::unstage_paths_at(&self.workdir, paths).map_err(BackendError::Git)
     }
 
     fn restore(&self, path: &str) -> Result<(), BackendError> {
@@ -518,7 +514,7 @@ impl Backend for LocalBackend {
         // surface through the backend contract.
         let repo = self.repo()?;
         if is_staged {
-            let _ = repo.unstage_file(path);
+            let _ = reef_core::git::unstage_paths_at(&self.workdir, &[path.to_string()]);
         }
         repo.restore_file(path)
             .map_err(|e| BackendError::Git(e.message().to_string()))
@@ -584,7 +580,7 @@ impl Backend for LocalBackend {
             .get_range_file_diff(oldest_oid, newest_oid, path, context_lines))
     }
 
-    fn subscribe_fs_events(&self) -> mpsc::Receiver<FsChange> {
+    fn subscribe_fs_events(&self) -> crossbeam_channel::Receiver<FsChange> {
         crate::fs_watcher::spawn_with_repo_state(
             self.workdir.clone(),
             Arc::clone(&self.has_repo),

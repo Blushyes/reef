@@ -47,6 +47,58 @@ fn remote_git_status_matches_local() {
 }
 
 #[test]
+fn remote_stage_and_unstage_many_match_local_status() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "tracked.txt", "v1\n", "init");
+    write_file(&raw, "tracked.txt", "v2\n");
+    write_file(&raw, "dir with space/new.txt", "new\n");
+    let paths = vec![
+        "tracked.txt".to_string(),
+        "dir with space/new.txt".to_string(),
+    ];
+
+    let local = LocalBackend::open_at(tmp.path().to_path_buf());
+    let remote = spawn_remote(tmp.path());
+    remote.stage_paths(&paths).expect("remote stage many");
+
+    let local_after_stage = local.git_status().expect("local staged status");
+    let remote_after_stage = remote.git_status().expect("remote staged status");
+    assert_eq!(local_after_stage.staged.len(), 2);
+    assert!(local_after_stage.unstaged.is_empty());
+    assert_eq!(
+        local_after_stage
+            .staged
+            .iter()
+            .map(|entry| (&entry.path, entry.status))
+            .collect::<Vec<_>>(),
+        remote_after_stage
+            .staged
+            .iter()
+            .map(|entry| (&entry.path, entry.status))
+            .collect::<Vec<_>>()
+    );
+
+    remote.unstage_paths(&paths).expect("remote unstage many");
+    let local_after_unstage = local.git_status().expect("local unstaged status");
+    let remote_after_unstage = remote.git_status().expect("remote unstaged status");
+    assert!(local_after_unstage.staged.is_empty());
+    assert_eq!(local_after_unstage.unstaged.len(), 2);
+    assert_eq!(
+        local_after_unstage
+            .unstaged
+            .iter()
+            .map(|entry| (&entry.path, entry.status))
+            .collect::<Vec<_>>(),
+        remote_after_unstage
+            .unstaged
+            .iter()
+            .map(|entry| (&entry.path, entry.status))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn remote_staged_diff_matches_local() {
     let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();

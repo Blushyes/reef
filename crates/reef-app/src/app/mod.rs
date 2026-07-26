@@ -6,8 +6,8 @@ use reef_io::Backend;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 mod db;
@@ -469,7 +469,7 @@ pub struct AppState {
     pub commit_detail: CommitDetailState,
     pub toasts: Vec<Toast>,
 
-    pub fs_watcher_rx: Option<mpsc::Receiver<reef_io::FsChange>>,
+    pub fs_watcher_rx: Option<crossbeam_channel::Receiver<reef_io::FsChange>>,
 
     pub show_help: bool,
     pub pending_edit: Option<PathBuf>,
@@ -525,7 +525,6 @@ pub struct AppState {
     pub fs_mutation_load: AsyncState,
     pub fs_mutation_select_on_done: Option<PathBuf>,
     pub replace_load: AsyncState,
-    pub next_git_revalidate_at: Instant,
     pub next_graph_revalidate_at: Instant,
 }
 
@@ -752,7 +751,6 @@ impl AppState {
             fs_mutation_load: AsyncState::default(),
             fs_mutation_select_on_done: None,
             replace_load: AsyncState::default(),
-            next_git_revalidate_at: now + Duration::from_millis(800),
             next_graph_revalidate_at: now + Duration::from_millis(1200),
         }
     }
@@ -1093,7 +1091,7 @@ mod tests {
         });
         app.git_status.confirm_push = true;
         app.git_status.confirm_force_push = true;
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let (tx, rx) = crossbeam_channel::bounded(1);
         app.fs_watcher_rx = Some(rx);
         tx.send(reef_io::FsChange {
             repo_presence_changed: true,
@@ -1594,6 +1592,14 @@ mod tests {
                 next_panel(panel, false, true),
             );
         }
+    }
+
+    #[test]
+    fn idle_git_tab_does_not_schedule_periodic_status_refresh() {
+        let mut app = minimal_app_state();
+        app.active_tab = AppTab::Git;
+
+        assert!(app.next_deadline().is_none());
     }
 
     fn minimal_app_state() -> AppState {

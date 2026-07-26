@@ -15,7 +15,7 @@ expensive work must not run from a renderer.
 - Treat input handlers as intent dispatchers. They decode terminal input and dispatch `reef_app::AppCommand`; they must not directly own business state or do blocking host work.
 - Route expensive work through `reef-app`'s task coordinator; merge worker results from
   `ReefApp::step`.
-- Put UI-independent logic in `crates/reef-core`; keep ratatui/crossterm rendering and input orchestration in `crates/reef-tui`.
+- Put UI-independent logic in `crates/reef-core`; shared host filesystem services such as the unified preference store belong in `crates/reef-io`; keep ratatui/crossterm rendering and input orchestration in `crates/reef-tui`.
 - Put renderer-neutral app state, async scheduling, worker-result merge, settings state, nav/history, preview/search/git/graph orchestration in `crates/reef-app`.
 - Keep terminal-only state in `crates/reef-tui`: ratatui layout caches, hit-test registry, terminal image protocol, text-selection geometry, mouse row/column mapping, scroll pacing, leader/chord timers, popup rects, and the live TUI theme object.
 - Prefer stale cached UI over blocking. Show old data plus loading/stale/error status instead of waiting during tab switches or hover/mouse movement.
@@ -28,8 +28,8 @@ expensive work must not run from a renderer.
 2. `ReefApp::dispatch` mutates renderer-neutral state or requests work.
 3. The request method marks an `AsyncState`, increments its generation, and sends a worker request through `TaskCoordinator`.
 4. Workers do git/filesystem/diff/highlight work off the render path and send `WorkerResult`.
-5. The host calls `ReefApp::step` after input, a coalesced worker wake notification, or the
-   reported `next_deadline`.
+5. The host calls `ReefApp::step` after input, a coalesced worker wake notification, a filesystem
+   watcher notification, or the reported `next_deadline`.
 6. `step` drains results, accepts only matching generations, updates state, emits runtime events,
    and reports the next deadline.
 7. Render reads `AppSnapshot` plus explicit read-only accessors. It must never be required for

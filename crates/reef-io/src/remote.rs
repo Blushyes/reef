@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use crossbeam_channel::{Receiver, Sender};
 use reef_proto::{
     ContentSearchCompletedDto, ContentSearchRequestDto, DirEntryDto, Envelope, MatchHitDto,
     Notification, ReadFileResponse, Request, Response, TrashResponseDto, WalkOptsDto,
@@ -35,6 +36,10 @@ use std::ops::ControlFlow;
 /// Default timeout for a single RPC round-trip. Applied to every `request`
 /// call so a hung agent can't stall the UI indefinitely.
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Large index mutations are one RPC now, but can legitimately take longer
+/// than an ordinary metadata request on a remote worktree.
+const GIT_MUTATION_RPC_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Max bytes we ever ask the agent to return for `ReadFile`. Matches the
 /// limits applied in `file_tree::load_preview` (512 KB highlight cap + some
@@ -139,8 +144,8 @@ pub struct RemoteBackend {
     pending: Arc<Mutex<PendingMap>>,
     /// See `ChunkSinkMap`. Shared with the read thread.
     search_chunks: Arc<Mutex<ChunkSinkMap>>,
-    fs_rx: Mutex<Option<mpsc::Receiver<FsChange>>>,
-    _fs_tx: mpsc::Sender<FsChange>,
+    fs_rx: Mutex<Option<Receiver<FsChange>>>,
+    _fs_tx: Sender<FsChange>,
     _reader: thread::JoinHandle<()>,
     _stderr_reader: thread::JoinHandle<()>,
     child: Mutex<Child>,
@@ -238,7 +243,7 @@ impl RemoteBackend {
 
         let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
         let search_chunks: Arc<Mutex<ChunkSinkMap>> = Arc::new(Mutex::new(HashMap::new()));
-        let (fs_tx, fs_rx) = mpsc::channel::<FsChange>();
+        let (fs_tx, fs_rx) = crossbeam_channel::unbounded::<FsChange>();
         let repo_presence = Arc::new(RepoPresence::default());
 
         let reader_pending = Arc::clone(&pending);
@@ -428,7 +433,7 @@ fn read_loop(
     stdout: ChildStdout,
     pending: Arc<Mutex<PendingMap>>,
     search_chunks: Arc<Mutex<ChunkSinkMap>>,
-    fs_tx: mpsc::Sender<FsChange>,
+    fs_tx: Sender<FsChange>,
     repo_presence: Arc<RepoPresence>,
 ) {
     let mut reader = BufReader::new(stdout);
@@ -728,17 +733,23 @@ impl Backend for RemoteBackend {
         Ok(resp.map(diff_content_from_dto))
     }
 
-    fn stage(&self, path: &str) -> Result<(), BackendError> {
-        let _: serde_json::Value = self.request(Request::Stage {
-            path: path.to_string(),
-        })?;
+    fn stage_paths(&self, paths: &[String]) -> Result<(), BackendError> {
+        let _: serde_json::Value = self.request_with_timeout(
+            Request::StageMany {
+                paths: paths.to_vec(),
+            },
+            GIT_MUTATION_RPC_TIMEOUT,
+        )?;
         Ok(())
     }
 
-    fn unstage(&self, path: &str) -> Result<(), BackendError> {
-        let _: serde_json::Value = self.request(Request::Unstage {
-            path: path.to_string(),
-        })?;
+    fn unstage_paths(&self, paths: &[String]) -> Result<(), BackendError> {
+        let _: serde_json::Value = self.request_with_timeout(
+            Request::UnstageMany {
+                paths: paths.to_vec(),
+            },
+            GIT_MUTATION_RPC_TIMEOUT,
+        )?;
         Ok(())
     }
 
@@ -842,7 +853,7 @@ impl Backend for RemoteBackend {
         Ok(resp.map(diff_content_from_dto))
     }
 
-    fn subscribe_fs_events(&self) -> mpsc::Receiver<FsChange> {
+    fn subscribe_fs_events(&self) -> Receiver<FsChange> {
         // First subscriber gets the channel created in `spawn`. Subsequent
         // calls would lose events — but the App only calls this once.
         // For safety we hand out a fresh disconnected receiver rather than
@@ -852,7 +863,7 @@ impl Backend for RemoteBackend {
                 return rx;
             }
         }
-        let (_tx, rx) = mpsc::channel::<FsChange>();
+        let (_tx, rx) = crossbeam_channel::unbounded::<FsChange>();
         rx
     }
 

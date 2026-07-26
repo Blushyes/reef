@@ -2,7 +2,7 @@
 //! in `TempDir` workdirs. Exercises the entire public API surface.
 
 use reef_core::diff::LineTag;
-use reef_core::git::{FileStatus, GitRepo, RefLabel};
+use reef_core::git::{FileStatus, GitRepo, RefLabel, stage_paths_at, unstage_paths_at};
 use std::fs;
 use test_support::{CwdGuard, commit_file, tempdir_repo, write_file};
 
@@ -79,16 +79,18 @@ fn get_status_detects_modified_file() {
 }
 
 #[test]
-fn stage_file_moves_from_unstaged_to_staged() {
+fn stage_paths_moves_multiple_files_from_unstaged_to_staged() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
     commit_file(&raw, "a.txt", "v1", "init");
     write_file(&raw, "a.txt", "v2");
+    write_file(&raw, "new.txt", "new");
 
     let (_g, repo) = open_in(tmp.path());
-    repo.stage_file("a.txt").expect("stage succeeds");
+    stage_paths_at(tmp.path(), &["a.txt".to_string(), "new.txt".to_string()])
+        .expect("stage succeeds");
     let (staged, unstaged) = repo.get_status();
-    assert_eq!(staged.len(), 1);
+    assert_eq!(staged.len(), 2);
     assert!(unstaged.is_empty());
 }
 
@@ -100,11 +102,30 @@ fn stage_then_unstage_roundtrip() {
     write_file(&raw, "a.txt", "v2");
 
     let (_g, repo) = open_in(tmp.path());
-    repo.stage_file("a.txt").unwrap();
-    repo.unstage_file("a.txt").unwrap();
+    let paths = vec!["a.txt".to_string()];
+    stage_paths_at(tmp.path(), &paths).unwrap();
+    unstage_paths_at(tmp.path(), &paths).unwrap();
     let (staged, unstaged) = repo.get_status();
     assert!(staged.is_empty());
     assert_eq!(unstaged.len(), 1);
+}
+
+#[test]
+fn unstage_paths_without_head_removes_index_entries() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, raw) = tempdir_repo();
+    write_file(&raw, "dir with space/你好.txt", "content");
+    let paths = vec!["dir with space/你好.txt".to_string()];
+
+    stage_paths_at(tmp.path(), &paths).expect("stage into unborn index");
+    unstage_paths_at(tmp.path(), &paths).expect("unstage from unborn index");
+
+    let (_g, repo) = open_in(tmp.path());
+    let (staged, unstaged) = repo.get_status();
+    assert!(staged.is_empty());
+    assert_eq!(unstaged.len(), 1);
+    assert_eq!(unstaged[0].path, paths[0]);
+    assert_eq!(unstaged[0].status, FileStatus::Untracked);
 }
 
 #[test]
@@ -151,7 +172,7 @@ fn get_diff_staged_compares_index_to_head() {
     write_file(&raw, "a.txt", "v2\n");
 
     let (_g, repo) = open_in(tmp.path());
-    repo.stage_file("a.txt").unwrap();
+    stage_paths_at(tmp.path(), &["a.txt".to_string()]).unwrap();
     let diff = repo.get_diff("a.txt", true, 3).expect("staged diff");
     let has_removed = diff
         .hunks
@@ -488,14 +509,14 @@ fn push_without_upstream_returns_error_message() {
     assert!(!err.is_empty(), "error message should be non-empty");
 }
 
-// ─── numstat + rename detection ─────────────────────────────────────────────
+// ─── lightweight status + rename detection ─────────────────────────────────
 
 #[test]
-fn get_status_fills_unstaged_line_counts() {
+fn get_status_skips_content_level_line_counts() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
     commit_file(&raw, "a.txt", "line1\nline2\n", "init");
-    // Delete line2, add line3 → 1 addition, 1 deletion.
+    // A status refresh should classify the path without walking its patch.
     write_file(&raw, "a.txt", "line1\nline3\n");
 
     let (_g, repo) = open_in(tmp.path());
@@ -504,12 +525,12 @@ fn get_status_fills_unstaged_line_counts() {
         .iter()
         .find(|f| f.path == "a.txt")
         .expect("a.txt in unstaged");
-    assert_eq!(entry.additions, 1);
-    assert_eq!(entry.deletions, 1);
+    assert_eq!(entry.additions, 0);
+    assert_eq!(entry.deletions, 0);
 }
 
 #[test]
-fn get_status_counts_untracked_file_lines() {
+fn get_status_skips_untracked_line_counts() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
     // Need at least one commit so `get_status` has a valid HEAD.
@@ -523,25 +544,22 @@ fn get_status_counts_untracked_file_lines() {
         .find(|f| f.path == "new.txt")
         .expect("new.txt in unstaged");
     assert_eq!(entry.status, FileStatus::Untracked);
-    assert_eq!(entry.additions, 3);
+    assert_eq!(entry.additions, 0);
     assert_eq!(entry.deletions, 0);
 }
 
 #[test]
-fn get_status_detects_staged_rename_with_line_counts() {
+fn get_status_detects_staged_rename_without_line_counts() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
-    // Commit a.txt then stage a "rename to b.txt, plus one added line".
-    // libgit2's find_similar should collapse (delete a.txt, add b.txt) into
-    // a single Renamed delta keyed on b.txt, and merge_renames carries that
-    // through so the sidebar's FileEntry has the right +1 count.
+    // Commit a.txt then stage a rename to b.txt plus one added line. Status
+    // detection should classify the rename without enumerating patch lines.
     commit_file(&raw, "a.txt", "line1\nline2\nline3\n", "init");
     fs::remove_file(tmp.path().join("a.txt")).unwrap();
     write_file(&raw, "b.txt", "line1\nline2\nline3\nline4\n");
 
     let (_g, repo) = open_in(tmp.path());
-    repo.stage_file("a.txt").expect("stage deletion");
-    repo.stage_file("b.txt").expect("stage addition");
+    stage_paths_at(tmp.path(), &["a.txt".to_string(), "b.txt".to_string()]).expect("stage rename");
 
     let (staged, _unstaged) = repo.get_status();
     let entry = staged
@@ -549,9 +567,6 @@ fn get_status_detects_staged_rename_with_line_counts() {
         .find(|f| f.status == FileStatus::Renamed)
         .expect("a renamed entry exists in staged");
     assert_eq!(entry.path, "b.txt", "Renamed entry keys on new path");
-    assert_eq!(
-        entry.additions, 1,
-        "exactly one line added on top of rename"
-    );
+    assert_eq!(entry.additions, 0);
     assert_eq!(entry.deletions, 0);
 }

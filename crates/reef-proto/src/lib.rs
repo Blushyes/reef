@@ -93,7 +93,10 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 /// - v12: handshake and filesystem notifications carry `has_repo`, allowing
 ///       remote clients to update repository capability after `git init` or
 ///       repository removal without probing Git from the UI thread.
-pub const PROTOCOL_VERSION: u32 = 12;
+/// - v13: `StageMany` and `UnstageMany` replace one-RPC-per-path mutations.
+///       The handshake stays strict so stale agents are redeployed instead of
+///       silently regressing a large stage operation to hundreds of requests.
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// Encode a single envelope-level value to `writer` using the
 /// length-prefixed framing. The caller is expected to flush.
@@ -209,6 +212,12 @@ pub enum Request {
     },
     Unstage {
         path: String,
+    },
+    StageMany {
+        paths: Vec<String>,
+    },
+    UnstageMany {
+        paths: Vec<String>,
     },
     Restore {
         path: String,

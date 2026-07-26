@@ -16,8 +16,9 @@ use std::ffi::OsString;
 use std::io;
 use std::ops::{ControlFlow, Range};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::{Mutex, OnceLock};
 
+use crossbeam_channel::Receiver;
 use reef_core::diff::DiffContent;
 pub use reef_core::file_tree::TreeEntry;
 use reef_core::git::graph::GraphRow;
@@ -29,6 +30,7 @@ pub mod agent_deploy;
 mod file_copy;
 pub mod fs_watcher;
 pub mod local;
+pub mod prefs;
 pub mod remote;
 mod target;
 
@@ -399,8 +401,19 @@ pub trait Backend: Send + Sync {
     ) -> Result<Option<DiffContent>, BackendError>;
     fn untracked_diff(&self, path: &str) -> Result<Option<DiffContent>, BackendError>;
 
-    fn stage(&self, path: &str) -> Result<(), BackendError>;
-    fn unstage(&self, path: &str) -> Result<(), BackendError>;
+    /// Stage a whole batch in one backend operation. Implementations must
+    /// preserve the input paths as one logical Git mutation rather than
+    /// opening an index transaction or RPC for every path.
+    fn stage_paths(&self, paths: &[String]) -> Result<(), BackendError>;
+    /// Unstage a whole batch in one backend operation. See [`Self::stage_paths`]
+    /// for the batching contract.
+    fn unstage_paths(&self, paths: &[String]) -> Result<(), BackendError>;
+    fn stage(&self, path: &str) -> Result<(), BackendError> {
+        self.stage_paths(&[path.to_string()])
+    }
+    fn unstage(&self, path: &str) -> Result<(), BackendError> {
+        self.unstage_paths(&[path.to_string()])
+    }
     fn restore(&self, path: &str) -> Result<(), BackendError>;
     /// Combined "discard one path" op used by the Git tab's folder /
     /// section discard flows. Staged paths are first unstaged, then the
@@ -454,7 +467,7 @@ pub trait Backend: Send + Sync {
     /// Subscribe to debounced fs-change events. Each backend decides whether
     /// to spawn a local watcher (LocalBackend) or relay notifications from
     /// the remote agent (RemoteBackend).
-    fn subscribe_fs_events(&self) -> mpsc::Receiver<FsChange>;
+    fn subscribe_fs_events(&self) -> Receiver<FsChange>;
 
     /// Best-effort editor launch hook. Remote backends may return
     /// `BackendError::Unimplemented`; callers can then use

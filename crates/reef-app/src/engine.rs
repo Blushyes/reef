@@ -8,7 +8,7 @@ use crossbeam_channel::TryRecvError;
 use reef_core::diff::DiffLayout;
 use reef_core::git::{FileEntry, GraphScope};
 use reef_core::preview::PreviewDocument;
-use reef_io::{Backend, BackendError, EditorLaunchSpec};
+use reef_io::{Backend, BackendError, EditorLaunchSpec, FsChange};
 
 use crate::app::TabChangeOutcome;
 use crate::tasks::WorkerResult;
@@ -232,7 +232,6 @@ impl ReefApp {
                         self.push_preview_merge_outcome(outcome);
                         if let Some(tab_change) = tab_change {
                             self.push_tab_change_outcome(tab_change);
-                            return;
                         }
                     }
                 }
@@ -1430,6 +1429,10 @@ impl ReefApp {
 
     pub fn worker_wake_receiver(&self) -> crossbeam_channel::Receiver<()> {
         self.state.tasks.worker_wake_receiver()
+    }
+
+    pub fn fs_watcher_receiver(&self) -> Option<crossbeam_channel::Receiver<FsChange>> {
+        self.state.fs_watcher_rx.clone()
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {

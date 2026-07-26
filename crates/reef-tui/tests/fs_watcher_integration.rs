@@ -1,9 +1,10 @@
 //! Integration tests for the host-owned fs watcher. Drives `fs_watcher::spawn`
 //! against a real tempdir and asserts the debounced channel contract.
 
+use crossbeam_channel::{Receiver, RecvTimeoutError, TryRecvError};
 use reef_io::{Backend, FsChange, LocalBackend, fs_watcher};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, mpsc};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -22,7 +23,7 @@ fn canonical(p: &Path) -> PathBuf {
 /// macOS FSEvents can take longer than a fixed warmup to register a recursive
 /// watch, especially under CI-like load; repeatedly touching a harmless marker
 /// turns that registration race into a real readiness handshake.
-fn wait_until_ready(workdir: &Path, rx: &mpsc::Receiver<FsChange>) {
+fn wait_until_ready(workdir: &Path, rx: &Receiver<FsChange>) {
     let marker = workdir.join(".reef-watch-ready");
     let start = Instant::now();
     let mut attempt = 0usize;
@@ -31,7 +32,7 @@ fn wait_until_ready(workdir: &Path, rx: &mpsc::Receiver<FsChange>) {
         std::fs::write(&marker, attempt.to_string()).unwrap();
         match rx.recv_timeout(Duration::from_millis(700)) {
             Ok(_) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) if start.elapsed() < Duration::from_secs(15) => {
+            Err(RecvTimeoutError::Timeout) if start.elapsed() < Duration::from_secs(15) => {
                 continue;
             }
             Err(e) => panic!("watcher did not become ready: {e:?}"),
@@ -41,7 +42,7 @@ fn wait_until_ready(workdir: &Path, rx: &mpsc::Receiver<FsChange>) {
     while rx.try_recv().is_ok() {}
 }
 
-fn recv_repo_presence_change(rx: &mpsc::Receiver<FsChange>) -> Option<FsChange> {
+fn recv_repo_presence_change(rx: &Receiver<FsChange>) -> Option<FsChange> {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -90,7 +91,7 @@ fn gitignored_write_does_not_trigger() {
     thread::sleep(Duration::from_millis(700));
     assert_eq!(
         rx.try_recv(),
-        Err(std::sync::mpsc::TryRecvError::Empty),
+        Err(TryRecvError::Empty),
         "gitignored write must not emit an event",
     );
 }
@@ -112,7 +113,7 @@ fn dotgit_internal_write_does_not_trigger() {
     thread::sleep(Duration::from_millis(700));
     assert_eq!(
         rx.try_recv(),
-        Err(std::sync::mpsc::TryRecvError::Empty),
+        Err(TryRecvError::Empty),
         ".git/ write must not emit an event",
     );
 }

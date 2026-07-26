@@ -5,6 +5,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::{Receiver, Sender};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use reef_core::git::GitRepo;
@@ -20,7 +21,7 @@ const REPO_DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
 /// Watch `workdir` recursively and emit a change on the returned receiver
 /// whenever a debounced non-ignored event fires. When the watcher can't start,
 /// the sender is dropped so callers observe `Disconnected` and stop polling.
-pub fn spawn(workdir: PathBuf) -> mpsc::Receiver<FsChange> {
+pub fn spawn(workdir: PathBuf) -> Receiver<FsChange> {
     let has_repo = Arc::new(AtomicBool::new(GitRepo::open_at(&workdir).is_ok()));
     spawn_with_repo_state(workdir, has_repo, Arc::new(AtomicBool::new(false)))
 }
@@ -29,8 +30,8 @@ pub(crate) fn spawn_with_repo_state(
     workdir: PathBuf,
     has_repo: Arc<AtomicBool>,
     repo_monitor_active: Arc<AtomicBool>,
-) -> mpsc::Receiver<FsChange> {
-    let (out_tx, out_rx) = mpsc::channel::<FsChange>();
+) -> Receiver<FsChange> {
+    let (out_tx, out_rx) = crossbeam_channel::unbounded::<FsChange>();
     let _ = thread::Builder::new()
         .name("reef-fs-watcher".into())
         .spawn(move || run(workdir, has_repo, repo_monitor_active, out_tx));
@@ -41,7 +42,7 @@ fn run(
     workdir: PathBuf,
     has_repo: Arc<AtomicBool>,
     repo_monitor_active: Arc<AtomicBool>,
-    out_tx: mpsc::Sender<FsChange>,
+    out_tx: Sender<FsChange>,
 ) {
     // macOS tempdirs and symlinked workdirs: notify delivers canonical paths,
     // so prefix checks would fail without canonicalizing up front.

@@ -9,6 +9,7 @@ publish = false
 workspace = true
 
 [dependencies]
+crossbeam-channel = "0.5"
 git2 = { version = "0.21.0", default-features = false }
 grep-matcher = "0.1.8"
 grep-regex = "0.1.14"

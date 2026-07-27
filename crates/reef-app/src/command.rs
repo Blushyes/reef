@@ -86,6 +86,8 @@ pub enum AppCommand {
     CommitReplaceInFiles,
     RefreshStatus,
     ApplyFsChange {
+        workspace_changed: bool,
+        git_metadata_changed: bool,
         repo_presence_changed: bool,
     },
     RefreshFileTree,

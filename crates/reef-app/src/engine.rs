@@ -452,9 +452,15 @@ impl ReefApp {
             AppCommand::CommitReplaceInFiles => self.state.commit_replace_in_files(),
             AppCommand::RefreshStatus => self.state.refresh_status(),
             AppCommand::ApplyFsChange {
+                workspace_changed,
+                git_metadata_changed,
                 repo_presence_changed,
             } => {
-                self.state.apply_fs_change(repo_presence_changed);
+                self.state.apply_fs_change(reef_io::FsChange {
+                    workspace_changed,
+                    git_metadata_changed,
+                    repo_presence_changed,
+                });
             }
             AppCommand::RefreshFileTree => self.state.refresh_file_tree(),
             AppCommand::RefreshFileTreeWithTarget(target) => {

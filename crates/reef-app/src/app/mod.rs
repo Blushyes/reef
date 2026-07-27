@@ -1094,6 +1094,8 @@ mod tests {
         let (tx, rx) = crossbeam_channel::bounded(1);
         app.fs_watcher_rx = Some(rx);
         tx.send(reef_io::FsChange {
+            workspace_changed: false,
+            git_metadata_changed: false,
             repo_presence_changed: true,
         })
         .unwrap();
@@ -1108,6 +1110,37 @@ mod tests {
             ),
             (None, false, false),
         );
+    }
+
+    #[test]
+    fn git_metadata_change_refreshes_git_without_reloading_workspace_content() {
+        let mut app = minimal_app_state();
+
+        app.apply_fs_change(reef_io::FsChange {
+            workspace_changed: false,
+            git_metadata_changed: true,
+            repo_presence_changed: false,
+        });
+
+        assert!(app.git_status_load.stale);
+        assert!(app.graph_load.stale);
+        assert!(!app.file_tree_load.stale);
+        assert!(!app.preview_load.stale);
+        assert!(!app.nav_workspace_load.stale);
+    }
+
+    #[test]
+    fn git_metadata_change_requests_status_refresh_on_git_tab() {
+        let mut app = minimal_app_state();
+        app.active_tab = AppTab::Git;
+
+        app.apply_fs_change(reef_io::FsChange {
+            workspace_changed: false,
+            git_metadata_changed: true,
+            repo_presence_changed: false,
+        });
+
+        assert!(app.has_step_work_due(Instant::now()));
     }
 
     #[test]

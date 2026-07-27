@@ -48,8 +48,6 @@ fn run(
     // so prefix checks would fail without canonicalizing up front.
     let original_workdir = workdir;
     let workdir = std::fs::canonicalize(&original_workdir).unwrap_or(original_workdir.clone());
-    let gitdir = workdir.join(".git");
-
     let repo_gi = build_repo_gitignore(&workdir);
 
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
@@ -75,11 +73,18 @@ fn run(
         }
     }
 
+    let mut watched_gitdirs = Vec::new();
+    let mut gitdir = gitdir_for(&workdir);
+    if let Some(gitdir) = gitdir.as_ref() {
+        watch_external_gitdir(&mut watcher, gitdir, &workdir, &mut watched_gitdirs);
+    }
+
     let current_has_repo = GitRepo::open_at(&workdir).is_ok();
     has_repo.store(current_has_repo, Ordering::Release);
     repo_monitor_active.store(true, Ordering::Release);
 
     let mut debounce_deadline: Option<Instant> = None;
+    let mut pending_change = FsChange::default();
     let mut next_repo_check = Instant::now() + REPO_DISCOVERY_INTERVAL;
     let mut previous_has_repo = current_has_repo;
     loop {
@@ -99,9 +104,18 @@ fn run(
             previous_has_repo = current_has_repo;
             has_repo.store(current_has_repo, Ordering::Release);
 
+            let next_gitdir = gitdir_for(&workdir);
+            if next_gitdir != gitdir {
+                gitdir = next_gitdir;
+                if let Some(gitdir) = gitdir.as_ref() {
+                    watch_external_gitdir(&mut watcher, gitdir, &workdir, &mut watched_gitdirs);
+                }
+            }
+
             if fs_change_ready || repo_presence_changed {
                 let change = FsChange {
                     repo_presence_changed,
+                    ..std::mem::take(&mut pending_change)
                 };
                 if out_tx.send(change).is_err() {
                     break;
@@ -116,7 +130,10 @@ fn run(
         let timeout = next_deadline.saturating_duration_since(now);
         match rx.recv_timeout(timeout) {
             Ok(Ok(ev)) => {
-                if is_relevant(&ev, &gitdir, &workdir, &repo_gi) {
+                let change = classify_event(&ev, gitdir.as_deref(), &workdir, &repo_gi);
+                if change.workspace_changed || change.git_metadata_changed {
+                    pending_change.workspace_changed |= change.workspace_changed;
+                    pending_change.git_metadata_changed |= change.git_metadata_changed;
                     debounce_deadline = Some(Instant::now() + DEBOUNCE);
                 }
             }
@@ -135,13 +152,39 @@ fn build_repo_gitignore(workdir: &Path) -> Gitignore {
     b.build().unwrap_or_else(|_| Gitignore::empty())
 }
 
-fn is_relevant(ev: &Event, gitdir: &Path, workdir: &Path, repo_gi: &Gitignore) -> bool {
+fn gitdir_for(workdir: &Path) -> Option<PathBuf> {
+    GitRepo::open_at(workdir)
+        .ok()
+        .map(|repo| normalize_event_path(repo.gitdir()))
+}
+
+fn watch_external_gitdir(
+    watcher: &mut RecommendedWatcher,
+    gitdir: &Path,
+    workdir: &Path,
+    watched_gitdirs: &mut Vec<PathBuf>,
+) {
+    if gitdir.starts_with(workdir) || watched_gitdirs.iter().any(|path| path == gitdir) {
+        return;
+    }
+    if let Err(error) = watcher.watch(gitdir, RecursiveMode::Recursive) {
+        eprintln!("[reef] fs watcher watch gitdir({gitdir:?}) failed: {error}");
+        return;
+    }
+    watched_gitdirs.push(gitdir.to_path_buf());
+}
+
+fn classify_event(
+    ev: &Event,
+    gitdir: Option<&Path>,
+    workdir: &Path,
+    repo_gi: &Gitignore,
+) -> FsChange {
+    let mut change = FsChange::default();
     for path in &ev.paths {
         let path = normalize_event_path(path);
-        if path == gitdir {
-            return true;
-        }
-        if path.starts_with(gitdir) {
+        if gitdir.is_some_and(|gitdir| path == gitdir || path.starts_with(gitdir)) {
+            change.git_metadata_changed = true;
             continue;
         }
         // matched_path_or_any_parents panics if path is not under the matcher
@@ -157,9 +200,9 @@ fn is_relevant(ev: &Event, gitdir: &Path, workdir: &Path, repo_gi: &Gitignore) -
         {
             continue;
         }
-        return true;
+        change.workspace_changed = true;
     }
-    false
+    change
 }
 
 fn normalize_event_path(path: &Path) -> PathBuf {

@@ -463,6 +463,8 @@ fn read_loop(
                     has_repo: current_has_repo,
                 } => {
                     let _ = fs_tx.send(FsChange {
+                        workspace_changed: true,
+                        git_metadata_changed: false,
                         repo_presence_changed: repo_presence
                             .update_from_notification(current_has_repo),
                     });

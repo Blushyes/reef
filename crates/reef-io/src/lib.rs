@@ -44,8 +44,12 @@ pub use target::{
 pub type EditorResolver = fn() -> Option<(String, Vec<String>)>;
 
 /// A debounced filesystem change observed by a backend watcher.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FsChange {
+    /// Whether a non-Git file in the workspace changed.
+    pub workspace_changed: bool,
+    /// Whether Git metadata such as the index, refs, or HEAD changed.
+    pub git_metadata_changed: bool,
     /// Whether this event changed the workdir's Git-repository capability.
     /// Consumers use this to invalidate graph state only for `git init` or
     /// repository removal, rather than for every worktree write.

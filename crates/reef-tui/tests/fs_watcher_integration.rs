@@ -97,7 +97,7 @@ fn gitignored_write_does_not_trigger() {
 }
 
 #[test]
-fn dotgit_internal_write_does_not_trigger() {
+fn git_metadata_write_triggers_git_only_event() {
     let _lock = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
     commit_file(&raw, "keep.txt", "v1", "init");
@@ -106,15 +106,46 @@ fn dotgit_internal_write_does_not_trigger() {
     let rx = fs_watcher::spawn(workdir);
 
     wait_until_ready(tmp.path(), &rx);
-    // Simulate a git-internal write. .git/ must be skipped outright so that
-    // repeated index churn during git operations never wakes the host.
+    // Simulate an external index/ref update. The AppState can refresh Git
+    // without rebuilding the file tree or reloading the preview.
     std::fs::write(tmp.path().join(".git/custom-marker"), "x").unwrap();
 
-    thread::sleep(Duration::from_millis(700));
+    let change = rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("expected a Git metadata event");
     assert_eq!(
-        rx.try_recv(),
-        Err(TryRecvError::Empty),
-        ".git/ write must not emit an event",
+        change,
+        FsChange {
+            workspace_changed: false,
+            git_metadata_changed: true,
+            repo_presence_changed: false,
+        }
+    );
+}
+
+#[test]
+fn git_metadata_above_nested_workdir_triggers_event() {
+    let _lock = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "src/keep.txt", "v1", "init");
+
+    let nested_workdir = tmp.path().join("src");
+    let backend = LocalBackend::open_at(canonical(&nested_workdir));
+    let rx = backend.subscribe_fs_events();
+    wait_until_ready(&nested_workdir, &rx);
+
+    std::fs::write(tmp.path().join(".git/custom-marker"), "x").unwrap();
+
+    let change = rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("expected a Git metadata event from the repository root");
+    assert_eq!(
+        change,
+        FsChange {
+            workspace_changed: false,
+            git_metadata_changed: true,
+            repo_presence_changed: false,
+        }
     );
 }
 
@@ -193,7 +224,8 @@ fn repository_presence_from_nested_workdir_tracks_ancestor_dotgit() {
         matches!(
             removed,
             Some(FsChange {
-                repo_presence_changed: true
+                repo_presence_changed: true,
+                ..
             })
         ),
         "removing .git should report a repository capability change, got {removed:?}",
@@ -207,7 +239,8 @@ fn repository_presence_from_nested_workdir_tracks_ancestor_dotgit() {
         matches!(
             restored,
             Some(FsChange {
-                repo_presence_changed: true
+                repo_presence_changed: true,
+                ..
             })
         ),
         "restoring .git should report a repository capability change, got {restored:?}",
@@ -236,7 +269,8 @@ fn repository_created_in_ancestor_after_watcher_start_updates_presence() {
         matches!(
             created,
             Some(FsChange {
-                repo_presence_changed: true
+                repo_presence_changed: true,
+                ..
             })
         ),
         "creating .git in an ancestor should report a repository capability change, got {created:?}",

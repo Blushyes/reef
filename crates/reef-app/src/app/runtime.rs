@@ -104,26 +104,32 @@ impl AppState {
     }
 
     pub fn drain_fs_watcher_events(&mut self) -> bool {
-        let mut fs_dirty = false;
-        let mut repo_presence_changed = false;
+        let mut change = reef_io::FsChange::default();
         if let Some(rx) = self.fs_watcher_rx.as_ref() {
-            while let Ok(change) = rx.try_recv() {
-                fs_dirty = true;
-                repo_presence_changed |= change.repo_presence_changed;
+            while let Ok(next_change) = rx.try_recv() {
+                change.workspace_changed |= next_change.workspace_changed;
+                change.git_metadata_changed |= next_change.git_metadata_changed;
+                change.repo_presence_changed |= next_change.repo_presence_changed;
             }
         }
-        if !fs_dirty {
+        if !change.workspace_changed
+            && !change.git_metadata_changed
+            && !change.repo_presence_changed
+        {
             return false;
         }
 
-        self.apply_fs_change(repo_presence_changed)
+        self.apply_fs_change(change)
     }
 
-    pub fn apply_fs_change(&mut self, repo_presence_changed: bool) -> bool {
-        self.file_tree_load.mark_stale();
-        self.preview_load.mark_stale();
+    pub fn apply_fs_change(&mut self, change: reef_io::FsChange) -> bool {
+        let workspace_refresh_needed = change.workspace_changed || change.repo_presence_changed;
+        if workspace_refresh_needed {
+            self.file_tree_load.mark_stale();
+            self.preview_load.mark_stale();
+        }
         let has_repo = self.backend.has_repo();
-        if repo_presence_changed {
+        if change.repo_presence_changed {
             self.cancel_git_confirmations();
             self.diff_load.invalidate();
             self.git_status_load.invalidate();
@@ -153,18 +159,23 @@ impl AppState {
                 self.git_status_load.mark_stale();
                 self.graph_load.mark_stale();
             }
-        } else if has_repo {
-            self.git_status_load.mark_stale();
+        } else if has_repo && (change.workspace_changed || change.git_metadata_changed) {
+            mark_stale_after_cancel(&mut self.git_status_load);
             if self.selected_file.is_some() {
-                self.diff_load.mark_stale();
+                mark_stale_after_cancel(&mut self.diff_load);
             } else {
                 self.diff_load.invalidate();
             }
+            if change.git_metadata_changed {
+                mark_stale_after_cancel(&mut self.graph_load);
+            }
         }
-        crate::features::quick_open::mark_stale(&mut self.quick_open);
-        self.nav_workspace_load.mark_stale();
-        self.nav_refine_cache.clear();
-        self.nav_refine_epoch = self.nav_refine_epoch.wrapping_add(1);
+        if workspace_refresh_needed {
+            crate::features::quick_open::mark_stale(&mut self.quick_open);
+            self.nav_workspace_load.mark_stale();
+            self.nav_refine_cache.clear();
+            self.nav_refine_epoch = self.nav_refine_epoch.wrapping_add(1);
+        }
         true
     }
 
@@ -523,4 +534,11 @@ fn push_min_deadline(target: &mut Option<Instant>, candidate: Option<Instant>) {
         Some(current) if *current <= candidate => {}
         _ => *target = Some(candidate),
     }
+}
+
+fn mark_stale_after_cancel(state: &mut AsyncState) {
+    if state.loading {
+        state.invalidate();
+    }
+    state.mark_stale();
 }

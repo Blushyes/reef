@@ -139,6 +139,9 @@ pub struct TuiApp {
     pub horizontal_scroll_pacer: crate::input::ScrollPacer,
     pub last_preview_content_origin: Option<(u16, u16, u16)>,
     pub last_markdown_content_origin: Option<(u16, u16)>,
+    pub(crate) markdown_layout: crate::ui::preview::markdown::MarkdownLayoutCache,
+    pub(crate) markdown_visual_scroll: usize,
+    pub(crate) markdown_engine_scroll_seen: Option<usize>,
     pub preview_click_state: Option<(Instant, u16, u16, u8)>,
 
     pub diff_selection: Option<crate::ui::selection::DiffSelection>,
@@ -280,6 +283,9 @@ impl App {
             horizontal_scroll_pacer: crate::input::ScrollPacer::new(),
             last_preview_content_origin: None,
             last_markdown_content_origin: None,
+            markdown_layout: crate::ui::preview::markdown::MarkdownLayoutCache::default(),
+            markdown_visual_scroll: 0,
+            markdown_engine_scroll_seen: None,
             preview_click_state: None,
             diff_selection: None,
             last_diff_rect: None,
@@ -2338,6 +2344,80 @@ impl App {
             .dispatch(reef_app::AppCommand::NavigateGitFiles(delta));
     }
 
+    pub(crate) fn scroll_file_preview(&mut self, delta: i32) {
+        let markdown_preview_id = self.engine.preview_content_ref().and_then(|preview| {
+            matches!(preview.body, reef_core::preview::PreviewBody::Markdown(_))
+                .then_some(preview as *const reef_core::preview::PreviewDocument as usize)
+        });
+        if !markdown_preview_id.is_some_and(|id| self.markdown_layout.matches(id)) {
+            self.engine
+                .dispatch(reef_app::AppCommand::PreviewScroll(delta));
+            return;
+        }
+
+        let max_scroll = self
+            .markdown_layout
+            .max_scroll(self.layout.last_preview_view_h as usize);
+        let next = if delta < 0 {
+            self.markdown_visual_scroll
+                .saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            self.markdown_visual_scroll
+                .saturating_add(delta as usize)
+                .min(max_scroll)
+        };
+        self.set_markdown_visual_scroll(next);
+    }
+
+    fn set_markdown_visual_scroll(&mut self, scroll: usize) {
+        self.markdown_visual_scroll = scroll.min(
+            self.markdown_layout
+                .max_scroll(self.layout.last_preview_view_h as usize),
+        );
+        let logical_scroll = self
+            .markdown_layout
+            .row(self.markdown_visual_scroll)
+            .map_or(0, |row| row.logical_row);
+        self.engine
+            .dispatch(reef_app::AppCommand::SetPreviewVerticalScroll(
+                logical_scroll,
+            ));
+        self.markdown_engine_scroll_seen = Some(logical_scroll);
+    }
+
+    fn scroll_file_preview_to_top(&mut self) {
+        let is_current_markdown = self.engine.preview_content_ref().is_some_and(|preview| {
+            matches!(preview.body, reef_core::preview::PreviewBody::Markdown(_))
+                && self
+                    .markdown_layout
+                    .matches(preview as *const reef_core::preview::PreviewDocument as usize)
+        });
+        if is_current_markdown {
+            self.set_markdown_visual_scroll(0);
+        } else {
+            self.engine
+                .dispatch(reef_app::AppCommand::SetPreviewVerticalScroll(0));
+        }
+    }
+
+    fn scroll_file_preview_to_bottom(&mut self) {
+        let is_current_markdown = self.engine.preview_content_ref().is_some_and(|preview| {
+            matches!(preview.body, reef_core::preview::PreviewBody::Markdown(_))
+                && self
+                    .markdown_layout
+                    .matches(preview as *const reef_core::preview::PreviewDocument as usize)
+        });
+        if is_current_markdown {
+            let bottom = self
+                .markdown_layout
+                .max_scroll(self.layout.last_preview_view_h as usize);
+            self.set_markdown_visual_scroll(bottom);
+        } else {
+            self.engine
+                .dispatch(reef_app::AppCommand::SetPreviewVerticalScroll(usize::MAX));
+        }
+    }
+
     /// Vim `gg` — jump the active content panel to its top. List panels
     /// (file tree, git status, commit graph) move their selection to the
     /// first row; content panels (Diff/Commit) reset the vertical scroll.
@@ -2373,8 +2453,7 @@ impl App {
                 }
             }
             (Tab::Files, Panel::Diff) | (Tab::Search, Panel::Diff) => {
-                self.engine
-                    .dispatch(reef_app::AppCommand::SetPreviewVerticalScroll(0));
+                self.scroll_file_preview_to_top();
             }
             (Tab::Search, Panel::Files) => {
                 // Search-tab left column owns its own list cursor via the
@@ -2416,9 +2495,7 @@ impl App {
 
     /// Vim `G` — jump the active content panel to its bottom. List panels
     /// move selection to the last row; content panels set the scroll to
-    /// `usize::MAX` and rely on the render-layer clamp
-    /// (ui::preview / diff_panel / commit_detail_panel all clamp
-    /// against `lines.len() - viewport`).
+    /// jump to their renderer-specific bottom offset.
     pub fn scroll_active_preview_to_bottom(&mut self) {
         if self.is_sqlite_preview() {
             return;
@@ -2432,8 +2509,7 @@ impl App {
                 }
             }
             (Tab::Files, Panel::Diff) | (Tab::Search, Panel::Diff) => {
-                self.engine
-                    .dispatch(reef_app::AppCommand::SetPreviewVerticalScroll(usize::MAX));
+                self.scroll_file_preview_to_bottom();
             }
             (Tab::Search, Panel::Files) => {}
             (Tab::Git, Panel::Files) => {

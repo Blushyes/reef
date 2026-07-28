@@ -1007,16 +1007,16 @@ fn handle_key_search(key: KeyEvent, app: &mut App) {
             // (search::begin) and works here via resolve_target.
             match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
-                    app.engine.dispatch(AppCommand::PreviewScroll(-1));
+                    app.scroll_file_preview(-1);
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    app.engine.dispatch(AppCommand::PreviewScroll(1));
+                    app.scroll_file_preview(1);
                 }
                 KeyCode::PageUp => {
-                    app.engine.dispatch(AppCommand::PreviewScroll(-20));
+                    app.scroll_file_preview(-20);
                 }
                 KeyCode::PageDown => {
-                    app.engine.dispatch(AppCommand::PreviewScroll(20));
+                    app.scroll_file_preview(20);
                 }
                 KeyCode::Left => {
                     let step = if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -1732,7 +1732,7 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 // within current_rows" — same field, different
                 // semantics. The renderer reads this for either body
                 // shape, so a single decrement works for both.
-                app.engine.dispatch(AppCommand::PreviewScroll(-1));
+                app.scroll_file_preview(-1);
             }
         },
         KeyCode::Down | KeyCode::Char('j') if !ctrl => match app.engine.active_panel() {
@@ -1743,7 +1743,7 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 // Same dual-semantics as the Up arm. Render clamps the
                 // upper bound against the actual row count, so we
                 // don't need to know current_rows.len() here.
-                app.engine.dispatch(AppCommand::PreviewScroll(1));
+                app.scroll_file_preview(1);
             }
         },
         // Readline-style nav: Ctrl+P/K = up, Ctrl+N/J = down. Mirrors
@@ -1756,7 +1756,7 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 app.engine.dispatch(AppCommand::NavigateFileTree(-1));
             }
             Panel::Diff | Panel::Commit => {
-                app.engine.dispatch(AppCommand::PreviewScroll(-1));
+                app.scroll_file_preview(-1);
             }
         },
         KeyCode::Char('n' | 'j') if ctrl => match app.engine.active_panel() {
@@ -1764,7 +1764,7 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 app.engine.dispatch(AppCommand::NavigateFileTree(1));
             }
             Panel::Diff | Panel::Commit => {
-                app.engine.dispatch(AppCommand::PreviewScroll(1));
+                app.scroll_file_preview(1);
             }
         },
         KeyCode::PageUp => match app.engine.active_panel() {
@@ -1779,7 +1779,7 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 if app.engine.preview_is_database() {
                     app.db_navigate(DbNav::PrevPage);
                 } else {
-                    app.engine.dispatch(AppCommand::PreviewScroll(-20));
+                    app.scroll_file_preview(-20);
                 }
             }
         },
@@ -1791,7 +1791,7 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 if app.engine.preview_is_database() {
                     app.db_navigate(DbNav::NextPage);
                 } else {
-                    app.engine.dispatch(AppCommand::PreviewScroll(20));
+                    app.scroll_file_preview(20);
                 }
             }
         },
@@ -3250,17 +3250,20 @@ fn mouse_to_preview_coord(app: &App, col: u16, row: u16) -> Option<(usize, usize
     let preview = app.engine.preview_content_ref()?;
     match &preview.body {
         reef_core::preview::PreviewBody::Markdown(markdown) => {
-            let line_count = markdown.line_count();
-            if line_count == 0 {
+            if app.markdown_layout.len() == 0 {
                 return None;
             }
             let (content_x, content_y) = app.last_markdown_content_origin?;
             let visible_row = row.saturating_sub(content_y) as usize;
-            let line_idx = (app.engine.preview_scroll() + visible_row).min(line_count - 1);
+            let visual_row = app.markdown_layout.row(
+                (app.markdown_visual_scroll + visible_row).min(app.markdown_layout.len() - 1),
+            )?;
+            let text = markdown.text_for_row(visual_row.logical_row)?;
+            let visible_text = &text[visual_row.byte_start..visual_row.byte_end];
             let visible_col =
                 (col.saturating_sub(content_x) as usize) + app.engine.preview_h_scroll();
-            let byte_offset = col_to_byte_offset(markdown.text_for_row(line_idx)?, visible_col);
-            Some((line_idx, byte_offset))
+            let byte_offset = visual_row.byte_start + col_to_byte_offset(visible_text, visible_col);
+            Some((visual_row.logical_row, byte_offset))
         }
         reef_core::preview::PreviewBody::Text(_) => {
             let origin = app.last_preview_content_origin?;
@@ -3379,29 +3382,38 @@ fn tick_preview_drag_autoscroll(app: &mut App) {
         return;
     }
 
-    // Clamp the scroll target to the line count, accounting for the
-    // viewport height (you can't scroll the last line off the top).
+    // Markdown owns a terminal-local visual-row scroll because one logical
+    // source row can wrap across several terminal rows. Other preview bodies
+    // continue to use the renderer-neutral logical scroll directly.
     let Some(preview) = app.engine.preview_content_ref() else {
         return;
     };
+    let is_markdown = matches!(preview.body, reef_core::preview::PreviewBody::Markdown(_));
     let line_count = match &preview.body {
-        reef_core::preview::PreviewBody::Markdown(markdown) => markdown.line_count(),
+        reef_core::preview::PreviewBody::Markdown(_) => app.markdown_layout.len(),
         reef_core::preview::PreviewBody::Text(text) => text.lines.len(),
         _ => return,
     };
     let max_scroll = line_count.saturating_sub(view_h as usize);
-    let new_scroll = if step < 0 {
-        app.engine
-            .preview_scroll()
-            .saturating_sub(step.unsigned_abs() as usize)
+    let current_scroll = if is_markdown {
+        app.markdown_visual_scroll
     } else {
-        (app.engine.preview_scroll() + step as usize).min(max_scroll)
+        app.engine.preview_scroll()
     };
-    if new_scroll == app.engine.preview_scroll() {
+    let new_scroll = if step < 0 {
+        current_scroll.saturating_sub(step.unsigned_abs() as usize)
+    } else {
+        (current_scroll + step as usize).min(max_scroll)
+    };
+    if new_scroll == current_scroll {
         return;
     }
-    app.engine
-        .dispatch(AppCommand::SetPreviewVerticalScroll(new_scroll));
+    if is_markdown {
+        app.scroll_file_preview(step);
+    } else {
+        app.engine
+            .dispatch(AppCommand::SetPreviewVerticalScroll(new_scroll));
+    }
     app.preview_autoscroll_at = Some(now);
 
     // Re-translate the frozen mouse against the new scroll — this is what
@@ -3679,7 +3691,7 @@ fn dispatch_vertical_scroll<B: Backend>(
     if app.engine.view_mode() == reef_app::ViewMode::FocusedPreview {
         match app.engine.active_tab() {
             Tab::Files | Tab::Search => {
-                app.engine.dispatch(AppCommand::PreviewScroll(step_i));
+                app.scroll_file_preview(step_i);
             }
             Tab::Git => {
                 app.engine.dispatch(AppCommand::DiffScroll(step_i));
@@ -3713,7 +3725,7 @@ fn dispatch_vertical_scroll<B: Backend>(
             if is_left {
                 app.engine.dispatch(AppCommand::ScrollFileTree(step_i));
             } else {
-                app.engine.dispatch(AppCommand::PreviewScroll(step_i));
+                app.scroll_file_preview(step_i);
             }
         }
         Tab::Graph => {
@@ -3736,7 +3748,7 @@ fn dispatch_vertical_scroll<B: Backend>(
                 // rather than mutating a scroll offset.
                 global_search::move_selection_by(app, step_i);
             } else {
-                app.engine.dispatch(AppCommand::PreviewScroll(step_i));
+                app.scroll_file_preview(step_i);
             }
         }
     }

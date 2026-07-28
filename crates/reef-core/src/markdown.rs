@@ -385,7 +385,9 @@ fn build_markdown_preview_inner(
                 active.push(text.as_ref());
                 active.style = old;
             }
-            Event::SoftBreak | Event::HardBreak => flush_inline(&mut rows, &mut inline),
+            Event::SoftBreak if quote_depth > 0 => flush_inline(&mut rows, &mut inline),
+            Event::SoftBreak => active_inline(&mut inline, &mut table).push(" "),
+            Event::HardBreak => flush_inline(&mut rows, &mut inline),
             Event::Rule => {
                 flush_inline(&mut rows, &mut inline);
                 rows.push(vec![MarkdownSpan {
@@ -846,6 +848,27 @@ mod tests {
     fn consecutive_blockquote_lines_keep_quote_prefix() {
         let md = build_markdown_preview("README.md", "> xxx\n> xxx\n").unwrap();
         assert_eq!(texts(&md), vec!["│ xxx", "│ xxx"]);
+    }
+
+    #[test]
+    fn soft_breaks_join_paragraph_lines() {
+        let md = build_markdown_preview(
+            "README.md",
+            "A paragraph wrapped for source readability\ncontinues on the next source line.\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            texts(&md),
+            vec!["A paragraph wrapped for source readability continues on the next source line."]
+        );
+    }
+
+    #[test]
+    fn hard_breaks_preserve_rendered_line_boundaries() {
+        let md = build_markdown_preview("README.md", "first line  \nsecond line\n").unwrap();
+
+        assert_eq!(texts(&md), vec!["first line", "second line"]);
     }
 
     #[test]

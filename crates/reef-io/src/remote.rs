@@ -464,6 +464,7 @@ fn read_loop(
                 } => {
                     let _ = fs_tx.send(FsChange {
                         workspace_changed: true,
+                        workspace_paths: Vec::new(),
                         git_metadata_changed: false,
                         repo_presence_changed: repo_presence
                             .update_from_notification(current_has_repo),

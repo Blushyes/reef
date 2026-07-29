@@ -44,10 +44,16 @@ pub use target::{
 pub type EditorResolver = fn() -> Option<(String, Vec<String>)>;
 
 /// A debounced filesystem change observed by a backend watcher.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FsChange {
     /// Whether a non-Git file in the workspace changed.
     pub workspace_changed: bool,
+    /// Workspace-relative paths reported by the watcher for this change.
+    ///
+    /// An empty list means the backend cannot identify the affected paths,
+    /// so consumers must conservatively treat every open workspace document
+    /// as potentially stale.
+    pub workspace_paths: Vec<PathBuf>,
     /// Whether Git metadata such as the index, refs, or HEAD changed.
     pub git_metadata_changed: bool,
     /// Whether this event changed the workdir's Git-repository capability.

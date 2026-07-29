@@ -134,6 +134,9 @@ fn run(
                 if change.workspace_changed || change.git_metadata_changed {
                     pending_change.workspace_changed |= change.workspace_changed;
                     pending_change.git_metadata_changed |= change.git_metadata_changed;
+                    pending_change
+                        .workspace_paths
+                        .extend(change.workspace_paths);
                     debounce_deadline = Some(Instant::now() + DEBOUNCE);
                 }
             }
@@ -201,6 +204,9 @@ fn classify_event(
             continue;
         }
         change.workspace_changed = true;
+        if let Ok(relative) = path.strip_prefix(workdir) {
+            change.workspace_paths.push(relative.to_path_buf());
+        }
     }
     change
 }

@@ -110,6 +110,7 @@ impl AppState {
                 change.workspace_changed |= next_change.workspace_changed;
                 change.git_metadata_changed |= next_change.git_metadata_changed;
                 change.repo_presence_changed |= next_change.repo_presence_changed;
+                change.workspace_paths.extend(next_change.workspace_paths);
             }
         }
         if !change.workspace_changed
@@ -126,7 +127,12 @@ impl AppState {
         let workspace_refresh_needed = change.workspace_changed || change.repo_presence_changed;
         if workspace_refresh_needed {
             self.file_tree_load.mark_stale();
-            self.preview_load.mark_stale();
+            if change.repo_presence_changed
+                || change.workspace_paths.is_empty()
+                || self.preview_path_changed(&change.workspace_paths)
+            {
+                self.preview_load.mark_stale();
+            }
         }
         let has_repo = self.backend.has_repo();
         if change.repo_presence_changed {
@@ -177,6 +183,14 @@ impl AppState {
             self.nav_refine_epoch = self.nav_refine_epoch.wrapping_add(1);
         }
         true
+    }
+
+    fn preview_path_changed(&self, changed_paths: &[PathBuf]) -> bool {
+        let Some(preview) = self.preview_content.as_deref() else {
+            return false;
+        };
+        let preview_path = Path::new(&preview.path);
+        changed_paths.iter().any(|path| path == preview_path)
     }
 
     pub fn apply_worker_result_core(

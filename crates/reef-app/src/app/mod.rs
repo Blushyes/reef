@@ -1095,6 +1095,7 @@ mod tests {
         app.fs_watcher_rx = Some(rx);
         tx.send(reef_io::FsChange {
             workspace_changed: false,
+            workspace_paths: Vec::new(),
             git_metadata_changed: false,
             repo_presence_changed: true,
         })
@@ -1118,6 +1119,7 @@ mod tests {
 
         app.apply_fs_change(reef_io::FsChange {
             workspace_changed: false,
+            workspace_paths: Vec::new(),
             git_metadata_changed: true,
             repo_presence_changed: false,
         });
@@ -1130,12 +1132,44 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_workspace_change_refreshes_tree_without_reloading_preview() {
+        let mut app = minimal_app_state();
+        app.preview_content = Some(Arc::new(global_search_text_preview("script.json")));
+
+        app.apply_fs_change(reef_io::FsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from(".DS_Store")],
+            git_metadata_changed: false,
+            repo_presence_changed: false,
+        });
+
+        assert!(app.file_tree_load.stale);
+        assert!(!app.preview_load.stale);
+    }
+
+    #[test]
+    fn selected_preview_workspace_change_reloads_preview() {
+        let mut app = minimal_app_state();
+        app.preview_content = Some(Arc::new(global_search_text_preview("script.json")));
+
+        app.apply_fs_change(reef_io::FsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from("script.json")],
+            git_metadata_changed: false,
+            repo_presence_changed: false,
+        });
+
+        assert!(app.preview_load.stale);
+    }
+
+    #[test]
     fn git_metadata_change_requests_status_refresh_on_git_tab() {
         let mut app = minimal_app_state();
         app.active_tab = AppTab::Git;
 
         app.apply_fs_change(reef_io::FsChange {
             workspace_changed: false,
+            workspace_paths: Vec::new(),
             git_metadata_changed: true,
             repo_presence_changed: false,
         });

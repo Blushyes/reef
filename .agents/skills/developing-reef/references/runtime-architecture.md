@@ -39,6 +39,10 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
   `repo_presence_changed` value through `AppCommand::ApplyFsChange`; it must not add a public
   mutable `ReefApp` entry point. Hosts that leave the watcher receiver to the engine simply call
   `step` after their wake notification.
+- Local filesystem watcher events carry workspace-relative changed paths. The file tree may
+  refresh for any workspace event, but an already-open preview reloads only when its own path is
+  among those changes. Backends without path-level watcher data leave the path list empty, which
+  intentionally keeps the conservative preview-refresh behavior.
 - Worker wake notifications are coalesced signals only. `ReefApp::step` remains the only owner of
   consuming and merging `WorkerResult`.
 - Scheduled work must contribute its earliest due time to `next_deadline`; do not add fixed-rate

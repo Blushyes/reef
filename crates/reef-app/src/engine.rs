@@ -458,6 +458,7 @@ impl ReefApp {
             } => {
                 self.state.apply_fs_change(reef_io::FsChange {
                     workspace_changed,
+                    workspace_paths: Vec::new(),
                     git_metadata_changed,
                     repo_presence_changed,
                 });

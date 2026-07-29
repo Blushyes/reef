@@ -66,12 +66,11 @@ fn workdir_write_triggers_event() {
     wait_until_ready(tmp.path(), &rx);
     write_file(&raw, "new.txt", "fresh content");
 
-    let got = rx.recv_timeout(Duration::from_secs(3));
-    assert!(
-        got.is_ok(),
-        "expected a debounced event within 3s, got {:?}",
-        got
-    );
+    let change = rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("expected a debounced workspace event");
+    assert!(change.workspace_changed);
+    assert!(change.workspace_paths.contains(&PathBuf::from("new.txt")));
 }
 
 #[test]
@@ -117,6 +116,7 @@ fn git_metadata_write_triggers_git_only_event() {
         change,
         FsChange {
             workspace_changed: false,
+            workspace_paths: Vec::new(),
             git_metadata_changed: true,
             repo_presence_changed: false,
         }
@@ -143,6 +143,7 @@ fn git_metadata_above_nested_workdir_triggers_event() {
         change,
         FsChange {
             workspace_changed: false,
+            workspace_paths: Vec::new(),
             git_metadata_changed: true,
             repo_presence_changed: false,
         }

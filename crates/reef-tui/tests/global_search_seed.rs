@@ -35,6 +35,7 @@ fn install_text_preview(app: &mut App, lines: &[&str]) {
             mime: Some("text/plain".into()),
             body: PreviewBody::Text(TextPreview {
                 lines: lines.iter().map(|s| s.to_string()).collect(),
+                source: None,
                 highlighted: None,
                 parsed: None,
             }),

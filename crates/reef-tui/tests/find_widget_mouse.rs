@@ -42,6 +42,7 @@ fn fresh_app() -> (App, TempDir, CwdGuard) {
                     "    bar();".to_string(),
                     "    bar();".to_string(),
                 ],
+                source: None,
                 highlighted: None,
                 parsed: None,
             }),
@@ -151,6 +152,7 @@ fn match_case_toggle_flips_and_rematches() {
             mime: Some("text/plain".into()),
             body: PreviewBody::Text(TextPreview {
                 lines: vec!["Bar bar BAR".to_string()],
+                source: None,
                 highlighted: None,
                 parsed: None,
             }),
@@ -185,6 +187,7 @@ fn whole_word_toggle_flips_and_filters_matches() {
             mime: Some("text/plain".into()),
             body: PreviewBody::Text(TextPreview {
                 lines: vec!["foo food foobar foo!".to_string()],
+                source: None,
                 highlighted: None,
                 parsed: None,
             }),
@@ -221,6 +224,7 @@ fn regex_toggle_reinterprets_query() {
             mime: Some("text/plain".into()),
             body: PreviewBody::Text(TextPreview {
                 lines: vec!["abc 12 d345 ef".to_string()],
+                source: None,
                 highlighted: None,
                 parsed: None,
             }),

@@ -49,6 +49,15 @@ impl AsyncState {
         true
     }
 
+    /// Complete a failed request without scheduling an automatic retry.
+    pub fn complete_terminal_err(&mut self, generation: u64, error: String) -> bool {
+        if !self.complete_err(generation, error) {
+            return false;
+        }
+        self.stale = false;
+        true
+    }
+
     pub fn should_request(&self) -> bool {
         self.stale && !self.loading
     }
@@ -81,6 +90,16 @@ mod tests {
         assert!(!state.loading);
         assert!(state.stale);
         assert!(state.should_request());
+        assert_eq!(state.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn terminal_error_does_not_request_retry() {
+        let mut state = AsyncState::default();
+        let generation = state.begin();
+
+        assert!(state.complete_terminal_err(generation, "boom".to_string()));
+        assert!(!state.should_request());
         assert_eq!(state.error.as_deref(), Some("boom"));
     }
 }

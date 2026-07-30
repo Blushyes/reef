@@ -96,7 +96,10 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 /// - v13: `StageMany` and `UnstageMany` replace one-RPC-per-path mutations.
 ///       The handshake stays strict so stale agents are redeployed instead of
 ///       silently regressing a large stage operation to hundreds of requests.
-pub const PROTOCOL_VERSION: u32 = 13;
+/// - v14: filesystem notifications preserve workspace paths and distinguish
+///       worktree changes from Git metadata changes; `GitStatusStats` moves
+///       content-level line counts off the latency-sensitive status request.
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// Encode a single envelope-level value to `writer` using the
 /// length-prefixed framing. The caller is expected to flush.
@@ -195,6 +198,7 @@ pub enum Request {
 
     // ── Git: status / diff ────
     GitStatus,
+    GitStatusStats,
     StagedDiff {
         path: String,
         context_lines: u32,
@@ -488,6 +492,9 @@ pub enum ErrorCode {
 pub enum Notification {
     FsChanged {
         has_repo: bool,
+        workspace_changed: bool,
+        workspace_paths: Vec<String>,
+        git_metadata_changed: bool,
     },
     AgentLog {
         level: String,
@@ -645,6 +652,12 @@ pub struct StatusSnapshotDto {
     pub unstaged: Vec<FileEntryDto>,
     pub branch_name: String,
     pub ahead_behind: Option<(usize, usize)>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitStatusStatsDto {
+    pub staged: HashMap<String, (u32, u32)>,
+    pub unstaged: HashMap<String, (u32, u32)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1101,14 +1114,24 @@ mod tests {
 
     #[test]
     fn notification_frame_roundtrip() {
-        let note = Frame::Notification(Notification::FsChanged { has_repo: true });
+        let note = Frame::Notification(Notification::FsChanged {
+            has_repo: true,
+            workspace_changed: true,
+            workspace_paths: vec!["src/main.rs".to_string()],
+            git_metadata_changed: false,
+        });
         let mut buf = Vec::new();
         encode_frame(&mut buf, &note).unwrap();
         let mut cursor = Cursor::new(&buf);
         let got = decode_frame(&mut cursor).unwrap();
         assert!(matches!(
             got,
-            Frame::Notification(Notification::FsChanged { has_repo: true })
+            Frame::Notification(Notification::FsChanged {
+                has_repo: true,
+                workspace_changed: true,
+                workspace_paths,
+                git_metadata_changed: false,
+            }) if workspace_paths == vec!["src/main.rs"]
         ));
     }
 

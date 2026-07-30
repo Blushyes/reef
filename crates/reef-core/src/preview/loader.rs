@@ -7,7 +7,7 @@ use super::{PreviewBody, PreviewDocument, TextPreview};
 
 const PROBE_BYTES: usize = 8192;
 const SQLITE_MIME: &str = "application/vnd.sqlite3";
-const MAX_TEXT_PROBE_BYTES: u64 = 10 * 1024 * 1024;
+pub const MAX_TEXT_PREVIEW_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_ENRICHMENT_BYTES: u64 = 512 * 1024;
 const MAX_ENRICHMENT_LINES: usize = 5_000;
 const MAX_TEXT_PREVIEW_LINES: usize = 10_000;
@@ -138,7 +138,7 @@ pub fn load_preview_from_path(
         ));
     }
 
-    if file_size > MAX_TEXT_PROBE_BYTES {
+    if file_size > MAX_TEXT_PREVIEW_BYTES {
         return Some(preview_document(
             &rel_str,
             file_size,
@@ -198,9 +198,21 @@ pub fn build_textual_preview_body(path: &str, content: &str) -> PreviewBody {
             .take(MAX_TEXT_PREVIEW_LINES)
             .map(str::to_string)
             .collect(),
+        source: structured_data_source_required(path).then(|| Arc::from(content)),
         highlighted: None,
         parsed: None,
     })
+}
+
+pub fn structured_data_source_required(path: &str) -> bool {
+    matches!(
+        Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("json" | "jsonc" | "json5" | "yaml" | "yml")
+    )
 }
 
 pub fn build_text_preview_enrichment(
@@ -349,6 +361,20 @@ mod tests {
             }
             other => panic!("expected Text body, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn structured_data_preserves_complete_source_after_visible_rows_are_capped() {
+        let source = format!(
+            "{{\"items\":[]}}\n{}",
+            "\n\n".repeat(MAX_TEXT_PREVIEW_LINES)
+        );
+        let PreviewBody::Text(text) = build_textual_preview_body("large.json", &source) else {
+            panic!("expected text preview");
+        };
+
+        assert_eq!(text.lines.len(), MAX_TEXT_PREVIEW_LINES);
+        assert_eq!(text.source.as_deref(), Some(source.as_str()));
     }
 
     #[test]
@@ -512,7 +538,7 @@ mod tests {
     fn load_preview_huge_unknown_skips_full_read() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("big.dat");
-        let big_size = MAX_TEXT_PROBE_BYTES + 1;
+        let big_size = MAX_TEXT_PREVIEW_BYTES + 1;
         {
             use std::io::Write;
 

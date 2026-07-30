@@ -11,7 +11,7 @@ use crate::app::{
 use reef_core::diff::DiffContent;
 use reef_core::file_ops::Resolution;
 use reef_core::git::graph::GraphRow;
-use reef_core::git::{CommitDetail, FileEntry, GraphScope, RefLabel};
+use reef_core::git::{CommitDetail, FileEntry, GitStatusStats, GraphScope, RefLabel};
 use reef_core::preview::{PreviewBody, PreviewDocument as PreviewContent, PreviewEnrichment};
 use reef_io::TreeEntry;
 use reef_io::{Backend, BackendError, WalkOpts};
@@ -195,6 +195,10 @@ pub enum WorkerResult {
     GitStatus {
         generation: u64,
         result: Result<GitStatusPayload, String>,
+    },
+    GitStatusStats {
+        generation: u64,
+        result: Result<GitStatusStats, String>,
     },
     GitMutation {
         generation: u64,
@@ -481,9 +485,10 @@ enum FilesTask {
         dest_rel: PathBuf,
         sources: Vec<PathBuf>,
     },
-    /// Drag-and-drop copy: each source lands under `dest_dir`. Sources can
-    /// be external host-local paths or workdir-local paths; `reef-io`
-    /// performs the actual local copy or remote upload.
+    /// Drag-and-drop / place-mode copy: each source lands under `dest_dir`.
+    /// Local backends may optimize sources already under their workdir into
+    /// native copies; remote backends always treat these paths as host-local
+    /// uploads. Workdir-internal copy uses `CopyPaths` instead.
     CopyFiles {
         generation: u64,
         backend: Arc<dyn Backend>,
@@ -647,6 +652,13 @@ enum GitTask {
     },
 }
 
+enum GitStatusStatsTask {
+    Refresh {
+        generation: u64,
+        backend: Arc<dyn Backend>,
+    },
+}
+
 enum GlobalSearchTask {
     Run {
         generation: u64,
@@ -687,12 +699,12 @@ enum GraphRefreshTask {
 }
 
 enum GraphContentTask {
-    LoadCommitDetail {
+    CommitDetail {
         generation: u64,
         backend: Arc<dyn Backend>,
         oid: String,
     },
-    LoadCommitFileDiff {
+    CommitFileDiff {
         generation: u64,
         backend: Arc<dyn Backend>,
         oid: String,
@@ -702,13 +714,13 @@ enum GraphContentTask {
         /// read correctly against the active UI theme — same as `load_preview`.
         dark: bool,
     },
-    LoadCommitRangeDetail {
+    CommitRangeDetail {
         generation: u64,
         backend: Arc<dyn Backend>,
         oldest_oid: String,
         newest_oid: String,
     },
-    LoadRangeFileDiff {
+    RangeFileDiff {
         generation: u64,
         backend: Arc<dyn Backend>,
         oldest_oid: String,
@@ -729,6 +741,7 @@ pub struct TaskCoordinator {
     preview_tx: mpsc::Sender<FilesTask>,
     preview_enrichment_tx: mpsc::Sender<PreviewEnrichmentTask>,
     git_tx: mpsc::Sender<GitTask>,
+    git_status_stats_tx: mpsc::Sender<GitStatusStatsTask>,
     graph_refresh_tx: mpsc::Sender<GraphRefreshTask>,
     graph_content_tx: mpsc::Sender<GraphContentTask>,
     global_search_tx: mpsc::Sender<GlobalSearchTask>,
@@ -767,6 +780,7 @@ impl TaskCoordinator {
             preview_tx: spawn_preview_worker(result_tx.clone()),
             preview_enrichment_tx: spawn_preview_enrichment_worker(result_tx.clone()),
             git_tx: spawn_git_worker(result_tx.clone()),
+            git_status_stats_tx: spawn_git_status_stats_worker(result_tx.clone()),
             graph_refresh_tx: spawn_graph_refresh_worker(result_tx.clone()),
             graph_content_tx: spawn_graph_content_worker(result_tx.clone()),
             global_search_tx: spawn_global_search_worker(result_tx.clone()),
@@ -1122,6 +1136,13 @@ impl TaskCoordinator {
         });
     }
 
+    pub fn refresh_status_stats(&self, generation: u64, backend: Arc<dyn Backend>) {
+        let _ = self.git_status_stats_tx.send(GitStatusStatsTask::Refresh {
+            generation,
+            backend,
+        });
+    }
+
     pub fn load_diff(
         &self,
         generation: u64,
@@ -1181,13 +1202,11 @@ impl TaskCoordinator {
     }
 
     pub fn load_commit_detail(&self, generation: u64, backend: Arc<dyn Backend>, oid: String) {
-        let _ = self
-            .graph_content_tx
-            .send(GraphContentTask::LoadCommitDetail {
-                generation,
-                backend,
-                oid,
-            });
+        let _ = self.graph_content_tx.send(GraphContentTask::CommitDetail {
+            generation,
+            backend,
+            oid,
+        });
     }
 
     pub fn load_commit_file_diff(
@@ -1201,7 +1220,7 @@ impl TaskCoordinator {
     ) {
         let _ = self
             .graph_content_tx
-            .send(GraphContentTask::LoadCommitFileDiff {
+            .send(GraphContentTask::CommitFileDiff {
                 generation,
                 backend,
                 oid,
@@ -1220,7 +1239,7 @@ impl TaskCoordinator {
     ) {
         let _ = self
             .graph_content_tx
-            .send(GraphContentTask::LoadCommitRangeDetail {
+            .send(GraphContentTask::CommitRangeDetail {
                 generation,
                 backend,
                 oldest_oid,
@@ -1239,17 +1258,15 @@ impl TaskCoordinator {
         context_lines: u32,
         dark: bool,
     ) {
-        let _ = self
-            .graph_content_tx
-            .send(GraphContentTask::LoadRangeFileDiff {
-                generation,
-                backend,
-                oldest_oid,
-                newest_oid,
-                path,
-                context_lines,
-                dark,
-            });
+        let _ = self.graph_content_tx.send(GraphContentTask::RangeFileDiff {
+            generation,
+            backend,
+            oldest_oid,
+            newest_oid,
+            path,
+            context_lines,
+            dark,
+        });
     }
 
     /// Kick off a workdir-wide content search. The worker walks `root`
@@ -2141,6 +2158,30 @@ fn spawn_git_worker(result_tx: WorkerResultSender) -> mpsc::Sender<GitTask> {
     tx
 }
 
+fn spawn_git_status_stats_worker(
+    result_tx: WorkerResultSender,
+) -> mpsc::Sender<GitStatusStatsTask> {
+    let (tx, rx) = mpsc::unbounded();
+    let _ = thread::Builder::new()
+        .name("reef-git-stats-worker".into())
+        .spawn(move || {
+            while let Ok(task) = recv_latest(&rx) {
+                match task {
+                    GitStatusStatsTask::Refresh {
+                        generation,
+                        backend,
+                    } => {
+                        let result = backend
+                            .git_status_stats()
+                            .map_err(|error| error.to_string());
+                        let _ = result_tx.send(WorkerResult::GitStatusStats { generation, result });
+                    }
+                }
+            }
+        });
+    tx
+}
+
 fn run_git_mutation(
     backend: &dyn Backend,
     mutation: GitMutation,
@@ -2181,7 +2222,7 @@ fn spawn_graph_refresh_worker(result_tx: WorkerResultSender) -> mpsc::Sender<Gra
     let _ = thread::Builder::new()
         .name("reef-graph-refresh-worker".into())
         .spawn(move || {
-            while let Ok(task) = rx.recv() {
+            while let Ok(task) = recv_latest(&rx) {
                 match task {
                     GraphRefreshTask::RefreshGraph {
                         generation,
@@ -2236,6 +2277,14 @@ fn spawn_graph_refresh_worker(result_tx: WorkerResultSender) -> mpsc::Sender<Gra
     tx
 }
 
+fn recv_latest<T>(rx: &mpsc::Receiver<T>) -> Result<T, mpsc::RecvError> {
+    let mut latest = rx.recv()?;
+    while let Ok(newer) = rx.try_recv() {
+        latest = newer;
+    }
+    Ok(latest)
+}
+
 fn spawn_graph_content_worker(result_tx: WorkerResultSender) -> mpsc::Sender<GraphContentTask> {
     let (tx, rx) = mpsc::unbounded();
     let _ = thread::Builder::new()
@@ -2243,7 +2292,7 @@ fn spawn_graph_content_worker(result_tx: WorkerResultSender) -> mpsc::Sender<Gra
         .spawn(move || {
             while let Ok(task) = rx.recv() {
                 match task {
-                    GraphContentTask::LoadCommitDetail {
+                    GraphContentTask::CommitDetail {
                         generation,
                         backend,
                         oid,
@@ -2251,7 +2300,7 @@ fn spawn_graph_content_worker(result_tx: WorkerResultSender) -> mpsc::Sender<Gra
                         let result = backend.commit_detail(&oid).map_err(|e| e.to_string());
                         let _ = result_tx.send(WorkerResult::CommitDetail { generation, result });
                     }
-                    GraphContentTask::LoadCommitFileDiff {
+                    GraphContentTask::CommitFileDiff {
                         generation,
                         backend,
                         oid,
@@ -2265,7 +2314,7 @@ fn spawn_graph_content_worker(result_tx: WorkerResultSender) -> mpsc::Sender<Gra
                             .map(|opt| opt.map(|diff| build_commit_file_diff(path, diff, dark)));
                         let _ = result_tx.send(WorkerResult::CommitFileDiff { generation, result });
                     }
-                    GraphContentTask::LoadCommitRangeDetail {
+                    GraphContentTask::CommitRangeDetail {
                         generation,
                         backend,
                         oldest_oid,
@@ -2276,7 +2325,7 @@ fn spawn_graph_content_worker(result_tx: WorkerResultSender) -> mpsc::Sender<Gra
                             .map_err(|e| e.to_string());
                         let _ = result_tx.send(WorkerResult::RangeDetail { generation, result });
                     }
-                    GraphContentTask::LoadRangeFileDiff {
+                    GraphContentTask::RangeFileDiff {
                         generation,
                         backend,
                         oldest_oid,
@@ -4229,6 +4278,7 @@ mod preview_panic_guard_tests {
             mime: Some("text/plain".into()),
             body: reef_core::preview::PreviewBody::Text(reef_core::preview::TextPreview {
                 lines: vec!["hi".into()],
+                source: None,
                 highlighted: None,
                 parsed: None,
             }),
@@ -4510,6 +4560,16 @@ mod preview_worker_coalescing_tests {
 #[cfg(test)]
 mod graph_worker_helpers_tests {
     use super::*;
+
+    #[test]
+    fn recv_latest_discards_obsolete_queued_work() {
+        let (tx, rx) = mpsc::unbounded();
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        tx.send(3).unwrap();
+
+        assert_eq!(recv_latest(&rx).unwrap(), 3);
+    }
 
     #[test]
     fn ref_present_in_map_matches_local_branch() {

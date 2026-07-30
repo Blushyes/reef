@@ -31,6 +31,7 @@ fn fresh_app() -> (App, TempDir, CwdGuard) {
             mime: Some("text/plain".into()),
             body: PreviewBody::Text(TextPreview {
                 lines: vec!["foo bar foo".to_string(), "bar foo".to_string()],
+                source: None,
                 highlighted: None,
                 parsed: None,
             }),

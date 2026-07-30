@@ -23,9 +23,9 @@ use reef_io::{Backend, LocalBackend};
 use reef_proto::{
     CommitDetailDto, CommitInfoDto, ContentSearchCompletedDto, DiffContentDto, DiffHunkDto,
     DiffLineDto, DirEntryDto, Envelope, ErrorCode, FileEntryDto, FileStatusDto, Frame,
-    HandshakeResponse, LineTagDto, MatchHitDto, Notification, PROTOCOL_VERSION, ReadFileResponse,
-    RefLabelDto, Request, Response, StatusSnapshotDto, TrashResponseDto, WalkResponseDto,
-    encode_frame, read_envelope,
+    GitStatusStatsDto, HandshakeResponse, LineTagDto, MatchHitDto, Notification, PROTOCOL_VERSION,
+    ReadFileResponse, RefLabelDto, Request, Response, StatusSnapshotDto, TrashResponseDto,
+    WalkResponseDto, encode_frame, read_envelope,
 };
 
 struct Args {
@@ -132,10 +132,9 @@ fn main() -> io::Result<()> {
     let _watcher = thread::Builder::new()
         .name("reef-agent-watcher".into())
         .spawn(move || {
-            while watcher_rx.recv().is_ok() {
-                let frame = Frame::Notification(Notification::FsChanged {
-                    has_repo: watcher_backend.has_repo(),
-                });
+            while let Ok(change) = watcher_rx.recv() {
+                let frame =
+                    Frame::Notification(fs_change_notification(change, watcher_backend.has_repo()));
                 if let Ok(mut w) = watcher_stdout.lock() {
                     if encode_frame(&mut *w, &frame).is_err() {
                         break;
@@ -182,6 +181,19 @@ fn main() -> io::Result<()> {
     }
 
     Ok(())
+}
+
+fn fs_change_notification(change: reef_io::FsChange, has_repo: bool) -> Notification {
+    Notification::FsChanged {
+        has_repo,
+        workspace_changed: change.workspace_changed,
+        workspace_paths: change
+            .workspace_paths
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect(),
+        git_metadata_changed: change.git_metadata_changed,
+    }
 }
 
 /// We overload `result == {"shutting_down": true}` to signal "server should
@@ -235,6 +247,14 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
                 unstaged: snap.unstaged.into_iter().map(file_entry_to_dto).collect(),
                 branch_name: snap.branch_name,
                 ahead_behind: snap.ahead_behind,
+            })
+            .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::GitStatusStats => match backend.git_status_stats() {
+            Ok(stats) => serde_json::to_value(GitStatusStatsDto {
+                staged: stats.staged,
+                unstaged: stats.unstaged,
             })
             .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
             Err(e) => Err(backend_err(e)),
@@ -588,6 +608,8 @@ fn read_file_response(
     rel: &str,
     max_bytes: u64,
 ) -> Result<serde_json::Value, (ErrorCode, String)> {
+    use std::io::Read;
+
     use reef_io::BackendError;
     let missing = || {
         serde_json::to_value(ReadFileResponse {
@@ -605,13 +627,15 @@ fn read_file_response(
     if !abs.is_file() {
         return missing();
     }
-    let raw = std::fs::read(&abs).map_err(|e| (ErrorCode::Io, e.to_string()))?;
-    let size = raw.len() as u64;
-    let bytes = if size > max_bytes {
-        raw[..max_bytes as usize].to_vec()
-    } else {
-        raw
-    };
+    let file = std::fs::File::open(&abs).map_err(|e| (ErrorCode::Io, e.to_string()))?;
+    let size = file
+        .metadata()
+        .map_err(|e| (ErrorCode::Io, e.to_string()))?
+        .len();
+    let mut bytes = Vec::new();
+    file.take(max_bytes)
+        .read_to_end(&mut bytes)
+        .map_err(|e| (ErrorCode::Io, e.to_string()))?;
     serde_json::to_value(ReadFileResponse {
         is_file: true,
         bytes,
@@ -1122,5 +1146,37 @@ fn trigger_event_to_dto(e: reef_sqlite_preview::TriggerEvent) -> reef_proto::Tri
         reef_sqlite_preview::TriggerEvent::Update => reef_proto::TriggerEventDto::Update,
         reef_sqlite_preview::TriggerEvent::Delete => reef_proto::TriggerEventDto::Delete,
         reef_sqlite_preview::TriggerEvent::Unknown => reef_proto::TriggerEventDto::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use reef_proto::Notification;
+
+    use super::fs_change_notification;
+
+    #[test]
+    fn filesystem_change_notification_preserves_kind_and_paths() {
+        let notification = fs_change_notification(
+            reef_io::FsChange {
+                workspace_changed: true,
+                workspace_paths: vec![PathBuf::from("src/main.rs")],
+                git_metadata_changed: false,
+                repo_presence_changed: false,
+            },
+            true,
+        );
+
+        assert!(matches!(
+            notification,
+            Notification::FsChanged {
+                has_repo: true,
+                workspace_changed: true,
+                workspace_paths,
+                git_metadata_changed: false,
+            } if workspace_paths == vec!["src/main.rs"]
+        ));
     }
 }

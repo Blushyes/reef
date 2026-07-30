@@ -1,6 +1,7 @@
+use crate::app::AppState;
 use crate::{
-    AppPanel, AppState, AppTab, ConfirmRequest, ConfirmTone, GitGraphState, MatchHit, SelectedFile,
-    ViewMode, features::hosts_picker::InputMode, preview_snapshot::PreviewDocumentSnapshot,
+    AppPanel, AppTab, ConfirmRequest, ConfirmTone, GitGraphState, MatchHit, SelectedFile, ViewMode,
+    features::hosts_picker::InputMode, preview_snapshot::PreviewDocumentSnapshot,
 };
 use reef_core::git::GraphScope;
 use std::{ops::Range, path::PathBuf, sync::Arc};
@@ -440,7 +441,8 @@ mod tests {
     use reef_io::LocalBackend;
 
     use super::AppSnapshot;
-    use crate::{AppPrefs, AppState, AppStateConfig, MatchHit};
+    use crate::MatchHit;
+    use crate::app::{AppPrefs, AppState, AppStateConfig};
 
     #[test]
     fn preview_snapshot_source_revision_tracks_accepted_content_generation() {
@@ -508,6 +510,7 @@ mod tests {
             mime: Some("text/rust".to_string()),
             body: PreviewBody::Text(TextPreview {
                 lines: vec!["fn main() {}".to_string()],
+                source: None,
                 highlighted: None,
                 parsed: None,
             }),

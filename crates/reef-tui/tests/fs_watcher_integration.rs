@@ -151,6 +151,36 @@ fn git_metadata_above_nested_workdir_triggers_event() {
 }
 
 #[test]
+fn linked_worktree_common_gitdir_write_triggers_git_only_event() {
+    let _lock = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_tmp, raw) = tempdir_repo();
+    commit_file(&raw, "keep.txt", "v1", "init");
+    let linked_parent = TempDir::new().expect("linked worktree parent");
+    let linked_workdir = linked_parent.path().join("linked");
+    let worktree = raw
+        .worktree("linked", &linked_workdir, None)
+        .expect("create linked worktree");
+    drop(worktree);
+
+    let rx = fs_watcher::spawn(canonical(&linked_workdir));
+    wait_until_ready(&linked_workdir, &rx);
+    std::fs::write(raw.path().join("common-marker"), "x").unwrap();
+
+    let change = rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("expected a Git metadata event from the common gitdir");
+    assert_eq!(
+        change,
+        FsChange {
+            workspace_changed: false,
+            workspace_paths: Vec::new(),
+            git_metadata_changed: true,
+            repo_presence_changed: false,
+        }
+    );
+}
+
+#[test]
 fn non_git_dir_still_triggers() {
     let _lock = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = TempDir::new().expect("tempdir");

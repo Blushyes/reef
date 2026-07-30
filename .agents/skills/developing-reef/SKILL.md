@@ -17,10 +17,14 @@ expensive work must not run from a renderer.
   `ReefApp::step`.
 - Put UI-independent logic in `crates/reef-core`; shared host filesystem services such as the unified preference store belong in `crates/reef-io`; keep ratatui/crossterm rendering and input orchestration in `crates/reef-tui`.
 - Put renderer-neutral app state, async scheduling, worker-result merge, settings state, nav/history, preview/search/git/graph orchestration in `crates/reef-app`.
+- Hosts construct `ReefApp` from `AppConfig`; `AppState` and its construction details stay private
+  to `reef-app`.
 - Keep terminal-only state in `crates/reef-tui`: ratatui layout caches, hit-test registry, terminal image protocol, text-selection geometry, mouse row/column mapping, scroll pacing, leader/chord timers, popup rects, and the live TUI theme object.
 - Prefer stale cached UI over blocking. Show old data plus loading/stale/error status instead of waiting during tab switches or hover/mouse movement.
 - Use generation tokens for async results. Late results from older requests must not overwrite newer selections or newer snapshots.
 - Keep each tab/panel independently refreshable. Adding a feature should not require another tab to render before data can update.
+- When a renderer needs preview content beyond the bounded display projection, expose that content through a typed, renderer-neutral `PreviewBodySnapshot`; do not make a host reparse source content while selecting or rendering a preview.
+- Preserve complete structured source separately from its bounded visible-line projection. Reef must not identify or name third-party formats; renderer-specific recognition belongs to the renderer that consumes this generic source.
 
 ## Runtime Data Flow
 

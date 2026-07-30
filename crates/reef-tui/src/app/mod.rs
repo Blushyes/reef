@@ -1,7 +1,7 @@
 use crate::ui::mouse::{ClickAction, HitTestRegistry};
 use crate::ui::theme::Theme;
 use reef_app::{
-    AppPanel as Panel, AppPrefs, AppStateConfig, AppTab as Tab, AsyncState, DbNav, DiffMode,
+    AppPanel as Panel, AppPrefs, AppTab as Tab, AsyncState, DbNav, DiffMode,
     GRAPH_RECENT_BRANCHES_MAX, HighlightFade, Toast, ViewMode,
 };
 use reef_core::diff::DiffLayout;
@@ -239,31 +239,27 @@ impl App {
 
         let (saved_layout, saved_mode) = load_prefs();
         let (graph_scope, graph_recent_branches) = load_graph_scope_pref();
-        let now = Instant::now();
         let mut app = Self {
             engine: reef_app::ReefApp::new(reef_app::AppConfig {
-                state: reef_app::AppState::new(AppStateConfig {
-                    backend,
-                    prefs: AppPrefs {
-                        diff_layout: saved_layout,
-                        diff_mode: saved_mode,
-                        status_tree_mode: crate::prefs::get_bool("status.tree_mode"),
-                        graph_scope,
-                        graph_recent_branches,
-                        commit_diff_layout: crate::prefs::get("commit.diff_layout")
-                            .as_deref()
-                            .map(DiffLayout::from_pref_str)
-                            .unwrap_or(DiffLayout::Unified),
-                        commit_diff_mode: crate::prefs::get("commit.diff_mode")
-                            .as_deref()
-                            .map(DiffMode::from_pref_str)
-                            .unwrap_or(DiffMode::Compact),
-                        commit_files_tree_mode: crate::prefs::get_bool("commit.files_tree_mode"),
-                        quick_open: crate::quick_open::from_prefs(),
-                    },
-                    now,
-                    subscribe_fs_events: true,
-                }),
+                backend,
+                prefs: AppPrefs {
+                    diff_layout: saved_layout,
+                    diff_mode: saved_mode,
+                    status_tree_mode: crate::prefs::get_bool("status.tree_mode"),
+                    graph_scope,
+                    graph_recent_branches,
+                    commit_diff_layout: crate::prefs::get("commit.diff_layout")
+                        .as_deref()
+                        .map(DiffLayout::from_pref_str)
+                        .unwrap_or(DiffLayout::Unified),
+                    commit_diff_mode: crate::prefs::get("commit.diff_mode")
+                        .as_deref()
+                        .map(DiffMode::from_pref_str)
+                        .unwrap_or(DiffMode::Compact),
+                    commit_files_tree_mode: crate::prefs::get_bool("commit.files_tree_mode"),
+                    quick_open: crate::quick_open::from_prefs(),
+                },
+                subscribe_fs_events: true,
             }),
             layout: TuiLayoutCache::default(),
             image_picker,
@@ -335,7 +331,7 @@ impl App {
     /// inline inside `commit_detail_panel` (the pre-split behaviour).
     /// Chosen so the middle column still shows readable file names and the
     /// diff column has at least ~40 cols for content after its gutter.
-    pub const GRAPH_THREE_COL_MIN_WIDTH: u16 = reef_app::AppState::GRAPH_THREE_COL_MIN_WIDTH;
+    pub const GRAPH_THREE_COL_MIN_WIDTH: u16 = reef_app::GRAPH_THREE_COL_MIN_WIDTH;
 
     /// Width of the left (graph / tree / status) sidebar for the current
     /// frame. Single source of truth for the `split_percent → columns`
@@ -2820,6 +2816,7 @@ mod tests {
                 mime: Some("text/markdown".into()),
                 body: PreviewBody::Text(reef_core::preview::TextPreview {
                     lines: vec![],
+                    source: None,
                     highlighted: None,
                     parsed: None,
                 }),

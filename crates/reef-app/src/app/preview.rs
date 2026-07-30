@@ -136,8 +136,7 @@ impl AppState {
         match result {
             Ok(content) => self.apply_preview_content(generation, content, preview_view_h),
             Err(error) => {
-                if self.preview_load.complete_err(generation, error) {
-                    self.preview_load.stale = false;
+                if self.preview_load.complete_terminal_err(generation, error) {
                     self.preview_enrichment_pending = None;
                     self.preview_in_flight_path = None;
                 }
@@ -157,12 +156,16 @@ impl AppState {
         }
         self.preview_enrichment_pending = None;
         self.preview_in_flight_path = None;
+        let source_changed =
+            !preview_source_unchanged(self.preview_content.as_deref(), content.as_ref());
         let same_file = matches!(
             (self.preview_content.as_deref(), content.as_ref()),
             (Some(old), Some(new)) if old.path == new.path
         );
         self.preview_content = content.map(Arc::new);
-        self.preview_source_revision = generation;
+        if source_changed {
+            self.preview_source_revision = generation;
+        }
         self.bump_preview_content_revision();
         if !same_file {
             self.preview_scroll = 0;
@@ -345,6 +348,31 @@ impl AppState {
     }
 }
 
+fn preview_source_unchanged(
+    previous: Option<&PreviewContent>,
+    next: Option<&PreviewContent>,
+) -> bool {
+    match (previous, next) {
+        (None, None) => true,
+        (Some(previous), Some(next))
+            if previous.path == next.path && previous.bytes_on_disk == next.bytes_on_disk =>
+        {
+            match (&previous.body, &next.body) {
+                (
+                    reef_core::preview::PreviewBody::Text(previous),
+                    reef_core::preview::PreviewBody::Text(next),
+                ) => previous.lines == next.lines && previous.source == next.source,
+                (
+                    reef_core::preview::PreviewBody::Markdown(previous),
+                    reef_core::preview::PreviewBody::Markdown(next),
+                ) => previous.source == next.source,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{path::PathBuf, sync::Arc, time::Instant};
@@ -355,7 +383,7 @@ mod tests {
     use reef_core::text::{StyledToken, TextStyle};
     use reef_io::LocalBackend;
 
-    use crate::{AppPrefs, AppState, AppStateConfig};
+    use crate::app::{AppPrefs, AppState, AppStateConfig};
 
     #[test]
     fn preview_error_keeps_previous_content_and_exposes_error() {
@@ -390,6 +418,52 @@ mod tests {
         assert!(!state.preview_load.loading);
         assert!(!state.preview_load.stale);
         assert!(state.preview_in_flight_path.is_none());
+    }
+
+    #[test]
+    fn identical_preview_reload_preserves_source_revision() {
+        let backend = Arc::new(LocalBackend::open_at(PathBuf::from(".")));
+        let mut state = AppState::new(AppStateConfig {
+            backend,
+            prefs: AppPrefs::default(),
+            now: Instant::now(),
+            subscribe_fs_events: false,
+        });
+
+        let first_generation = state.preview_load.begin();
+        state.apply_preview_content(first_generation, Some(text_preview("src/main.rs")), 20);
+        let source_revision = state.preview_source_revision;
+
+        let second_generation = state.preview_load.begin();
+        state.apply_preview_content(second_generation, Some(text_preview("src/main.rs")), 20);
+
+        assert_ne!(first_generation, second_generation);
+        assert_eq!(state.preview_source_revision, source_revision);
+    }
+
+    #[test]
+    fn changed_preview_reload_advances_source_revision() {
+        let backend = Arc::new(LocalBackend::open_at(PathBuf::from(".")));
+        let mut state = AppState::new(AppStateConfig {
+            backend,
+            prefs: AppPrefs::default(),
+            now: Instant::now(),
+            subscribe_fs_events: false,
+        });
+
+        let first_generation = state.preview_load.begin();
+        state.apply_preview_content(first_generation, Some(text_preview("src/main.rs")), 20);
+
+        let mut changed = text_preview("src/main.rs");
+        let PreviewBody::Text(text) = &mut changed.body else {
+            panic!("expected text preview");
+        };
+        text.lines = vec!["fn changed() {}".to_string()];
+        changed.bytes_on_disk = text.lines[0].len() as u64;
+        let second_generation = state.preview_load.begin();
+        state.apply_preview_content(second_generation, Some(changed), 20);
+
+        assert_eq!(state.preview_source_revision, second_generation);
     }
 
     #[test]
@@ -544,6 +618,7 @@ mod tests {
             mime: Some("text/rust".to_string()),
             body: PreviewBody::Text(TextPreview {
                 lines: vec!["fn main() {}".to_string()],
+                source: None,
                 highlighted: None,
                 parsed: None,
             }),

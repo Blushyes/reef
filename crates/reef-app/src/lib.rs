@@ -16,11 +16,11 @@ mod tasks;
 mod text_input;
 
 pub use app::{
-    AppPanel, AppPrefs, AppState, AppStateConfig, CommitDetailState, CommitError, CommitFileDiff,
-    CommitFileDiffLoadOutcome, DiffHighlighted, DiffMode, DiscardTarget, FocusedPreviewFileRow,
-    FocusedPreviewFileSource, GLOBAL_SEARCH_DEBOUNCE, GLOBAL_SEARCH_MAX_H_SCROLL,
-    GLOBAL_SEARCH_MAX_LINE_CHARS, GLOBAL_SEARCH_MAX_RESULTS, GLOBAL_SEARCH_PREVIEW_SYNC_DEBOUNCE,
-    GRAPH_RECENT_BRANCHES_MAX, GitGraphState, GitStatusState, GraphBranchPickerOpenOutcome,
+    AppPanel, AppPrefs, CommitDetailState, CommitError, CommitFileDiff, CommitFileDiffLoadOutcome,
+    DiffHighlighted, DiffMode, DiscardTarget, FocusedPreviewFileRow, FocusedPreviewFileSource,
+    GLOBAL_SEARCH_DEBOUNCE, GLOBAL_SEARCH_MAX_H_SCROLL, GLOBAL_SEARCH_MAX_LINE_CHARS,
+    GLOBAL_SEARCH_MAX_RESULTS, GLOBAL_SEARCH_PREVIEW_SYNC_DEBOUNCE, GRAPH_RECENT_BRANCHES_MAX,
+    GRAPH_THREE_COL_MIN_WIDTH, GitGraphState, GitStatusState, GraphBranchPickerOpenOutcome,
     GraphScopeChangeOutcome, HighlightFade, HighlightedDiff, LineTokens, LspRefineOutcome,
     MatchHit, NavAnchor, NavCandidatesPopup, NavPendingJump, NormalizeActivePanelOutcome,
     PREFETCH_DELAY, PREVIEW_DEBOUNCE, PreviewHighlight, PreviewMergeOutcome, PushError,

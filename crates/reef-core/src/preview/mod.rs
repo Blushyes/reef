@@ -9,8 +9,9 @@ use std::sync::Arc;
 pub use binary::{BinaryInfo, BinaryReason};
 pub use image::ImagePreview;
 pub use loader::{
-    INITIAL_DB_PAGE_ROWS, build_text_preview_enrichment, build_textual_preview_body, load_preview,
-    load_preview_from_path, text_preview_can_be_enriched,
+    INITIAL_DB_PAGE_ROWS, MAX_TEXT_PREVIEW_BYTES, build_text_preview_enrichment,
+    build_textual_preview_body, load_preview, load_preview_from_path,
+    structured_data_source_required, text_preview_can_be_enriched,
 };
 
 #[derive(Debug, Clone)]
@@ -34,6 +35,9 @@ pub enum PreviewBody {
 #[derive(Debug, Clone)]
 pub struct TextPreview {
     pub lines: Vec<String>,
+    /// Complete source retained for structured-data consumers. `lines` remains the bounded
+    /// display projection used by ordinary text previews.
+    pub source: Option<Arc<str>>,
     pub highlighted: Option<Vec<Vec<crate::text::StyledToken>>>,
     pub parsed: Option<Arc<crate::nav::FileParse>>,
 }

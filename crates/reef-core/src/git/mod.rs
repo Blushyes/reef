@@ -19,6 +19,12 @@ pub struct FileEntry {
     pub deletions: u32,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitStatusStats {
+    pub staged: HashMap<String, (u32, u32)>,
+    pub unstaged: HashMap<String, (u32, u32)>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileStatus {
     Modified,
@@ -59,8 +65,8 @@ mod tests {
         let batches = pathspec_batches(&paths);
 
         assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0], vec![format!(":(literal){}", paths[0])]);
-        assert_eq!(batches[1], vec![format!(":(literal){}", paths[1])]);
+        assert_eq!(batches[0], vec![format!(":(top,literal){}", paths[0])]);
+        assert_eq!(batches[1], vec![format!(":(top,literal){}", paths[1])]);
     }
 }
 
@@ -132,6 +138,10 @@ impl GitRepo {
 
     pub fn gitdir(&self) -> &Path {
         self.repo.path()
+    }
+
+    pub fn commondir(&self) -> &Path {
+        self.repo.commondir()
     }
 
     pub fn branch_name(&self) -> String {
@@ -255,6 +265,60 @@ impl GitRepo {
 
         (staged, unstaged)
     }
+
+    /// Compute content-level line statistics separately from status
+    /// classification. Callers should run this on a background worker and
+    /// merge it into an already-visible status snapshot.
+    pub fn get_status_stats(&self) -> GitStatusStats {
+        if let Ok(mut index) = self.repo.index() {
+            let _ = index.read(true);
+        }
+
+        let head_tree = self
+            .repo
+            .head()
+            .ok()
+            .and_then(|head| head.peel_to_tree().ok());
+        let mut staged = self
+            .repo
+            .diff_tree_to_index(head_tree.as_ref(), None, None)
+            .map(|mut diff| {
+                merge_renames(&mut diff);
+                collect_diff_line_counts(&diff)
+            })
+            .unwrap_or_default();
+        let mut unstaged = self
+            .repo
+            .diff_index_to_workdir(None, None)
+            .map(|mut diff| {
+                merge_renames(&mut diff);
+                collect_diff_line_counts(&diff)
+            })
+            .unwrap_or_default();
+
+        let (staged_entries, unstaged_entries) = self.get_status();
+        staged.retain(|path, _| {
+            staged_entries
+                .iter()
+                .any(|entry| entry.path.as_str() == path)
+        });
+        unstaged.retain(|path, _| {
+            unstaged_entries
+                .iter()
+                .any(|entry| entry.path.as_str() == path)
+        });
+        for entry in unstaged_entries {
+            if entry.status == FileStatus::Untracked {
+                unstaged.insert(
+                    entry.path.clone(),
+                    (count_workdir_lines(self.repo.workdir(), &entry.path), 0),
+                );
+            }
+        }
+
+        GitStatusStats { staged, unstaged }
+    }
+
     pub fn get_diff(&self, path: &str, staged: bool, context_lines: u32) -> Option<DiffContent> {
         if staged {
             self.get_staged_diff(path, context_lines)
@@ -469,6 +533,63 @@ impl GitRepo {
     }
 }
 
+fn merge_renames(diff: &mut git2::Diff) {
+    let mut options = git2::DiffFindOptions::new();
+    options.renames(true);
+    let _ = diff.find_similar(Some(&mut options));
+}
+
+fn collect_diff_line_counts(diff: &git2::Diff) -> HashMap<String, (u32, u32)> {
+    let mut counts = HashMap::new();
+    let _ = diff.foreach(
+        &mut |_, _| true,
+        None,
+        None,
+        Some(&mut |delta, _hunk, line| {
+            let path = delta
+                .new_file()
+                .path()
+                .or_else(|| delta.old_file().path())
+                .and_then(Path::to_str)
+                .unwrap_or("");
+            if path.is_empty() {
+                return true;
+            }
+            let count = counts.entry(path.to_string()).or_insert((0, 0));
+            match line.origin() {
+                '+' => count.0 += 1,
+                '-' => count.1 += 1,
+                _ => {}
+            }
+            true
+        }),
+    );
+    counts
+}
+
+fn count_workdir_lines(workdir: Option<&Path>, path: &str) -> u32 {
+    use std::io::{BufRead, BufReader};
+
+    let Some(root) = workdir else {
+        return 0;
+    };
+    let Ok(file) = std::fs::File::open(root.join(path)) else {
+        return 0;
+    };
+    let mut reader = BufReader::new(file);
+    let mut buffer = Vec::with_capacity(8192);
+    let mut count = 0u32;
+    loop {
+        buffer.clear();
+        match reader.read_until(b'\n', &mut buffer) {
+            Ok(0) => return count,
+            Ok(_) if buffer.contains(&0) => return 0,
+            Ok(_) => count = count.saturating_add(1),
+            Err(_) => return 0,
+        }
+    }
+}
+
 /// Keep well below platform command-line limits while still amortizing a
 /// large stage/unstage over a handful of Git processes.
 const GIT_PATH_CHUNK_BYTES: usize = 24 * 1024;
@@ -476,8 +597,9 @@ const GIT_PATH_CHUNK_BYTES: usize = 24 * 1024;
 /// Stage every supplied repository-relative path with the system Git client.
 ///
 /// `git add -A` records deletions as well as additions and modifications. The
-/// pathspec is literal so a file named like `:(glob)*` cannot expand into a
-/// mutation of unrelated files.
+/// pathspec is literal and rooted at the repository top level, so status paths
+/// remain valid when Reef opens a subdirectory of a repository and a file named
+/// like `:(glob)*` cannot expand into a mutation of unrelated files.
 pub fn stage_paths_at(workdir: &Path, paths: &[String]) -> Result<(), String> {
     run_git_path_batches(workdir, &["add", "-A"], paths)
 }
@@ -532,7 +654,7 @@ fn pathspec_batches(paths: &[String]) -> Vec<Vec<String>> {
     let mut current_bytes: usize = 0;
 
     for path in paths {
-        let pathspec = format!(":(literal){path}");
+        let pathspec = format!(":(top,literal){path}");
         let pathspec_bytes = pathspec.len().saturating_add(1);
         if !current.is_empty()
             && current_bytes.saturating_add(pathspec_bytes) > GIT_PATH_CHUNK_BYTES

@@ -207,6 +207,91 @@ pub fn canonical_child_within(canon_root: &Path, rel: &Path) -> Result<PathBuf, 
     Ok(canon_target)
 }
 
+/// Resolve a workdir-relative directory entry without following its final
+/// component. The parent must already exist and must resolve inside
+/// `canon_root`; this is the correct boundary for entry operations such as
+/// create, rename, remove, and file-copy destinations.
+fn canonical_entry_within(canon_root: &Path, rel: &Path) -> Result<PathBuf, BackendError> {
+    let joined = resolve_rel_within(canon_root, rel)?;
+    let name = joined.file_name().ok_or_else(|| {
+        BackendError::PathEscape(format!(
+            "path must identify an entry within the workdir: {}",
+            rel.display()
+        ))
+    })?;
+    let parent = joined.parent().ok_or_else(|| {
+        BackendError::PathEscape(format!(
+            "path has no parent within the workdir: {}",
+            rel.display()
+        ))
+    })?;
+    let canon_parent = canonicalize_or_backend_err(parent, "canonicalize target parent")?;
+    if !canon_parent.starts_with(canon_root) {
+        return Err(BackendError::PathEscape(format!(
+            "symlink escapes workdir: {}",
+            rel.display()
+        )));
+    }
+    Ok(canon_parent.join(name))
+}
+
+/// Resolve a file-copy destination. Existing destinations are followed and
+/// canonicalised because `std::fs::copy` follows a final symlink; a new
+/// destination instead uses the entry boundary so its existing parent is
+/// checked without requiring the file itself to exist.
+fn canonical_file_write_target_within(
+    canon_root: &Path,
+    rel: &Path,
+) -> Result<PathBuf, BackendError> {
+    let joined = resolve_rel_within(canon_root, rel)?;
+    match std::fs::symlink_metadata(&joined) {
+        Ok(_) => canonical_child_within(canon_root, rel),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            canonical_entry_within(canon_root, rel)
+        }
+        Err(error) => Err(BackendError::Io(format!("stat write target: {error}"))),
+    }
+}
+
+/// Resolve a write target whose trailing components may not exist yet.
+/// Canonicalising the nearest existing ancestor prevents an in-workdir
+/// symlink from redirecting `create_dir_all` or recursive copies outside the
+/// workdir while still allowing new nested directories to be created.
+fn canonical_descendant_within(canon_root: &Path, rel: &Path) -> Result<PathBuf, BackendError> {
+    let joined = resolve_rel_within(canon_root, rel)?;
+    let mut existing = joined.as_path();
+    loop {
+        match std::fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                existing = existing.parent().ok_or_else(|| {
+                    BackendError::PathEscape(format!(
+                        "path has no existing ancestor within the workdir: {}",
+                        rel.display()
+                    ))
+                })?;
+            }
+            Err(error) => {
+                return Err(BackendError::Io(format!("stat target ancestor: {error}")));
+            }
+        }
+    }
+    let canon_existing = canonicalize_or_backend_err(existing, "canonicalize target ancestor")?;
+    if !canon_existing.starts_with(canon_root) {
+        return Err(BackendError::PathEscape(format!(
+            "symlink escapes workdir: {}",
+            rel.display()
+        )));
+    }
+    let suffix = joined.strip_prefix(existing).map_err(|_| {
+        BackendError::Io(format!(
+            "resolve target descendant failed: {}",
+            rel.display()
+        ))
+    })?;
+    Ok(canon_existing.join(suffix))
+}
+
 /// Build a `grep_regex::RegexMatcher` configured the way reef's
 /// content search expects. Shared between `search_content_local`
 /// (the streaming search worker) and `tasks::replace_one_file` (the
@@ -470,6 +555,10 @@ impl Backend for LocalBackend {
         })
     }
 
+    fn git_status_stats(&self) -> Result<reef_core::git::GitStatusStats, BackendError> {
+        Ok(self.repo()?.get_status_stats())
+    }
+
     fn staged_diff(
         &self,
         path: &str,
@@ -622,7 +711,7 @@ impl Backend for LocalBackend {
     }
 
     fn create_file(&self, rel_path: &Path) -> Result<(), BackendError> {
-        let abs = self.resolve_rel(rel_path)?;
+        let abs = canonical_entry_within(self.canonical_workdir()?, rel_path)?;
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -637,27 +726,30 @@ impl Backend for LocalBackend {
     }
 
     fn create_dir_all(&self, rel_path: &Path) -> Result<(), BackendError> {
-        let abs = self.resolve_rel(rel_path)?;
+        let abs = canonical_descendant_within(self.canonical_workdir()?, rel_path)?;
         std::fs::create_dir_all(&abs).map_err(|e| BackendError::Io(e.to_string()))
     }
 
     fn rename(&self, from_rel: &Path, to_rel: &Path) -> Result<(), BackendError> {
-        let from = self.resolve_rel(from_rel)?;
-        let to = self.resolve_rel(to_rel)?;
+        let canon_root = self.canonical_workdir()?;
+        let from = canonical_entry_within(canon_root, from_rel)?;
+        let to = canonical_entry_within(canon_root, to_rel)?;
         std::fs::rename(&from, &to).map_err(|e| BackendError::Io(e.to_string()))
     }
 
     fn copy_file(&self, from_rel: &Path, to_rel: &Path) -> Result<(), BackendError> {
-        let from = self.resolve_rel(from_rel)?;
-        let to = self.resolve_rel(to_rel)?;
+        let canon_root = self.canonical_workdir()?;
+        let from = canonical_child_within(canon_root, from_rel)?;
+        let to = canonical_file_write_target_within(canon_root, to_rel)?;
         std::fs::copy(&from, &to)
             .map(|_| ())
             .map_err(|e| BackendError::Io(e.to_string()))
     }
 
     fn copy_dir_recursive(&self, from_rel: &Path, to_rel: &Path) -> Result<(), BackendError> {
-        let from = self.resolve_rel(from_rel)?;
-        let to = self.resolve_rel(to_rel)?;
+        let canon_root = self.canonical_workdir()?;
+        let from = canonical_child_within(canon_root, from_rel)?;
+        let to = canonical_descendant_within(canon_root, to_rel)?;
         copy_dir_recursive_inner(&from, &to).map_err(|e| BackendError::Io(e.to_string()))
     }
 
@@ -670,7 +762,12 @@ impl Backend for LocalBackend {
         // degenerates to a plain copy. Keeping the shape identical to the
         // remote implementation lets higher layers ignore the local-vs-remote
         // split.
-        let to = self.resolve_rel(remote_dst_rel)?;
+        let canon_root = self.canonical_workdir()?;
+        let to = if local_src.is_dir() {
+            canonical_descendant_within(canon_root, remote_dst_rel)?
+        } else {
+            canonical_file_write_target_within(canon_root, remote_dst_rel)?
+        };
         if local_src.is_dir() {
             copy_dir_recursive_inner(local_src, &to).map_err(|e| BackendError::Io(e.to_string()))
         } else {
@@ -681,12 +778,12 @@ impl Backend for LocalBackend {
     }
 
     fn remove_file(&self, rel_path: &Path) -> Result<(), BackendError> {
-        let abs = self.resolve_rel(rel_path)?;
+        let abs = canonical_entry_within(self.canonical_workdir()?, rel_path)?;
         std::fs::remove_file(&abs).map_err(|e| BackendError::Io(e.to_string()))
     }
 
     fn remove_dir_all(&self, rel_path: &Path) -> Result<(), BackendError> {
-        let abs = self.resolve_rel(rel_path)?;
+        let abs = canonical_entry_within(self.canonical_workdir()?, rel_path)?;
         std::fs::remove_dir_all(&abs).map_err(|e| BackendError::Io(e.to_string()))
     }
 
@@ -697,9 +794,10 @@ impl Backend for LocalBackend {
     fn trash(&self, rel_paths: &[PathBuf]) -> Result<TrashOutcome, BackendError> {
         // Resolve every path first so a `PathEscape` fails atomically
         // before any side-effects.
+        let canon_root = self.canonical_workdir()?;
         let abs: Vec<PathBuf> = rel_paths
             .iter()
-            .map(|r| self.resolve_rel(r))
+            .map(|r| canonical_entry_within(canon_root, r))
             .collect::<Result<_, _>>()?;
         trash::delete_all(&abs)
             .map(|_| TrashOutcome { used_trash: true })
@@ -707,9 +805,12 @@ impl Backend for LocalBackend {
     }
 
     fn hard_delete(&self, rel_paths: &[PathBuf]) -> Result<(), BackendError> {
+        let canon_root = self.canonical_workdir()?;
         for r in rel_paths {
-            let abs = self.resolve_rel(r)?;
-            let res = if abs.is_dir() {
+            let abs = canonical_entry_within(canon_root, r)?;
+            let metadata =
+                std::fs::symlink_metadata(&abs).map_err(|e| BackendError::Io(e.to_string()))?;
+            let res = if metadata.file_type().is_dir() {
                 std::fs::remove_dir_all(&abs)
             } else {
                 std::fs::remove_file(&abs)

@@ -10,7 +10,7 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use reef_core::git::GitRepo;
 
-use crate::FsChange;
+use crate::{FsChange, FsChangeCoalescer};
 
 const DEBOUNCE: Duration = Duration::from_millis(300);
 // A missing repository may later be created at any ancestor of `workdir`.
@@ -74,8 +74,8 @@ fn run(
     }
 
     let mut watched_gitdirs = Vec::new();
-    let mut gitdir = gitdir_for(&workdir);
-    if let Some(gitdir) = gitdir.as_ref() {
+    let mut gitdirs = gitdirs_for(&workdir);
+    for gitdir in &gitdirs {
         watch_external_gitdir(&mut watcher, gitdir, &workdir, &mut watched_gitdirs);
     }
 
@@ -84,7 +84,7 @@ fn run(
     repo_monitor_active.store(true, Ordering::Release);
 
     let mut debounce_deadline: Option<Instant> = None;
-    let mut pending_change = FsChange::default();
+    let mut pending_change = FsChangeCoalescer::default();
     let mut next_repo_check = Instant::now() + REPO_DISCOVERY_INTERVAL;
     let mut previous_has_repo = current_has_repo;
     loop {
@@ -104,10 +104,10 @@ fn run(
             previous_has_repo = current_has_repo;
             has_repo.store(current_has_repo, Ordering::Release);
 
-            let next_gitdir = gitdir_for(&workdir);
-            if next_gitdir != gitdir {
-                gitdir = next_gitdir;
-                if let Some(gitdir) = gitdir.as_ref() {
+            let next_gitdirs = gitdirs_for(&workdir);
+            if next_gitdirs != gitdirs {
+                gitdirs = next_gitdirs;
+                for gitdir in &gitdirs {
                     watch_external_gitdir(&mut watcher, gitdir, &workdir, &mut watched_gitdirs);
                 }
             }
@@ -115,7 +115,7 @@ fn run(
             if fs_change_ready || repo_presence_changed {
                 let change = FsChange {
                     repo_presence_changed,
-                    ..std::mem::take(&mut pending_change)
+                    ..pending_change.take()
                 };
                 if out_tx.send(change).is_err() {
                     break;
@@ -130,13 +130,9 @@ fn run(
         let timeout = next_deadline.saturating_duration_since(now);
         match rx.recv_timeout(timeout) {
             Ok(Ok(ev)) => {
-                let change = classify_event(&ev, gitdir.as_deref(), &workdir, &repo_gi);
+                let change = classify_event(&ev, &gitdirs, &workdir, &repo_gi);
                 if change.workspace_changed || change.git_metadata_changed {
-                    pending_change.workspace_changed |= change.workspace_changed;
-                    pending_change.git_metadata_changed |= change.git_metadata_changed;
-                    pending_change
-                        .workspace_paths
-                        .extend(change.workspace_paths);
+                    pending_change.push(change);
                     debounce_deadline = Some(Instant::now() + DEBOUNCE);
                 }
             }
@@ -155,10 +151,19 @@ fn build_repo_gitignore(workdir: &Path) -> Gitignore {
     b.build().unwrap_or_else(|_| Gitignore::empty())
 }
 
-fn gitdir_for(workdir: &Path) -> Option<PathBuf> {
-    GitRepo::open_at(workdir)
-        .ok()
-        .map(|repo| normalize_event_path(repo.gitdir()))
+fn gitdirs_for(workdir: &Path) -> Vec<PathBuf> {
+    let Ok(repo) = GitRepo::open_at(workdir) else {
+        return Vec::new();
+    };
+    let gitdir = normalize_event_path(repo.gitdir());
+    let commondir = normalize_event_path(repo.commondir());
+    if gitdir.starts_with(&commondir) {
+        vec![commondir]
+    } else if commondir.starts_with(&gitdir) {
+        vec![gitdir]
+    } else {
+        vec![gitdir, commondir]
+    }
 }
 
 fn watch_external_gitdir(
@@ -179,15 +184,18 @@ fn watch_external_gitdir(
 
 fn classify_event(
     ev: &Event,
-    gitdir: Option<&Path>,
+    gitdirs: &[PathBuf],
     workdir: &Path,
     repo_gi: &Gitignore,
 ) -> FsChange {
-    let mut change = FsChange::default();
+    let mut change = FsChangeCoalescer::default();
     for path in &ev.paths {
         let path = normalize_event_path(path);
-        if gitdir.is_some_and(|gitdir| path == gitdir || path.starts_with(gitdir)) {
-            change.git_metadata_changed = true;
+        if gitdirs
+            .iter()
+            .any(|gitdir| path == *gitdir || path.starts_with(gitdir))
+        {
+            change.mark_git_metadata_changed();
             continue;
         }
         // matched_path_or_any_parents panics if path is not under the matcher
@@ -203,12 +211,11 @@ fn classify_event(
         {
             continue;
         }
-        change.workspace_changed = true;
         if let Ok(relative) = path.strip_prefix(workdir) {
-            change.workspace_paths.push(relative.to_path_buf());
+            change.push_workspace_path(relative.to_path_buf());
         }
     }
-    change
+    change.into_change()
 }
 
 fn normalize_event_path(path: &Path) -> PathBuf {
@@ -224,5 +231,29 @@ fn normalize_event_path(path: &Path) -> PathBuf {
     match path.file_name() {
         Some(name) => parent.join(name),
         None => parent,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use test_support::{commit_file, tempdir_repo};
+
+    #[test]
+    fn linked_worktree_uses_common_gitdir_as_metadata_root() {
+        let (_tmp, repo) = tempdir_repo();
+        commit_file(&repo, "keep.txt", "v1", "init");
+        let linked_parent = TempDir::new().expect("linked worktree parent");
+        let linked_workdir = linked_parent.path().join("linked");
+        let worktree = repo
+            .worktree("linked", &linked_workdir, None)
+            .expect("create linked worktree");
+        drop(worktree);
+
+        assert_eq!(
+            gitdirs_for(&linked_workdir),
+            vec![normalize_event_path(repo.commondir())]
+        );
     }
 }

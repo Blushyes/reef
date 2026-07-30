@@ -22,7 +22,7 @@ use crossbeam_channel::Receiver;
 use reef_core::diff::DiffContent;
 pub use reef_core::file_tree::TreeEntry;
 use reef_core::git::graph::GraphRow;
-use reef_core::git::{CommitDetail, CommitInfo, FileEntry, GraphScope, RefLabel};
+use reef_core::git::{CommitDetail, CommitInfo, FileEntry, GitStatusStats, GraphScope, RefLabel};
 use reef_core::preview::PreviewDocument as PreviewContent;
 use std::collections::{HashMap, HashSet};
 
@@ -60,6 +60,171 @@ pub struct FsChange {
     /// Consumers use this to invalidate graph state only for `git init` or
     /// repository removal, rather than for every worktree write.
     pub repo_presence_changed: bool,
+}
+
+const MAX_COALESCED_WORKSPACE_PATHS: usize = 16_384;
+const MAX_COALESCED_WORKSPACE_PATH_WIRE_BYTES: usize = reef_proto::MAX_FRAME_SIZE as usize / 2;
+
+/// Combines filesystem notifications without allowing a burst of changed
+/// paths to grow without bound.
+///
+/// Once precise paths exceed the bounded notification budget, the coalesced
+/// change switches to an empty path list. [`FsChange`] defines that as a
+/// conservative whole-workspace invalidation.
+pub struct FsChangeCoalescer {
+    change: FsChange,
+    workspace_paths: HashSet<PathBuf>,
+    workspace_path_wire_bytes_upper_bound: usize,
+    max_workspace_paths: usize,
+    max_workspace_path_wire_bytes: usize,
+    workspace_paths_complete: bool,
+}
+
+impl Default for FsChangeCoalescer {
+    fn default() -> Self {
+        Self::with_limits(
+            MAX_COALESCED_WORKSPACE_PATHS,
+            MAX_COALESCED_WORKSPACE_PATH_WIRE_BYTES,
+        )
+    }
+}
+
+impl FsChangeCoalescer {
+    fn with_limits(max_workspace_paths: usize, max_workspace_path_wire_bytes: usize) -> Self {
+        Self {
+            change: FsChange::default(),
+            workspace_paths: HashSet::new(),
+            workspace_path_wire_bytes_upper_bound: 0,
+            max_workspace_paths,
+            max_workspace_path_wire_bytes,
+            workspace_paths_complete: true,
+        }
+    }
+
+    pub fn push(&mut self, change: FsChange) {
+        self.change.git_metadata_changed |= change.git_metadata_changed;
+        self.change.repo_presence_changed |= change.repo_presence_changed;
+        if !change.workspace_changed {
+            return;
+        }
+        if change.workspace_paths.is_empty() {
+            self.mark_workspace_paths_incomplete();
+            return;
+        }
+        for path in change.workspace_paths {
+            self.push_workspace_path(path);
+        }
+    }
+
+    pub fn take(&mut self) -> FsChange {
+        std::mem::take(self).change
+    }
+
+    pub(crate) fn push_workspace_path(&mut self, path: PathBuf) {
+        self.change.workspace_changed = true;
+        if !self.workspace_paths_complete || self.workspace_paths.contains(&path) {
+            return;
+        }
+
+        let wire_bytes_upper_bound = path_wire_size_upper_bound(&path);
+        if self.workspace_paths.len() >= self.max_workspace_paths
+            || self
+                .workspace_path_wire_bytes_upper_bound
+                .saturating_add(wire_bytes_upper_bound)
+                > self.max_workspace_path_wire_bytes
+        {
+            self.mark_workspace_paths_incomplete();
+            return;
+        }
+
+        self.workspace_path_wire_bytes_upper_bound += wire_bytes_upper_bound;
+        self.workspace_paths.insert(path.clone());
+        self.change.workspace_paths.push(path);
+    }
+
+    pub(crate) fn mark_git_metadata_changed(&mut self) {
+        self.change.git_metadata_changed = true;
+    }
+
+    pub(crate) fn into_change(self) -> FsChange {
+        self.change
+    }
+
+    fn mark_workspace_paths_incomplete(&mut self) {
+        self.change.workspace_changed = true;
+        self.change.workspace_paths.clear();
+        self.workspace_paths.clear();
+        self.workspace_path_wire_bytes_upper_bound = 0;
+        self.workspace_paths_complete = false;
+    }
+}
+
+fn path_wire_size_upper_bound(path: &Path) -> usize {
+    path.to_string_lossy()
+        .len()
+        .saturating_mul(6)
+        .saturating_add(3)
+}
+
+#[cfg(test)]
+mod fs_change_coalescer_tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_workspace_paths_are_coalesced_once() {
+        let mut changes = FsChangeCoalescer::default();
+        let path = PathBuf::from("src/main.rs");
+
+        changes.push(FsChange {
+            workspace_changed: true,
+            workspace_paths: vec![path.clone(), path.clone()],
+            ..FsChange::default()
+        });
+
+        assert_eq!(changes.take().workspace_paths, [path]);
+    }
+
+    #[test]
+    fn imprecise_workspace_change_remains_conservative_after_precise_change() {
+        let mut changes = FsChangeCoalescer::default();
+        changes.push(FsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from("src/main.rs")],
+            ..FsChange::default()
+        });
+        changes.push(FsChange {
+            workspace_changed: true,
+            ..FsChange::default()
+        });
+        changes.push(FsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from("src/lib.rs")],
+            ..FsChange::default()
+        });
+
+        assert!(changes.take().workspace_paths.is_empty());
+    }
+
+    #[test]
+    fn path_limit_switches_to_whole_workspace_invalidation() {
+        let mut changes = FsChangeCoalescer::with_limits(1, usize::MAX);
+        changes.push_workspace_path(PathBuf::from("src/main.rs"));
+        changes.push_workspace_path(PathBuf::from("src/lib.rs"));
+
+        let change = changes.take();
+
+        assert!(change.workspace_changed && change.workspace_paths.is_empty());
+    }
+
+    #[test]
+    fn wire_size_limit_switches_to_whole_workspace_invalidation() {
+        let mut changes = FsChangeCoalescer::with_limits(usize::MAX, 1);
+        changes.push_workspace_path(PathBuf::from("src/main.rs"));
+
+        let change = changes.take();
+
+        assert!(change.workspace_changed && change.workspace_paths.is_empty());
+    }
 }
 
 static EDITOR_RESOLVER: OnceLock<Mutex<EditorResolver>> = OnceLock::new();
@@ -398,6 +563,10 @@ pub trait Backend: Send + Sync {
 
     // ─── git: status / diff / stage ─────────────────────────────────────────
     fn git_status(&self) -> Result<StatusSnapshot, BackendError>;
+    /// Compute content-level line counts independently from status
+    /// classification. Callers merge the result into a visible status
+    /// snapshot on a separate generation.
+    fn git_status_stats(&self) -> Result<GitStatusStats, BackendError>;
 
     fn staged_diff(
         &self,

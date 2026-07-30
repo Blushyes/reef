@@ -45,6 +45,7 @@ fn install_rust_preview(app: &mut App, path: &str, src: &str) {
             mime: Some("text/plain".into()),
             body: PreviewBody::Text(TextPreview {
                 lines: src.lines().map(|s| s.to_string()).collect(),
+                source: None,
                 highlighted: None,
                 parsed,
             }),
@@ -64,6 +65,7 @@ fn install_plain_rust_preview_and_request_enrichment(app: &mut App, path: &str, 
             mime: Some("text/plain".into()),
             body: PreviewBody::Text(TextPreview {
                 lines: src.lines().map(str::to_owned).collect(),
+                source: None,
                 highlighted: None,
                 parsed: None,
             }),
@@ -323,6 +325,7 @@ fn goto_definition_on_unknown_extension_is_noop() {
             mime: Some("text/plain".into()),
             body: PreviewBody::Text(TextPreview {
                 lines: vec!["fn helper() {}".to_string()],
+                source: None,
                 highlighted: None,
                 parsed: None,
             }),

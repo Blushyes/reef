@@ -53,7 +53,13 @@ fn wait_for_git_status(app: &mut App) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         app.tick();
-        if !app.engine.state.git_status_load.loading {
+        let stats_settled = app.engine.state.active_tab != reef_app::AppTab::Git
+            || (!app.engine.state.git_status_stats_load.loading
+                && !app.engine.state.git_status_stats_load.stale);
+        if !app.engine.state.git_status_load.loading
+            && !app.engine.state.git_status_load.stale
+            && stats_settled
+        {
             return;
         }
         thread::sleep(Duration::from_millis(10));

@@ -156,6 +156,47 @@ fn load_preview_large_markdown_stays_markdown_locally_and_remotely() {
     assert_eq!(shape_of(&remote_preview.body), BodyShape::Markdown);
 }
 
+#[test]
+fn remote_structured_preview_preserves_complete_source_above_ordinary_text_limit() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, _repo) = tempdir_repo();
+    let source = format!(r#"{{"payload":"{}"}}"#, "x".repeat(2 * 1024 * 1024));
+    std::fs::write(tmp.path().join("large.json"), source.as_bytes()).unwrap();
+
+    let remote = spawn_remote(tmp.path());
+    let preview = remote
+        .load_preview(Path::new("large.json"), true)
+        .expect("remote structured preview");
+    let PreviewBody::Text(text) = preview.body else {
+        panic!("expected text preview");
+    };
+
+    assert_eq!(text.source.as_deref(), Some(source.as_str()));
+}
+
+#[test]
+fn oversized_structured_preview_is_too_large_locally_and_remotely() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, _repo) = tempdir_repo();
+    let source = format!(
+        r#"{{"payload":"{}"}}"#,
+        "x".repeat(reef_core::preview::MAX_TEXT_PREVIEW_BYTES as usize)
+    );
+    std::fs::write(tmp.path().join("oversized.json"), source.as_bytes()).unwrap();
+
+    let local = LocalBackend::open_at(tmp.path().to_path_buf());
+    let remote = spawn_remote(tmp.path());
+    let local_preview = local
+        .load_preview(Path::new("oversized.json"), true)
+        .expect("local structured preview");
+    let remote_preview = remote
+        .load_preview(Path::new("oversized.json"), true)
+        .expect("remote structured preview");
+
+    assert_eq!(shape_of(&local_preview.body), BodyShape::BinaryTooLarge);
+    assert_eq!(shape_of(&remote_preview.body), BodyShape::BinaryTooLarge);
+}
+
 /// Build a tiny SQLite fixture at `path` with `SETUP_SQL` so both
 /// backends have something real to read. Bare-minimum schema —
 /// enough to exercise the table list, row count, and first-page

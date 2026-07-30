@@ -162,7 +162,7 @@ impl AppState {
         };
         let missing = error.is_none();
         if let Some(error) = error {
-            self.preview_load.complete_err(generation, error);
+            self.preview_load.complete_terminal_err(generation, error);
         } else {
             self.preview_load.complete_ok(generation);
         }

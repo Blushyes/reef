@@ -32,6 +32,8 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
 
 ## Runtime Progress Contract
 
+- Hosts supply immutable startup dependencies through `AppConfig`; they never construct or retain
+  `AppState`.
 - `ReefApp` does not own a polling loop. The host owns waiting and calls `step` after user input,
   worker wake notification, filesystem watcher notification, or the `next_deadline` returned by
   the previous step.
@@ -43,6 +45,12 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
   refresh for any workspace event, but an already-open preview reloads only when its own path is
   among those changes. Backends without path-level watcher data leave the path list empty, which
   intentionally keeps the conservative preview-refresh behavior.
+- Filesystem event coalescing deduplicates precise paths and keeps the aggregate bounded. When a
+  burst exceeds that bound, the coalescer emits an empty path list so consumers perform the same
+  conservative whole-workspace refresh instead of dropping future notifications.
+- A remote backend connection is ready only after its filesystem-event subscription succeeds.
+  Subscription failure fails the connection instead of exposing a backend whose cached state can
+  never be invalidated.
 - Worker wake notifications are coalesced signals only. `ReefApp::step` remains the only owner of
   consuming and merging `WorkerResult`.
 - Scheduled work must contribute its earliest due time to `next_deadline`; do not add fixed-rate
@@ -57,6 +65,8 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
 - Call `begin()` only when sending a new worker request.
 - Call `mark_stale()` when data may be outdated but the UI can keep showing the old snapshot.
 - Accept results only through `complete_ok(generation)` / `complete_err(generation, error)`.
+- Use `complete_terminal_err(generation, error)` when the same request must wait for a new user
+  action or invalidation instead of retrying automatically.
 - Never manually overwrite `loading`, `stale`, or `generation` from render/panel code.
 - If a result is older than the current generation, drop it silently.
 
@@ -76,20 +86,29 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
 - Git decorations update visible entries in place; they must not rebuild the tree by themselves.
 - Preview loads run through the `reef-app` task coordinator. The preview worker publishes the base document first; only after that result is accepted does a separate enrichment worker add syntax highlighting and tree-sitter data. Renderers must accept the plain snapshot immediately and treat enrichment as an in-place revision update. Adapter actions that need enrichment, such as TUI code navigation or deferred UTF-16 highlights, must retain a generation/path-bound intent and retry it from `RetryDeferredPreviewActions`; they must not discard the input while the enrichment request is pending.
 - Preview snapshots expose separate content and presentation revisions. `source_revision` changes only when accepted raw preview content changes; `revision` may also change when asynchronous enrichment arrives. Content-relative state such as find, selection, and navigation uses `source_revision`, while renderer caches that include styling use `revision`.
+- OS drag-and-drop and place-mode sources use `CopyFiles`. A remote backend treats every such path
+  as host-local and uploads it; workdir-internal clipboard copies use `CopyPaths`. Placement uses
+  keep-both names on both backend types; remote placement reserves them from one destination
+  snapshot per batch.
 
 ### Git
 
 - Git status, ahead/behind, and branch label are cached from the git worker.
 - Selecting a file requests a diff asynchronously.
-- Stage and unstage submit the selected paths as one batch. Local backends use native Git pathspec
-  commands and remote backends send one matching batch RPC; neither path loops over individual files.
-- Status refresh classifies file state without computing repository-wide content line counts. Diff
-  statistics belong to explicit diff requests, not to rendering or status refresh.
+- Stage and unstage submit the selected paths as one logical batch. Local backends use native Git
+  pathspec commands; remote backends split that path list only at the protocol frame-size boundary
+  and send the minimum number of batch RPCs.
+- Status refresh classifies file state without computing repository-wide content line counts.
+  A dedicated Git-stats worker computes `+N/-M` asynchronously under its own generation and
+  merges those counts into the already-visible status snapshot. A failed stats request keeps the
+  cached counts and waits for the next status invalidation before retrying.
 - Stage/unstage/discard/push may do command-side effects, then mark status/diff/graph state stale instead of forcing render-time refresh.
 
 ### Graph
 
 - Graph refresh walks commits/refs in the graph-refresh worker.
+- The graph-refresh queue coalesces pending requests to the newest generation before each commit
+  walk.
 - Commit detail and per-file commit diffs run on the separate graph-content worker, so a periodic
   commit walk never queues a user-selected file diff behind it.
 - Ref/head changes should invalidate graph state by marking it stale; do not rewalk commits on worktree-only fs events.

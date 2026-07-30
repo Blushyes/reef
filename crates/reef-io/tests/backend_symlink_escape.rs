@@ -42,6 +42,13 @@ fn with_escape_layout() -> (TempDir, TempDir) {
     (workdir, secret_dir)
 }
 
+fn with_directory_escape_layout() -> (TempDir, TempDir) {
+    let outside = TempDir::new().expect("outside tempdir");
+    let workdir = TempDir::new().expect("workdir tempdir");
+    symlink(outside.path(), workdir.path().join("link")).unwrap();
+    (workdir, outside)
+}
+
 #[test]
 fn local_read_file_rejects_symlink_escape() {
     let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -94,5 +101,96 @@ fn remote_read_file_rejects_symlink_escape() {
     assert!(
         matches!(err, BackendError::PathEscape(_)),
         "expected PathEscape over RPC, got {err:?}"
+    );
+}
+
+#[test]
+fn local_create_file_rejects_symlinked_parent_escape() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (workdir, outside) = with_directory_escape_layout();
+    let backend = LocalBackend::open_at(workdir.path().to_path_buf());
+
+    let error = backend
+        .create_file(Path::new("link/created.txt"))
+        .unwrap_err();
+
+    assert!(
+        matches!(error, BackendError::PathEscape(_))
+            && !outside.path().join("created.txt").exists(),
+        "expected PathEscape without an outside write, got {error:?}"
+    );
+}
+
+#[test]
+fn remote_create_file_rejects_symlinked_parent_escape() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (workdir, outside) = with_directory_escape_layout();
+    let backend = spawn_remote(workdir.path());
+
+    let error = backend
+        .create_file(Path::new("link/created.txt"))
+        .unwrap_err();
+
+    assert!(
+        matches!(error, BackendError::PathEscape(_))
+            && !outside.path().join("created.txt").exists(),
+        "expected PathEscape over RPC without an outside write, got {error:?}"
+    );
+}
+
+#[test]
+fn local_create_dir_all_rejects_symlinked_ancestor_escape() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (workdir, outside) = with_directory_escape_layout();
+    let backend = LocalBackend::open_at(workdir.path().to_path_buf());
+
+    let error = backend
+        .create_dir_all(Path::new("link/nested/dir"))
+        .unwrap_err();
+
+    assert!(
+        matches!(error, BackendError::PathEscape(_)) && !outside.path().join("nested").exists(),
+        "expected PathEscape without an outside directory, got {error:?}"
+    );
+}
+
+#[test]
+fn remote_create_dir_all_rejects_symlinked_ancestor_escape() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (workdir, outside) = with_directory_escape_layout();
+    let backend = spawn_remote(workdir.path());
+
+    let error = backend
+        .create_dir_all(Path::new("link/nested/dir"))
+        .unwrap_err();
+
+    assert!(
+        matches!(error, BackendError::PathEscape(_)) && !outside.path().join("nested").exists(),
+        "expected PathEscape over RPC without an outside directory, got {error:?}"
+    );
+}
+
+#[test]
+fn remote_copy_file_rejects_symlinked_destination_escape() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (workdir, outside) = with_directory_escape_layout();
+    std::fs::write(workdir.path().join("source.txt"), "inside").unwrap();
+    std::fs::write(outside.path().join("target.txt"), "outside").unwrap();
+    symlink(
+        outside.path().join("target.txt"),
+        workdir.path().join("target.txt"),
+    )
+    .unwrap();
+    let backend = spawn_remote(workdir.path());
+
+    let error = backend
+        .copy_file(Path::new("source.txt"), Path::new("target.txt"))
+        .unwrap_err();
+    let outside_content =
+        std::fs::read_to_string(outside.path().join("target.txt")).expect("read outside target");
+
+    assert!(
+        matches!(error, BackendError::PathEscape(_)) && outside_content == "outside",
+        "expected PathEscape without overwriting the outside file, got {error:?}"
     );
 }

@@ -52,6 +52,7 @@ fn install_rust_preview(app: &mut App, path: &str, src: &str) {
             mime: Some("text/plain".into()),
             body: PreviewBody::Text(TextPreview {
                 lines: src.lines().map(|s| s.to_string()).collect(),
+                source: None,
                 highlighted: None,
                 parsed,
             }),
@@ -253,6 +254,7 @@ fn vue_goto_registers_pending_jump_and_uses_cache_on_repeat() {
             mime: Some("text/plain".into()),
             body: PreviewBody::Text(TextPreview {
                 lines: src.lines().map(|s| s.to_string()).collect(),
+                source: None,
                 highlighted: None,
                 parsed,
             }),

@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader, BufWriter, Write};
+use std::ops::{ControlFlow, Range};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,19 +32,87 @@ use crate::TreeEntry;
 use reef_core::diff::DiffContent;
 use reef_core::git::{CommitDetail, CommitInfo, FileEntry, GraphScope, RefLabel};
 use reef_core::preview::PreviewDocument as PreviewContent;
-use std::ops::ControlFlow;
 
 /// Default timeout for a single RPC round-trip. Applied to every `request`
 /// call so a hung agent can't stall the UI indefinitely.
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Large index mutations are one RPC now, but can legitimately take longer
-/// than an ordinary metadata request on a remote worktree.
+/// Large index mutations can span frame-bounded RPCs and legitimately take
+/// longer than an ordinary metadata request on a remote worktree.
 const GIT_MUTATION_RPC_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Max bytes we ever ask the agent to return for `ReadFile`. Matches the
-/// limits applied in `file_tree::load_preview` (512 KB highlight cap + some
-/// headroom for un-highlighted previews).
+#[derive(Clone, Copy)]
+enum GitPathRequestKind {
+    Stage,
+    Unstage,
+}
+
+impl GitPathRequestKind {
+    fn request(self, paths: Vec<String>) -> Request {
+        match self {
+            Self::Stage => Request::StageMany { paths },
+            Self::Unstage => Request::UnstageMany { paths },
+        }
+    }
+}
+
+fn git_path_batch_ranges(
+    paths: &[String],
+    kind: GitPathRequestKind,
+    max_frame_size: usize,
+) -> Result<Vec<Range<usize>>, BackendError> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let empty_frame_size = serde_json::to_vec(&Envelope {
+        id: u64::MAX,
+        body: kind.request(Vec::new()),
+    })
+    .map_err(|error| BackendError::Protocol(format!("encode git path request: {error}")))?
+    .len();
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut frame_size = empty_frame_size;
+
+    for (index, path) in paths.iter().enumerate() {
+        let encoded_path_size = serde_json::to_vec(path)
+            .map_err(|error| BackendError::Protocol(format!("encode git path: {error}")))?
+            .len();
+        let separator_size = usize::from(index > start);
+        let next_frame_size = frame_size
+            .checked_add(separator_size)
+            .and_then(|size| size.checked_add(encoded_path_size))
+            .ok_or_else(|| BackendError::Protocol("git path request size overflow".to_string()))?;
+
+        if next_frame_size <= max_frame_size {
+            frame_size = next_frame_size;
+            continue;
+        }
+        if index == start {
+            return Err(BackendError::Protocol(format!(
+                "git path at index {index} requires {next_frame_size} bytes, exceeding the \
+                 {max_frame_size}-byte protocol frame limit"
+            )));
+        }
+
+        ranges.push(start..index);
+        start = index;
+        frame_size = empty_frame_size
+            .checked_add(encoded_path_size)
+            .ok_or_else(|| BackendError::Protocol("git path request size overflow".to_string()))?;
+        if frame_size > max_frame_size {
+            return Err(BackendError::Protocol(format!(
+                "git path at index {index} requires {frame_size} bytes, exceeding the \
+                 {max_frame_size}-byte protocol frame limit"
+            )));
+        }
+    }
+    ranges.push(start..paths.len());
+    Ok(ranges)
+}
+
+/// Max bytes requested for an ordinary bounded text projection.
 const READ_FILE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 type PendingMap = HashMap<u64, mpsc::Sender<Response>>;
@@ -305,9 +374,11 @@ impl RemoteBackend {
             .repo_presence
             .initialize_if_unchanged(repo_presence_snapshot, info.has_repo);
 
-        // Ask the agent to start streaming fs events. If the call fails we
-        // still return the backend — fs-change polling simply won't fire.
-        let _ = backend.request::<serde_json::Value>(Request::Subscribe);
+        backend
+            .request::<serde_json::Value>(Request::Subscribe)
+            .map_err(|error| {
+                io::Error::other(format!("remote backend subscription failed: {error}"))
+            })?;
 
         Ok(backend)
     }
@@ -361,6 +432,20 @@ impl RemoteBackend {
                 .map_err(|e| BackendError::Protocol(format!("response decode: {e}"))),
             Response::Err { code, message, .. } => Err(BackendError::from_wire(code, message)),
         }
+    }
+
+    fn request_git_path_batches(
+        &self,
+        paths: &[String],
+        kind: GitPathRequestKind,
+    ) -> Result<(), BackendError> {
+        for range in git_path_batch_ranges(paths, kind, reef_proto::MAX_FRAME_SIZE as usize)? {
+            let _: serde_json::Value = self.request_with_timeout(
+                kind.request(paths[range].to_vec()),
+                GIT_MUTATION_RPC_TIMEOUT,
+            )?;
+        }
+        Ok(())
     }
 
     /// Test-only accessor for the in-flight RPC map size. Used by the
@@ -461,14 +546,17 @@ fn read_loop(
             reef_proto::Frame::Notification(note) => match note {
                 Notification::FsChanged {
                     has_repo: current_has_repo,
+                    workspace_changed,
+                    workspace_paths,
+                    git_metadata_changed,
                 } => {
-                    let _ = fs_tx.send(FsChange {
-                        workspace_changed: true,
-                        workspace_paths: Vec::new(),
-                        git_metadata_changed: false,
-                        repo_presence_changed: repo_presence
-                            .update_from_notification(current_has_repo),
-                    });
+                    let _ = fs_tx.send(fs_change_from_notification(
+                        &repo_presence,
+                        current_has_repo,
+                        workspace_changed,
+                        workspace_paths,
+                        git_metadata_changed,
+                    ));
                 }
                 Notification::AgentLog { level, message } => {
                     eprintln!("[reef-agent:{level}] {message}");
@@ -490,6 +578,21 @@ fn read_loop(
                 }
             },
         }
+    }
+}
+
+fn fs_change_from_notification(
+    repo_presence: &RepoPresence,
+    has_repo: bool,
+    workspace_changed: bool,
+    workspace_paths: Vec<String>,
+    git_metadata_changed: bool,
+) -> FsChange {
+    FsChange {
+        workspace_changed,
+        workspace_paths: workspace_paths.into_iter().map(PathBuf::from).collect(),
+        git_metadata_changed,
+        repo_presence_changed: repo_presence.update_from_notification(has_repo),
     }
 }
 
@@ -581,10 +684,16 @@ impl Backend for RemoteBackend {
                 body: PreviewBody::Database(database_info_v2_from_dto(dto)),
             });
         }
+        let source_required = reef_core::preview::structured_data_source_required(&rel_str);
+        let read_limit = if source_required {
+            reef_core::preview::MAX_TEXT_PREVIEW_BYTES
+        } else {
+            READ_FILE_MAX_BYTES
+        };
         let resp: ReadFileResponse = self
             .request(Request::ReadFile {
                 path: rel_str.clone(),
-                max_bytes: READ_FILE_MAX_BYTES,
+                max_bytes: read_limit,
             })
             .ok()?;
         if !resp.is_file {
@@ -592,6 +701,21 @@ impl Backend for RemoteBackend {
         }
         let raw = resp.bytes;
         let bytes_on_disk = resp.size;
+
+        if source_required && bytes_on_disk > read_limit {
+            return Some(PreviewContent {
+                path: rel_str,
+                local_path: None,
+                bytes_on_disk,
+                mime: None,
+                body: PreviewBody::Binary(BinaryInfo::with_head_bytes(
+                    bytes_on_disk,
+                    None,
+                    BinaryReason::TooLarge,
+                    &raw,
+                )),
+            });
+        }
 
         if raw.is_empty() {
             return Some(PreviewContent {
@@ -705,6 +829,14 @@ impl Backend for RemoteBackend {
         })
     }
 
+    fn git_status_stats(&self) -> Result<reef_core::git::GitStatusStats, BackendError> {
+        let stats: reef_proto::GitStatusStatsDto = self.request(Request::GitStatusStats)?;
+        Ok(reef_core::git::GitStatusStats {
+            staged: stats.staged,
+            unstaged: stats.unstaged,
+        })
+    }
+
     fn staged_diff(
         &self,
         path: &str,
@@ -737,23 +869,11 @@ impl Backend for RemoteBackend {
     }
 
     fn stage_paths(&self, paths: &[String]) -> Result<(), BackendError> {
-        let _: serde_json::Value = self.request_with_timeout(
-            Request::StageMany {
-                paths: paths.to_vec(),
-            },
-            GIT_MUTATION_RPC_TIMEOUT,
-        )?;
-        Ok(())
+        self.request_git_path_batches(paths, GitPathRequestKind::Stage)
     }
 
     fn unstage_paths(&self, paths: &[String]) -> Result<(), BackendError> {
-        let _: serde_json::Value = self.request_with_timeout(
-            Request::UnstageMany {
-                paths: paths.to_vec(),
-            },
-            GIT_MUTATION_RPC_TIMEOUT,
-        )?;
-        Ok(())
+        self.request_git_path_batches(paths, GitPathRequestKind::Unstage)
     }
 
     fn restore(&self, path: &str) -> Result<(), BackendError> {
@@ -1511,7 +1631,13 @@ fn sqlite_value_from_dto(v: reef_proto::SqliteValueDto) -> reef_sqlite_preview::
 
 #[cfg(test)]
 mod tests {
-    use super::RepoPresence;
+    use std::path::PathBuf;
+
+    use reef_proto::Envelope;
+
+    use super::{
+        GitPathRequestKind, RepoPresence, fs_change_from_notification, git_path_batch_ranges,
+    };
 
     #[test]
     fn handshake_initializes_repo_presence_without_a_newer_notification() {
@@ -1540,5 +1666,80 @@ mod tests {
         assert!(repo_presence.update_from_notification(true));
         assert!(!repo_presence.update_from_notification(true));
         assert!(repo_presence.is_present());
+    }
+
+    #[test]
+    fn filesystem_notification_preserves_change_kind_and_paths() {
+        let repo_presence = RepoPresence::default();
+        let snapshot = repo_presence.snapshot();
+        assert!(repo_presence.initialize_if_unchanged(snapshot, true));
+
+        let change = fs_change_from_notification(
+            &repo_presence,
+            true,
+            true,
+            vec!["src/main.rs".to_string()],
+            false,
+        );
+
+        assert!(change.workspace_changed);
+        assert_eq!(change.workspace_paths, vec![PathBuf::from("src/main.rs")]);
+        assert!(!change.git_metadata_changed);
+        assert!(!change.repo_presence_changed);
+    }
+
+    #[test]
+    fn git_notification_does_not_become_a_workspace_change() {
+        let repo_presence = RepoPresence::default();
+        let snapshot = repo_presence.snapshot();
+        assert!(repo_presence.initialize_if_unchanged(snapshot, true));
+
+        let change = fs_change_from_notification(&repo_presence, true, false, Vec::new(), true);
+
+        assert!(!change.workspace_changed);
+        assert!(change.workspace_paths.is_empty());
+        assert!(change.git_metadata_changed);
+        assert!(!change.repo_presence_changed);
+    }
+
+    #[test]
+    fn git_path_batches_fit_the_serialized_protocol_frame() {
+        let paths = vec![
+            "src/alpha.rs".to_string(),
+            "src/with-a-quoted-\"-name.rs".to_string(),
+            "src/with-a-newline-\n-name.rs".to_string(),
+        ];
+        let one_path_size = paths
+            .iter()
+            .map(|path| {
+                serde_json::to_vec(&Envelope {
+                    id: u64::MAX,
+                    body: GitPathRequestKind::Stage.request(vec![path.clone()]),
+                })
+                .unwrap()
+                .len()
+            })
+            .max()
+            .unwrap();
+        let ranges =
+            git_path_batch_ranges(&paths, GitPathRequestKind::Stage, one_path_size).unwrap();
+
+        assert_eq!(ranges, vec![0..1, 1..2, 2..3]);
+    }
+
+    #[test]
+    fn git_path_batches_reject_a_path_larger_than_one_frame() {
+        let paths = vec!["src/alpha.rs".to_string()];
+        let frame_size = serde_json::to_vec(&Envelope {
+            id: u64::MAX,
+            body: GitPathRequestKind::Unstage.request(paths.clone()),
+        })
+        .unwrap()
+        .len();
+
+        let error =
+            git_path_batch_ranges(&paths, GitPathRequestKind::Unstage, frame_size - 1).unwrap_err();
+
+        assert!(error.to_string().contains("exceeding"));
     }
 }

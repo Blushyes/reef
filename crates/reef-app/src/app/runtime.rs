@@ -34,7 +34,11 @@ impl AppState {
         }
         match self.active_tab {
             AppTab::Files => self.preview_load.should_request() && self.preview_schedule.is_none(),
-            AppTab::Git => self.git_status_load.should_request() || self.diff_load.should_request(),
+            AppTab::Git => {
+                self.git_status_load.should_request()
+                    || self.should_request_git_status_stats()
+                    || self.diff_load.should_request()
+            }
             AppTab::Graph => {
                 self.commit_detail_load.should_request()
                     || self.commit_file_diff_load.should_request()
@@ -68,6 +72,8 @@ impl AppState {
             AppTab::Git => {
                 if self.git_status_load.should_request() {
                     self.refresh_status();
+                } else if self.should_request_git_status_stats() {
+                    self.refresh_status_stats();
                 }
                 if self.diff_load.should_request() {
                     self.load_diff(options.dark);
@@ -104,15 +110,13 @@ impl AppState {
     }
 
     pub fn drain_fs_watcher_events(&mut self) -> bool {
-        let mut change = reef_io::FsChange::default();
+        let mut changes = reef_io::FsChangeCoalescer::default();
         if let Some(rx) = self.fs_watcher_rx.as_ref() {
             while let Ok(next_change) = rx.try_recv() {
-                change.workspace_changed |= next_change.workspace_changed;
-                change.git_metadata_changed |= next_change.git_metadata_changed;
-                change.repo_presence_changed |= next_change.repo_presence_changed;
-                change.workspace_paths.extend(next_change.workspace_paths);
+                changes.push(next_change);
             }
         }
+        let change = changes.take();
         if !change.workspace_changed
             && !change.git_metadata_changed
             && !change.repo_presence_changed
@@ -139,6 +143,7 @@ impl AppState {
             self.cancel_git_confirmations();
             self.diff_load.invalidate();
             self.git_status_load.invalidate();
+            self.git_status_stats_load.invalidate();
             self.git_mutation_load.invalidate();
             self.commit_load.invalidate();
             self.push_load.invalidate();
@@ -163,10 +168,12 @@ impl AppState {
             self.commit_detail.file_diff = None;
             if has_repo {
                 self.git_status_load.mark_stale();
+                self.git_status_stats_load.mark_stale();
                 self.graph_load.mark_stale();
             }
         } else if has_repo && (change.workspace_changed || change.git_metadata_changed) {
             mark_stale_after_cancel(&mut self.git_status_load);
+            mark_stale_after_cancel(&mut self.git_status_stats_load);
             if self.selected_file.is_some() {
                 mark_stale_after_cancel(&mut self.diff_load);
             } else {
@@ -190,7 +197,9 @@ impl AppState {
             return false;
         };
         let preview_path = Path::new(&preview.path);
-        changed_paths.iter().any(|path| path == preview_path)
+        changed_paths
+            .iter()
+            .any(|path| path == preview_path || preview_path.starts_with(path))
     }
 
     pub fn apply_worker_result_core(
@@ -242,10 +251,14 @@ impl AppState {
                 Ok(payload) => {
                     if self.git_status_load.complete_ok(generation) {
                         let before = self.selected_file.clone();
+                        let mut staged = payload.staged;
+                        let mut unstaged = payload.unstaged;
+                        Self::retain_cached_git_status_stats(&mut staged, &self.staged_files);
+                        Self::retain_cached_git_status_stats(&mut unstaged, &self.unstaged_files);
                         let tree_needs_rebuild =
-                            self.git_status_tree_needs_rebuild(&payload.staged, &payload.unstaged);
-                        self.staged_files = payload.staged;
-                        self.unstaged_files = payload.unstaged;
+                            self.git_status_tree_needs_rebuild(&staged, &unstaged);
+                        self.staged_files = staged;
+                        self.unstaged_files = unstaged;
                         self.git_status.ahead_behind = payload.ahead_behind;
                         self.branch_name = payload.branch_name;
                         if tree_needs_rebuild {
@@ -278,20 +291,41 @@ impl AppState {
                         if before != self.selected_file {
                             events.push(AppRuntimeEvent::LoadDiffRequested);
                         }
+                        if self.active_tab == AppTab::Git {
+                            self.refresh_status_stats();
+                        } else {
+                            self.git_status_stats_load.mark_stale();
+                        }
                     }
                 }
                 Err(error) => {
                     self.git_status_load.complete_err(generation, error);
                 }
             },
+            WorkerResult::GitStatusStats { generation, result } => match result {
+                Ok(stats) => {
+                    if self.git_status_stats_load.complete_ok(generation) {
+                        self.apply_git_status_stats(stats);
+                    }
+                }
+                Err(error) => {
+                    self.git_status_stats_load.complete_err(generation, error);
+                }
+            },
             WorkerResult::GitMutation { generation, result } => match result {
                 Ok(payload) => {
-                    self.git_mutation_load.complete_ok(generation);
+                    if !self.git_mutation_load.complete_ok(generation) {
+                        return events;
+                    }
                     self.apply_git_mutation_payload(payload, &mut events);
                 }
                 Err(error) => {
-                    self.git_mutation_load
-                        .complete_err(generation, error.clone());
+                    if !self
+                        .git_mutation_load
+                        .complete_err(generation, error.clone())
+                    {
+                        return events;
+                    }
                     self.push_toast(Toast::warn(format!("git update failed: {error}")));
                     self.refresh_status();
                     events.push(AppRuntimeEvent::LoadDiffRequested);
@@ -537,6 +571,10 @@ impl AppState {
             WorkerResult::Preview { .. } | WorkerResult::LspRefineDone { .. } => {}
         }
         events
+    }
+
+    fn should_request_git_status_stats(&self) -> bool {
+        self.git_status_stats_load.error.is_none() && self.git_status_stats_load.should_request()
     }
 }
 

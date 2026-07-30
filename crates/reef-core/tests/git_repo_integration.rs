@@ -79,6 +79,25 @@ fn get_status_detects_modified_file() {
 }
 
 #[test]
+fn get_status_stats_counts_staged_unstaged_and_untracked_lines() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "staged.txt", "old\n", "init");
+    commit_file(&raw, "unstaged.txt", "one\ntwo\n", "second");
+    write_file(&raw, "staged.txt", "new\n");
+    stage_paths_at(tmp.path(), &["staged.txt".to_string()]).unwrap();
+    write_file(&raw, "unstaged.txt", "one\nTWO\nthree\n");
+    write_file(&raw, "untracked.txt", "a\nb\n");
+
+    let (_g, repo) = open_in(tmp.path());
+    let stats = repo.get_status_stats();
+
+    assert_eq!(stats.staged.get("staged.txt"), Some(&(1, 1)));
+    assert_eq!(stats.unstaged.get("unstaged.txt"), Some(&(2, 1)));
+    assert_eq!(stats.unstaged.get("untracked.txt"), Some(&(2, 0)));
+}
+
+#[test]
 fn stage_paths_moves_multiple_files_from_unstaged_to_staged() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
@@ -105,6 +124,31 @@ fn stage_then_unstage_roundtrip() {
     let paths = vec!["a.txt".to_string()];
     stage_paths_at(tmp.path(), &paths).unwrap();
     unstage_paths_at(tmp.path(), &paths).unwrap();
+    let (staged, unstaged) = repo.get_status();
+    assert!(staged.is_empty());
+    assert_eq!(unstaged.len(), 1);
+}
+
+#[test]
+fn stage_and_unstage_repo_relative_paths_from_subdirectory() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "nested/a.txt", "v1", "init");
+    write_file(&raw, "nested/a.txt", "v2");
+
+    let nested = tmp.path().join("nested");
+    let repo = GitRepo::open_at(&nested).expect("discover repository from subdirectory");
+    let (_, unstaged) = repo.get_status();
+    assert_eq!(unstaged.len(), 1);
+    assert_eq!(unstaged[0].path, "nested/a.txt");
+
+    let paths = vec![unstaged[0].path.clone()];
+    stage_paths_at(&nested, &paths).expect("stage repository-relative path from subdirectory");
+    let (staged, unstaged) = repo.get_status();
+    assert_eq!(staged.len(), 1);
+    assert!(unstaged.is_empty());
+
+    unstage_paths_at(&nested, &paths).expect("unstage repository-relative path from subdirectory");
     let (staged, unstaged) = repo.get_status();
     assert!(staged.is_empty());
     assert_eq!(unstaged.len(), 1);

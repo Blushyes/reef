@@ -10,7 +10,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use reef_io::{Backend, BackendError, LocalBackend, RemoteBackend};
+use reef_io::{Backend, BackendError, LocalBackend, RemoteBackend, copy_local_sources_to_backend};
 use tempfile::TempDir;
 use test_support::agent_bin;
 
@@ -95,4 +95,23 @@ fn remote_spawn_variant_refuses_upload() {
         matches!(err, BackendError::Unimplemented(_)),
         "expected Unimplemented for --agent-exec remote, got {err:?}"
     );
+}
+
+#[test]
+fn remote_copy_files_does_not_treat_matching_local_path_as_remote_source() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let workdir = TempDir::new().unwrap();
+    let destination = workdir.path().join("destination");
+    std::fs::create_dir(&destination).unwrap();
+    let source = workdir.path().join("source.txt");
+    std::fs::write(&source, "host-local content").unwrap();
+    let remote = spawn_remote(workdir.path());
+
+    let error = copy_local_sources_to_backend(&remote, &[source], &destination).unwrap_err();
+
+    assert!(
+        error.contains("remote upload requires an ssh session"),
+        "expected the host-local upload path, got: {error}"
+    );
+    assert!(!destination.join("source.txt").exists());
 }

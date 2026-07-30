@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -5,14 +6,15 @@ use crate::Backend;
 
 /// Copy local filesystem sources into a backend directory.
 ///
-/// Sources may already live under the backend workdir or may be external
-/// host-local paths, such as files dropped from Finder. Workdir-local sources
-/// use backend-native copy operations; external sources use
-/// [`Backend::upload_from_local`] so remote backends can transfer them across
-/// the SSH boundary. Local destinations auto-rename top-level collisions
-/// (`foo.txt` -> `foo (1).txt`); remote destinations let the agent report a
-/// path-exists error because the client cannot probe remote filenames without
-/// adding another round trip per candidate.
+/// For a local backend, sources already under the workdir use backend-native
+/// copy operations and external host-local sources use
+/// [`Backend::upload_from_local`]. For a remote backend every source is
+/// host-local and crosses the SSH boundary through `upload_from_local`;
+/// workdir-internal copy is handled separately by the app's `CopyPaths` task.
+///
+/// Top-level collisions use keep-both naming (`foo.txt` -> `foo (1).txt`).
+/// Remote destinations are listed once per batch and the reserved-name set is
+/// updated after each source, avoiding one SSH round trip per candidate.
 pub fn copy_local_sources_to_backend(
     backend: &dyn Backend,
     sources: &[PathBuf],
@@ -38,6 +40,19 @@ pub fn copy_local_sources_to_backend(
         )
     };
 
+    let mut remote_names = if is_remote {
+        Some(
+            backend
+                .list_dir(&dest_rel)
+                .map_err(|e| format!("list destination {:?}: {}", dest_dir, e))?
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<HashSet<_>>(),
+        )
+    } else {
+        None
+    };
+
     let mut count = 0;
     for source in sources {
         let basename = source
@@ -57,36 +72,40 @@ pub fn copy_local_sources_to_backend(
             }
         }
 
-        let final_dest = if is_remote {
-            dest_dir.join(basename)
+        let final_name = if let Some(names) = remote_names.as_mut() {
+            PathBuf::from(reserve_name(names, basename))
         } else {
-            resolve_name_conflict(dest_dir, basename)
+            PathBuf::from(resolve_name_conflict_name(dest_dir, basename))
         };
-        let final_rel = final_dest
-            .strip_prefix(&workdir)
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| dest_rel.join(basename));
+        let final_dest = dest_dir.join(&final_name);
+        let final_rel = dest_rel.join(&final_name);
 
-        match (source.strip_prefix(&workdir).ok(), source.is_dir()) {
-            (Some(src_rel), true) => backend
-                .copy_dir_recursive(src_rel, &final_rel)
-                .map_err(|e| format!("copy {:?} -> {:?}: {}", source, final_dest, e))?,
-            (Some(src_rel), false) => backend
-                .copy_file(src_rel, &final_rel)
-                .map_err(|e| format!("copy {:?} -> {:?}: {}", source, final_dest, e))?,
-            (None, _) => backend
+        if is_remote {
+            backend
                 .upload_from_local(source, &final_rel)
-                .map_err(|e| format!("upload {:?} -> {:?}: {}", source, final_dest, e))?,
+                .map_err(|e| format!("upload {:?} -> {:?}: {}", source, final_dest, e))?;
+        } else {
+            match (source.strip_prefix(&workdir).ok(), source.is_dir()) {
+                (Some(src_rel), true) => backend
+                    .copy_dir_recursive(src_rel, &final_rel)
+                    .map_err(|e| format!("copy {:?} -> {:?}: {}", source, final_dest, e))?,
+                (Some(src_rel), false) => backend
+                    .copy_file(src_rel, &final_rel)
+                    .map_err(|e| format!("copy {:?} -> {:?}: {}", source, final_dest, e))?,
+                (None, _) => backend
+                    .upload_from_local(source, &final_rel)
+                    .map_err(|e| format!("upload {:?} -> {:?}: {}", source, final_dest, e))?,
+            }
         }
         count += 1;
     }
     Ok(count)
 }
 
-fn resolve_name_conflict(dest_dir: &Path, basename: &OsStr) -> PathBuf {
+fn resolve_name_conflict_name(dest_dir: &Path, basename: &OsStr) -> std::ffi::OsString {
     let candidate = dest_dir.join(basename);
     if !candidate.exists() {
-        return candidate;
+        return basename.to_os_string();
     }
     let name = basename.to_string_lossy().into_owned();
     let (stem, ext) = split_stem_ext(&name);
@@ -97,10 +116,32 @@ fn resolve_name_conflict(dest_dir: &Path, basename: &OsStr) -> PathBuf {
         };
         let candidate = dest_dir.join(&renamed);
         if !candidate.exists() {
-            return candidate;
+            return renamed.into();
         }
     }
-    dest_dir.join(format!("{} copy", name))
+    format!("{} copy", name).into()
+}
+
+fn reserve_name(names: &mut HashSet<String>, basename: &OsStr) -> String {
+    let name = basename.to_string_lossy().into_owned();
+    if names.insert(name.clone()) {
+        return name;
+    }
+
+    let (stem, ext) = split_stem_ext(&name);
+    for n in 1..u32::MAX {
+        let renamed = match ext {
+            Some(extension) => format!("{stem} ({n}).{extension}"),
+            None => format!("{stem} ({n})"),
+        };
+        if names.insert(renamed.clone()) {
+            return renamed;
+        }
+    }
+
+    let renamed = format!("{name} copy");
+    names.insert(renamed.clone());
+    renamed
 }
 
 fn split_stem_ext(name: &str) -> (&str, Option<&str>) {
@@ -118,8 +159,11 @@ fn split_stem_ext(name: &str) -> (&str, Option<&str>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_local_sources_to_backend, resolve_name_conflict, split_stem_ext};
+    use super::{
+        copy_local_sources_to_backend, reserve_name, resolve_name_conflict_name, split_stem_ext,
+    };
     use crate::LocalBackend;
+    use std::collections::HashSet;
     use std::fs;
 
     #[test]
@@ -139,16 +183,16 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let basename = std::ffi::OsString::from("foo.txt");
 
-        let p0 = resolve_name_conflict(tmp.path(), &basename);
-        assert_eq!(p0.file_name().unwrap(), "foo.txt");
+        let p0 = resolve_name_conflict_name(tmp.path(), &basename);
+        assert_eq!(p0, "foo.txt");
 
-        fs::write(&p0, "").unwrap();
-        let p1 = resolve_name_conflict(tmp.path(), &basename);
-        assert_eq!(p1.file_name().unwrap(), "foo (1).txt");
+        fs::write(tmp.path().join(&p0), "").unwrap();
+        let p1 = resolve_name_conflict_name(tmp.path(), &basename);
+        assert_eq!(p1, "foo (1).txt");
 
-        fs::write(&p1, "").unwrap();
-        let p2 = resolve_name_conflict(tmp.path(), &basename);
-        assert_eq!(p2.file_name().unwrap(), "foo (2).txt");
+        fs::write(tmp.path().join(&p1), "").unwrap();
+        let p2 = resolve_name_conflict_name(tmp.path(), &basename);
+        assert_eq!(p2, "foo (2).txt");
     }
 
     #[test]
@@ -156,8 +200,22 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let basename = std::ffi::OsString::from(".env");
         fs::write(tmp.path().join(".env"), "").unwrap();
-        let path = resolve_name_conflict(tmp.path(), &basename);
-        assert_eq!(path.file_name().unwrap(), ".env (1)");
+        let name = resolve_name_conflict_name(tmp.path(), &basename);
+        assert_eq!(name, ".env (1)");
+    }
+
+    #[test]
+    fn reserve_name_uses_keep_both_names_within_one_batch() {
+        let mut names = HashSet::from(["foo.txt".to_string(), "foo (1).txt".to_string()]);
+
+        assert_eq!(
+            reserve_name(&mut names, std::ffi::OsStr::new("foo.txt")),
+            "foo (2).txt"
+        );
+        assert_eq!(
+            reserve_name(&mut names, std::ffi::OsStr::new("foo.txt")),
+            "foo (3).txt"
+        );
     }
 
     #[test]

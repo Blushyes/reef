@@ -10,10 +10,10 @@ use reef_core::git::{FileEntry, GraphScope};
 use reef_core::preview::PreviewDocument;
 use reef_io::{Backend, BackendError, EditorLaunchSpec, FsChange};
 
-use crate::app::TabChangeOutcome;
+use crate::app::{AppState, AppStateConfig, TabChangeOutcome};
 use crate::tasks::WorkerResult;
 use crate::{
-    AppCommand, AppEffect, AppPanel, AppRuntimeEvent, AppSnapshot, AppState, AppTab, AsyncState,
+    AppCommand, AppEffect, AppPanel, AppPrefs, AppRuntimeEvent, AppSnapshot, AppTab, AsyncState,
     CommitDetailState, CommitFileDiffLoadOutcome, ConfirmRequest, ContextMenuItem, DbPreviewState,
     FileClipboard, FindWidgetState, GitGraphState, GitStatusState, GlobalSearchRowSnapshot,
     GraphBranchPickerRowSnapshot, GraphScopeChangeOutcome, HighlightedDiff, HostsPickerRowSnapshot,
@@ -50,8 +50,14 @@ pub struct AppCommandOutcome {
 
 impl ReefApp {
     pub fn new(config: AppConfig) -> Self {
+        let state = AppState::new(AppStateConfig {
+            backend: config.backend,
+            prefs: config.prefs,
+            now: Instant::now(),
+            subscribe_fs_events: config.subscribe_fs_events,
+        });
         Self {
-            state: config.state,
+            state,
             effects: Vec::new(),
             runtime_events: Vec::new(),
         }
@@ -2188,7 +2194,9 @@ impl ReefApp {
 }
 
 pub struct AppConfig {
-    pub state: AppState,
+    pub backend: Arc<dyn Backend>,
+    pub prefs: AppPrefs,
+    pub subscribe_fs_events: bool,
 }
 
 #[cfg(test)]
@@ -2201,13 +2209,11 @@ mod tests {
 
     fn test_app() -> ReefApp {
         let backend = Arc::new(LocalBackend::open_at(PathBuf::from(".")));
-        let state = AppState::new(crate::AppStateConfig {
+        ReefApp::new(AppConfig {
             backend,
-            prefs: crate::AppPrefs::default(),
-            now: Instant::now(),
+            prefs: AppPrefs::default(),
             subscribe_fs_events: false,
-        });
-        ReefApp::new(AppConfig { state })
+        })
     }
 
     fn global_search_hit(path: &str) -> MatchHit {
@@ -2294,6 +2300,7 @@ mod tests {
                 mime: Some("text/plain".to_string()),
                 body: PreviewBody::Text(TextPreview {
                     lines: vec!["fn main() {}".to_string()],
+                    source: None,
                     highlighted: None,
                     parsed: None,
                 }),
@@ -2390,6 +2397,7 @@ mod tests {
                 mime: Some("text/plain".to_string()),
                 body: PreviewBody::Text(TextPreview {
                     lines: vec!["needle".to_string()],
+                    source: None,
                     highlighted: None,
                     parsed: None,
                 }),

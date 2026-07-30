@@ -53,9 +53,52 @@ impl AppState {
         if !self.backend.has_repo() {
             return;
         }
+        self.git_status_stats_load.invalidate();
         let generation = self.git_status_load.begin();
         self.tasks
             .refresh_status(generation, Arc::clone(&self.backend));
+    }
+
+    pub(super) fn refresh_status_stats(&mut self) {
+        if !self.backend.has_repo() {
+            return;
+        }
+        let generation = self.git_status_stats_load.begin();
+        self.tasks
+            .refresh_status_stats(generation, Arc::clone(&self.backend));
+    }
+
+    pub(super) fn retain_cached_git_status_stats(next: &mut [FileEntry], previous: &[FileEntry]) {
+        let counts: HashMap<&str, (u32, u32)> = previous
+            .iter()
+            .map(|entry| (entry.path.as_str(), (entry.additions, entry.deletions)))
+            .collect();
+        for entry in next {
+            if let Some((additions, deletions)) = counts.get(entry.path.as_str()) {
+                entry.additions = *additions;
+                entry.deletions = *deletions;
+            }
+        }
+    }
+
+    pub(super) fn apply_git_status_stats(&mut self, stats: reef_core::git::GitStatusStats) {
+        for entry in &mut self.staged_files {
+            entry.additions = 0;
+            entry.deletions = 0;
+            if let Some((additions, deletions)) = stats.staged.get(&entry.path) {
+                entry.additions = *additions;
+                entry.deletions = *deletions;
+            }
+        }
+        for entry in &mut self.unstaged_files {
+            entry.additions = 0;
+            entry.deletions = 0;
+            if let Some((additions, deletions)) = stats.unstaged.get(&entry.path) {
+                entry.additions = *additions;
+                entry.deletions = *deletions;
+            }
+        }
+        self.rebuild_git_status_tree_rows();
     }
 
     pub fn select_file(&mut self, path: String, is_staged: bool, dark: bool) {

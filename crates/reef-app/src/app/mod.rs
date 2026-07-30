@@ -512,6 +512,7 @@ pub struct AppState {
     pub db_page_load: AsyncState,
     pub db_detail_load: AsyncState,
     pub git_status_load: AsyncState,
+    pub git_status_stats_load: AsyncState,
     pub git_mutation_load: AsyncState,
     pub commit_load: AsyncState,
     pub push_load: AsyncState,
@@ -738,6 +739,7 @@ impl AppState {
             db_page_load: AsyncState::default(),
             db_detail_load: AsyncState::default(),
             git_status_load: AsyncState::default(),
+            git_status_stats_load: AsyncState::default(),
             git_mutation_load: AsyncState::default(),
             commit_load: AsyncState::default(),
             push_load: AsyncState::default(),
@@ -1040,6 +1042,144 @@ mod tests {
     }
 
     #[test]
+    fn status_metadata_refresh_retains_visible_counts_until_stats_arrive() {
+        let mut previous = git_entry("src/a.rs");
+        previous.additions = 7;
+        previous.deletions = 3;
+        let mut next = vec![git_entry("src/a.rs"), git_entry("src/b.rs")];
+
+        AppState::retain_cached_git_status_stats(&mut next, &[previous]);
+
+        assert_eq!((next[0].additions, next[0].deletions), (7, 3));
+        assert_eq!((next[1].additions, next[1].deletions), (0, 0));
+    }
+
+    #[test]
+    fn completed_status_stats_replace_cached_counts() {
+        let mut staged = git_entry("src/a.rs");
+        staged.additions = 7;
+        staged.deletions = 3;
+        let mut app = AppState {
+            staged_files: vec![staged],
+            unstaged_files: vec![git_entry("src/b.rs")],
+            ..minimal_app_state()
+        };
+
+        app.apply_git_status_stats(reef_core::git::GitStatusStats {
+            staged: HashMap::from([("src/a.rs".to_string(), (2, 1))]),
+            unstaged: HashMap::new(),
+        });
+
+        assert_eq!(
+            (app.staged_files[0].additions, app.staged_files[0].deletions),
+            (2, 1)
+        );
+        assert_eq!(
+            (
+                app.unstaged_files[0].additions,
+                app.unstaged_files[0].deletions
+            ),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn completed_status_metadata_defers_stats_when_git_tab_is_inactive() {
+        let mut app = minimal_app_state();
+        app.active_tab = AppTab::Files;
+        let generation = app.git_status_load.begin();
+
+        app.apply_worker_result_core(
+            WorkerResult::GitStatus {
+                generation,
+                result: Ok(crate::tasks::GitStatusPayload {
+                    staged: Vec::new(),
+                    unstaged: vec![git_entry("src/a.rs")],
+                    ahead_behind: None,
+                    branch_name: "main".to_string(),
+                }),
+            },
+            Instant::now(),
+        );
+
+        assert!(!app.git_status_stats_load.loading);
+        assert!(app.git_status_stats_load.stale);
+    }
+
+    #[test]
+    fn failed_status_stats_wait_for_a_new_invalidation_before_retrying() {
+        let mut app = minimal_app_state();
+        app.active_tab = AppTab::Git;
+        let generation = app.git_status_stats_load.begin();
+
+        app.apply_worker_result_core(
+            WorkerResult::GitStatusStats {
+                generation,
+                result: Err("stats failed".to_string()),
+            },
+            Instant::now(),
+        );
+
+        assert!(!app.has_step_work_due(Instant::now()));
+
+        app.git_status_stats_load.invalidate();
+        app.git_status_stats_load.mark_stale();
+
+        assert!(app.has_step_work_due(Instant::now()));
+    }
+
+    #[test]
+    fn stale_git_mutation_success_does_not_change_current_selection() {
+        let mut app = AppState {
+            selected_file: Some(SelectedFile {
+                path: "src/a.rs".to_string(),
+                is_staged: false,
+            }),
+            ..minimal_app_state()
+        };
+        let generation = app.git_mutation_load.begin();
+        app.git_mutation_load.invalidate();
+
+        let events = app.apply_worker_result_core(
+            WorkerResult::GitMutation {
+                generation,
+                result: Ok(GitMutationPayload {
+                    mutation: GitMutation::Stage(vec!["src/a.rs".to_string()]),
+                    touched: vec!["src/a.rs".to_string()],
+                    errors: Vec::new(),
+                }),
+            },
+            Instant::now(),
+        );
+
+        assert!(
+            events.is_empty()
+                && !app.git_status_load.loading
+                && app
+                    .selected_file
+                    .as_ref()
+                    .is_some_and(|selected| !selected.is_staged)
+        );
+    }
+
+    #[test]
+    fn stale_git_mutation_error_does_not_emit_side_effects() {
+        let mut app = minimal_app_state();
+        let generation = app.git_mutation_load.begin();
+        app.git_mutation_load.invalidate();
+
+        let events = app.apply_worker_result_core(
+            WorkerResult::GitMutation {
+                generation,
+                result: Err("stale failure".to_string()),
+            },
+            Instant::now(),
+        );
+
+        assert!(events.is_empty() && app.toasts.is_empty() && !app.git_status_load.loading);
+    }
+
+    #[test]
     fn changed_git_paths_request_tree_rebuild() {
         let app = AppState {
             staged_files: vec![git_entry("src/a.rs")],
@@ -1155,6 +1295,21 @@ mod tests {
         app.apply_fs_change(reef_io::FsChange {
             workspace_changed: true,
             workspace_paths: vec![PathBuf::from("script.json")],
+            git_metadata_changed: false,
+            repo_presence_changed: false,
+        });
+
+        assert!(app.preview_load.stale);
+    }
+
+    #[test]
+    fn selected_preview_parent_directory_change_reloads_preview() {
+        let mut app = minimal_app_state();
+        app.preview_content = Some(Arc::new(global_search_text_preview("docs/guide/index.md")));
+
+        app.apply_fs_change(reef_io::FsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from("docs/guide")],
             git_metadata_changed: false,
             repo_presence_changed: false,
         });
@@ -1459,6 +1614,7 @@ mod tests {
             mime: Some("text/plain".to_string()),
             body: PreviewBody::Text(TextPreview {
                 lines: vec!["needle and needle".to_string()],
+                source: None,
                 highlighted: None,
                 parsed: None,
             }),
@@ -1543,6 +1699,24 @@ mod tests {
 
         assert!(!app.sync_global_search_preview_if_stale(20));
         assert!(app.preview_highlight.is_none());
+    }
+
+    #[test]
+    fn failed_global_search_accept_does_not_retry_preview() {
+        let mut app = minimal_app_state();
+        let hit = dummy_hit("Cargo.toml");
+        app.active_tab = AppTab::Search;
+        app.global_search.results = vec![hit.clone()];
+        let generation = app.preview_load.begin();
+        app.preview_in_flight_path = Some(hit.path.clone());
+        app.begin_global_search_hit_accept(hit, None);
+
+        assert!(
+            app.reject_global_search_hit_accept(generation, Some("preview failed".to_string()))
+        );
+
+        assert!(!app.preview_load.stale);
+        assert!(!app.has_step_work_due(Instant::now()));
     }
 
     #[test]
@@ -1704,6 +1878,7 @@ mod tests {
             mime: Some("text/plain".to_string()),
             body: PreviewBody::Text(TextPreview {
                 lines: vec!["needle".to_string()],
+                source: None,
                 highlighted: None,
                 parsed: None,
             }),

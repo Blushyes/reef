@@ -84,6 +84,7 @@ pub enum PreviewBodySnapshot {
     },
     StructuredData {
         format: StructuredDataFormatSnapshot,
+        source: Option<String>,
     },
     Diff {
         lines: Vec<String>,
@@ -304,11 +305,11 @@ fn text_body_snapshot(
                 style_spans,
             }
         }
-        PreviewDetectedKindSnapshot::StructuredData | PreviewDetectedKindSnapshot::ApiSchema => {
-            PreviewBodySnapshot::StructuredData {
-                format: structured_format_for_path(path),
-            }
-        }
+        PreviewDetectedKindSnapshot::StructuredData => structured_data_snapshot(path, text),
+        PreviewDetectedKindSnapshot::ApiSchema => PreviewBodySnapshot::StructuredData {
+            format: structured_format_for_path(path),
+            source: text.source.as_deref().map(ToOwned::to_owned),
+        },
         PreviewDetectedKindSnapshot::Diff => PreviewBodySnapshot::Diff {
             lines: text.lines.clone(),
         },
@@ -325,6 +326,13 @@ fn text_body_snapshot(
                 style_spans,
             }
         }
+    }
+}
+
+fn structured_data_snapshot(path: &str, text: &TextPreview) -> PreviewBodySnapshot {
+    PreviewBodySnapshot::StructuredData {
+        format: structured_format_for_path(path),
+        source: text.source.as_deref().map(ToOwned::to_owned),
     }
 }
 
@@ -656,6 +664,7 @@ mod tests {
             mime: Some("text/plain".into()),
             body: PreviewBody::Text(TextPreview {
                 lines: lines.iter().map(|line| line.to_string()).collect(),
+                source: None,
                 highlighted: None,
                 parsed: None,
             }),
@@ -676,12 +685,55 @@ mod tests {
             snapshot.body,
             PreviewBodySnapshot::StructuredData {
                 format: StructuredDataFormatSnapshot::Json,
+                ..
             }
         ));
         assert_eq!(
             snapshot.source.local_path.as_deref(),
             Some("/tmp/ws/schema.json")
         );
+    }
+
+    #[test]
+    fn structured_data_uses_complete_source_after_visible_rows_are_capped() {
+        let source = format!("{{\"items\":[]}}\n{}", "\n\n".repeat(10_000));
+        let body = reef_core::preview::build_textual_preview_body("large.json", &source);
+        let PreviewBody::Text(text) = &body else {
+            panic!("expected text preview");
+        };
+        assert_eq!(text.lines.len(), 10_000);
+
+        let doc = PreviewDocument {
+            path: "large.json".to_string(),
+            local_path: None,
+            bytes_on_disk: source.len() as u64,
+            mime: Some("application/json".into()),
+            body,
+        };
+        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 1, 1);
+
+        assert!(matches!(
+            snapshot.body,
+            PreviewBodySnapshot::StructuredData {
+                source: Some(ref payload),
+                ..
+            } if payload == &source
+        ));
+    }
+
+    #[test]
+    fn ordinary_json_stays_structured_data() {
+        let doc = text_doc("package.json", &[r#"{"name":"reef","version":3}"#]);
+
+        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 1, 1);
+
+        assert!(matches!(
+            snapshot.body,
+            PreviewBodySnapshot::StructuredData {
+                format: StructuredDataFormatSnapshot::Json,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -715,6 +767,7 @@ mod tests {
             mime: Some("application/json".into()),
             body: PreviewBody::Text(TextPreview {
                 lines: vec!["{\"name\":\"reef\"}".to_string()],
+                source: None,
                 highlighted: Some(vec![vec![StyledToken::new(
                     TextStyle {
                         fg: Some(Rgb {
@@ -737,7 +790,8 @@ mod tests {
         assert!(matches!(
             snapshot.body,
             PreviewBodySnapshot::StructuredData {
-                format: StructuredDataFormatSnapshot::Json
+                format: StructuredDataFormatSnapshot::Json,
+                ..
             }
         ));
     }
@@ -761,6 +815,7 @@ mod tests {
             mime: Some("text/plain".into()),
             body: PreviewBody::Text(TextPreview {
                 lines: vec!["let icon = \"🪸\";".to_string()],
+                source: None,
                 highlighted: Some(vec![vec![
                     StyledToken::new(style, "let icon = \""),
                     StyledToken::new(style, "🪸"),

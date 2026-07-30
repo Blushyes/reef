@@ -55,6 +55,11 @@ if rg -n '^pub mod (app|command|effect|engine|features|location|runtime|snapshot
   exit 1
 fi
 
+if rg -n '\bAppState(Config)?\b' crates/reef-app/src/lib.rs >&2; then
+  printf 'AppState is internal; hosts must construct and mutate ReefApp through AppConfig/AppCommand.\n' >&2
+  exit 1
+fi
+
 if rg -n 'reef_app::(app|features|tasks|runtime|text_input)::|use reef_app::(app|features|tasks|runtime|text_input)::' crates --glob '!crates/reef-app/**' >&2; then
   printf 'Crates outside reef-app must use reef_app root exports, not internal module paths.\n' >&2
   exit 1

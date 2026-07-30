@@ -40,6 +40,7 @@ fn text_preview(line_count: usize) -> PreviewContent {
         mime: Some("text/plain".into()),
         body: PreviewBody::Text(TextPreview {
             lines: (0..line_count).map(|i| format!("line {}", i)).collect(),
+            source: None,
             highlighted: None,
             parsed: None,
         }),

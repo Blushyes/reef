@@ -7,15 +7,16 @@
 //!
 //! - **Read-only.** Connections are opened with
 //!   `SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_NO_MUTEX` and the URI flag
-//!   `?mode=ro&immutable=1`, so we never take a write lock and we don't
-//!   participate in WAL recovery if another process is writing.
+//!   `?mode=ro`. They cannot write, but still participate in SQLite's normal
+//!   locking and WAL snapshot handling so previews include uncheckpointed
+//!   commits from live databases.
 //! - **No connection cache.** Every call opens a fresh `Connection` and
 //!   drops it before returning. Open is µs-scale on local disk and the
 //!   call sites already run on background workers — caching would force
 //!   Send/Sync gymnastics for no measurable win.
-//! - **No async.** The whole reader is synchronous; the preview worker on
-//!   the reef side is already a background thread, and the agent side
-//!   handles each request on a fresh thread.
+//! - **No async.** The whole reader is synchronous; callers run it on
+//!   background workers, and long-running cell queries observe cancellation
+//!   through SQLite's progress handler.
 //!
 //! Errors collapse into a small enum so the UI can pick a friendly message
 //! without parsing rusqlite text. Cell values are typed (`SqliteValue`)
@@ -23,6 +24,8 @@
 //! show `<blob N B>` placeholders distinctly.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rusqlite::{Connection, OpenFlags};
 
@@ -34,14 +37,12 @@ use rusqlite::{Connection, OpenFlags};
 /// database" error.
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 
-/// Hard size cap. SQLite preview opens read-only with `immutable=1` so
-/// memory pressure is mostly bounded by the per-page result, but a
-/// multi-GB DB still costs us a stat + a page-index scan on first
-/// `sqlite_master` query. Beyond this we'd rather show the generic
-/// "too large" binary card and bail. 256 MiB matches the order of
-/// magnitude of the largest fixture / dev DBs one would reasonably
-/// browse — bigger than that and the caller probably wants `sqlite3`,
-/// not a preview pane.
+/// Hard size cap. SQLite preview opens read-only and bounds each page result,
+/// but a multi-GB DB still costs us a stat + a page-index scan on the first
+/// `sqlite_master` query. Beyond this we'd rather show the generic "too large"
+/// binary card and bail. 256 MiB matches the order of magnitude of the largest
+/// fixture / dev DBs one would reasonably browse — bigger than that and the
+/// caller probably wants `sqlite3`, not a preview pane.
 pub const MAX_PREVIEW_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Per-cell text length cap. Any TEXT longer than this is truncated
@@ -50,6 +51,14 @@ pub const MAX_PREVIEW_BYTES: u64 = 256 * 1024 * 1024;
 /// payload — without this, a single row containing a 1 MB JSON blob in
 /// a TEXT column could exceed `MAX_FRAME_SIZE` over SSH.
 pub const MAX_TEXT_CELL_CHARS: usize = 200;
+
+/// Maximum worst-case serialized size of one primary-key row locator. Large
+/// TEXT/BLOB keys fall back to an offset plus row fingerprint so one page can
+/// never carry unbounded key material over the remote protocol.
+const MAX_PRIMARY_KEY_LOCATOR_WIRE_BYTES: usize = 8 * 1024;
+
+/// Maximum TEXT bytes emitted in one remote cell notification.
+pub const DB_CELL_CHUNK_BYTES: usize = 1024 * 1024;
 
 /// File extensions we treat as candidates for SQLite. The check is a
 /// fast pre-filter; the actual gate is the magic-bytes match below.
@@ -63,6 +72,8 @@ const SQLITE_EXTENSIONS: &[&str] = &["db", "sqlite", "sqlite3"];
 /// not-actually-sqlite).
 #[derive(Debug)]
 pub enum PreviewError {
+    /// The caller invalidated an obsolete cell request.
+    Cancelled,
     /// File doesn't have a SQLite magic header. Either we were called
     /// on a non-DB file or the file is truncated/corrupt at offset 0.
     NotSqlite,
@@ -89,11 +100,18 @@ pub enum PreviewError {
     /// been dropped underneath us (rare with `mode=ro`, but possible
     /// across reconnects).
     ObjectNotFound { schema: String, name: String },
+    /// The requested row no longer exists at the locator returned with its page.
+    RowNotFound { offset: u64 },
+    /// The requested column index does not exist on the selected object.
+    ColumnNotFound { index: usize },
+    /// The selected view row no longer matches the page snapshot.
+    CellChanged,
 }
 
 impl std::fmt::Display for PreviewError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            PreviewError::Cancelled => f.write_str("cancelled"),
             PreviewError::NotSqlite => f.write_str("not a SQLite database"),
             PreviewError::TooLarge { size } => write!(f, "file too large ({size} bytes)"),
             PreviewError::OpenFailed(s) => write!(f, "open failed: {s}"),
@@ -105,6 +123,13 @@ impl std::fmt::Display for PreviewError {
             PreviewError::ObjectNotFound { schema, name } => {
                 write!(f, "object not found: {schema}.{name}")
             }
+            PreviewError::RowNotFound { offset } => {
+                write!(f, "row not found at offset {offset}")
+            }
+            PreviewError::ColumnNotFound { index } => {
+                write!(f, "column not found at index {index}")
+            }
+            PreviewError::CellChanged => f.write_str("selected row changed since page load"),
         }
     }
 }
@@ -156,6 +181,28 @@ pub enum SqliteValue {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DbCellRevision {
+    pub byte_len: u64,
+    pub content_hash: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DbLocatorValue {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DbRowLocator {
+    RowId(i64),
+    PrimaryKey(Vec<DbLocatorValue>),
+    OffsetFingerprint { offset: u64, fingerprint: u64 },
+}
+
 impl std::fmt::Display for SqliteValue {
     /// Canonical display form, shared between width measurement and
     /// rendering so the two never disagree about a cell's column
@@ -184,6 +231,8 @@ pub struct DbPage {
     /// Each inner Vec aligns positionally with the parent table's
     /// `columns`. Length always equals `columns.len()` for every row.
     pub rows: Vec<Vec<SqliteValue>>,
+    /// Identity for each positional row above.
+    pub row_locators: Vec<DbRowLocator>,
 }
 
 /// Top-level preview payload. Built once when the user selects a `.db`
@@ -697,12 +746,143 @@ pub fn load_page_qualified(
         return Err(PreviewError::NotSqlite);
     }
     let conn = open_readonly(path)?;
-    read_page_qualified(&conn, schema, name, offset, limit)
+    read_page_qualified(&conn, schema, kind, name, offset, limit)
+}
+
+/// Read one complete cell using the row locator returned by
+/// [`load_page_qualified`]. Unlike page payloads, TEXT is not truncated.
+pub fn load_cell_qualified(
+    path: &Path,
+    schema: &str,
+    kind: DbObjectKind,
+    name: &str,
+    locator: &DbRowLocator,
+    column: usize,
+    cancellation: Arc<AtomicBool>,
+) -> Result<SqliteValue, PreviewError> {
+    if cancellation.load(Ordering::Acquire) {
+        return Err(PreviewError::Cancelled);
+    }
+    if !kind.has_rows() {
+        return Err(PreviewError::UnsupportedObjectKind);
+    }
+    if !probe_magic(path)? {
+        return Err(PreviewError::NotSqlite);
+    }
+    let conn = open_readonly(path)?;
+    let progress_cancellation = Arc::clone(&cancellation);
+    conn.progress_handler(
+        1_000,
+        Some(move || progress_cancellation.load(Ordering::Acquire)),
+    );
+    let key = DbObjectKey {
+        schema: schema.to_string(),
+        name: name.to_string(),
+        kind,
+    };
+    let result = read_cell_qualified(&conn, &key, locator, column);
+    if cancellation.load(Ordering::Acquire) {
+        Err(PreviewError::Cancelled)
+    } else {
+        result
+    }
+}
+
+fn read_cell_qualified(
+    conn: &Connection,
+    key: &DbObjectKey,
+    locator: &DbRowLocator,
+    column: usize,
+) -> Result<SqliteValue, PreviewError> {
+    let columns = read_columns_qualified(conn, &key.schema, &key.name)?;
+    if column >= columns.len() {
+        return Err(PreviewError::ColumnNotFound { index: column });
+    }
+    let qualified = quote_qualified(&key.schema, &key.name);
+    let (sql, params, expected_fingerprint, offset) = match locator {
+        DbRowLocator::RowId(rowid) => {
+            let alias = available_rowid_alias(&columns).ok_or(PreviewError::CellChanged)?;
+            (
+                format!(
+                    "SELECT * FROM {qualified} WHERE {} = ?1 LIMIT 1",
+                    quote_ident(alias)
+                ),
+                vec![rusqlite::types::Value::Integer(*rowid)],
+                None,
+                0,
+            )
+        }
+        DbRowLocator::PrimaryKey(values) => {
+            let primary_key: Vec<_> = columns.iter().filter(|column| column.pk).collect();
+            if primary_key.len() != values.len() {
+                return Err(PreviewError::CellChanged);
+            }
+            let predicate = primary_key
+                .iter()
+                .enumerate()
+                .map(|(index, column)| format!("{} IS ?{}", quote_ident(&column.name), index + 1))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            (
+                format!("SELECT * FROM {qualified} WHERE {predicate} LIMIT 1"),
+                values.iter().map(locator_param).collect(),
+                None,
+                0,
+            )
+        }
+        DbRowLocator::OffsetFingerprint {
+            offset,
+            fingerprint,
+        } => {
+            let locator_plan = row_locator_plan(conn, &key.schema, key.kind, &key.name, &columns)?;
+            let order = row_locator_order_clause(&locator_plan, &columns);
+            (
+                format!("SELECT * FROM {qualified}{order} LIMIT 1 OFFSET ?1"),
+                vec![rusqlite::types::Value::Integer(*offset as i64)],
+                Some(*fingerprint),
+                *offset,
+            )
+        }
+    };
+    let mut statement = conn
+        .prepare(&sql)
+        .map_err(|error| PreviewError::QueryFailed(error.to_string()))?;
+    let mut rows = statement
+        .query(rusqlite::params_from_iter(params))
+        .map_err(|error| PreviewError::QueryFailed(error.to_string()))?;
+    let row = rows
+        .next()
+        .map_err(|error| PreviewError::QueryFailed(error.to_string()))?
+        .ok_or(PreviewError::RowNotFound { offset })?;
+    if let Some(expected) = expected_fingerprint {
+        let actual = row_fingerprint(row, columns.len())
+            .map_err(|error| PreviewError::QueryFailed(error.to_string()))?;
+        if actual != expected {
+            return Err(PreviewError::CellChanged);
+        }
+    }
+    let value = row
+        .get_ref(column)
+        .map_err(|error| PreviewError::QueryFailed(error.to_string()))?;
+    Ok(sqlite_value(value, false))
+}
+
+pub fn db_cell_revision(bytes: &[u8]) -> DbCellRevision {
+    let mut content_hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        content_hash ^= u64::from(*byte);
+        content_hash = content_hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    DbCellRevision {
+        byte_len: bytes.len() as u64,
+        content_hash,
+    }
 }
 
 fn read_page_qualified(
     conn: &Connection,
     schema: &str,
+    kind: DbObjectKind,
     name: &str,
     offset: u64,
     limit: u32,
@@ -711,37 +891,228 @@ fn read_page_qualified(
     if columns.is_empty() {
         // Either the object doesn't exist or is genuinely zero-column —
         // both rare and both handled identically (empty page).
-        return Ok(DbPage { rows: Vec::new() });
+        return Ok(DbPage {
+            rows: Vec::new(),
+            row_locators: Vec::new(),
+        });
     }
-    let sql = format!(
-        "SELECT * FROM {} LIMIT ?1 OFFSET ?2",
-        quote_qualified(schema, name)
-    );
+    let locator_plan = row_locator_plan(conn, schema, kind, name, &columns)?;
+    let qualified = quote_qualified(schema, name);
+    let order = row_locator_order_clause(&locator_plan, &columns);
+    let sql = match &locator_plan {
+        RowLocatorPlan::RowId(alias) => {
+            let alias = quote_ident(alias);
+            format!("SELECT {alias}, * FROM {qualified}{order} LIMIT ?1 OFFSET ?2")
+        }
+        RowLocatorPlan::PrimaryKey(_) => {
+            format!("SELECT * FROM {qualified}{order} LIMIT ?1 OFFSET ?2")
+        }
+        RowLocatorPlan::OffsetFingerprint => {
+            format!("SELECT * FROM {qualified} LIMIT ?1 OFFSET ?2")
+        }
+    };
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|e| PreviewError::QueryFailed(e.to_string()))?;
     let col_count = columns.len();
-    let rows = stmt
+    let page_rows = stmt
         .query_map([limit as i64, offset as i64], |row| {
+            let cell_start = usize::from(matches!(&locator_plan, RowLocatorPlan::RowId(_)));
             let mut cells = Vec::with_capacity(col_count);
             for i in 0..col_count {
-                let v = match row.get_ref(i)? {
-                    rusqlite::types::ValueRef::Null => SqliteValue::Null,
-                    rusqlite::types::ValueRef::Integer(n) => SqliteValue::Integer(n),
-                    rusqlite::types::ValueRef::Real(f) => SqliteValue::Real(f),
-                    rusqlite::types::ValueRef::Text(bytes) => text_cell(bytes),
-                    rusqlite::types::ValueRef::Blob(bytes) => {
-                        SqliteValue::Blob { len: bytes.len() }
-                    }
-                };
-                cells.push(v);
+                cells.push(sqlite_value(row.get_ref(cell_start + i)?, true));
             }
-            Ok(cells)
+            let locator = match &locator_plan {
+                RowLocatorPlan::RowId(_) => DbRowLocator::RowId(row.get(0)?),
+                RowLocatorPlan::PrimaryKey(indices) => primary_key_locator(row, indices)?
+                    .unwrap_or(DbRowLocator::OffsetFingerprint {
+                        offset: 0,
+                        fingerprint: row_fingerprint(row, col_count)?,
+                    }),
+                RowLocatorPlan::OffsetFingerprint => DbRowLocator::OffsetFingerprint {
+                    offset: 0,
+                    fingerprint: row_fingerprint(row, col_count)?,
+                },
+            };
+            Ok((cells, locator))
         })
         .map_err(|e| PreviewError::QueryFailed(e.to_string()))?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| PreviewError::QueryFailed(e.to_string()))?;
-    Ok(DbPage { rows })
+    let (rows, mut row_locators): (Vec<_>, Vec<_>) = page_rows.into_iter().unzip();
+    for (index, locator) in row_locators.iter_mut().enumerate() {
+        if let DbRowLocator::OffsetFingerprint {
+            offset: row_offset, ..
+        } = locator
+        {
+            *row_offset = offset.saturating_add(index as u64);
+        }
+    }
+    Ok(DbPage { rows, row_locators })
+}
+
+enum RowLocatorPlan {
+    RowId(&'static str),
+    PrimaryKey(Vec<usize>),
+    OffsetFingerprint,
+}
+
+fn row_locator_order_clause(plan: &RowLocatorPlan, columns: &[ColumnInfo]) -> String {
+    match plan {
+        RowLocatorPlan::RowId(alias) => format!(" ORDER BY {}", quote_ident(alias)),
+        RowLocatorPlan::PrimaryKey(indices) => format!(
+            " ORDER BY {}",
+            indices
+                .iter()
+                .map(|index| quote_ident(&columns[*index].name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        RowLocatorPlan::OffsetFingerprint => String::new(),
+    }
+}
+
+fn row_locator_plan(
+    conn: &Connection,
+    schema: &str,
+    kind: DbObjectKind,
+    name: &str,
+    columns: &[ColumnInfo],
+) -> Result<RowLocatorPlan, PreviewError> {
+    match kind {
+        DbObjectKind::Table => {
+            let without_rowid = read_create_sql(conn, schema, name)?
+                .as_deref()
+                .is_some_and(sql_has_without_rowid_suffix);
+            if !without_rowid && let Some(alias) = available_rowid_alias(columns) {
+                return Ok(RowLocatorPlan::RowId(alias));
+            }
+            let primary_key = columns
+                .iter()
+                .enumerate()
+                .filter_map(|(index, column)| column.pk.then_some(index))
+                .collect::<Vec<_>>();
+            if !primary_key.is_empty() {
+                return Ok(RowLocatorPlan::PrimaryKey(primary_key));
+            }
+            if without_rowid {
+                return Err(PreviewError::QueryFailed(format!(
+                    "WITHOUT ROWID table {schema}.{name} has no primary key"
+                )));
+            }
+            Ok(RowLocatorPlan::OffsetFingerprint)
+        }
+        DbObjectKind::View => Ok(RowLocatorPlan::OffsetFingerprint),
+        DbObjectKind::Index | DbObjectKind::Trigger => Err(PreviewError::UnsupportedObjectKind),
+    }
+}
+
+fn available_rowid_alias(columns: &[ColumnInfo]) -> Option<&'static str> {
+    ["rowid", "_rowid_", "oid"].into_iter().find(|candidate| {
+        columns
+            .iter()
+            .all(|column| !column.name.eq_ignore_ascii_case(candidate))
+    })
+}
+
+fn primary_key_locator(
+    row: &rusqlite::Row<'_>,
+    indices: &[usize],
+) -> rusqlite::Result<Option<DbRowLocator>> {
+    let mut wire_bytes = 0usize;
+    let mut values = Vec::with_capacity(indices.len());
+    for index in indices {
+        let value = row.get_ref(*index)?;
+        wire_bytes = wire_bytes.saturating_add(locator_value_wire_upper_bound(value));
+        if wire_bytes > MAX_PRIMARY_KEY_LOCATOR_WIRE_BYTES {
+            return Ok(None);
+        }
+        values.push(locator_value(value));
+    }
+    Ok(Some(DbRowLocator::PrimaryKey(values)))
+}
+
+fn locator_value_wire_upper_bound(value: rusqlite::types::ValueRef<'_>) -> usize {
+    const JSON_FIELD_OVERHEAD: usize = 64;
+    match value {
+        rusqlite::types::ValueRef::Null
+        | rusqlite::types::ValueRef::Integer(_)
+        | rusqlite::types::ValueRef::Real(_) => JSON_FIELD_OVERHEAD,
+        rusqlite::types::ValueRef::Text(value) => value
+            .len()
+            .saturating_mul(6)
+            .saturating_add(JSON_FIELD_OVERHEAD),
+        rusqlite::types::ValueRef::Blob(value) => value
+            .len()
+            .saturating_mul(4)
+            .saturating_add(JSON_FIELD_OVERHEAD),
+    }
+}
+
+fn locator_value(value: rusqlite::types::ValueRef<'_>) -> DbLocatorValue {
+    match value {
+        rusqlite::types::ValueRef::Null => DbLocatorValue::Null,
+        rusqlite::types::ValueRef::Integer(value) => DbLocatorValue::Integer(value),
+        rusqlite::types::ValueRef::Real(value) => DbLocatorValue::Real(value),
+        rusqlite::types::ValueRef::Text(value) => {
+            DbLocatorValue::Text(String::from_utf8_lossy(value).into_owned())
+        }
+        rusqlite::types::ValueRef::Blob(value) => DbLocatorValue::Blob(value.to_vec()),
+    }
+}
+
+fn locator_param(value: &DbLocatorValue) -> rusqlite::types::Value {
+    match value {
+        DbLocatorValue::Null => rusqlite::types::Value::Null,
+        DbLocatorValue::Integer(value) => rusqlite::types::Value::Integer(*value),
+        DbLocatorValue::Real(value) => rusqlite::types::Value::Real(*value),
+        DbLocatorValue::Text(value) => rusqlite::types::Value::Text(value.clone()),
+        DbLocatorValue::Blob(value) => rusqlite::types::Value::Blob(value.clone()),
+    }
+}
+
+fn row_fingerprint(row: &rusqlite::Row<'_>, columns: usize) -> rusqlite::Result<u64> {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for index in 0..columns {
+        let value = row.get_ref(index)?;
+        let (tag, bytes): (u8, std::borrow::Cow<'_, [u8]>) = match value {
+            rusqlite::types::ValueRef::Null => (0, std::borrow::Cow::Borrowed(&[])),
+            rusqlite::types::ValueRef::Integer(value) => {
+                (1, std::borrow::Cow::Owned(value.to_le_bytes().to_vec()))
+            }
+            rusqlite::types::ValueRef::Real(value) => (
+                2,
+                std::borrow::Cow::Owned(value.to_bits().to_le_bytes().to_vec()),
+            ),
+            rusqlite::types::ValueRef::Text(value) => (3, std::borrow::Cow::Borrowed(value)),
+            rusqlite::types::ValueRef::Blob(value) => (4, std::borrow::Cow::Borrowed(value)),
+        };
+        hash ^= u64::from(tag);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        for byte in (bytes.len() as u64).to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        for byte in bytes.iter() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    Ok(hash)
+}
+
+fn sqlite_value(value: rusqlite::types::ValueRef<'_>, truncate_text: bool) -> SqliteValue {
+    match value {
+        rusqlite::types::ValueRef::Null => SqliteValue::Null,
+        rusqlite::types::ValueRef::Integer(value) => SqliteValue::Integer(value),
+        rusqlite::types::ValueRef::Real(value) => SqliteValue::Real(value),
+        rusqlite::types::ValueRef::Text(bytes) if truncate_text => text_cell(bytes),
+        rusqlite::types::ValueRef::Text(bytes) => SqliteValue::Text {
+            value: String::from_utf8_lossy(bytes).into_owned(),
+            truncated: false,
+        },
+        rusqlite::types::ValueRef::Blob(bytes) => SqliteValue::Blob { len: bytes.len() },
+    }
 }
 
 /// Build a `Text` cell, truncating to [`MAX_TEXT_CELL_CHARS`] graphemes
@@ -797,7 +1168,10 @@ pub fn read_initial(path: &Path, initial_page_size: u32) -> Result<DatabaseInfo,
         return Ok(DatabaseInfo {
             tables,
             selected_table: 0,
-            initial_page: DbPage { rows: Vec::new() },
+            initial_page: DbPage {
+                rows: Vec::new(),
+                row_locators: Vec::new(),
+            },
             bytes_on_disk,
         });
     }
@@ -818,6 +1192,7 @@ pub fn read_initial(path: &Path, initial_page_size: u32) -> Result<DatabaseInfo,
     let initial_page = read_page_qualified(
         &conn,
         "main",
+        DbObjectKind::Table,
         &tables[selected_table].name,
         0,
         initial_page_size,
@@ -1051,10 +1426,18 @@ pub fn read_initial_v2(
         .and_then(pick_default_object);
 
     let initial_page = match &default_object {
-        Some(key) if key.kind.has_rows() => {
-            read_page_qualified(&conn, &key.schema, &key.name, 0, initial_page_size)?
-        }
-        _ => DbPage { rows: Vec::new() },
+        Some(key) if key.kind.has_rows() => read_page_qualified(
+            &conn,
+            &key.schema,
+            key.kind,
+            &key.name,
+            0,
+            initial_page_size,
+        )?,
+        _ => DbPage {
+            rows: Vec::new(),
+            row_locators: Vec::new(),
+        },
     };
 
     Ok(DatabaseInfoV2 {
@@ -1355,6 +1738,10 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn uncancelled() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
     /// Build a SQLite database with arbitrary user-supplied SQL setup
     /// and return its on-disk path (kept alive by the returned
     /// `TempDir`).
@@ -1525,6 +1912,207 @@ mod tests {
             }
             other => panic!("expected truncated Text, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn load_cell_returns_complete_text_after_page_truncation() {
+        let full_text = "完整内容".repeat(MAX_TEXT_CELL_CHARS);
+        let (_tmp, path) = setup_db(&[
+            "CREATE TABLE notes(body TEXT)",
+            &format!("INSERT INTO notes VALUES ('{full_text}')"),
+        ]);
+
+        let page = load_page_qualified(&path, "main", DbObjectKind::Table, "notes", 0, 1).unwrap();
+        let value = load_cell_qualified(
+            &path,
+            "main",
+            DbObjectKind::Table,
+            "notes",
+            &page.row_locators[0],
+            0,
+            uncancelled(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            value,
+            SqliteValue::Text {
+                value: full_text,
+                truncated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn cancelled_cell_load_stops_before_querying() {
+        let (_tmp, path) = setup_db(&[
+            "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT)",
+            "INSERT INTO notes(body) VALUES ('body')",
+        ]);
+        let page = load_page_qualified(&path, "main", DbObjectKind::Table, "notes", 0, 1).unwrap();
+        let cancellation = Arc::new(AtomicBool::new(true));
+
+        let error = load_cell_qualified(
+            &path,
+            "main",
+            DbObjectKind::Table,
+            "notes",
+            &page.row_locators[0],
+            1,
+            cancellation,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, PreviewError::Cancelled));
+    }
+
+    #[test]
+    fn page_and_cell_share_one_deterministic_row_order() {
+        let (_tmp, path) = setup_db(&[
+            "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT)",
+            "CREATE INDEX notes_body ON notes(body)",
+            "INSERT INTO notes(body) VALUES ('z'), ('a'), ('m')",
+        ]);
+
+        let page = load_page_qualified(&path, "main", DbObjectKind::Table, "notes", 0, 10).unwrap();
+        let cell = load_cell_qualified(
+            &path,
+            "main",
+            DbObjectKind::Table,
+            "notes",
+            &page.row_locators[0],
+            1,
+            uncancelled(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            page.rows[0][1],
+            SqliteValue::Text {
+                value: "z".to_string(),
+                truncated: false,
+            }
+        );
+        assert_eq!(cell, page.rows[0][1]);
+    }
+
+    #[test]
+    fn row_locator_uses_an_unshadowed_hidden_rowid_alias() {
+        let (_tmp, path) = setup_db(&[
+            "CREATE TABLE notes(rowid TEXT, body TEXT)",
+            "INSERT INTO notes VALUES ('declared', 'selected')",
+        ]);
+
+        let page = load_page_qualified(&path, "main", DbObjectKind::Table, "notes", 0, 10).unwrap();
+        let cell = load_cell_qualified(
+            &path,
+            "main",
+            DbObjectKind::Table,
+            "notes",
+            &page.row_locators[0],
+            1,
+            uncancelled(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            cell,
+            SqliteValue::Text {
+                value: "selected".to_string(),
+                truncated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn row_locator_survives_rows_inserted_before_the_selection() {
+        let (_tmp, path) = setup_db(&[
+            "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT)",
+            "INSERT INTO notes VALUES (10, 'selected')",
+        ]);
+        let page = load_page_qualified(&path, "main", DbObjectKind::Table, "notes", 0, 10).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("INSERT INTO notes VALUES (5, 'new first row')", [])
+            .unwrap();
+
+        let cell = load_cell_qualified(
+            &path,
+            "main",
+            DbObjectKind::Table,
+            "notes",
+            &page.row_locators[0],
+            1,
+            uncancelled(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            cell,
+            SqliteValue::Text {
+                value: "selected".to_string(),
+                truncated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn oversized_primary_key_uses_bounded_fingerprint_locator() {
+        let primary_key = "k".repeat(MAX_PRIMARY_KEY_LOCATOR_WIRE_BYTES + 1);
+        let (_tmp, path) = setup_db(&[
+            "CREATE TABLE notes(id TEXT PRIMARY KEY, body TEXT) WITHOUT ROWID",
+            &format!("INSERT INTO notes VALUES ('{primary_key}', 'selected')"),
+        ]);
+
+        let page = load_page_qualified(&path, "main", DbObjectKind::Table, "notes", 0, 10).unwrap();
+        assert!(matches!(
+            page.row_locators[0],
+            DbRowLocator::OffsetFingerprint { .. }
+        ));
+
+        let cell = load_cell_qualified(
+            &path,
+            "main",
+            DbObjectKind::Table,
+            "notes",
+            &page.row_locators[0],
+            1,
+            uncancelled(),
+        )
+        .unwrap();
+        assert_eq!(
+            cell,
+            SqliteValue::Text {
+                value: "selected".to_string(),
+                truncated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn view_locator_rejects_a_different_row_at_the_same_offset() {
+        let (_tmp, path) = setup_db(&[
+            "CREATE TABLE notes(id INTEGER, body TEXT)",
+            "INSERT INTO notes VALUES (1, 'selected')",
+            "CREATE VIEW note_view AS SELECT id, body FROM notes",
+        ]);
+        let page =
+            load_page_qualified(&path, "main", DbObjectKind::View, "note_view", 0, 10).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("UPDATE notes SET body = 'changed' WHERE id = 1", [])
+            .unwrap();
+
+        let error = load_cell_qualified(
+            &path,
+            "main",
+            DbObjectKind::View,
+            "note_view",
+            &page.row_locators[0],
+            1,
+            uncancelled(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, PreviewError::CellChanged));
     }
 
     #[test]

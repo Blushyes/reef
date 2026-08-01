@@ -48,7 +48,7 @@ impl FileStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileStatus, GIT_PATH_CHUNK_BYTES, pathspec_batches};
+    use super::FileStatus;
 
     #[test]
     fn file_status_label_all_variants() {
@@ -57,16 +57,6 @@ mod tests {
         assert_eq!(FileStatus::Deleted.label(), "D");
         assert_eq!(FileStatus::Renamed.label(), "R");
         assert_eq!(FileStatus::Untracked.label(), "U");
-    }
-
-    #[test]
-    fn pathspec_batches_split_at_cli_boundary() {
-        let paths = vec!["x".repeat(GIT_PATH_CHUNK_BYTES); 2];
-        let batches = pathspec_batches(&paths);
-
-        assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0], vec![format!(":(top,literal){}", paths[0])]);
-        assert_eq!(batches[1], vec![format!(":(top,literal){}", paths[1])]);
     }
 }
 
@@ -590,10 +580,6 @@ fn count_workdir_lines(workdir: Option<&Path>, path: &str) -> u32 {
     }
 }
 
-/// Keep well below platform command-line limits while still amortizing a
-/// large stage/unstage over a handful of Git processes.
-const GIT_PATH_CHUNK_BYTES: usize = 24 * 1024;
-
 /// Stage every supplied repository-relative path with the system Git client.
 ///
 /// `git add -A` records deletions as well as additions and modifications. The
@@ -601,7 +587,7 @@ const GIT_PATH_CHUNK_BYTES: usize = 24 * 1024;
 /// remain valid when Reef opens a subdirectory of a repository and a file named
 /// like `:(glob)*` cannot expand into a mutation of unrelated files.
 pub fn stage_paths_at(workdir: &Path, paths: &[String]) -> Result<(), String> {
-    run_git_path_batches(workdir, &["add", "-A"], paths)
+    run_git_path_batch(workdir, &["add", "-A"], paths)
 }
 
 /// Remove every supplied path from the index while preserving its worktree
@@ -613,7 +599,7 @@ pub fn unstage_paths_at(workdir: &Path, paths: &[String]) -> Result<(), String> 
     } else {
         vec!["rm", "--cached", "-r"]
     };
-    run_git_path_batches(workdir, &args, paths)
+    run_git_path_batch(workdir, &args, paths)
 }
 
 fn git_has_head(workdir: &Path) -> Result<bool, String> {
@@ -625,50 +611,52 @@ fn git_has_head(workdir: &Path) -> Result<bool, String> {
     Ok(output.status.success())
 }
 
-fn run_git_path_batches(workdir: &Path, args: &[&str], paths: &[String]) -> Result<(), String> {
-    for (index, paths) in pathspec_batches(paths).into_iter().enumerate() {
-        let mut command = std::process::Command::new("git");
-        command
-            .current_dir(workdir)
-            .env("LC_ALL", "C")
-            .env("GIT_PAGER", "cat")
-            .args(args)
-            .arg("--")
-            .args(paths);
-        let output = command.output().map_err(git_command_spawn_error)?;
-        if !output.status.success() {
-            return Err(format!(
-                "git {} failed while applying batch {}: {}",
-                args.join(" "),
-                index + 1,
-                git_command_output(&output)
-            ));
+fn run_git_path_batch(workdir: &Path, args: &[&str], paths: &[String]) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut child = std::process::Command::new("git")
+        .current_dir(workdir)
+        .env("LC_ALL", "C")
+        .env("GIT_PAGER", "cat")
+        .args(args)
+        .args(["--pathspec-from-file=-", "--pathspec-file-nul"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(git_command_spawn_error)?;
+    let write_result = (|| -> Result<(), String> {
+        use std::io::Write;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "failed to open git pathspec input".to_string())?;
+        let mut stdin = stdin;
+        for path in paths {
+            stdin
+                .write_all(format!(":(top,literal){path}\0").as_bytes())
+                .map_err(|error| format!("failed to write git pathspec input: {error}"))?;
         }
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("failed to wait for git: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            git_command_output(&output)
+        ));
     }
     Ok(())
-}
-
-fn pathspec_batches(paths: &[String]) -> Vec<Vec<String>> {
-    let mut batches = Vec::new();
-    let mut current = Vec::new();
-    let mut current_bytes: usize = 0;
-
-    for path in paths {
-        let pathspec = format!(":(top,literal){path}");
-        let pathspec_bytes = pathspec.len().saturating_add(1);
-        if !current.is_empty()
-            && current_bytes.saturating_add(pathspec_bytes) > GIT_PATH_CHUNK_BYTES
-        {
-            batches.push(std::mem::take(&mut current));
-            current_bytes = 0;
-        }
-        current_bytes = current_bytes.saturating_add(pathspec_bytes);
-        current.push(pathspec);
-    }
-    if !current.is_empty() {
-        batches.push(current);
-    }
-    batches
 }
 
 fn git_command_spawn_error(error: std::io::Error) -> String {

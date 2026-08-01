@@ -2355,8 +2355,6 @@ name = "reef-app"
 version = "0.41.0"
 dependencies = [
  "crossbeam-channel",
- "grep-matcher",
- "grep-regex",
  "reef-core",
  "reef-io",
  "reef-sqlite-preview",

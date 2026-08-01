@@ -42,8 +42,8 @@ use crate::features::{
     tree_edit::TreeEditState,
 };
 use crate::tasks::{
-    DbPageRequest, GitMutation, GitMutationPayload, GitRevertPath, GraphPayload, PasteItem,
-    PastePlanError, PastePlanPayload, TaskCoordinator, TreeEditMutation, TreeEditPlan,
+    DbCellRequest, DbPageRequest, GitMutation, GitMutationPayload, GitRevertPath, GraphPayload,
+    PasteItem, PastePlanError, PastePlanPayload, TaskCoordinator, TreeEditMutation, TreeEditPlan,
     TreeEditPlanError, WorkerResult,
 };
 use crate::{
@@ -400,6 +400,7 @@ pub struct MatchHit {
     pub display: String,
     pub line: usize,
     pub line_text: String,
+    pub line_revision: u64,
     pub byte_range: Range<usize>,
 }
 
@@ -511,6 +512,8 @@ pub struct AppState {
     pub preview_load: AsyncState,
     pub db_page_load: AsyncState,
     pub db_detail_load: AsyncState,
+    pub db_cell_load: AsyncState,
+    pub db_cell_cancellation: Option<reef_io::CancellationToken>,
     pub git_status_load: AsyncState,
     pub git_status_stats_load: AsyncState,
     pub git_mutation_load: AsyncState,
@@ -738,6 +741,8 @@ impl AppState {
             preview_load: AsyncState::default(),
             db_page_load: AsyncState::default(),
             db_detail_load: AsyncState::default(),
+            db_cell_load: AsyncState::default(),
+            db_cell_cancellation: None,
             git_status_load: AsyncState::default(),
             git_status_stats_load: AsyncState::default(),
             git_mutation_load: AsyncState::default(),
@@ -1303,6 +1308,47 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_preview_target_controls_workspace_invalidation() {
+        let mut app = minimal_app_state();
+        app.preview_content = Some(Arc::new(global_search_text_preview("old.json")));
+        app.preview_schedule = Some((PathBuf::from("next.json"), Instant::now()));
+
+        app.apply_fs_change(reef_io::FsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from("old.json")],
+            git_metadata_changed: false,
+            repo_presence_changed: false,
+        });
+
+        assert!(!app.preview_load.stale);
+
+        app.apply_fs_change(reef_io::FsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from("next.json")],
+            git_metadata_changed: false,
+            repo_presence_changed: false,
+        });
+
+        assert!(app.preview_load.stale);
+    }
+
+    #[test]
+    fn in_flight_preview_target_controls_workspace_invalidation() {
+        let mut app = minimal_app_state();
+        app.preview_content = Some(Arc::new(global_search_text_preview("old.json")));
+        app.preview_in_flight_path = Some(PathBuf::from("next.json"));
+
+        app.apply_fs_change(reef_io::FsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from("next.json")],
+            git_metadata_changed: false,
+            repo_presence_changed: false,
+        });
+
+        assert!(app.preview_load.stale);
+    }
+
+    #[test]
     fn selected_preview_parent_directory_change_reloads_preview() {
         let mut app = minimal_app_state();
         app.preview_content = Some(Arc::new(global_search_text_preview("docs/guide/index.md")));
@@ -1609,6 +1655,7 @@ mod tests {
         app.global_search.results = vec![hit];
         app.preview_content = Some(Arc::new(PreviewContent {
             path: "Cargo.toml".to_string(),
+            resolved_path: None,
             local_path: None,
             bytes_on_disk: 0,
             mime: Some("text/plain".to_string()),
@@ -1864,6 +1911,7 @@ mod tests {
             display: name.to_string(),
             line: 0,
             line_text: String::new(),
+            line_revision: reef_io::content_line_revision(b""),
             byte_range: 0..0,
         }
     }
@@ -1873,6 +1921,7 @@ mod tests {
 
         PreviewContent {
             path: path.to_string(),
+            resolved_path: None,
             local_path: None,
             bytes_on_disk: 0,
             mime: Some("text/plain".to_string()),

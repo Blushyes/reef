@@ -162,7 +162,7 @@ impl AppState {
         };
         let missing = error.is_none();
         if let Some(error) = error {
-            self.preview_load.complete_terminal_err(generation, error);
+            self.preview_load.complete_err(generation, error);
         } else {
             self.preview_load.complete_ok(generation);
         }
@@ -420,7 +420,7 @@ impl AppState {
                 .or_default()
                 .push(crate::tasks::ReplaceLine {
                     line_no: hit.line,
-                    expected_text: hit.line_text.clone(),
+                    expected_revision: hit.line_revision,
                 });
         }
         let items: Vec<crate::tasks::ReplaceItem> = buckets

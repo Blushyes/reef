@@ -2811,6 +2811,7 @@ mod tests {
         fx.app.engine.state.preview_content = Some(
             PreviewContent {
                 path: "docs/guide/index.md".into(),
+                resolved_path: None,
                 local_path: None,
                 bytes_on_disk: 0,
                 mime: Some("text/markdown".into()),
@@ -3334,6 +3335,7 @@ mod tests {
             display: "missing.png".to_string(),
             line: 0,
             line_text: "needle".to_string(),
+            line_revision: reef_io::content_line_revision(b"needle"),
             byte_range: 0..6,
         };
         fx.app.engine.state.global_search.core.active = true;

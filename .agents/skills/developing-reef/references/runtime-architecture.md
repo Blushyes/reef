@@ -37,14 +37,16 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
 - `ReefApp` does not own a polling loop. The host owns waiting and calls `step` after user input,
   worker wake notification, filesystem watcher notification, or the `next_deadline` returned by
   the previous step.
-- A host adapter that consumes a concrete filesystem watcher event must forward its semantic
-  `repo_presence_changed` value through `AppCommand::ApplyFsChange`; it must not add a public
-  mutable `ReefApp` entry point. Hosts that leave the watcher receiver to the engine simply call
-  `step` after their wake notification.
+- A host adapter that consumes a concrete filesystem watcher event must forward the complete
+  semantic change, including `workspace_paths`, `git_metadata_changed`, and
+  `repo_presence_changed`, through `AppCommand::ApplyFsChange`; it must not add a public mutable
+  `ReefApp` entry point. Hosts that leave the watcher receiver to the engine simply call `step`
+  after their wake notification.
 - Local filesystem watcher events carry workspace-relative changed paths. The file tree may
-  refresh for any workspace event, but an already-open preview reloads only when its own path is
-  among those changes. Backends without path-level watcher data leave the path list empty, which
-  intentionally keeps the conservative preview-refresh behavior.
+  refresh for any workspace event, but an already-open preview reloads only when one of the
+  dependency paths declared by its `PreviewDocument` changes. Backends without path-level watcher
+  data leave the path list empty, which intentionally keeps the conservative preview-refresh
+  behavior.
 - Filesystem event coalescing deduplicates precise paths and keeps the aggregate bounded. When a
   burst exceeds that bound, the coalescer emits an empty path list so consumers perform the same
   conservative whole-workspace refresh instead of dropping future notifications.
@@ -63,10 +65,14 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
 ## AsyncState Rules
 
 - Call `begin()` only when sending a new worker request.
-- Call `mark_stale()` when data may be outdated but the UI can keep showing the old snapshot.
-- Accept results only through `complete_ok(generation)` / `complete_err(generation, error)`.
-- Use `complete_terminal_err(generation, error)` when the same request must wait for a new user
-  action or invalidation instead of retrying automatically.
+- Call `mark_stale()` when data may be outdated but the UI can keep showing the old snapshot. If
+  it runs during a load, the matching successful completion preserves that invalidation for one
+  follow-up load.
+- `begin()` clears the invalidation being serviced. `complete_ok(generation)` accepts only the
+  matching generation and preserves any newer invalidation raised during the load.
+- `complete_err(generation, error)` records an error and preserves any newer invalidation raised
+  during the load. Without a newer invalidation, a filesystem event, user action, or explicit
+  refresh must invalidate the state before the request can run again.
 - Never manually overwrite `loading`, `stale`, or `generation` from render/panel code.
 - If a result is older than the current generation, drop it silently.
 
@@ -79,6 +85,12 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
 - Renderers send full-value semantic commands for query and replacement edits. They do not mutate search cursors or result state directly.
 - Hosts pass a preview viewport height to `SyncGlobalSearchPreviewToSelected` and `SyncGlobalSearchPreviewIfStale`; `reef-app` keeps the target path and request generation aligned, then reveals the selected match even when the preview content is reused.
 - Large result sets are exposed through paged row snapshots. Renderers request visible windows and keep previously loaded rows visible while a newer generation is loading.
+- Every search request carries a cancellation token into the backend. Remote agents run content
+  scans on a dedicated worker so their connection thread can process `CancelSearch`; obsolete
+  queued or active scans stop during the current file read instead of delaying the newest query.
+- Replace-in-files sends only the pattern, replacement, and complete-line revision guards to the
+  backend. The backend owns the bounded read, guarded transform, and atomic write; remote source
+  files never cross the single-frame protocol boundary.
 
 ### Files
 
@@ -90,14 +102,31 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
   as host-local and uploads it; workdir-internal clipboard copies use `CopyPaths`. Placement uses
   keep-both names on both backend types; remote placement reserves them from one destination
   snapshot per batch.
+- SQLite row pages keep TEXT cells bounded for predictable local and remote payload sizes. Every
+  page row includes a bounded backend locator: an unshadowed hidden rowid alias when available,
+  primary-key values when they fit the locator budget, or an offset plus fingerprint when the
+  object exposes no stable key or its key is too large. A renderer that opens one cell dispatches
+  `DbLoadCell` with that locator; the backend
+  performs one complete-value read. Remote agents stream frame-bounded TEXT chunks from that read
+  and finish with a full-cell revision that the client validates before publishing. Generation
+  plus object/locator/column identity prevents a late result from replacing a newer cell selection.
+  Complete-cell reads have a dedicated latest-wins worker and a cancellation token; replacing or
+  closing the selection cancels the local SQLite query or remote agent stream without blocking
+  ordinary preview/page requests.
+  Tables derive their last page from the eager row count. Views keep the last page unknown and
+  discover it from a short page or an empty request immediately after a full page.
+- Database preview state records the accepted preview source revision. When the same path receives
+  changed source content, `reef-app` preserves a still-valid object selection but schedules a fresh
+  page or detail load; path equality alone must never keep rows from an older database snapshot.
 
 ### Git
 
 - Git status, ahead/behind, and branch label are cached from the git worker.
 - Selecting a file requests a diff asynchronously.
-- Stage and unstage submit the selected paths as one logical batch. Local backends use native Git
-  pathspec commands; remote backends split that path list only at the protocol frame-size boundary
-  and send the minimum number of batch RPCs.
+- Stage and unstage submit the selected paths as one logical batch. Local backends pass NUL-delimited
+  literal pathspecs to one native mutating Git process. Remote backends stream frame-bounded path
+  chunks under one operation id; the agent accumulates them and invokes one native Git mutation
+  only after the terminal chunk arrives.
 - Status refresh classifies file state without computing repository-wide content line counts.
   A dedicated Git-stats worker computes `+N/-M` asynchronously under its own generation and
   merges those counts into the already-visible status snapshot. A failed stats request keeps the

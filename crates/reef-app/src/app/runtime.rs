@@ -193,13 +193,17 @@ impl AppState {
     }
 
     fn preview_path_changed(&self, changed_paths: &[PathBuf]) -> bool {
-        let Some(preview) = self.preview_content.as_deref() else {
-            return false;
-        };
-        let preview_path = Path::new(&preview.path);
-        changed_paths
-            .iter()
-            .any(|path| path == preview_path || preview_path.starts_with(path))
+        if let Some((path, _)) = self.preview_schedule.as_ref() {
+            return preview_dependencies_changed(std::slice::from_ref(path), changed_paths);
+        }
+        let mut dependency_paths = Vec::new();
+        if let Some(path) = self.preview_in_flight_path.as_ref() {
+            dependency_paths.push(path.clone());
+        }
+        if let Some(preview) = self.preview_content.as_deref() {
+            dependency_paths.extend(preview.dependency_paths());
+        }
+        preview_dependencies_changed(&dependency_paths, changed_paths)
     }
 
     pub fn apply_worker_result_core(
@@ -356,21 +360,46 @@ impl AppState {
                     if !self.db_page_load.complete_ok(generation) {
                         return events;
                     }
+                    let known_last_page = self
+                        .preview_database_info()
+                        .and_then(|info| info.lookup(&payload.key))
+                        .and_then(|object| {
+                            max_page_for_object(
+                                object,
+                                self.db_preview
+                                    .as_ref()
+                                    .map(|state| state.rows_per_page)
+                                    .unwrap_or(0),
+                            )
+                        });
                     let Some(state) = self.db_preview.as_mut() else {
                         return events;
                     };
                     if Path::new(&state.path) != payload.path.as_path() {
                         return events;
                     }
+                    if payload.key == state.selection
+                        && payload.page > state.page
+                        && payload.rows.is_empty()
+                        && known_last_page.is_none()
+                    {
+                        if payload.page == state.page.saturating_add(1) {
+                            state.last_page = Some(state.page);
+                        }
+                        return events;
+                    }
+                    let short_page = payload.rows.len() < state.rows_per_page as usize;
                     state.selection = payload.key;
                     state.page = payload.page;
+                    state.last_page =
+                        known_last_page.or_else(|| short_page.then_some(payload.page));
                     state.current_rows = payload.rows;
+                    state.current_row_locators = payload.row_locators;
                     state.detail = None;
                     self.reset_preview_scroll(payload.reset_h_scroll);
                 }
                 Err(error) => {
                     if self.db_page_load.complete_err(generation, error.clone()) {
-                        self.db_page_load.stale = false;
                         self.push_toast(Toast::warn(format!("sqlite page load failed: {error}")));
                     }
                 }
@@ -389,12 +418,42 @@ impl AppState {
                     state.selection = payload.key;
                     state.detail = Some(payload.detail);
                     state.current_rows.clear();
+                    state.current_row_locators.clear();
                     self.reset_preview_scroll(true);
                 }
                 Err(error) => {
                     if self.db_detail_load.complete_err(generation, error.clone()) {
-                        self.db_detail_load.stale = false;
                         self.push_toast(Toast::warn(format!("sqlite detail load failed: {error}")));
+                    }
+                }
+            },
+            WorkerResult::DbCell { generation, result } => match result {
+                Ok(payload) => {
+                    if !self.db_cell_load.complete_ok(generation) {
+                        return events;
+                    }
+                    self.db_cell_cancellation = None;
+                    let Some(state) = self.db_preview.as_mut() else {
+                        return events;
+                    };
+                    if Path::new(&state.path) != payload.path.as_path() {
+                        return events;
+                    }
+                    let Some(cell) = state.cell.as_mut() else {
+                        return events;
+                    };
+                    if cell.object_key != payload.key
+                        || cell.row_offset != payload.row_offset
+                        || cell.row_locator != payload.row_locator
+                        || cell.column != payload.column
+                    {
+                        return events;
+                    }
+                    cell.value = Some(payload.value);
+                }
+                Err(error) => {
+                    if self.db_cell_load.complete_err(generation, error) {
+                        self.db_cell_cancellation = None;
                     }
                 }
             },
@@ -406,7 +465,6 @@ impl AppState {
                 }
                 Err(error) => {
                     if self.quick_open_load.complete_err(generation, error.clone()) {
-                        self.quick_open_load.stale = false;
                         self.push_toast(Toast::warn(format!("quick open index failed: {error}")));
                     }
                 }
@@ -486,7 +544,6 @@ impl AppState {
                     if self.file_copy_load.complete_err(generation, error.clone()) {
                         self.place_mode.active = false;
                         self.place_mode.sources.clear();
-                        self.file_copy_load.stale = false;
                         self.file_copy_load.error = None;
                         events.push(AppRuntimeEvent::FileCopyDone { result: Err(error) });
                     }
@@ -520,7 +577,6 @@ impl AppState {
                     {
                         events.push(AppRuntimeEvent::DismissConfirm);
                         self.fs_mutation_select_on_done = None;
-                        self.fs_mutation_load.stale = false;
                         self.fs_mutation_load.error = None;
                         events.push(AppRuntimeEvent::FsMutationDone {
                             kind,
@@ -576,6 +632,14 @@ impl AppState {
     fn should_request_git_status_stats(&self) -> bool {
         self.git_status_stats_load.error.is_none() && self.git_status_stats_load.should_request()
     }
+}
+
+fn preview_dependencies_changed(dependency_paths: &[PathBuf], changed_paths: &[PathBuf]) -> bool {
+    changed_paths.iter().any(|changed_path| {
+        dependency_paths.iter().any(|dependency_path| {
+            changed_path == dependency_path || dependency_path.starts_with(changed_path)
+        })
+    })
 }
 
 fn push_min_deadline(target: &mut Option<Instant>, candidate: Option<Instant>) {

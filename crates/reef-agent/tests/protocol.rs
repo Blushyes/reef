@@ -10,8 +10,8 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
 use reef_proto::{
-    CommitInfoDto, DirEntryDto, Envelope, FileStatusDto, Frame, HandshakeResponse, Request,
-    Response, StatusSnapshotDto, decode_frame, encode_frame,
+    CommitInfoDto, DirEntryDto, Envelope, FileStatusDto, Frame, GitPathMutationKindDto,
+    HandshakeResponse, Request, Response, StatusSnapshotDto, decode_frame, encode_frame,
 };
 use test_support::{commit_file, tempdir_repo, write_file};
 
@@ -195,6 +195,7 @@ fn read_file_returns_bytes_and_respects_cap() {
     assert!(payload.is_file);
     assert_eq!(payload.size, 10);
     assert_eq!(payload.bytes, b"abcd".to_vec());
+    assert_eq!(payload.resolved_path.as_deref(), Some("big.txt"));
 
     agent.shutdown();
 }
@@ -211,8 +212,21 @@ fn stage_unstage_many_reflects_in_status() {
 
     // Stage one batch.
     let paths = vec!["a.txt".to_string(), "b.txt".to_string()];
-    let _ = ok_result(agent.request(Request::StageMany {
-        paths: paths.clone(),
+    let _ = ok_result(agent.request(Request::GitPathMutationChunk {
+        operation_id: 7,
+        kind: GitPathMutationKindDto::Stage,
+        paths: vec![paths[0].clone()],
+        final_chunk: false,
+    }));
+    let before_final: StatusSnapshotDto =
+        serde_json::from_value(ok_result(agent.request(Request::GitStatus))).unwrap();
+    assert!(before_final.staged.is_empty());
+
+    let _ = ok_result(agent.request(Request::GitPathMutationChunk {
+        operation_id: 7,
+        kind: GitPathMutationKindDto::Stage,
+        paths: vec![paths[1].clone()],
+        final_chunk: true,
     }));
     let snap: StatusSnapshotDto =
         serde_json::from_value(ok_result(agent.request(Request::GitStatus))).unwrap();
@@ -220,7 +234,12 @@ fn stage_unstage_many_reflects_in_status() {
     assert!(snap.unstaged.is_empty());
 
     // Unstage the same batch.
-    let _ = ok_result(agent.request(Request::UnstageMany { paths }));
+    let _ = ok_result(agent.request(Request::GitPathMutationChunk {
+        operation_id: 8,
+        kind: GitPathMutationKindDto::Unstage,
+        paths,
+        final_chunk: true,
+    }));
     let snap: StatusSnapshotDto =
         serde_json::from_value(ok_result(agent.request(Request::GitStatus))).unwrap();
     assert!(snap.staged.is_empty());

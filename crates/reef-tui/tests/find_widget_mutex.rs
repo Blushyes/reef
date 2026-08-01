@@ -26,6 +26,7 @@ fn fresh_app() -> (App, TempDir, CwdGuard) {
     app.engine.state.preview_content = Some(
         PreviewContent {
             path: "scratch.txt".to_string(),
+            resolved_path: None,
             local_path: None,
             bytes_on_disk: 19,
             mime: Some("text/plain".into()),

@@ -40,6 +40,7 @@ fn install_rust_preview(app: &mut App, path: &str, src: &str) {
     app.engine.state.preview_content = Some(
         PreviewContent {
             path: path.to_string(),
+            resolved_path: None,
             local_path: None,
             bytes_on_disk: src.len() as u64,
             mime: Some("text/plain".into()),
@@ -60,6 +61,7 @@ fn install_plain_rust_preview_and_request_enrichment(app: &mut App, path: &str, 
         generation,
         Some(PreviewContent {
             path: path.to_string(),
+            resolved_path: None,
             local_path: None,
             bytes_on_disk: src.len() as u64,
             mime: Some("text/plain".into()),
@@ -320,6 +322,7 @@ fn goto_definition_on_unknown_extension_is_noop() {
     app.engine.state.preview_content = Some(
         PreviewContent {
             path: "scratch.txt".to_string(),
+            resolved_path: None,
             local_path: None,
             bytes_on_disk: 14,
             mime: Some("text/plain".into()),

@@ -59,7 +59,7 @@ pub struct AsyncSnapshot {
 }
 
 impl AsyncSnapshot {
-    fn from_state(state: &crate::AsyncState) -> Self {
+    pub(crate) fn from_state(state: &crate::AsyncState) -> Self {
         Self {
             loading: state.loading,
             stale: state.stale,
@@ -505,6 +505,7 @@ mod tests {
     fn text_preview(path: &str) -> PreviewDocument {
         PreviewDocument {
             path: path.to_string(),
+            resolved_path: None,
             local_path: None,
             bytes_on_disk: 0,
             mime: Some("text/rust".to_string()),
@@ -523,6 +524,7 @@ mod tests {
             display: format!("{path}:{line}"),
             line,
             line_text: "reef".to_string(),
+            line_revision: reef_io::content_line_revision(b"reef"),
             byte_range,
         }
     }

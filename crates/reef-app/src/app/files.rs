@@ -686,7 +686,6 @@ impl AppState {
                     .fs_mutation_load
                     .complete_err(generation, error.clone())
                 {
-                    self.fs_mutation_load.stale = false;
                     self.fs_mutation_load.error = None;
                     events.push(AppRuntimeEvent::FsMutationDone {
                         kind: fs_mutation_kind_for_tree_edit_plan_error(mutation),
@@ -734,7 +733,6 @@ impl AppState {
                     .fs_mutation_load
                     .complete_err(generation, error.error.clone())
                 {
-                    self.fs_mutation_load.stale = false;
                     self.fs_mutation_load.error = None;
                     events.push(AppRuntimeEvent::FsMutationDone {
                         kind: match error.op {

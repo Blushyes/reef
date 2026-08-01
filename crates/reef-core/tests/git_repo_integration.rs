@@ -114,6 +114,26 @@ fn stage_paths_moves_multiple_files_from_unstaged_to_staged() {
 }
 
 #[test]
+fn stage_paths_accepts_a_large_literal_pathspec_batch() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "seed.txt", "seed", "init");
+    let paths = (0..400)
+        .map(|index| format!("generated/:(glob)-{index:04}.txt"))
+        .collect::<Vec<_>>();
+    for path in &paths {
+        write_file(&raw, path, "new");
+    }
+
+    let (_guard, repo) = open_in(tmp.path());
+    stage_paths_at(tmp.path(), &paths).expect("large literal stage succeeds");
+    let (staged, unstaged) = repo.get_status();
+
+    assert_eq!(staged.len(), paths.len());
+    assert!(unstaged.is_empty());
+}
+
+#[test]
 fn stage_then_unstage_roundtrip() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();

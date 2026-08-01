@@ -22,6 +22,7 @@ fn preview_document(
 ) -> PreviewDocument {
     PreviewDocument {
         path: path.to_string(),
+        resolved_path: None,
         local_path: None,
         bytes_on_disk,
         mime: mime.map(str::to_string),

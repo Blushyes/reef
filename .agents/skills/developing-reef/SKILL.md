@@ -58,6 +58,16 @@ Read `references/runtime-architecture.md` before changing `crates/reef-app/src/*
 ## App Boundary Guardrails
 
 - `reef-tui` must not directly own business state that belongs in `reef-app`. Settings, preview/search/git/graph/nav/history state should flow through `ReefApp` commands, snapshots, or read-only accessors.
+- SQLite hosts dispatch the shared database commands and read `DbPreviewState` plus its
+  page/detail/cell load status through `ReefApp`. Paginated rows keep bounded TEXT values and
+  bounded row locators; oversized primary keys use an offset plus fingerprint. Opening a cell
+  requests its complete value through `DbLoadCell` using the locator returned with its page.
+  Remote TEXT delivery streams frame-bounded chunks from that one read and validates the
+  terminal full-cell revision. A newer cell selection cancels the previous local or remote read;
+  cell work runs separately from ordinary file and database-page previews. Table row counts
+  provide a known last page; views keep an unknown last page until a short or empty follow-up page
+  establishes the boundary. Schema expansion,
+  object selection, paging, typed rows, and details must not be reimplemented by a renderer adapter.
 - `reef-app` must not depend on `ratatui`, `crossterm`, or `ratatui-image`.
 - Worker result merge paths belong in `reef-app`; TUI may adapt terminal-only payloads such as image protocol state before dispatching the merge command.
 - `scripts/check-architecture.sh` is the cheap CI tripwire. If it blocks a legitimate change, prefer changing the whitelist with a short explanation over adding another bypass.

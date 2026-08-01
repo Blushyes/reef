@@ -312,7 +312,7 @@ fn end_to_end_search_then_replace_with_per_match_exclusion() {
             .or_default()
             .push(reef_app::ReplaceLine {
                 line_no: hit.line,
-                expected_text: hit.line_text.clone(),
+                expected_revision: hit.line_revision,
             });
     }
     let items: Vec<reef_app::ReplaceItem> = buckets

@@ -13,14 +13,14 @@ use reef_io::{Backend, BackendError, EditorLaunchSpec, FsChange};
 use crate::app::{AppState, AppStateConfig, TabChangeOutcome};
 use crate::tasks::WorkerResult;
 use crate::{
-    AppCommand, AppEffect, AppPanel, AppPrefs, AppRuntimeEvent, AppSnapshot, AppTab, AsyncState,
-    CommitDetailState, CommitFileDiffLoadOutcome, ConfirmRequest, ContextMenuItem, DbPreviewState,
-    FileClipboard, FindWidgetState, GitGraphState, GitStatusState, GlobalSearchRowSnapshot,
-    GraphBranchPickerRowSnapshot, GraphScopeChangeOutcome, HighlightedDiff, HostsPickerRowSnapshot,
-    HoverTarget, LocationSnapshot, LspRefineOutcome, MatchHit, NormalizeActivePanelOutcome,
-    PickerInputOutcome, PlaceModeState, PreviewHighlight, QuickOpenRowSnapshot, SearchState,
-    SelectedFile, SelectionSet, SettingsState, TextEditOutcome, TickOptions, TreeDragState,
-    TreeEditState, TreeEntry, ViewMode,
+    AppCommand, AppEffect, AppPanel, AppPrefs, AppRuntimeEvent, AppSnapshot, AppTab, AsyncSnapshot,
+    AsyncState, CommitDetailState, CommitFileDiffLoadOutcome, ConfirmRequest, ContextMenuItem,
+    DbPreviewState, FileClipboard, FindWidgetState, GitGraphState, GitStatusState,
+    GlobalSearchRowSnapshot, GraphBranchPickerRowSnapshot, GraphScopeChangeOutcome,
+    HighlightedDiff, HostsPickerRowSnapshot, HoverTarget, LocationSnapshot, LspRefineOutcome,
+    MatchHit, NormalizeActivePanelOutcome, PickerInputOutcome, PlaceModeState, PreviewHighlight,
+    QuickOpenRowSnapshot, SearchState, SelectedFile, SelectionSet, SettingsState, TextEditOutcome,
+    TickOptions, TreeDragState, TreeEditState, TreeEntry, ViewMode,
 };
 
 pub struct ReefApp {
@@ -459,12 +459,13 @@ impl ReefApp {
             AppCommand::RefreshStatus => self.state.refresh_status(),
             AppCommand::ApplyFsChange {
                 workspace_changed,
+                workspace_paths,
                 git_metadata_changed,
                 repo_presence_changed,
             } => {
                 self.state.apply_fs_change(reef_io::FsChange {
                     workspace_changed,
-                    workspace_paths: Vec::new(),
+                    workspace_paths,
                     git_metadata_changed,
                     repo_presence_changed,
                 });
@@ -582,6 +583,9 @@ impl ReefApp {
             AppCommand::DbToggleSchema(name) => self.state.db_toggle_schema(&name),
             AppCommand::DbSelectObject(key) => self.state.db_select_object(key),
             AppCommand::DbNavigateToPage(page) => self.state.db_navigate_to_page(page),
+            AppCommand::DbLoadCell { row, column } => {
+                self.state.dispatch_db_cell_load(row, column);
+            }
             AppCommand::EditDbGoto(op) => {
                 let _ = self.state.edit_db_goto_input(op);
             }
@@ -1526,6 +1530,18 @@ impl ReefApp {
         self.state.db_preview()
     }
 
+    pub fn db_page_load_snapshot(&self) -> AsyncSnapshot {
+        AsyncSnapshot::from_state(&self.state.db_page_load)
+    }
+
+    pub fn db_detail_load_snapshot(&self) -> AsyncSnapshot {
+        AsyncSnapshot::from_state(&self.state.db_detail_load)
+    }
+
+    pub fn db_cell_load_snapshot(&self) -> AsyncSnapshot {
+        AsyncSnapshot::from_state(&self.state.db_cell_load)
+    }
+
     pub fn graph_sidebar_width(&self, total_width: u16) -> u16 {
         self.state.graph_sidebar_width(total_width)
     }
@@ -2222,6 +2238,7 @@ mod tests {
             display: path.to_string(),
             line: 3,
             line_text: "needle".to_string(),
+            line_revision: reef_io::content_line_revision(b"needle"),
             byte_range: 0..6,
         }
     }
@@ -2287,6 +2304,95 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_fs_change_preserves_precise_workspace_paths() {
+        let mut app = test_app();
+        app.state.preview_content = Some(Arc::new(PreviewDocument {
+            path: "script.json".to_string(),
+            resolved_path: None,
+            local_path: None,
+            bytes_on_disk: 2,
+            mime: Some("application/json".to_string()),
+            body: PreviewBody::Text(TextPreview {
+                lines: vec!["{}".to_string()],
+                source: None,
+                highlighted: None,
+                parsed: None,
+            }),
+        }));
+        app.state.preview_load.stale = false;
+
+        app.dispatch(AppCommand::ApplyFsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from(".DS_Store")],
+            git_metadata_changed: false,
+            repo_presence_changed: false,
+        });
+
+        assert!(!app.state.preview_load.stale);
+    }
+
+    #[test]
+    fn resolved_preview_target_change_invalidates_symlink_preview() {
+        let mut app = test_app();
+        app.state.preview_content = Some(Arc::new(PreviewDocument {
+            path: "current.txt".to_string(),
+            resolved_path: Some(PathBuf::from("target.txt")),
+            local_path: None,
+            bytes_on_disk: 4,
+            mime: Some("text/plain".to_string()),
+            body: PreviewBody::Text(TextPreview {
+                lines: vec!["reef".to_string()],
+                source: None,
+                highlighted: None,
+                parsed: None,
+            }),
+        }));
+        app.state.preview_load.stale = false;
+
+        app.dispatch(AppCommand::ApplyFsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from("target.txt")],
+            git_metadata_changed: false,
+            repo_presence_changed: false,
+        });
+
+        assert!(app.state.preview_load.stale);
+    }
+
+    #[test]
+    fn sqlite_sidecar_change_invalidates_open_preview() {
+        let mut app = test_app();
+        app.state.preview_content = Some(Arc::new(PreviewDocument {
+            path: "fixture.db".to_string(),
+            resolved_path: None,
+            local_path: None,
+            bytes_on_disk: 0,
+            mime: Some("application/vnd.sqlite3".to_string()),
+            body: PreviewBody::Database(reef_sqlite_preview::DatabaseInfoV2 {
+                schemas: Vec::new(),
+                default_schema: "main".to_string(),
+                default_object: None,
+                initial_page: reef_sqlite_preview::DbPage {
+                    rows: Vec::new(),
+                    row_locators: Vec::new(),
+                },
+                bytes_on_disk: 0,
+            }),
+        }));
+        app.state.preview_load.stale = false;
+        app.state.preview_in_flight_path = Some(PathBuf::from("other.txt"));
+
+        app.dispatch(AppCommand::ApplyFsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from("fixture.db-wal")],
+            git_metadata_changed: false,
+            repo_presence_changed: false,
+        });
+
+        assert!(app.state.preview_load.stale);
+    }
+
+    #[test]
     fn accepted_preview_result_schedules_enrichment_after_base_merge() {
         let mut app = test_app();
         let wake = app.worker_wake_receiver();
@@ -2295,6 +2401,7 @@ mod tests {
             generation,
             result: Ok(Some(PreviewDocument {
                 path: "src/main.rs".to_string(),
+                resolved_path: None,
                 local_path: None,
                 bytes_on_disk: 13,
                 mime: Some("text/plain".to_string()),
@@ -2392,6 +2499,7 @@ mod tests {
             generation,
             result: Ok(Some(PreviewDocument {
                 path: hit.path.to_string_lossy().to_string(),
+                resolved_path: None,
                 local_path: None,
                 bytes_on_disk: 7,
                 mime: Some("text/plain".to_string()),

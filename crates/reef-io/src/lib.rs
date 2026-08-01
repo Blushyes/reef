@@ -16,7 +16,8 @@ use std::ffi::OsString;
 use std::io;
 use std::ops::{ControlFlow, Range};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crossbeam_channel::Receiver;
 use reef_core::diff::DiffContent;
@@ -272,6 +273,7 @@ pub fn default_editor_command() -> Option<(String, Vec<String>)> {
 /// shows them as toasts / status messages.
 #[derive(Debug, Clone)]
 pub enum BackendError {
+    Cancelled,
     NotFound,
     Io(String),
     Git(String),
@@ -294,6 +296,7 @@ pub enum BackendError {
 impl std::fmt::Display for BackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            BackendError::Cancelled => f.write_str("cancelled"),
             BackendError::NotFound => f.write_str("not found"),
             BackendError::Io(s) => write!(f, "io: {s}"),
             BackendError::Git(s) => write!(f, "git: {s}"),
@@ -324,6 +327,7 @@ impl BackendError {
     pub fn from_wire(code: reef_proto::ErrorCode, message: String) -> Self {
         use reef_proto::ErrorCode;
         match code {
+            ErrorCode::Cancelled => BackendError::Cancelled,
             ErrorCode::NotFound => BackendError::NotFound,
             ErrorCode::Io => BackendError::Io(message),
             ErrorCode::Git => BackendError::Git(message),
@@ -343,6 +347,7 @@ impl BackendError {
     pub fn wire_code(&self) -> reef_proto::ErrorCode {
         use reef_proto::ErrorCode;
         match self {
+            BackendError::Cancelled => ErrorCode::Cancelled,
             BackendError::NotFound => ErrorCode::NotFound,
             BackendError::Io(_) => ErrorCode::Io,
             BackendError::Git(_) => ErrorCode::Git,
@@ -429,7 +434,25 @@ pub struct ContentMatchHit {
     pub display: String,
     pub line: usize,
     pub line_text: String,
+    /// Stable revision of the complete, untruncated line bytes. UI text may
+    /// be truncated for display, so replacement must use this value for its
+    /// stale-content guard.
+    pub line_revision: u64,
     pub byte_range: Range<usize>,
+}
+
+/// Stable revision for one complete content-search line.
+///
+/// This deliberately hashes bytes rather than displayed text: search results
+/// bound `line_text`, while replace-in-files must detect edits anywhere on the
+/// original line before writing it back.
+pub fn content_line_revision(line: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    line.iter().fold(OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
+    })
 }
 
 /// Knobs for `search_content`. Mirrors `ContentSearchRequestDto`.
@@ -440,6 +463,49 @@ pub struct ContentSearchRequest {
     pub case_sensitive: Option<bool>,
     pub max_results: u32,
     pub max_line_chars: u32,
+    pub cancellation: CancellationToken,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    pub fn from_flag(flag: Arc<AtomicBool>) -> Self {
+        Self(flag)
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    pub fn shared_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplaceLineGuard {
+    pub line_no: u64,
+    pub expected_revision: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplaceFileRequest {
+    pub pattern: String,
+    pub replacement: Vec<u8>,
+    pub lines: Vec<ReplaceLineGuard>,
+    pub max_file_size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplaceFileOutcome {
+    Changed { lines_replaced: u64, stale: u64 },
+    NoMatch { stale: u64 },
+    TooLarge,
 }
 
 /// Terminal response for `search_content`. Hits themselves arrive through
@@ -530,10 +596,8 @@ pub trait Backend: Send + Sync {
     fn read_file(&self, rel_path: &Path, max_bytes: u64) -> Result<Vec<u8>, BackendError>;
 
     /// Size in bytes of the regular file at `rel_path`. Lets callers
-    /// short-circuit before paying for the bytes themselves — e.g. the
-    /// global-replace worker uses this to skip files over its 50 MB cap
-    /// without round-tripping a truncated copy. `NotFound` if the path
-    /// doesn't resolve to a regular file under the workdir.
+    /// short-circuit before paying for the bytes themselves. `NotFound` if
+    /// the path doesn't resolve to a regular file under the workdir.
     fn file_size(&self, rel_path: &Path) -> Result<u64, BackendError>;
 
     /// Load one page of rows from a row-bearing object at `rel_path`.
@@ -550,6 +614,17 @@ pub trait Backend: Send + Sync {
         offset: u64,
         limit: u32,
     ) -> Result<reef_sqlite_preview::DbPage, BackendError>;
+
+    /// Load one complete cell using a locator returned by [`Self::db_load_page`].
+    /// Implementations must observe `cancellation` while the query is running.
+    fn db_load_cell(
+        &self,
+        rel_path: &Path,
+        key: &reef_sqlite_preview::DbObjectKey,
+        locator: &reef_sqlite_preview::DbRowLocator,
+        column: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<reef_sqlite_preview::SqliteValue, BackendError>;
 
     /// Detail-pane payload for an index, trigger, table, or view.
     /// Tables / views return their `CREATE` SQL; indexes return
@@ -695,12 +770,11 @@ pub trait Backend: Send + Sync {
     fn remove_file(&self, rel_path: &Path) -> Result<(), BackendError>;
     /// Recursive directory removal. `fs::remove_dir_all` semantics.
     fn remove_dir_all(&self, rel_path: &Path) -> Result<(), BackendError>;
-    /// Overwrite the regular file at `rel_path` with `content`. Used by
-    /// the global find-and-replace path. Atomic: implementations write to
-    /// a sibling tempfile and `rename` into place so a mid-write crash
-    /// leaves the original intact. The original file's mode bits are
-    /// preserved across the swap (without this every replaced file
-    /// silently chmods to the tempfile default of `0600`).
+    /// Overwrite the regular file at `rel_path` with `content`. Atomic:
+    /// implementations write to a sibling tempfile and `rename` into place
+    /// so a mid-write crash leaves the original intact. The original file's
+    /// mode bits are preserved across the swap (without this every replaced
+    /// file silently chmods to the tempfile default of `0600`).
     ///
     /// The path must already exist and resolve to a regular file under
     /// the workdir. Symlinks are followed during canonicalisation; if
@@ -709,6 +783,15 @@ pub trait Backend: Send + Sync {
     /// `BackendError::NotFound` — replace is never used to create new
     /// files.
     fn write_file(&self, rel_path: &Path, content: &[u8]) -> Result<(), BackendError>;
+    /// Replace guarded search hits inside one existing regular file. The
+    /// backend owns the complete read/transform/atomic-write operation so a
+    /// remote implementation never transfers the file through one protocol
+    /// frame.
+    fn replace_file(
+        &self,
+        rel_path: &Path,
+        request: &ReplaceFileRequest,
+    ) -> Result<ReplaceFileOutcome, BackendError>;
     /// Move each path to the OS Trash. On hosts without a trash tool the
     /// backend falls back to `fs::remove_*` and reports
     /// `TrashOutcome { used_trash: false }` so the UI can phrase the

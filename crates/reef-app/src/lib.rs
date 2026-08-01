@@ -32,7 +32,7 @@ pub use command::AppCommand;
 pub use effect::{AppEffect, Toast, ToastLevel};
 pub use engine::{AppCommandOutcome, AppConfig, AppStepOutcome, ReefApp};
 pub use features::confirm::{ConfirmRequest, ConfirmTone, TreeDeleteConfirm};
-pub use features::db_preview::{DbNav, DbPreviewState, max_page_for_object};
+pub use features::db_preview::{DbCellPreviewState, DbNav, DbPreviewState, max_page_for_object};
 pub use features::file_clipboard::FileClipboard;
 pub use features::file_selection::SelectionSet;
 pub use features::file_tree::{FileTree, FileTreeState, TreeEntry};
@@ -68,6 +68,9 @@ pub use preview_snapshot::{
     PreviewDocumentSnapshot, PreviewSourceSnapshot, RgbSnapshot, StructuredDataFormatSnapshot,
     TextStyleSnapshot, TextStyleSpanSnapshot,
 };
+pub use reef_sqlite_preview::{
+    DbObjectDetail, DbObjectKey, DbObjectKind, SqliteValue, TriggerEvent, TriggerTiming,
+};
 pub use runtime::{AppRuntimeEvent, AsyncState, FileActionNotice};
 pub use snapshot::{
     AppSnapshot, AsyncSnapshot, FilesPanelSnapshot, GitPanelSnapshot, GlobalSearchPanelSnapshot,
@@ -78,10 +81,10 @@ pub use snapshot::{
 };
 pub use tab::AppTab;
 pub use tasks::{
-    _reset_highlight_cache, DbDetailPayload, DbPagePayload, DbPageRequest, FileTreePayload,
-    FsMutationKind, GitMutation, GitMutationPayload, GitRevertPath, GitStatusPayload, GraphPayload,
-    MAX_REPLACE_FILE_SIZE, PasteItem, ReplaceItem, ReplaceLine, ReplaceSummary, TaskCoordinator,
-    WorkerResult, highlight_diff,
+    _reset_highlight_cache, DbCellPayload, DbCellRequest, DbDetailPayload, DbPagePayload,
+    DbPageRequest, FileTreePayload, FsMutationKind, GitMutation, GitMutationPayload, GitRevertPath,
+    GitStatusPayload, GraphPayload, MAX_REPLACE_FILE_SIZE, PasteItem, ReplaceItem, ReplaceLine,
+    ReplaceSummary, TaskCoordinator, WorkerResult, highlight_diff,
 };
 pub use text_input::{
     TextEditOp, TextEditOutcome, apply_multi_line_op, apply_single_line_op,

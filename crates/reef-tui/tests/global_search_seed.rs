@@ -30,6 +30,7 @@ fn install_text_preview(app: &mut App, lines: &[&str]) {
     app.engine.state.preview_content = Some(
         PreviewContent {
             path: "scratch.txt".to_string(),
+            resolved_path: None,
             local_path: None,
             bytes_on_disk: lines.iter().map(|line| line.len() as u64).sum(),
             mime: Some("text/plain".into()),
@@ -50,6 +51,7 @@ fn install_markdown_preview(app: &mut App, source: &str) {
     app.engine.state.preview_content = Some(
         PreviewContent {
             path: "README.md".to_string(),
+            resolved_path: None,
             local_path: None,
             bytes_on_disk: source.len() as u64,
             mime: Some("text/markdown".into()),

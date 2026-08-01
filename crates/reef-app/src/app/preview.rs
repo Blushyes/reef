@@ -136,7 +136,7 @@ impl AppState {
         match result {
             Ok(content) => self.apply_preview_content(generation, content, preview_view_h),
             Err(error) => {
-                if self.preview_load.complete_terminal_err(generation, error) {
+                if self.preview_load.complete_err(generation, error) {
                     self.preview_enrichment_pending = None;
                     self.preview_in_flight_path = None;
                 }
@@ -382,6 +382,9 @@ mod tests {
     };
     use reef_core::text::{StyledToken, TextStyle};
     use reef_io::LocalBackend;
+    use reef_sqlite_preview::{
+        DatabaseInfoV2, DbObject, DbObjectKind, DbPage, SchemaKind, SchemaSummary, SqliteValue,
+    };
 
     use crate::app::{AppPrefs, AppState, AppStateConfig};
 
@@ -464,6 +467,33 @@ mod tests {
         state.apply_preview_content(second_generation, Some(changed), 20);
 
         assert_eq!(state.preview_source_revision, second_generation);
+    }
+
+    #[test]
+    fn changed_database_reload_refreshes_preserved_selection() {
+        let backend = Arc::new(LocalBackend::open_at(PathBuf::from(".")));
+        let mut state = AppState::new(AppStateConfig {
+            backend,
+            prefs: AppPrefs::default(),
+            now: Instant::now(),
+            subscribe_fs_events: false,
+        });
+
+        let first_generation = state.preview_load.begin();
+        state.apply_preview_content(first_generation, Some(database_preview(1, "old row")), 20);
+        let db = state.db_preview.as_mut().expect("database state");
+        db.current_rows = vec![vec![SqliteValue::Text {
+            value: "stale row".into(),
+            truncated: false,
+        }]];
+
+        let second_generation = state.preview_load.begin();
+        state.apply_preview_content(second_generation, Some(database_preview(2, "new row")), 20);
+
+        let db = state.db_preview.as_ref().expect("database state");
+        assert_eq!(db.source_revision, second_generation);
+        assert_eq!(db.selection.name, "items");
+        assert!(state.db_page_load.loading);
     }
 
     #[test]
@@ -564,6 +594,7 @@ mod tests {
             generation,
             Some(PreviewDocument {
                 path: "README.md".to_string(),
+                resolved_path: None,
                 local_path: None,
                 bytes_on_disk: source.len() as u64,
                 mime: Some("text/markdown".to_string()),
@@ -613,6 +644,7 @@ mod tests {
     fn text_preview(path: &str) -> PreviewDocument {
         PreviewDocument {
             path: path.to_string(),
+            resolved_path: None,
             local_path: None,
             bytes_on_disk: 0,
             mime: Some("text/rust".to_string()),
@@ -621,6 +653,46 @@ mod tests {
                 source: None,
                 highlighted: None,
                 parsed: None,
+            }),
+        }
+    }
+
+    fn database_preview(bytes_on_disk: u64, value: &str) -> PreviewDocument {
+        let object = DbObject {
+            schema: "main".into(),
+            name: "items".into(),
+            kind: DbObjectKind::Table,
+            tbl_name: Some("items".into()),
+            row_count: Some(1),
+            columns: Vec::new(),
+            is_virtual: false,
+            is_without_rowid: false,
+            is_strict: false,
+        };
+        PreviewDocument {
+            path: "fixture.db".into(),
+            resolved_path: None,
+            local_path: None,
+            bytes_on_disk,
+            mime: Some("application/x-sqlite3".into()),
+            body: PreviewBody::Database(DatabaseInfoV2 {
+                schemas: vec![SchemaSummary {
+                    name: "main".into(),
+                    kind: SchemaKind::Main,
+                    file: None,
+                    objects: vec![object.clone()],
+                    truncated: false,
+                }],
+                default_schema: "main".into(),
+                default_object: Some(object.key()),
+                initial_page: DbPage {
+                    rows: vec![vec![SqliteValue::Text {
+                        value: value.into(),
+                        truncated: false,
+                    }]],
+                    row_locators: Vec::new(),
+                },
+                bytes_on_disk,
             }),
         }
     }

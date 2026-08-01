@@ -112,6 +112,7 @@ fn search_content_parity() {
         case_sensitive: None,
         max_results: 1000,
         max_line_chars: 250,
+        cancellation: reef_io::CancellationToken::default(),
     };
     let (mut l_hits, _l_chunks, l_trunc) = drain_search(&l, &req);
     let (mut r_hits, _r_chunks, r_trunc) = drain_search(&r, &req);
@@ -128,6 +129,7 @@ fn search_content_parity() {
         assert_eq!(a.display, b.display);
         assert_eq!(a.line, b.line);
         assert_eq!(a.line_text, b.line_text);
+        assert_eq!(a.line_revision, b.line_revision);
         assert_eq!(a.byte_range, b.byte_range);
     }
     assert!(!l_hits.is_empty(), "expected at least one 'foo' hit");
@@ -170,6 +172,7 @@ fn search_content_streams_multiple_chunks() {
         case_sensitive: None,
         max_results: 1000,
         max_line_chars: 250,
+        cancellation: reef_io::CancellationToken::default(),
     };
     let (l_hits, l_chunks, _) = drain_search(&l, &req);
     let (r_hits, r_chunks, _) = drain_search(&r, &req);
@@ -182,4 +185,37 @@ fn search_content_streams_multiple_chunks() {
         r_chunks >= 2,
         "remote backend should stream ≥2 chunks, got {r_chunks}"
     );
+}
+
+#[test]
+fn remote_search_cancellation_stops_obsolete_walk() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let remote_tmp = TempDir::new().unwrap();
+    seed_big_tree(remote_tmp.path(), 400, 4);
+    let remote = spawn_remote(remote_tmp.path());
+    let cancellation = reef_io::CancellationToken::default();
+    let request = ContentSearchRequest {
+        pattern: "foo".into(),
+        fixed_strings: true,
+        case_sensitive: None,
+        max_results: 10_000,
+        max_line_chars: 250,
+        cancellation: cancellation.clone(),
+    };
+    let mut received = 0usize;
+    let mut chunks = 0usize;
+    let mut sink = |hits: Vec<ContentMatchHit>| {
+        received += hits.len();
+        chunks += 1;
+        cancellation.cancel();
+        ControlFlow::Break(())
+    };
+
+    remote.search_content(&request, &mut sink).unwrap();
+
+    assert_eq!(chunks, 1);
+    assert!(received < 1_600, "cancelled search streamed every hit");
+    remote
+        .walk_repo_paths(&WalkOpts::default())
+        .expect("agent remains responsive after cancellation");
 }

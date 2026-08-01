@@ -13,8 +13,6 @@ test-helpers = []
 
 [dependencies]
 crossbeam-channel = "0.5"
-grep-matcher = "0.1.8"
-grep-regex = "0.1.14"
 reef-core = { path = "../reef-core" }
 reef-io = { path = "../reef-io" }
 reef-sqlite-preview = { path = "../reef-sqlite-preview" }

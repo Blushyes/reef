@@ -519,6 +519,7 @@ mod tests {
             display: name.to_string(),
             line: 0,
             line_text: String::new(),
+            line_revision: reef_io::content_line_revision(b""),
             byte_range: 0..0,
         }
     }

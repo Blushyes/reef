@@ -659,6 +659,7 @@ mod tests {
     fn text_doc(path: &str, lines: &[&str]) -> PreviewDocument {
         PreviewDocument {
             path: path.to_string(),
+            resolved_path: None,
             local_path: None,
             bytes_on_disk: lines.iter().map(|line| line.len() as u64).sum(),
             mime: Some("text/plain".into()),
@@ -705,6 +706,7 @@ mod tests {
 
         let doc = PreviewDocument {
             path: "large.json".to_string(),
+            resolved_path: None,
             local_path: None,
             bytes_on_disk: source.len() as u64,
             mime: Some("application/json".into()),
@@ -762,6 +764,7 @@ mod tests {
     fn structured_data_snapshot_omits_text_payload() {
         let doc = PreviewDocument {
             path: "package.json".to_string(),
+            resolved_path: None,
             local_path: None,
             bytes_on_disk: 15,
             mime: Some("application/json".into()),
@@ -810,6 +813,7 @@ mod tests {
         };
         let doc = PreviewDocument {
             path: "src/main.rs".to_string(),
+            resolved_path: None,
             local_path: None,
             bytes_on_disk: 16,
             mime: Some("text/plain".into()),
@@ -846,6 +850,7 @@ mod tests {
             .expect("markdown preview");
         let doc = PreviewDocument {
             path: "README.md".to_string(),
+            resolved_path: None,
             local_path: None,
             bytes_on_disk: source.len() as u64,
             mime: Some("text/markdown".into()),
@@ -868,6 +873,7 @@ mod tests {
                 .expect("markdown preview");
         let doc = PreviewDocument {
             path: "README.md".to_string(),
+            resolved_path: None,
             local_path: None,
             bytes_on_disk: source.len() as u64,
             mime: Some("text/markdown".into()),
@@ -900,6 +906,7 @@ mod tests {
         let source = "# Large\n\nbody\n";
         let doc = PreviewDocument {
             path: "README.md".to_string(),
+            resolved_path: None,
             local_path: None,
             bytes_on_disk: source.len() as u64,
             mime: Some("text/markdown".into()),
@@ -921,6 +928,7 @@ mod tests {
     fn video_binary_keeps_video_kind() {
         let doc = PreviewDocument {
             path: "clip.mp4".to_string(),
+            resolved_path: None,
             local_path: None,
             bytes_on_disk: 42,
             mime: Some("video/mp4".into()),
@@ -943,6 +951,7 @@ mod tests {
     fn binary_snapshot_carries_head_hex() {
         let doc = PreviewDocument {
             path: "archive.bin".to_string(),
+            resolved_path: None,
             local_path: None,
             bytes_on_disk: 4,
             mime: None,

@@ -99,7 +99,27 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 /// - v14: filesystem notifications preserve workspace paths and distinguish
 ///       worktree changes from Git metadata changes; `GitStatusStats` moves
 ///       content-level line counts off the latency-sensitive status request.
-pub const PROTOCOL_VERSION: u32 = 14;
+/// - v15: adds `LoadDbCell` so renderers can request one complete SQLite
+///        TEXT value without expanding every paginated row payload.
+/// - v16: changes `LoadDbCell` to bounded byte chunks so complete TEXT
+///        values cannot exceed the frame limit.
+/// - v17: adds a full-cell revision to every SQLite TEXT chunk so clients
+///        reject chunks assembled across different database versions.
+/// - v18: SQLite pages carry row locators and one cell request streams chunks
+///        from a single database read instead of re-querying every byte range.
+/// - v19: content-search hits carry a revision of the complete matched line so
+///        replace-in-files can reject edits hidden beyond the display cap.
+/// - v20: large stage/unstage path sets stream through frame-bounded chunks
+///        that the agent applies as one Git mutation. File and SQLite preview
+///        responses also carry the canonical workspace path used by selective
+///        file-watcher invalidation.
+/// - v21: content searches can be cancelled while the agent is scanning, and
+///        guarded replace-in-files runs entirely on the agent so large files
+///        never cross the single-frame transport boundary.
+/// - v22: adds `CancelDbCell`, allowing a newer SQLite cell selection to stop
+///        an obsolete query or TEXT stream before the serial agent worker starts
+///        the latest request.
+pub const PROTOCOL_VERSION: u32 = 22;
 
 /// Encode a single envelope-level value to `writer` using the
 /// length-prefixed framing. The caller is expected to flush.
@@ -217,11 +237,11 @@ pub enum Request {
     Unstage {
         path: String,
     },
-    StageMany {
+    GitPathMutationChunk {
+        operation_id: u64,
+        kind: GitPathMutationKindDto,
         paths: Vec<String>,
-    },
-    UnstageMany {
-        paths: Vec<String>,
+        final_chunk: bool,
     },
     Restore {
         path: String,
@@ -329,29 +349,34 @@ pub enum Request {
         rel_path: String,
     },
     /// Size in bytes of an existing regular file at `rel_path`.
-    /// Cheap probe used by callers (notably the global-replace worker)
-    /// that need to decide whether to bother fetching the bytes —
-    /// avoids round-tripping a truncated 50 MB copy of a file the
-    /// caller is about to skip anyway.
+    /// Cheap probe for callers that need to decide whether to fetch the
+    /// bytes.
     FileSize {
         rel_path: String,
     },
 
     /// Atomically overwrite an existing regular file with `content`.
-    /// Used by global find-and-replace. Path validation rejects
-    /// absolute paths, `..` traversal, and symlinks whose canonical
-    /// target falls outside the workdir. Fails `NotFound` if the
-    /// target doesn't already exist — write-file is replace-only,
-    /// not create.
+    /// Path validation rejects absolute paths, `..` traversal, and symlinks
+    /// whose canonical target falls outside the workdir. Fails `NotFound` if
+    /// the target doesn't already exist — write-file is replace-only, not
+    /// create. Callers must keep the encoded request below [`MAX_FRAME_SIZE`].
     ///
     /// `content` rides through the same `serde_bytes` base64 path as
-    /// `ReadFileResponse.bytes` — without it, serde_json would
-    /// expand each byte into a separate integer array element and a
-    /// 50 MB replacement would blow up to ~350 MB of JSON.
+    /// `ReadFileResponse.bytes` so serde_json does not expand each byte into
+    /// a separate integer array element.
     WriteFile {
         rel_path: String,
         #[serde(with = "serde_bytes")]
         content: Vec<u8>,
+    },
+    /// Replace guarded search hits without transferring the complete file.
+    ReplaceFile {
+        rel_path: String,
+        pattern: String,
+        #[serde(with = "serde_bytes")]
+        replacement: Vec<u8>,
+        lines: Vec<ReplaceLineGuardDto>,
+        max_file_size: u64,
     },
     /// Move one or more paths to the OS Trash, or fall back to permanent
     /// deletion when no trash is configured on the remote host.
@@ -378,6 +403,10 @@ pub enum Request {
     /// stop walking and set `truncated = true`.
     SearchContent {
         request: ContentSearchRequestDto,
+    },
+    /// Cancel one in-flight or queued `SearchContent` request.
+    CancelSearch {
+        request_id: u64,
     },
 
     // ── M5: SQLite preview ────
@@ -409,8 +438,8 @@ pub enum Request {
     /// V2 of `LoadDbInitial`. Returns the full schema graph
     /// (`PRAGMA database_list` + tables/views/indexes/triggers across
     /// all schemas) plus the first page of rows for the default
-    /// selection. Response is `Option<DatabaseInfoV2Dto>` — `None`
-    /// when the agent's magic-bytes probe rejects the file. v8-and-
+    /// selection. Response is `LoadDbInitialV2ResponseDto`; its `info`
+    /// is `None` when the agent's magic-bytes probe rejects the file. v8-and-
     /// older agents respond `Unimplemented`; the client downgrades to
     /// `LoadDbInitial`.
     LoadDbInitialV2 {
@@ -441,6 +470,21 @@ pub enum Request {
         kind: DbObjectKindDto,
         name: String,
     },
+    /// Read one complete cell identified by a locator from `LoadDbPageV2`.
+    /// Scalar and BLOB values complete in the response; TEXT bytes are sent
+    /// as bounded `DbCellChunk` notifications before the terminal response.
+    LoadDbCell {
+        rel_path: String,
+        schema: String,
+        kind: DbObjectKindDto,
+        name: String,
+        locator: DbRowLocatorDto,
+        column: usize,
+    },
+    /// Cancel one in-flight or queued [`LoadDbCell`] request.
+    CancelDbCell {
+        request_id: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -469,6 +513,7 @@ impl Response {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
+    Cancelled,
     NotFound,
     Io,
     Git,
@@ -511,6 +556,11 @@ pub enum Notification {
         request_id: u64,
         hits: Vec<MatchHitDto>,
     },
+    DbCellChunk {
+        request_id: u64,
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+    },
 }
 
 // ── DTOs ──────────────────────────────────────────────────────────────────
@@ -542,6 +592,28 @@ pub struct ReadFileResponse {
     #[serde(with = "serde_bytes")]
     pub bytes: Vec<u8>,
     pub size: u64,
+    pub resolved_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplaceLineGuardDto {
+    pub line_no: u64,
+    pub expected_revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReplaceFileOutcomeDto {
+    Changed { lines_replaced: u64, stale: u64 },
+    NoMatch { stale: u64 },
+    TooLarge,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GitPathMutationKindDto {
+    Stage,
+    Unstage,
 }
 
 /// Bare minimum replacement for the `serde_bytes` crate. Base64-encodes raw
@@ -818,6 +890,8 @@ pub struct MatchHitDto {
     /// Matched line text, already truncated to the client's
     /// `MAX_LINE_CHARS` cap (passed through in the request).
     pub line_text: String,
+    /// Stable revision of the complete, untruncated line bytes.
+    pub line_revision: u64,
     /// Byte range of the match within `line_text`. Half-open.
     pub byte_range_start: u32,
     pub byte_range_end: u32,
@@ -915,6 +989,34 @@ pub struct ColumnInfoDto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbPageDto {
     pub rows: Vec<Vec<SqliteValueDto>>,
+    pub row_locators: Vec<DbRowLocatorDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DbLocatorValueDto {
+    Null,
+    Integer {
+        value: i64,
+    },
+    Real {
+        value: f64,
+    },
+    Text {
+        value: String,
+    },
+    Blob {
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DbRowLocatorDto {
+    RowId { value: i64 },
+    PrimaryKey { values: Vec<DbLocatorValueDto> },
+    OffsetFingerprint { offset: u64, fingerprint: u64 },
 }
 
 /// One typed cell value. NULL is distinct from an empty TEXT so the
@@ -940,6 +1042,14 @@ pub enum SqliteValueDto {
     Blob {
         len: u64,
     },
+}
+
+/// Terminal response for a streamed SQLite cell request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DbCellCompletedDto {
+    Complete { value: SqliteValueDto },
+    Text { byte_len: u64, content_hash: u64 },
 }
 
 // ── v9: multi-schema preview DTOs ──────────────────────────────────────────
@@ -1014,6 +1124,12 @@ pub struct DatabaseInfoV2Dto {
     pub default_object: Option<DbObjectKeyDto>,
     pub initial_page: DbPageDto,
     pub bytes_on_disk: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadDbInitialV2ResponseDto {
+    pub info: Option<DatabaseInfoV2Dto>,
+    pub resolved_path: Option<String>,
 }
 
 /// Trigger timing mirror.
@@ -1170,6 +1286,7 @@ mod tests {
                 is_file: true,
                 bytes: bytes.clone(),
                 size: n as u64,
+                resolved_path: Some("target.bin".into()),
             };
             let json = serde_json::to_vec(&dto).unwrap();
             let decoded: ReadFileResponse = serde_json::from_slice(&json).unwrap();

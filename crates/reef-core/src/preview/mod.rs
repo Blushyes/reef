@@ -17,6 +17,10 @@ pub use loader::{
 #[derive(Debug, Clone)]
 pub struct PreviewDocument {
     pub path: String,
+    /// Canonical target expressed relative to the workspace root when the
+    /// backend can resolve it. This keeps watcher invalidation correct for a
+    /// preview opened through an in-workspace symlink.
+    pub resolved_path: Option<PathBuf>,
     pub local_path: Option<PathBuf>,
     pub bytes_on_disk: u64,
     pub mime: Option<String>,
@@ -61,6 +65,44 @@ impl PreviewDocument {
 
     pub fn is_database(&self) -> bool {
         matches!(self.body, PreviewBody::Database(_))
+    }
+
+    /// Workspace-relative files whose changes can alter this document.
+    ///
+    /// Most previews depend only on their source path. SQLite also reads
+    /// committed data from its rollback journal or WAL sidecars, so watcher
+    /// invalidation must observe those files without teaching app state about
+    /// a specific preview format.
+    pub fn dependency_paths(&self) -> Vec<PathBuf> {
+        let logical_path = std::path::Path::new(&self.path);
+        let mut paths = self.dependency_paths_from(logical_path);
+        if let Some(resolved_path) = self.resolved_path.as_deref()
+            && resolved_path != logical_path
+        {
+            paths.extend(self.dependency_paths_from(resolved_path));
+        }
+        paths
+    }
+
+    /// Host-local files whose metadata determines whether a cached preview is
+    /// still current. Remote documents do not expose host-local paths.
+    pub fn local_dependency_paths(&self) -> Vec<PathBuf> {
+        self.local_path
+            .as_deref()
+            .map(|path| self.dependency_paths_from(path))
+            .unwrap_or_default()
+    }
+
+    fn dependency_paths_from(&self, source: &std::path::Path) -> Vec<PathBuf> {
+        let mut paths = vec![source.to_path_buf()];
+        if self.is_database() {
+            paths.extend(["-wal", "-shm", "-journal"].into_iter().map(|suffix| {
+                let mut sidecar = source.as_os_str().to_os_string();
+                sidecar.push(suffix);
+                PathBuf::from(sidecar)
+            }));
+        }
+        paths
     }
 }
 

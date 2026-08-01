@@ -87,6 +87,7 @@ pub enum AppCommand {
     RefreshStatus,
     ApplyFsChange {
         workspace_changed: bool,
+        workspace_paths: Vec<PathBuf>,
         git_metadata_changed: bool,
         repo_presence_changed: bool,
     },
@@ -143,6 +144,10 @@ pub enum AppCommand {
     DbToggleSchema(String),
     DbSelectObject(reef_sqlite_preview::DbObjectKey),
     DbNavigateToPage(u64),
+    DbLoadCell {
+        row: usize,
+        column: usize,
+    },
     EditDbGoto(TextEditOp),
     PasteDbGoto(String),
     ConfirmDbGoto,

@@ -142,6 +142,7 @@ pub(crate) fn load_image_preview(
 
     PreviewDocument {
         path: rel_str.to_string(),
+        resolved_path: None,
         local_path: None,
         bytes_on_disk: file_size,
         mime: Some(mime.to_string()),
@@ -159,6 +160,7 @@ fn binary_card(
 ) -> PreviewDocument {
     PreviewDocument {
         path: rel_str.to_string(),
+        resolved_path: None,
         local_path: None,
         bytes_on_disk: file_size,
         mime: Some(mime.to_string()),
@@ -201,6 +203,7 @@ where
 
     PreviewDocument {
         path: rel_str.to_string(),
+        resolved_path: None,
         local_path: None,
         bytes_on_disk: file_size,
         mime: Some(mime.to_string()),

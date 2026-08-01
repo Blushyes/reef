@@ -47,6 +47,7 @@ fn install_rust_preview(app: &mut App, path: &str, src: &str) {
     app.engine.state.preview_content = Some(
         PreviewContent {
             path: path.to_string(),
+            resolved_path: None,
             local_path: None,
             bytes_on_disk: src.len() as u64,
             mime: Some("text/plain".into()),
@@ -249,6 +250,7 @@ fn vue_goto_registers_pending_jump_and_uses_cache_on_repeat() {
     app.engine.state.preview_content = Some(
         PreviewContent {
             path: "App.vue".to_string(),
+            resolved_path: None,
             local_path: None,
             bytes_on_disk: src.len() as u64,
             mime: Some("text/plain".into()),

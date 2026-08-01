@@ -118,6 +118,28 @@ fn load_preview_text_lines_match() {
     assert_eq!(lt.lines, rt.lines, "text lines diverged");
 }
 
+#[cfg(unix)]
+#[test]
+fn remote_preview_reports_the_canonical_workspace_dependency() {
+    use std::os::unix::fs::symlink;
+
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, _repo) = tempdir_repo();
+    std::fs::write(tmp.path().join("target.txt"), "hello\n").unwrap();
+    symlink("target.txt", tmp.path().join("alias.txt")).unwrap();
+
+    let remote = spawn_remote(tmp.path());
+    let preview = remote
+        .load_preview(Path::new("alias.txt"), true)
+        .expect("remote symlink preview");
+
+    assert_eq!(preview.path, "alias.txt");
+    assert_eq!(
+        preview.resolved_path.as_deref(),
+        Some(Path::new("target.txt"))
+    );
+}
+
 #[test]
 fn load_preview_markdown_model_matches_on_local_and_remote() {
     let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -280,6 +302,28 @@ fn load_preview_parity_for_sqlite_database() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn remote_sqlite_preview_reports_the_canonical_workspace_dependency() {
+    use std::os::unix::fs::symlink;
+
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, _repo) = tempdir_repo();
+    seed_sqlite_db(&tmp.path().join("target.db"));
+    symlink("target.db", tmp.path().join("alias.db")).unwrap();
+
+    let remote = spawn_remote(tmp.path());
+    let preview = remote
+        .load_preview(Path::new("alias.db"), true)
+        .expect("remote sqlite symlink preview");
+
+    assert_eq!(shape_of(&preview.body), BodyShape::Database);
+    assert_eq!(
+        preview.resolved_path.as_deref(),
+        Some(Path::new("target.db"))
+    );
+}
+
 #[test]
 fn db_load_page_parity_across_backends() {
     let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -332,6 +376,60 @@ fn db_load_page_offset_works_across_backends() {
     assert_eq!(lp.rows.len(), 1);
     assert_eq!(rp.rows.len(), 1);
     assert_eq!(lp.rows, rp.rows);
+}
+
+#[test]
+fn db_load_cell_returns_complete_text_across_backends() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, _repo) = tempdir_repo();
+    let db_path = tmp.path().join("fixture.db");
+    seed_sqlite_db(&db_path);
+    let unit = "完整单元格";
+    let full_text = unit.repeat(reef_sqlite_preview::DB_CELL_CHUNK_BYTES / unit.len() + 100);
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute("UPDATE posts SET body = ?1 WHERE id = 1", [&full_text])
+        .expect("seed long text");
+    drop(connection);
+    let key = reef_sqlite_preview::DbObjectKey {
+        schema: "main".to_string(),
+        name: "posts".to_string(),
+        kind: reef_sqlite_preview::DbObjectKind::Table,
+    };
+
+    let local = LocalBackend::open_at(tmp.path().to_path_buf());
+    let remote = spawn_remote(tmp.path());
+    let page = local
+        .db_load_page(Path::new("fixture.db"), &key, 0, 1)
+        .expect("local db_load_page");
+    let locator = &page.row_locators[0];
+    let local_value = local
+        .db_load_cell(
+            Path::new("fixture.db"),
+            &key,
+            locator,
+            1,
+            &reef_io::CancellationToken::default(),
+        )
+        .expect("local db_load_cell");
+    let remote_value = remote
+        .db_load_cell(
+            Path::new("fixture.db"),
+            &key,
+            locator,
+            1,
+            &reef_io::CancellationToken::default(),
+        )
+        .expect("remote db_load_cell");
+
+    assert_eq!(local_value, remote_value);
+    assert_eq!(
+        local_value,
+        reef_sqlite_preview::SqliteValue::Text {
+            value: full_text,
+            truncated: false,
+        }
+    );
 }
 
 #[test]

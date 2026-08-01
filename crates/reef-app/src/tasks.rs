@@ -83,6 +83,7 @@ pub struct DbPagePayload {
     pub key: reef_sqlite_preview::DbObjectKey,
     pub page: u64,
     pub rows: Vec<Vec<reef_sqlite_preview::SqliteValue>>,
+    pub row_locators: Vec<reef_sqlite_preview::DbRowLocator>,
     pub reset_h_scroll: bool,
 }
 
@@ -100,6 +101,32 @@ pub struct DbDetailPayload {
     pub path: PathBuf,
     pub key: reef_sqlite_preview::DbObjectKey,
     pub detail: reef_sqlite_preview::DbObjectDetail,
+}
+
+#[derive(Debug)]
+pub struct DbCellPayload {
+    pub path: PathBuf,
+    pub key: reef_sqlite_preview::DbObjectKey,
+    pub row_offset: u64,
+    pub row_locator: reef_sqlite_preview::DbRowLocator,
+    pub column: usize,
+    pub value: reef_sqlite_preview::SqliteValue,
+}
+
+#[derive(Debug)]
+pub struct DbCellRequest {
+    pub path: PathBuf,
+    pub key: reef_sqlite_preview::DbObjectKey,
+    pub row_offset: u64,
+    pub row_locator: reef_sqlite_preview::DbRowLocator,
+    pub column: usize,
+    pub cancellation: reef_io::CancellationToken,
+}
+
+struct DbCellTask {
+    generation: u64,
+    backend: Arc<dyn Backend>,
+    request: DbCellRequest,
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +206,10 @@ pub enum WorkerResult {
     DbDetail {
         generation: u64,
         result: Result<DbDetailPayload, String>,
+    },
+    DbCell {
+        generation: u64,
+        result: Result<DbCellPayload, String>,
     },
     QuickOpenIndex {
         generation: u64,
@@ -346,13 +377,10 @@ pub struct ReplaceItem {
 pub struct ReplaceLine {
     /// 0-indexed line number in the file.
     pub line_no: usize,
-    /// `line_text` snapshot from the UI's `MatchHit`. The worker
-    /// compares the current file's line against this snapshot before
-    /// rewriting; a mismatch (file was edited under us) bumps
-    /// `summary.skipped_stale`. May have been truncated by
-    /// `global_search::truncate_line` to `MAX_LINE_CHARS` chars; use
-    /// `starts_with` semantics when the snapshot is at the cap.
-    pub expected_text: String,
+    /// Revision of the complete line observed by content search. The worker
+    /// compares the current complete line before rewriting; display text is
+    /// intentionally not part of this consistency check because it is capped.
+    pub expected_revision: u64,
 }
 
 /// Aggregate result of a `FilesTask::ReplaceInFiles` run. Every
@@ -739,6 +767,7 @@ pub struct TaskCoordinator {
     /// clicked. Both threads can hit the `LocalBackend` preview cache
     /// safely via the internal `Mutex`.
     preview_tx: mpsc::Sender<FilesTask>,
+    db_cell_tx: mpsc::Sender<DbCellTask>,
     preview_enrichment_tx: mpsc::Sender<PreviewEnrichmentTask>,
     git_tx: mpsc::Sender<GitTask>,
     git_status_stats_tx: mpsc::Sender<GitStatusStatsTask>,
@@ -778,6 +807,7 @@ impl TaskCoordinator {
         Self {
             files_tx: spawn_files_worker(result_tx.clone()),
             preview_tx: spawn_preview_worker(result_tx.clone()),
+            db_cell_tx: spawn_db_cell_worker(result_tx.clone()),
             preview_enrichment_tx: spawn_preview_enrichment_worker(result_tx.clone()),
             git_tx: spawn_git_worker(result_tx.clone()),
             git_status_stats_tx: spawn_git_status_stats_worker(result_tx.clone()),
@@ -914,6 +944,14 @@ impl TaskCoordinator {
             backend,
             path,
             key,
+        });
+    }
+
+    pub fn load_db_cell(&self, generation: u64, backend: Arc<dyn Backend>, request: DbCellRequest) {
+        let _ = self.db_cell_tx.send(DbCellTask {
+            generation,
+            backend,
+            request,
         });
     }
 
@@ -1904,6 +1942,22 @@ fn coalesce_preview_worker_task(
     rx: &mpsc::Receiver<FilesTask>,
     backlog: &mut VecDeque<FilesTask>,
 ) -> FilesTask {
+    if matches!(
+        first,
+        FilesTask::LoadDbPage { .. } | FilesTask::LoadDbDetail { .. }
+    ) {
+        let mut selected = first;
+        while let Ok(task) = rx.try_recv() {
+            match task {
+                FilesTask::LoadDbPage { .. } | FilesTask::LoadDbDetail { .. } => {
+                    selected = task;
+                }
+                other => backlog.push_back(other),
+            }
+        }
+        return selected;
+    }
+
     let mut selected = match first {
         FilesTask::LoadPreview { .. } | FilesTask::PrefetchPreview { .. } => first,
         other => return other,
@@ -2045,6 +2099,7 @@ fn spawn_preview_worker(result_tx: WorkerResultSender) -> mpsc::Sender<FilesTask
                                 key: request.key,
                                 page: request.page,
                                 rows: page_data.rows,
+                                row_locators: page_data.row_locators,
                                 reset_h_scroll: request.reset_h_scroll,
                             })
                             .map_err(|e| e.to_string());
@@ -2080,6 +2135,53 @@ fn spawn_preview_worker(result_tx: WorkerResultSender) -> mpsc::Sender<FilesTask
             }
         });
     tx
+}
+
+fn spawn_db_cell_worker(result_tx: WorkerResultSender) -> mpsc::Sender<DbCellTask> {
+    let (tx, rx) = mpsc::unbounded::<DbCellTask>();
+    let _ = thread::Builder::new()
+        .name("reef-db-cell-worker".into())
+        .spawn(move || {
+            while let Ok(task) = recv_latest_db_cell_task(&rx) {
+                if task.request.cancellation.is_cancelled() {
+                    continue;
+                }
+                let result = task
+                    .backend
+                    .db_load_cell(
+                        &task.request.path,
+                        &task.request.key,
+                        &task.request.row_locator,
+                        task.request.column,
+                        &task.request.cancellation,
+                    )
+                    .map(|value| DbCellPayload {
+                        path: task.request.path,
+                        key: task.request.key,
+                        row_offset: task.request.row_offset,
+                        row_locator: task.request.row_locator,
+                        column: task.request.column,
+                        value,
+                    })
+                    .map_err(|error| error.to_string());
+                let _ = result_tx.send(WorkerResult::DbCell {
+                    generation: task.generation,
+                    result,
+                });
+            }
+        });
+    tx
+}
+
+fn recv_latest_db_cell_task(
+    rx: &mpsc::Receiver<DbCellTask>,
+) -> Result<DbCellTask, mpsc::RecvError> {
+    let mut task = rx.recv()?;
+    while let Ok(newer) = rx.try_recv() {
+        task.request.cancellation.cancel();
+        task = newer;
+    }
+    Ok(task)
 }
 
 fn spawn_git_worker(result_tx: WorkerResultSender) -> mpsc::Sender<GitTask> {
@@ -3220,12 +3322,9 @@ fn spawn_lsp_worker(result_tx: WorkerResultSender) -> mpsc::Sender<LspTask> {
 /// of waiting for the whole walk. Returns `truncated = true` iff the
 /// backend reported hitting the hit cap.
 ///
-/// Cancellation: the sink returns `ControlFlow::Break(())` once `cancel`
-/// flips. The Local backend honours this at the next file boundary; the
-/// Remote backend stops forwarding to the UI but lets the agent finish
-/// the walk naturally (we don't have a "cancel this request" wire op
-/// yet — adding one would be the obvious follow-up if mis-typing a
-/// pattern on a huge remote monorepo proves costly).
+/// Cancellation is carried into the backend as well as checked by the sink.
+/// Local file reads are interruptible, while remote walks receive a protocol
+/// cancellation request, so obsolete work does not delay a newer query.
 fn run_global_search_via_backend(
     generation: u64,
     cancel: Arc<AtomicBool>,
@@ -3242,6 +3341,7 @@ fn run_global_search_via_backend(
         case_sensitive: None,
         max_results: GLOBAL_SEARCH_MAX_RESULTS as u32,
         max_line_chars: GLOBAL_SEARCH_MAX_LINE_CHARS as u32,
+        cancellation: reef_io::CancellationToken::from_flag(Arc::clone(&cancel)),
     };
 
     let mut on_chunk = |hits: Vec<reef_io::ContentMatchHit>| -> std::ops::ControlFlow<()> {
@@ -3258,6 +3358,7 @@ fn run_global_search_via_backend(
                 display: h.display,
                 line: h.line,
                 line_text: h.line_text,
+                line_revision: h.line_revision,
                 byte_range: h.byte_range,
             })
             .collect();
@@ -3282,61 +3383,13 @@ fn run_global_search_via_backend(
     }
 }
 
-/// Walk file bytes preserving each line's terminator. Each yielded
-/// segment ends at (and includes) a `\n`, except possibly the last
-/// segment if the file doesn't end with a newline. `\r\n` is kept
-/// intact because we only split on `\n` — the `\r` rides with the
-/// preceding bytes. This is the byte-level analogue of
-/// `bstr::ByteSlice::lines_with_terminator` without the dep.
-fn lines_with_terminator(bytes: &[u8]) -> Vec<&[u8]> {
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    for (i, b) in bytes.iter().enumerate() {
-        if *b == b'\n' {
-            out.push(&bytes[start..=i]);
-            start = i + 1;
-        }
-    }
-    if start < bytes.len() {
-        out.push(&bytes[start..]);
-    }
-    out
-}
-
-/// Drop a single trailing `\n` (and any `\r` immediately before it) so
-/// the byte slice represents the visible line content the search
-/// matcher saw. The matcher operates on the line body without the
-/// terminator — keeping `\r` would make `starts_with` comparisons
-/// against `expected_line_text` (CRLF-stripped by `grep_searcher`)
-/// fail on every CRLF file.
-fn strip_line_terminator(line: &[u8]) -> &[u8] {
-    let n = line.len();
-    if n >= 2 && line[n - 2] == b'\r' && line[n - 1] == b'\n' {
-        &line[..n - 2]
-    } else if n >= 1 && line[n - 1] == b'\n' {
-        &line[..n - 1]
-    } else {
-        line
-    }
-}
-
 /// Run one `FilesTask::ReplaceInFiles` batch. Streams a
 /// `WorkerResult::ReplaceProgress` per file and a final
 /// `WorkerResult::ReplaceDone`.
 ///
-/// Per-file flow:
-///   1. `backend.read_file` (cap = `MAX_REPLACE_FILE_SIZE`).
-///   2. Build a `grep_regex::RegexMatcher` from the same `query` that
-///      drove the search — guarantees byte-identical matching.
-///   3. Walk lines preserving terminators; for each `included_line` whose
-///      current text still matches the UI snapshot
-///      (`expected_line_text`), replace ALL occurrences of the pattern
-///      on that line with `replace_text` in-place.
-///   4. Concatenate back to bytes and `backend.write_file`.
-///
-/// All bytes stay as `Vec<u8>` end-to-end so non-UTF-8 files survive
-/// untouched. Failed files surface in `summary.errors` without aborting
-/// the rest of the batch.
+/// Each backend owns the complete guarded transform and atomic write. For a
+/// remote workspace this keeps the source file on the agent and transfers
+/// only the pattern, replacement, line revisions, and bounded outcome.
 fn run_replace_in_files(
     generation: u64,
     backend: &dyn Backend,
@@ -3355,40 +3408,36 @@ fn run_replace_in_files(
         });
         return;
     }
-    // Same builder the search worker used (smart-case, fixed-strings)
-    // so the worker rewrites exactly the matches the UI streamed in.
-    let matcher = match reef_io::local::build_smart_case_matcher(
-        query, /* fixed_strings */ true, /* case_sensitive */ None,
-    ) {
-        Ok(m) => m,
-        Err(e) => {
-            let _ = result_tx.send(WorkerResult::ReplaceDone {
-                generation,
-                result: Err(format!("build matcher: {e}")),
-            });
-            return;
-        }
-    };
-
-    let replace_bytes = replace_text.as_bytes();
-
     for (file_idx, item) in items.iter().enumerate() {
         let path = &item.path;
-        match replace_one_file(backend, &matcher, path, item, replace_bytes) {
-            FileReplaceOutcome::Changed {
+        let request = reef_io::ReplaceFileRequest {
+            pattern: query.to_string(),
+            replacement: replace_text.as_bytes().to_vec(),
+            lines: item
+                .lines
+                .iter()
+                .map(|line| reef_io::ReplaceLineGuard {
+                    line_no: line.line_no as u64,
+                    expected_revision: line.expected_revision,
+                })
+                .collect(),
+            max_file_size: MAX_REPLACE_FILE_SIZE,
+        };
+        match backend.replace_file(path, &request) {
+            Ok(reef_io::ReplaceFileOutcome::Changed {
                 lines_replaced,
                 stale,
-            } => {
+            }) => {
                 summary.files_changed += 1;
-                summary.lines_replaced += lines_replaced;
-                summary.skipped_stale += stale;
+                summary.lines_replaced += lines_replaced as usize;
+                summary.skipped_stale += stale as usize;
             }
-            FileReplaceOutcome::NoMatch { stale } => {
-                summary.skipped_stale += stale;
+            Ok(reef_io::ReplaceFileOutcome::NoMatch { stale }) => {
+                summary.skipped_stale += stale as usize;
             }
-            FileReplaceOutcome::TooLarge => summary.skipped_too_large += 1,
-            FileReplaceOutcome::SymlinkEscape => summary.skipped_symlink_escape += 1,
-            FileReplaceOutcome::Err(msg) => summary.errors.push((path.clone(), msg)),
+            Ok(reef_io::ReplaceFileOutcome::TooLarge) => summary.skipped_too_large += 1,
+            Err(reef_io::BackendError::PathEscape(_)) => summary.skipped_symlink_escape += 1,
+            Err(error) => summary.errors.push((path.clone(), error.to_string())),
         }
         let _ = result_tx.send(WorkerResult::ReplaceProgress {
             generation,
@@ -3401,157 +3450,6 @@ fn run_replace_in_files(
         generation,
         result: Ok(summary),
     });
-}
-
-enum FileReplaceOutcome {
-    /// File was rewritten with `lines_replaced` rewrites; `stale`
-    /// counts per-line stale-skips that the same pass observed (mixed
-    /// outcomes within one file are common when only some lines drift).
-    Changed {
-        lines_replaced: usize,
-        stale: usize,
-    },
-    /// File was read OK but no included line was rewritten. `stale`
-    /// carries the count for the per-batch counter.
-    NoMatch {
-        stale: usize,
-    },
-    TooLarge,
-    SymlinkEscape,
-    Err(String),
-}
-
-/// Per-file inner of `run_replace_in_files`. Pulled out so the outer
-/// loop only handles bookkeeping and the file-level decisions stay
-/// readable.
-fn replace_one_file(
-    backend: &dyn Backend,
-    matcher: &grep_regex::RegexMatcher,
-    path: &Path,
-    item: &ReplaceItem,
-    replace_bytes: &[u8],
-) -> FileReplaceOutcome {
-    use grep_matcher::Matcher;
-
-    // Cheap probe first — if the file exceeds the cap we skip without
-    // ever pulling its bytes across the wire (matters most for the
-    // remote backend, where `read_file` would otherwise transfer up to
-    // the cap and then we'd discard the truncated copy). Bare-`>` so a
-    // file that's *exactly* `MAX_REPLACE_FILE_SIZE` is still in scope —
-    // the cap is "no larger than", not "smaller than".
-    match backend.file_size(path) {
-        Ok(sz) if sz > MAX_REPLACE_FILE_SIZE => return FileReplaceOutcome::TooLarge,
-        Ok(_) => {}
-        Err(reef_io::BackendError::PathEscape(_)) => {
-            return FileReplaceOutcome::SymlinkEscape;
-        }
-        Err(e) => return FileReplaceOutcome::Err(format!("stat: {e}")),
-    }
-    let original = match backend.read_file(path, MAX_REPLACE_FILE_SIZE) {
-        Ok(bytes) => bytes,
-        Err(reef_io::BackendError::PathEscape(_)) => {
-            return FileReplaceOutcome::SymlinkEscape;
-        }
-        Err(e) => return FileReplaceOutcome::Err(format!("read: {e}")),
-    };
-
-    // Pre-walk line numbers so the replacement loop is straight-line.
-    let lines = lines_with_terminator(&original);
-    let mut out: Vec<u8> = Vec::with_capacity(original.len());
-    let mut included_idx = 0usize;
-    let included = &item.lines;
-    let mut lines_replaced = 0usize;
-    let mut stale = 0usize;
-
-    for (line_no, raw_line) in lines.iter().enumerate() {
-        let target = match included.get(included_idx) {
-            Some(t) if t.line_no == line_no => {
-                included_idx += 1;
-                Some(t)
-            }
-            _ => None,
-        };
-        let Some(target) = target else {
-            out.extend_from_slice(raw_line);
-            continue;
-        };
-
-        let body = strip_line_terminator(raw_line);
-        // TOCTOU guard. The UI saw `target.expected_text`; if the
-        // file's current line doesn't still start with that, an
-        // external editor changed the file under us — skip the
-        // replacement, count as stale.
-        let snapshot = target.expected_text.as_str();
-        let matches_snapshot = match std::str::from_utf8(body) {
-            Ok(text) => {
-                if snapshot.chars().count() >= GLOBAL_SEARCH_MAX_LINE_CHARS {
-                    text.starts_with(snapshot)
-                } else {
-                    text == snapshot
-                }
-            }
-            Err(_) => false,
-        };
-        if !matches_snapshot {
-            stale += 1;
-            out.extend_from_slice(raw_line);
-            continue;
-        }
-
-        // Replace every occurrence on this line. `find_iter` is
-        // borrow-checker-friendly via a callback and stops cleanly on
-        // matcher errors — same regex engine the search built so we
-        // see exactly what it streamed.
-        let mut new_body: Vec<u8> = Vec::with_capacity(body.len());
-        let mut cursor = 0usize;
-        let mut had_match = false;
-        let walk = matcher.find_iter(body, |m| {
-            had_match = true;
-            new_body.extend_from_slice(&body[cursor..m.start()]);
-            new_body.extend_from_slice(replace_bytes);
-            cursor = m.end();
-            true
-        });
-        if walk.is_err() {
-            // Pathological matcher state — leave the line intact.
-            out.extend_from_slice(raw_line);
-            continue;
-        }
-        if !had_match {
-            // The matcher disagrees with the UI snapshot (smart-case
-            // edge case, etc.). Treat as stale rather than silently
-            // doing nothing.
-            stale += 1;
-            out.extend_from_slice(raw_line);
-            continue;
-        }
-        new_body.extend_from_slice(&body[cursor..]);
-        // Re-attach the original terminator so `\r\n` files stay
-        // `\r\n` and `\n`-only files stay `\n`-only.
-        out.extend_from_slice(&new_body);
-        out.extend_from_slice(&raw_line[body.len()..]);
-        lines_replaced += 1;
-    }
-
-    if lines_replaced == 0 {
-        return FileReplaceOutcome::NoMatch { stale };
-    }
-    // Pathological case: user replaced `foo` with `foo`. The line
-    // was visited but produced byte-identical output, so the rewrite
-    // is a no-op. Skip the atomic write (saves a tempfile + rename
-    // + git status churn + fs-watcher event); report as NoMatch so
-    // downstream summary counts stay honest.
-    if out == original {
-        return FileReplaceOutcome::NoMatch { stale };
-    }
-
-    if let Err(e) = backend.write_file(path, &out) {
-        return FileReplaceOutcome::Err(format!("write: {e}"));
-    }
-    FileReplaceOutcome::Changed {
-        lines_replaced,
-        stale,
-    }
 }
 
 #[cfg(test)]
@@ -3958,7 +3856,7 @@ mod fs_mutation_tests {
 
 #[cfg(test)]
 mod replace_tests {
-    //! Worker-level tests for `run_replace_in_files` / `replace_one_file`.
+    //! Worker-level tests for the replace-in-files backend contract.
     //! Drive `LocalBackend` against a tempdir so the same code path the
     //! UI hits in production is exercised end-to-end (read → match →
     //! rewrite → atomic write). Uses the same worker-result sender shape
@@ -4002,7 +3900,7 @@ mod replace_tests {
                 .iter()
                 .map(|(line_no, expected_text)| ReplaceLine {
                     line_no: *line_no,
-                    expected_text: (*expected_text).to_string(),
+                    expected_revision: reef_io::content_line_revision(expected_text.as_bytes()),
                 })
                 .collect(),
         }
@@ -4053,6 +3951,28 @@ mod replace_tests {
         assert_eq!(
             fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
             "edited\nfoo here\n"
+        );
+    }
+
+    #[test]
+    fn skips_line_when_edit_is_beyond_search_display_cap() {
+        let tmp = TempDir::new().unwrap();
+        let original = format!("foo{}", "a".repeat(GLOBAL_SEARCH_MAX_LINE_CHARS));
+        let edited = format!("{}b\n", &original[..original.len() - 1]);
+        fs::write(tmp.path().join("a.txt"), &edited).unwrap();
+        let backend: Arc<dyn Backend> = Arc::new(LocalBackend::open_at(tmp.path().to_path_buf()));
+
+        let summary = run(
+            backend,
+            "foo",
+            "BAR",
+            vec![item("a.txt", &[(0, &original)])],
+        );
+
+        assert_eq!(summary.skipped_stale, 1);
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+            edited
         );
     }
 
@@ -4190,22 +4110,8 @@ mod replace_tests {
     }
 
     #[test]
-    fn skips_oversize_files_via_file_size_probe_without_reading_bytes() {
-        // Regression: the previous worker code first read up to
-        // `MAX_REPLACE_FILE_SIZE` bytes and then checked `>=`, which (a)
-        // round-tripped a useless 50 MB copy on the remote backend and
-        // (b) misclassified a file *exactly* at the cap as too-large.
-        // The fix routes through `Backend::file_size` first and uses
-        // strict `>` so a cap-sized file is still in scope.
+    fn replaces_a_file_below_the_size_cap() {
         let tmp = TempDir::new().unwrap();
-        // One byte over the cap — a real 50 MB+ allocation would be
-        // wasteful for a unit test, so we synthesise a marker and
-        // stub the backend response by writing actual bytes; we use a
-        // tiny override of the cap inside the worker via a wrapper
-        // in a follow-up if performance becomes an issue.
-        // For now, just verify a normal file under the cap goes
-        // through and a file over the cap reports `skipped_too_large`
-        // without panicking.
         fs::write(tmp.path().join("ok.txt"), "tiny needle line\n").unwrap();
         let backend: Arc<dyn Backend> = Arc::new(LocalBackend::open_at(tmp.path().to_path_buf()));
         let summary = run(
@@ -4214,7 +4120,6 @@ mod replace_tests {
             "x",
             vec![item("ok.txt", &[(0, "tiny needle line")])],
         );
-        // File well under the cap → replaced normally.
         assert_eq!(summary.lines_replaced, 1);
         assert_eq!(summary.skipped_too_large, 0);
     }
@@ -4273,6 +4178,7 @@ mod preview_panic_guard_tests {
     fn run_preview_with_panic_guard_passes_through_some() {
         let preview = PreviewContent {
             path: "x.txt".into(),
+            resolved_path: None,
             local_path: None,
             bytes_on_disk: 2,
             mime: Some("text/plain".into()),
@@ -4340,6 +4246,38 @@ mod preview_worker_coalescing_tests {
                 page: 0,
                 rows_per_page: 100,
                 reset_h_scroll: false,
+            },
+        }
+    }
+
+    fn load_db_detail(generation: u64) -> FilesTask {
+        FilesTask::LoadDbDetail {
+            generation,
+            backend: backend(),
+            path: PathBuf::from("data.sqlite"),
+            key: reef_sqlite_preview::DbObjectKey {
+                schema: "main".to_string(),
+                name: "items_by_name".to_string(),
+                kind: reef_sqlite_preview::DbObjectKind::Index,
+            },
+        }
+    }
+
+    fn load_db_cell(generation: u64, cancellation: reef_io::CancellationToken) -> DbCellTask {
+        DbCellTask {
+            generation,
+            backend: backend(),
+            request: DbCellRequest {
+                path: PathBuf::from("data.sqlite"),
+                key: reef_sqlite_preview::DbObjectKey {
+                    schema: "main".to_string(),
+                    name: "items".to_string(),
+                    kind: reef_sqlite_preview::DbObjectKind::Table,
+                },
+                row_offset: 0,
+                row_locator: reef_sqlite_preview::DbRowLocator::RowId(1),
+                column: 0,
+                cancellation,
             },
         }
     }
@@ -4420,6 +4358,43 @@ mod preview_worker_coalescing_tests {
             FilesTask::LoadDbPage { generation, .. } => assert_eq!(generation, 12),
             _ => panic!("expected LoadDbPage to stay queued"),
         }
+    }
+
+    #[test]
+    fn database_content_coalescing_keeps_only_the_latest_selection() {
+        let (tx, rx) = mpsc::unbounded();
+        let mut backlog = VecDeque::new();
+        tx.send(load_db_detail(2)).unwrap();
+        tx.send(load_db_page(3)).unwrap();
+        tx.send(rebuild_tree(9)).unwrap();
+
+        let selected = coalesce_preview_worker_task(load_db_page(1), &rx, &mut backlog);
+
+        match selected {
+            FilesTask::LoadDbPage { generation, .. } => assert_eq!(generation, 3),
+            _ => panic!("expected latest database content request"),
+        }
+        assert_eq!(backlog.len(), 1);
+        assert!(matches!(
+            backlog.pop_front(),
+            Some(FilesTask::RebuildTree { generation: 9, .. })
+        ));
+    }
+
+    #[test]
+    fn database_cell_queue_cancels_obsolete_requests() {
+        let (tx, rx) = mpsc::unbounded();
+        let obsolete_cancellation = reef_io::CancellationToken::default();
+        tx.send(load_db_cell(1, obsolete_cancellation.clone()))
+            .unwrap();
+        tx.send(load_db_cell(2, reef_io::CancellationToken::default()))
+            .unwrap();
+
+        let selected = recv_latest_db_cell_task(&rx).unwrap();
+
+        assert_eq!(selected.generation, 2);
+        assert!(obsolete_cancellation.is_cancelled());
+        assert!(!selected.request.cancellation.is_cancelled());
     }
 
     #[test]
@@ -4534,6 +4509,7 @@ mod preview_worker_coalescing_tests {
         let source = format!("# Title\n\n{}", "large markdown paragraph ".repeat(24_000));
         let content = PreviewContent {
             path: "README.md".into(),
+            resolved_path: None,
             local_path: None,
             bytes_on_disk: source.len() as u64,
             mime: Some("text/markdown".into()),

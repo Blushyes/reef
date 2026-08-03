@@ -1368,6 +1368,59 @@ mod tests {
     }
 
     #[test]
+    fn selecting_displayed_preview_again_does_not_schedule_a_reload() {
+        let mut app = minimal_app_state();
+        app.preview_content = Some(Arc::new(global_search_text_preview("script.json")));
+
+        app.load_preview_for_path(PathBuf::from("script.json"));
+
+        assert!(app.preview_schedule.is_none());
+        assert!(app.preview_in_flight_path.is_none());
+    }
+
+    #[test]
+    fn stale_displayed_preview_still_schedules_a_reload() {
+        let mut app = minimal_app_state();
+        app.preview_content = Some(Arc::new(global_search_text_preview("script.json")));
+        app.preview_load.mark_stale();
+
+        app.load_preview_for_path(PathBuf::from("script.json"));
+
+        assert_eq!(
+            app.preview_schedule
+                .as_ref()
+                .map(|(path, _)| path.as_path()),
+            Some(Path::new("script.json"))
+        );
+    }
+
+    #[test]
+    fn selecting_pending_preview_again_preserves_the_original_request() {
+        let mut app = minimal_app_state();
+        let deadline = Instant::now();
+        app.preview_schedule = Some((PathBuf::from("script.json"), deadline));
+
+        app.load_preview_for_path(PathBuf::from("script.json"));
+
+        assert_eq!(
+            app.preview_schedule,
+            Some((PathBuf::from("script.json"), deadline))
+        );
+    }
+
+    #[test]
+    fn reselecting_displayed_preview_cancels_a_pending_other_path() {
+        let mut app = minimal_app_state();
+        app.preview_content = Some(Arc::new(global_search_text_preview("script.json")));
+        app.preview_schedule = Some((PathBuf::from("other.json"), Instant::now()));
+
+        app.load_preview_for_path(PathBuf::from("script.json"));
+
+        assert!(app.preview_schedule.is_none());
+        assert!(app.preview_is_for(Path::new("script.json")));
+    }
+
+    #[test]
     fn in_flight_preview_target_controls_workspace_invalidation() {
         let mut app = minimal_app_state();
         app.preview_content = Some(Arc::new(global_search_text_preview("old.json")));

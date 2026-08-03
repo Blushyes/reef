@@ -1906,6 +1906,10 @@ impl ReefApp {
             .map(|(path, _)| path.clone())
     }
 
+    pub fn preview_target_matches(&self, path: &Path) -> bool {
+        self.state.preview_target_matches(path)
+    }
+
     pub fn preview_is_database(&self) -> bool {
         self.state
             .preview_content

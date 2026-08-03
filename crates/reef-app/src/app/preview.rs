@@ -66,6 +66,15 @@ impl AppState {
         {
             self.preview_highlight = None;
         }
+        if !self.preview_load.should_request() {
+            if self.preview_is_for(&rel_path) {
+                self.cancel_preview_work_for_other_path(&rel_path);
+                return;
+            }
+            if self.preview_target_matches(&rel_path) {
+                return;
+            }
+        }
         self.preview_schedule = Some((rel_path, Instant::now() + PREVIEW_DEBOUNCE));
         self.prefetch_schedule = None;
     }

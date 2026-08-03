@@ -119,7 +119,9 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 /// - v22: adds `CancelDbCell`, allowing a newer SQLite cell selection to stop
 ///        an obsolete query or TEXT stream before the serial agent worker starts
 ///        the latest request.
-pub const PROTOCOL_VERSION: u32 = 22;
+/// - v23: adds `AbortGitPathMutation`, allowing a client to discard accumulated
+///        stage/unstage chunks when the logical batch cannot be completed.
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// Encode a single envelope-level value to `writer` using the
 /// length-prefixed framing. The caller is expected to flush.
@@ -242,6 +244,9 @@ pub enum Request {
         kind: GitPathMutationKindDto,
         paths: Vec<String>,
         final_chunk: bool,
+    },
+    AbortGitPathMutation {
+        operation_id: u64,
     },
     Restore {
         path: String,

@@ -435,6 +435,14 @@ impl RemoteBackend {
         })
     }
 
+    fn abort_git_path_mutation(&self, operation_id: u64) -> Result<(), BackendError> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        self.send_envelope(Envelope {
+            id,
+            body: Request::AbortGitPathMutation { operation_id },
+        })
+    }
+
     fn request<T: serde::de::DeserializeOwned>(&self, req: Request) -> Result<T, BackendError> {
         self.request_with_timeout(req, DEFAULT_RPC_TIMEOUT)
     }
@@ -472,7 +480,7 @@ impl RemoteBackend {
         let ranges = git_path_batch_ranges(paths, kind, operation_id, MAX_FRAME_SIZE as usize)?;
         let chunk_count = ranges.len();
         for (index, range) in ranges.into_iter().enumerate() {
-            let _: serde_json::Value = self.request_with_timeout(
+            let result: Result<serde_json::Value, BackendError> = self.request_with_timeout(
                 Request::GitPathMutationChunk {
                     operation_id,
                     kind: kind.dto(),
@@ -480,7 +488,14 @@ impl RemoteBackend {
                     final_chunk: index + 1 == chunk_count,
                 },
                 GIT_MUTATION_RPC_TIMEOUT,
-            )?;
+            );
+            if let Err(error) = result {
+                // The failed frame may already have reached the agent. Abort is
+                // deliberately fire-and-forget so cleanup cannot hide or delay
+                // the original mutation error.
+                let _ = self.abort_git_path_mutation(operation_id);
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -935,6 +950,10 @@ impl Backend for RemoteBackend {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if last_progress.elapsed() >= DEFAULT_RPC_TIMEOUT {
+                        // The response guard only releases client-side routing.
+                        // Stop the agent's serial SQLite worker as well so a
+                        // timed-out value cannot block the next cell request.
+                        let _ = self.cancel_db_cell(id);
                         return Err(BackendError::Rpc(
                             "SQLite cell request timed out".to_string(),
                         ));

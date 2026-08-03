@@ -249,6 +249,35 @@ fn stage_unstage_many_reflects_in_status() {
 }
 
 #[test]
+fn abort_git_path_mutation_discards_accumulated_chunks() {
+    let _lock = AGENT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "a.txt", "v1\n", "init");
+    write_file(&raw, "a.txt", "v2\n");
+
+    let mut agent = Agent::spawn(tmp.path());
+    let _ = ok_result(agent.request(Request::GitPathMutationChunk {
+        operation_id: 9,
+        kind: GitPathMutationKindDto::Stage,
+        paths: vec!["a.txt".to_string()],
+        final_chunk: false,
+    }));
+
+    let aborted = ok_result(agent.request(Request::AbortGitPathMutation { operation_id: 9 }));
+    assert_eq!(aborted, serde_json::json!({ "aborted": true }));
+    let already_absent =
+        ok_result(agent.request(Request::AbortGitPathMutation { operation_id: 9 }));
+    assert_eq!(already_absent, serde_json::json!({ "aborted": false }));
+
+    let status: StatusSnapshotDto =
+        serde_json::from_value(ok_result(agent.request(Request::GitStatus))).unwrap();
+    assert!(status.staged.is_empty());
+    assert_eq!(status.unstaged.len(), 1);
+
+    agent.shutdown();
+}
+
+#[test]
 fn list_commits_returns_history() {
     let _lock = AGENT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();

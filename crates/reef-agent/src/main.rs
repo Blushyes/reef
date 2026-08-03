@@ -197,6 +197,12 @@ fn main() -> io::Result<()> {
 
         let response = if matches!(envelope.body, Request::GitPathMutationChunk { .. }) {
             dispatch_git_path_mutation_chunk(&*backend, envelope, &mut pending_git_path_mutations)
+        } else if let Request::AbortGitPathMutation { operation_id } = &envelope.body {
+            let aborted = pending_git_path_mutations.remove(operation_id).is_some();
+            Some(Response::Ok {
+                id: envelope.id,
+                result: serde_json::json!({ "aborted": aborted }),
+            })
         } else if let Request::SearchContent { request } = &envelope.body {
             let cancellation = reef_io::CancellationToken::default();
             search_cancellations
@@ -527,6 +533,10 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
         Request::GitPathMutationChunk { .. } => Err((
             ErrorCode::Protocol,
             "git mutation chunks must be dispatched by the connection state machine".into(),
+        )),
+        Request::AbortGitPathMutation { .. } => Err((
+            ErrorCode::Protocol,
+            "git mutation aborts must be dispatched by the connection state machine".into(),
         )),
         Request::Restore { path } => match backend.restore(&path) {
             Ok(()) => Ok(serde_json::json!({"ok": true})),

@@ -627,6 +627,7 @@ enum PreviewEnrichmentInput {
     Text {
         bytes_on_disk: u64,
         lines: Vec<String>,
+        source: Option<Arc<str>>,
     },
     Markdown {
         source: String,
@@ -1996,6 +1997,7 @@ fn preview_enrichment_task(
             PreviewEnrichmentInput::Text {
                 bytes_on_disk: content.bytes_on_disk,
                 lines: text.lines.clone(),
+                source: text.source.clone(),
             }
         }
         PreviewBody::Markdown(markdown) => {
@@ -2036,10 +2038,12 @@ fn spawn_preview_enrichment_worker(
                         PreviewEnrichmentInput::Text {
                             bytes_on_disk,
                             ref lines,
+                            ref source,
                         } => reef_core::preview::build_text_preview_enrichment(
                             &task.path,
                             bytes_on_disk,
                             lines,
+                            source.as_deref(),
                             task.dark,
                         )
                         .map(PreviewEnrichment::Text),
@@ -4517,6 +4521,25 @@ mod preview_worker_coalescing_tests {
         };
 
         assert!(matches!(content.body, PreviewBody::Markdown(_)));
+        assert!(preview_enrichment_task(1, &content, false).is_none());
+    }
+
+    #[test]
+    fn large_structured_preview_skips_enrichment_worker() {
+        let source = r#"{"event":"open"}"#;
+        let content = PreviewContent {
+            path: "events.jsonl".into(),
+            resolved_path: None,
+            local_path: None,
+            bytes_on_disk: 513 * 1024,
+            mime: Some("application/x-ndjson".into()),
+            body: reef_core::preview::build_textual_preview_body("events.jsonl", source),
+        };
+
+        let PreviewBody::Text(text) = &content.body else {
+            panic!("expected text preview");
+        };
+        assert!(text.source.is_some());
         assert!(preview_enrichment_task(1, &content, false).is_none());
     }
 

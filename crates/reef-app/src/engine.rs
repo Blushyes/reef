@@ -420,6 +420,15 @@ impl ReefApp {
             AppCommand::ClampPreviewHorizontalScroll(max_scroll) => {
                 self.state.clamp_preview_horizontal_scroll(max_scroll);
             }
+            AppCommand::SetStructuredPreviewMode(mode) => {
+                self.state.set_structured_preview_mode(mode);
+            }
+            AppCommand::ToggleStructuredPreviewMode => {
+                self.state.toggle_structured_preview_mode();
+            }
+            AppCommand::ToggleStructuredPreviewNode(node_id) => {
+                self.state.toggle_structured_preview_node(&node_id);
+            }
             AppCommand::SetDiffVerticalScroll(value) => {
                 self.state.set_diff_vertical_scroll(value);
             }
@@ -1878,6 +1887,16 @@ impl ReefApp {
 
     pub fn preview_enrichment_pending(&self) -> bool {
         self.state.preview_enrichment_pending()
+    }
+
+    pub fn structured_preview_mode(&self) -> crate::StructuredPreviewMode {
+        self.state.structured_preview_mode
+    }
+
+    pub fn structured_preview_document(
+        &self,
+    ) -> Option<Arc<reef_core::structured_data::StructuredDataDocument>> {
+        self.state.structured_preview_document()
     }
 
     pub fn preview_scheduled_path(&self) -> Option<PathBuf> {

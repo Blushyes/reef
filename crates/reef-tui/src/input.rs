@@ -1823,6 +1823,13 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
         {
             app.engine.dispatch(AppCommand::OpenDbGoto);
         }
+        KeyCode::Char('t')
+            if !ctrl
+                && matches!(app.engine.active_panel(), Panel::Diff | Panel::Commit)
+                && app.engine.structured_preview_document().is_some() =>
+        {
+            app.toggle_structured_preview_mode();
+        }
         KeyCode::Left if app.engine.active_panel() == Panel::Diff => {
             let step = if key.modifiers.contains(KeyModifiers::SHIFT) {
                 10
@@ -2520,6 +2527,20 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
         }
     }
 
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+        && let Some(rect) = app.last_preview_rect
+        && point_in_rect(rect, mouse.column, mouse.row)
+        && let Some(action) = app.hit_registry.hit_test(mouse.column, mouse.row)
+        && matches!(
+            action,
+            ui::mouse::ClickAction::SetStructuredPreviewMode(_)
+                | ui::mouse::ClickAction::ToggleStructuredPreviewNode(_)
+        )
+    {
+        app.handle_action(action);
+        return;
+    }
+
     // Clicking a rendered Markdown link opens it. Sits before preview
     // drag-selection so links behave like links; non-link text still
     // falls through to selectable reading-view text.
@@ -2834,6 +2855,11 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
 /// clipboard copy. A `Drag` after a double/triple click extends the active
 /// endpoint normally (VS Code-style word-range extension).
 fn handle_preview_selection(mouse: &MouseEvent, app: &mut App) -> bool {
+    if app.engine.structured_preview_mode() == reef_app::StructuredPreviewMode::Tree
+        && app.engine.structured_preview_document().is_some()
+    {
+        return false;
+    }
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             let Some(rect) = app.last_preview_rect else {

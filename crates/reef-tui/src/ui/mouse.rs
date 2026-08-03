@@ -166,6 +166,8 @@ pub enum ClickAction {
     NavCandidatesClose,
     /// Click a rendered Markdown link in the file preview.
     OpenMarkdownLink(String),
+    SetStructuredPreviewMode(reef_app::StructuredPreviewMode),
+    ToggleStructuredPreviewNode(String),
 }
 
 #[derive(Debug, Clone)]

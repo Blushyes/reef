@@ -212,7 +212,7 @@ pub fn structured_data_source_required(path: &str) -> bool {
             .and_then(|extension| extension.to_str())
             .map(str::to_ascii_lowercase)
             .as_deref(),
-        Some("json" | "jsonc" | "json5" | "yaml" | "yml")
+        Some("json" | "jsonc" | "json5" | "jsonl" | "yaml" | "yml")
     )
 }
 
@@ -220,6 +220,7 @@ pub fn build_text_preview_enrichment(
     path: &str,
     bytes_on_disk: u64,
     lines: &[String],
+    source: Option<&str>,
     dark: bool,
 ) -> Option<super::TextPreviewEnrichment> {
     if !text_preview_can_be_enriched(bytes_on_disk, lines.len()) {
@@ -230,13 +231,33 @@ pub fn build_text_preview_enrichment(
         let source: Arc<[u8]> = Arc::from(lines.join("\n").into_bytes().into_boxed_slice());
         crate::nav::parse_file_if_supported(lang, source).map(Arc::new)
     });
-    if highlighted.is_none() && parsed.is_none() {
+    let structured = source.and_then(|source| structured_document_for_path(path, source));
+    if highlighted.is_none() && parsed.is_none() && structured.is_none() {
         return None;
     }
     Some(super::TextPreviewEnrichment {
         highlighted,
         parsed,
+        structured,
     })
+}
+
+fn structured_document_for_path(
+    path: &str,
+    source: &str,
+) -> Option<crate::structured_data::StructuredDataDocument> {
+    match Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("json") => crate::structured_data::StructuredDataDocument::from_json(source).ok(),
+        Some("jsonl") => {
+            crate::structured_data::StructuredDataDocument::from_json_lines(source).ok()
+        }
+        _ => None,
+    }
 }
 
 pub fn text_preview_can_be_enriched(bytes_on_disk: u64, line_count: usize) -> bool {
@@ -354,6 +375,7 @@ mod tests {
                     "src.rs",
                     content.bytes_on_disk,
                     &text.lines,
+                    text.source.as_deref(),
                     true,
                 )
                 .expect("small rust preview should enrich");
@@ -376,6 +398,49 @@ mod tests {
 
         assert_eq!(text.lines.len(), MAX_TEXT_PREVIEW_LINES);
         assert_eq!(text.source.as_deref(), Some(source.as_str()));
+    }
+
+    #[test]
+    fn json_lines_enrichment_builds_a_structured_outline() {
+        let source = "{\"event\":\"open\"}\n{\"event\":\"close\"}\n";
+        let PreviewBody::Text(text) = build_textual_preview_body("events.jsonl", source) else {
+            panic!("expected text preview");
+        };
+
+        let enrichment = build_text_preview_enrichment(
+            "events.jsonl",
+            source.len() as u64,
+            &text.lines,
+            text.source.as_deref(),
+            true,
+        )
+        .expect("jsonl preview should enrich");
+
+        let document = enrichment.structured.expect("structured document");
+        assert!(
+            document
+                .outline()
+                .rows()
+                .iter()
+                .any(|row| row.id == "root/1/event.value")
+        );
+    }
+
+    #[test]
+    fn large_structured_preview_skips_enrichment() {
+        let source = r#"{"event":"open","count":1}"#;
+        let lines = vec![source.to_string()];
+
+        assert!(
+            build_text_preview_enrichment(
+                "events.jsonl",
+                MAX_ENRICHMENT_BYTES + 1,
+                &lines,
+                Some(source),
+                true,
+            )
+            .is_none()
+        );
     }
 
     #[test]

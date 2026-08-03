@@ -50,6 +50,7 @@ pub struct TextPreview {
 pub struct TextPreviewEnrichment {
     pub highlighted: Option<Vec<Vec<crate::text::StyledToken>>>,
     pub parsed: Option<Arc<crate::nav::FileParse>>,
+    pub structured: Option<crate::structured_data::StructuredDataDocument>,
 }
 
 #[derive(Debug, Clone)]

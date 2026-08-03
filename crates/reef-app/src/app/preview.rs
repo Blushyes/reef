@@ -162,6 +162,9 @@ impl AppState {
             (self.preview_content.as_deref(), content.as_ref()),
             (Some(old), Some(new)) if old.path == new.path
         );
+        if !same_file {
+            self.structured_preview = None;
+        }
         self.preview_content = content.map(Arc::new);
         if source_changed {
             self.preview_source_revision = generation;
@@ -220,6 +223,13 @@ impl AppState {
             ) => {
                 text.highlighted = enrichment.highlighted;
                 text.parsed = enrichment.parsed;
+                self.structured_preview =
+                    enrichment
+                        .structured
+                        .map(|document| StructuredPreviewState {
+                            path: path.to_string(),
+                            document: Arc::new(document),
+                        });
             }
             (
                 reef_core::preview::PreviewBody::Markdown(markdown),
@@ -251,6 +261,45 @@ impl AppState {
 
     pub fn preview_enrichment_pending(&self) -> bool {
         self.preview_enrichment_pending.is_some()
+    }
+
+    pub fn structured_preview_document(
+        &self,
+    ) -> Option<Arc<reef_core::structured_data::StructuredDataDocument>> {
+        let state = self.structured_preview.as_ref()?;
+        self.preview_content
+            .as_ref()
+            .is_some_and(|preview| preview.path == state.path)
+            .then(|| Arc::clone(&state.document))
+    }
+
+    pub fn set_structured_preview_mode(&mut self, mode: StructuredPreviewMode) {
+        if self.structured_preview_mode == mode {
+            return;
+        }
+        self.structured_preview_mode = mode;
+        self.preview_scroll = 0;
+        self.preview_h_scroll = 0;
+    }
+
+    pub fn toggle_structured_preview_mode(&mut self) {
+        let mode = match self.structured_preview_mode {
+            StructuredPreviewMode::Tree => StructuredPreviewMode::Raw,
+            StructuredPreviewMode::Raw => StructuredPreviewMode::Tree,
+        };
+        self.set_structured_preview_mode(mode);
+    }
+
+    pub fn toggle_structured_preview_node(&mut self, node_id: &str) {
+        let Some(state) = self.structured_preview.as_mut() else {
+            return;
+        };
+        Arc::make_mut(&mut state.document).toggle_collapsed(node_id);
+        self.preview_scroll = self
+            .preview_scroll
+            .min(state.document.outline().row_count().saturating_sub(1));
+        self.preview_h_scroll = 0;
+        self.bump_preview_content_revision();
     }
 
     fn bump_preview_content_revision(&mut self) {
@@ -386,7 +435,7 @@ mod tests {
         DatabaseInfoV2, DbObject, DbObjectKind, DbPage, SchemaKind, SchemaSummary, SqliteValue,
     };
 
-    use crate::app::{AppPrefs, AppState, AppStateConfig};
+    use crate::app::{AppPrefs, AppState, AppStateConfig, StructuredPreviewMode};
 
     #[test]
     fn preview_error_keeps_previous_content_and_exposes_error() {
@@ -517,6 +566,7 @@ mod tests {
             Some(PreviewEnrichment::Text(TextPreviewEnrichment {
                 highlighted: Some(vec![vec![StyledToken::new(TextStyle::default(), "hello")]]),
                 parsed: None,
+                structured: None,
             })),
         );
 
@@ -545,6 +595,7 @@ mod tests {
             Some(PreviewEnrichment::Text(TextPreviewEnrichment {
                 highlighted: None,
                 parsed: None,
+                structured: None,
             })),
         );
         assert!(!stale);
@@ -567,6 +618,52 @@ mod tests {
         assert!(state.complete_preview_enrichment(generation, "src/main.rs", None));
         assert!(!state.preview_enrichment_pending());
         assert_eq!(state.preview_content_revision, base_revision);
+    }
+
+    #[test]
+    fn structured_preview_mode_and_collapsed_nodes_live_in_app_state() {
+        let backend = Arc::new(LocalBackend::open_at(PathBuf::from(".")));
+        let mut state = AppState::new(AppStateConfig {
+            backend,
+            prefs: AppPrefs::default(),
+            now: Instant::now(),
+            subscribe_fs_events: false,
+        });
+        let generation = state.preview_load.begin();
+        state.apply_preview_content(generation, Some(text_preview("data.json")), 20);
+        assert!(state.request_current_preview_enrichment(generation));
+        let document = reef_core::structured_data::StructuredDataDocument::from_json(
+            r#"{"items":[{"id":1},{"id":2}]}"#,
+        )
+        .unwrap();
+
+        assert!(state.complete_preview_enrichment(
+            generation,
+            "data.json",
+            Some(PreviewEnrichment::Text(TextPreviewEnrichment {
+                highlighted: None,
+                parsed: None,
+                structured: Some(document),
+            })),
+        ));
+        let expanded_rows = state
+            .structured_preview_document()
+            .unwrap()
+            .outline()
+            .row_count();
+
+        state.toggle_structured_preview_node("root/items");
+        state.toggle_structured_preview_mode();
+
+        assert_eq!(state.structured_preview_mode, StructuredPreviewMode::Raw);
+        assert!(
+            state
+                .structured_preview_document()
+                .unwrap()
+                .outline()
+                .row_count()
+                < expanded_rows
+        );
     }
 
     #[test]

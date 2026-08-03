@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fmt;
+use std::sync::Arc;
 
 use serde::de::{DeserializeSeed, Error as DeError, MapAccess, SeqAccess, Visitor};
 use unicode_width::UnicodeWidthStr;
@@ -34,6 +35,13 @@ pub enum StructuredDataScalar {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuredDataError {
     message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct StructuredDataDocument {
+    root: Arc<StructuredDataNode>,
+    collapsed_ids: HashSet<String>,
+    outline: Arc<JsonOutline>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,10 +106,67 @@ impl fmt::Display for StructuredDataError {
 
 impl std::error::Error for StructuredDataError {}
 
+impl StructuredDataDocument {
+    pub fn from_json(input: &str) -> Result<Self, StructuredDataError> {
+        Ok(Self::new(parse_json(input)?))
+    }
+
+    pub fn from_json_lines(input: &str) -> Result<Self, StructuredDataError> {
+        Ok(Self::new(parse_json_lines(input)?))
+    }
+
+    fn new(root: StructuredDataNode) -> Self {
+        let root = Arc::new(root);
+        let collapsed_ids = HashSet::new();
+        let outline = Arc::new(json_outline(&root, &collapsed_ids));
+        Self {
+            root,
+            collapsed_ids,
+            outline,
+        }
+    }
+
+    pub fn outline(&self) -> &JsonOutline {
+        &self.outline
+    }
+
+    pub fn toggle_collapsed(&mut self, node_id: &str) {
+        if !self.collapsed_ids.remove(node_id) {
+            self.collapsed_ids.insert(node_id.to_string());
+        }
+        self.outline = Arc::new(json_outline(&self.root, &self.collapsed_ids));
+    }
+}
+
 pub fn parse_json(input: &str) -> Result<StructuredDataNode, StructuredDataError> {
+    parse_json_at_path(input, ROOT_NODE_ID)
+}
+
+pub fn parse_json_lines(input: &str) -> Result<StructuredDataNode, StructuredDataError> {
+    let mut children = Vec::new();
+    for (line_index, line) in input.lines().enumerate() {
+        if line.trim().is_empty() {
+            return Err(StructuredDataError::new(format!(
+                "line {} is empty",
+                line_index + 1
+            )));
+        }
+        let path = array_child_path(ROOT_NODE_ID, children.len());
+        let node = parse_json_at_path(line, &path).map_err(|error| {
+            StructuredDataError::new(format!("line {}: {error}", line_index + 1))
+        })?;
+        children.push(node);
+    }
+    Ok(StructuredDataNode {
+        id: ROOT_NODE_ID.to_string(),
+        value: StructuredDataValue::Array(children),
+    })
+}
+
+fn parse_json_at_path(input: &str, path: &str) -> Result<StructuredDataNode, StructuredDataError> {
     let mut deserializer = serde_json::Deserializer::from_str(input);
     let node = NodeSeed {
-        path: ROOT_NODE_ID.to_string(),
+        path: path.to_string(),
     }
     .deserialize(&mut deserializer)
     .map_err(|error| StructuredDataError::new(error.to_string()))?;
@@ -570,6 +635,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_json_lines_builds_an_array_with_stable_record_ids() {
+        let root = parse_json_lines("{\"event\":\"open\"}\n{\"event\":\"close\"}\n").unwrap();
+        let StructuredDataValue::Array(records) = root.value else {
+            panic!("root is array");
+        };
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            ["root/0", "root/1"]
+        );
+    }
+
+    #[test]
+    fn parse_json_lines_reports_the_invalid_line() {
+        let error = parse_json_lines("{\"event\":\"open\"}\nnot-json\n").unwrap_err();
+
+        assert!(
+            error.to_string().starts_with("line 2:"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn json_outline_rows_are_left_aligned_and_paged() {
         let root = parse_json(r#"{"name":"reef","features":["preview","git"],"ok":true}"#).unwrap();
         let rows = json_outline_rows(&root, &HashSet::new(), 1, 3);
@@ -661,5 +752,23 @@ mod tests {
             .unwrap();
 
         assert_eq!(items.selectable_text(), "\"items\" :   [");
+    }
+
+    #[test]
+    fn structured_document_rebuilds_its_cached_outline_when_a_node_toggles() {
+        let mut document =
+            StructuredDataDocument::from_json(r#"{"items":[{"id":1},{"id":2}]}"#).unwrap();
+        let expanded_rows = document.outline().row_count();
+
+        document.toggle_collapsed("root/items");
+
+        assert!(document.outline().row_count() < expanded_rows);
+        let items = document
+            .outline()
+            .rows()
+            .iter()
+            .find(|row| row.id == "root/items.collapsed")
+            .unwrap();
+        assert!(items.disclosure.as_ref().unwrap().collapsed);
     }
 }

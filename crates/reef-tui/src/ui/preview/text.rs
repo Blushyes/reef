@@ -1,5 +1,7 @@
 use crate::TuiApp as App;
-use crate::ui::preview::chrome::render_card_header;
+use crate::ui::preview::chrome::{
+    StructuredHeaderOptions, render_card_header, render_structured_card_header,
+};
 use crate::ui::text::{clip_spans, overlay_match_highlight, overlay_selection_highlight};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -32,7 +34,22 @@ pub(in crate::ui) fn render(
         } else {
             None
         };
-    let y = render_card_header(f, area, &preview.path, &th, focused, match_count);
+    let y = if app.engine.structured_preview_document().is_some() {
+        render_structured_card_header(
+            f,
+            area,
+            &preview.path,
+            &th,
+            focused,
+            StructuredHeaderOptions {
+                match_count,
+                mode: app.engine.structured_preview_mode(),
+            },
+            &mut app.hit_registry,
+        )
+    } else {
+        render_card_header(f, area, &preview.path, &th, focused, match_count)
+    };
 
     let content_height = (max_y - y) as usize;
     app.layout.last_preview_view_h = content_height as u16;

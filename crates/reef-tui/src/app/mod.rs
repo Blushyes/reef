@@ -257,6 +257,12 @@ impl App {
                         .map(DiffMode::from_pref_str)
                         .unwrap_or(DiffMode::Compact),
                     commit_files_tree_mode: crate::prefs::get_bool("commit.files_tree_mode"),
+                    structured_preview_mode: crate::prefs::get(
+                        reef_core::prefs::STRUCTURED_PREVIEW_MODE,
+                    )
+                    .as_deref()
+                    .map(reef_app::StructuredPreviewMode::from_pref_str)
+                    .unwrap_or_default(),
                     quick_open: crate::quick_open::from_prefs(),
                 },
                 subscribe_fs_events: true,
@@ -1250,6 +1256,23 @@ impl App {
         );
     }
 
+    pub fn set_structured_preview_mode(&mut self, mode: reef_app::StructuredPreviewMode) {
+        self.engine
+            .dispatch(reef_app::AppCommand::SetStructuredPreviewMode(mode));
+        crate::prefs::set(reef_core::prefs::STRUCTURED_PREVIEW_MODE, mode.pref_str());
+        self.preview_selection = None;
+    }
+
+    pub fn toggle_structured_preview_mode(&mut self) {
+        self.engine
+            .dispatch(reef_app::AppCommand::ToggleStructuredPreviewMode);
+        crate::prefs::set(
+            reef_core::prefs::STRUCTURED_PREVIEW_MODE,
+            self.engine.structured_preview_mode().pref_str(),
+        );
+        self.preview_selection = None;
+    }
+
     pub fn stage_file(&mut self, path: &str) {
         self.engine.dispatch(reef_app::AppCommand::StageFile {
             path: path.to_string(),
@@ -2150,6 +2173,14 @@ impl App {
             }
             ClickAction::OpenMarkdownLink(target) => {
                 self.open_markdown_link(&target);
+            }
+            ClickAction::SetStructuredPreviewMode(mode) => {
+                self.set_structured_preview_mode(mode);
+            }
+            ClickAction::ToggleStructuredPreviewNode(node_id) => {
+                self.engine
+                    .dispatch(reef_app::AppCommand::ToggleStructuredPreviewNode(node_id));
+                self.preview_selection = None;
             }
             ClickAction::HostsPickerSelect(idx) => {
                 // Mouse click on a hosts-picker row: move selection to

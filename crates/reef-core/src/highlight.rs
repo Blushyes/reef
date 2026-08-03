@@ -31,7 +31,7 @@ fn resolve_syntax(path: &str, lines: &[String]) -> Option<&'static SyntaxReferen
         let mapped = match ext {
             "jsx" | "cjs" | "mjs" => "js",
             "mts" | "cts" => "ts",
-            "jsonc" | "json5" => "json",
+            "jsonc" | "json5" | "jsonl" => "json",
             "ejs" | "erb" => "html",
             "zshrc" | "bashrc" | "profile" => "sh",
             _ => ext,
@@ -166,12 +166,24 @@ mod tests {
     }
 
     #[test]
+    fn highlight_json_lines_uses_json_syntax() {
+        let lines = vec![r#"{"event":"open","count":1}"#.to_string()];
+        let out = highlight_file("events.jsonl", &lines, true).expect("jsonl must highlight");
+
+        assert!(
+            out[0].len() > 1,
+            "expected JSON tokenization, got {:?}",
+            out[0]
+        );
+    }
+
+    #[test]
     fn highlight_extensions_exist() {
         let exts = [
-            "rs", "py", "js", "ts", "tsx", "jsx", "go", "md", "json", "jsonc", "yml", "yaml",
-            "toml", "sh", "bash", "zsh", "html", "css", "scss", "c", "cpp", "h", "hpp", "java",
-            "kt", "swift", "rb", "php", "lua", "vue", "svelte", "dart", "zig", "nix", "hcl", "tf",
-            "proto", "sql", "xml", "ini", "cjs", "mjs", "mts",
+            "rs", "py", "js", "ts", "tsx", "jsx", "go", "md", "json", "jsonc", "jsonl", "yml",
+            "yaml", "toml", "sh", "bash", "zsh", "html", "css", "scss", "c", "cpp", "h", "hpp",
+            "java", "kt", "swift", "rb", "php", "lua", "vue", "svelte", "dart", "zig", "nix",
+            "hcl", "tf", "proto", "sql", "xml", "ini", "cjs", "mjs", "mts",
         ];
         let mut missing = vec![];
         for ext in exts {

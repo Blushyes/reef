@@ -71,6 +71,29 @@ pub enum DiffMode {
     FullFile,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StructuredPreviewMode {
+    #[default]
+    Tree,
+    Raw,
+}
+
+impl StructuredPreviewMode {
+    pub fn pref_str(self) -> &'static str {
+        match self {
+            Self::Tree => "tree",
+            Self::Raw => "raw",
+        }
+    }
+
+    pub fn from_pref_str(value: &str) -> Self {
+        match value {
+            "raw" => Self::Raw,
+            _ => Self::Tree,
+        }
+    }
+}
+
 impl DiffMode {
     pub fn pref_str(self) -> &'static str {
         match self {
@@ -411,6 +434,12 @@ struct PendingPreviewEnrichment {
 }
 
 #[derive(Debug, Clone)]
+struct StructuredPreviewState {
+    path: String,
+    document: Arc<reef_core::structured_data::StructuredDataDocument>,
+}
+
+#[derive(Debug, Clone)]
 struct PendingGlobalSearchAccept {
     hit: MatchHit,
     origin: Option<LocationSnapshot>,
@@ -450,6 +479,8 @@ pub struct AppState {
     pub preview_snapshot: Option<Arc<crate::PreviewDocumentSnapshot>>,
     pub preview_enrichment_dark: bool,
     preview_enrichment_pending: Option<PendingPreviewEnrichment>,
+    structured_preview: Option<StructuredPreviewState>,
+    pub structured_preview_mode: StructuredPreviewMode,
     pub preview_schedule: Option<(PathBuf, Instant)>,
     pub prefetch_schedule: Option<Instant>,
     pub preview_in_flight_path: Option<PathBuf>,
@@ -541,6 +572,7 @@ pub struct AppPrefs {
     pub commit_diff_layout: DiffLayout,
     pub commit_diff_mode: DiffMode,
     pub commit_files_tree_mode: bool,
+    pub structured_preview_mode: StructuredPreviewMode,
     pub quick_open: QuickOpenState,
 }
 
@@ -555,6 +587,7 @@ impl Default for AppPrefs {
             commit_diff_layout: DiffLayout::Unified,
             commit_diff_mode: DiffMode::Compact,
             commit_files_tree_mode: false,
+            structured_preview_mode: StructuredPreviewMode::Tree,
             quick_open: QuickOpenState::default(),
         }
     }
@@ -675,6 +708,8 @@ impl AppState {
             preview_snapshot: None,
             preview_enrichment_dark: false,
             preview_enrichment_pending: None,
+            structured_preview: None,
+            structured_preview_mode: prefs.structured_preview_mode,
             preview_schedule: None,
             prefetch_schedule: None,
             preview_in_flight_path: None,
@@ -1542,6 +1577,7 @@ mod tests {
                 commit_diff_layout: DiffLayout::SideBySide,
                 commit_diff_mode: DiffMode::FullFile,
                 commit_files_tree_mode: true,
+                structured_preview_mode: StructuredPreviewMode::Raw,
                 quick_open: crate::QuickOpenState::default(),
             },
             now: Instant::now(),
@@ -1559,6 +1595,7 @@ mod tests {
         assert_eq!(app.commit_detail.diff_layout, DiffLayout::SideBySide);
         assert_eq!(app.commit_detail.diff_mode, DiffMode::FullFile);
         assert!(app.commit_detail.files_tree_mode);
+        assert_eq!(app.structured_preview_mode, StructuredPreviewMode::Raw);
         assert!(app.fs_watcher_rx.is_none());
     }
 

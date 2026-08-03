@@ -112,6 +112,7 @@ pub enum PreviewBodySnapshot {
 #[serde(rename_all = "camelCase")]
 pub enum StructuredDataFormatSnapshot {
     Json,
+    JsonLines,
     Yaml,
     OpenApi,
     JsonSchema,
@@ -472,7 +473,9 @@ fn detected_kind(document: &PreviewDocument) -> PreviewDetectedKindSnapshot {
         }
         PreviewBody::Binary(_) => PreviewDetectedKindSnapshot::Binary,
         PreviewBody::Text(_) if is_api_schema_path(&path) => PreviewDetectedKindSnapshot::ApiSchema,
-        PreviewBody::Text(_) if matches!(ext, "json" | "jsonc" | "json5" | "yaml" | "yml") => {
+        PreviewBody::Text(_)
+            if matches!(ext, "json" | "jsonc" | "json5" | "jsonl" | "yaml" | "yml") =>
+        {
             PreviewDetectedKindSnapshot::StructuredData
         }
         PreviewBody::Text(_) if matches!(ext, "diff" | "patch") => {
@@ -493,7 +496,7 @@ fn language_for_path(path: &str) -> Option<String> {
     reef_core::nav::NavLang::from_path(Path::new(path)).map(|lang| format!("{lang:?}"))
 }
 
-fn structured_format_for_path(path: &str) -> StructuredDataFormatSnapshot {
+pub fn structured_format_for_path(path: &str) -> StructuredDataFormatSnapshot {
     let lower = path.to_ascii_lowercase();
     if is_api_schema_path(&lower) {
         if lower.ends_with("schema.json") || lower.ends_with(".schema.json") {
@@ -501,6 +504,8 @@ fn structured_format_for_path(path: &str) -> StructuredDataFormatSnapshot {
         } else {
             StructuredDataFormatSnapshot::OpenApi
         }
+    } else if lower.ends_with(".jsonl") {
+        StructuredDataFormatSnapshot::JsonLines
     } else if lower.ends_with(".yaml") || lower.ends_with(".yml") {
         StructuredDataFormatSnapshot::Yaml
     } else {
@@ -735,6 +740,30 @@ mod tests {
                 format: StructuredDataFormatSnapshot::Json,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn json_lines_preview_becomes_structured_data_with_complete_source() {
+        let source = "{\"event\":\"open\"}\n{\"event\":\"close\"}\n";
+        let body = reef_core::preview::build_textual_preview_body("events.jsonl", source);
+        let doc = PreviewDocument {
+            path: "events.jsonl".to_string(),
+            resolved_path: None,
+            local_path: None,
+            bytes_on_disk: source.len() as u64,
+            mime: Some("application/x-ndjson".into()),
+            body,
+        };
+
+        let snapshot = PreviewDocumentSnapshot::from_document(&doc, 1, 1);
+
+        assert!(matches!(
+            snapshot.body,
+            PreviewBodySnapshot::StructuredData {
+                format: StructuredDataFormatSnapshot::JsonLines,
+                source: Some(ref payload),
+            } if payload == source
         ));
     }
 

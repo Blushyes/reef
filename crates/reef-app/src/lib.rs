@@ -24,9 +24,9 @@ pub use app::{
     GraphScopeChangeOutcome, HighlightFade, HighlightedDiff, LineTokens, LspRefineOutcome,
     MatchHit, NavAnchor, NavCandidatesPopup, NavPendingJump, NormalizeActivePanelOutcome,
     PREFETCH_DELAY, PREVIEW_DEBOUNCE, PreviewHighlight, PreviewMergeOutcome, PushError,
-    RangeDetail, SearchPanelFocus, SelectedFile, TabChangeOutcome, TickOptions,
-    ToggleSidebarOutcome, ViewMode, center_scroll, compute_sidebar_width, compute_three_col_widths,
-    compute_uses_three_col,
+    RangeDetail, SearchPanelFocus, SelectedFile, StructuredPreviewMode, TabChangeOutcome,
+    TickOptions, ToggleSidebarOutcome, ViewMode, center_scroll, compute_sidebar_width,
+    compute_three_col_widths, compute_uses_three_col,
 };
 pub use command::AppCommand;
 pub use effect::{AppEffect, Toast, ToastLevel};
@@ -66,7 +66,7 @@ pub use preview_snapshot::{
     DatabasePageSnapshot, DatabaseSchemaSnapshot, MarkdownCodeHighlightSnapshot,
     MarkdownCodeTokenSnapshot, PreviewBodySnapshot, PreviewDetectedKindSnapshot,
     PreviewDocumentSnapshot, PreviewSourceSnapshot, RgbSnapshot, StructuredDataFormatSnapshot,
-    TextStyleSnapshot, TextStyleSpanSnapshot,
+    TextStyleSnapshot, TextStyleSpanSnapshot, structured_format_for_path,
 };
 pub use reef_sqlite_preview::{
     DbObjectDetail, DbObjectKey, DbObjectKind, SqliteValue, TriggerEvent, TriggerTiming,

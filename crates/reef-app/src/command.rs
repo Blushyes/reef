@@ -68,6 +68,9 @@ pub enum AppCommand {
     },
     SetPreviewHorizontalScroll(usize),
     ClampPreviewHorizontalScroll(usize),
+    SetStructuredPreviewMode(crate::StructuredPreviewMode),
+    ToggleStructuredPreviewMode,
+    ToggleStructuredPreviewNode(String),
     SetDiffVerticalScroll(usize),
     SetDiffHorizontalScroll(usize),
     SetDiffScrollState {

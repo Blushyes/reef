@@ -1,8 +1,10 @@
 use crate::ui::focus::header_title_style;
+use crate::ui::mouse::{ClickAction, HitTestRegistry};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use reef_app::StructuredPreviewMode;
 use unicode_width::UnicodeWidthStr;
 
 pub fn render_card_header(
@@ -66,4 +68,114 @@ pub fn render_card_header(
         y += 1;
     }
     y
+}
+
+pub fn render_structured_card_header(
+    f: &mut Frame,
+    area: Rect,
+    path: &str,
+    theme: &crate::ui::theme::Theme,
+    focused: bool,
+    options: StructuredHeaderOptions,
+    hit_registry: &mut HitTestRegistry,
+) -> u16 {
+    let mut y = area.y;
+    let max_y = area.y + area.height;
+    if y >= max_y {
+        return y;
+    }
+
+    let tree = crate::i18n::t(crate::i18n::Msg::StructuredModeTree);
+    let raw = crate::i18n::t(crate::i18n::Msg::StructuredModeRaw);
+    let count = options
+        .match_count
+        .map(|(current, total)| format!("[{current}/{total}] "));
+    let count_width = count
+        .as_deref()
+        .map(UnicodeWidthStr::width)
+        .unwrap_or_default();
+    let modes_width = UnicodeWidthStr::width(tree) + 1 + UnicodeWidthStr::width(raw);
+    let tail_width = count_width + modes_width;
+
+    if tail_width < area.width as usize {
+        let tail_x = area.x + area.width - tail_width as u16;
+        let title_width = tail_x.saturating_sub(area.x).saturating_sub(1);
+        f.render_widget(
+            Line::from(Span::styled(path, header_title_style(theme, focused))),
+            Rect::new(area.x, y, title_width, 1),
+        );
+
+        let active = Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD);
+        let inactive = Style::default().fg(theme.fg_secondary);
+        let mut spans = Vec::new();
+        if let Some(count) = count.as_deref() {
+            spans.push(Span::styled(count, active));
+        }
+        spans.push(Span::styled(
+            tree,
+            if options.mode == StructuredPreviewMode::Tree {
+                active
+            } else {
+                inactive
+            },
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            raw,
+            if options.mode == StructuredPreviewMode::Raw {
+                active
+            } else {
+                inactive
+            },
+        ));
+        f.render_widget(
+            Line::from(spans),
+            Rect::new(tail_x, y, tail_width as u16, 1),
+        );
+
+        let modes_x = tail_x + count_width as u16;
+        hit_registry.register_row(
+            modes_x,
+            y,
+            UnicodeWidthStr::width(tree) as u16,
+            ClickAction::SetStructuredPreviewMode(StructuredPreviewMode::Tree),
+        );
+        hit_registry.register_row(
+            modes_x + UnicodeWidthStr::width(tree) as u16 + 1,
+            y,
+            UnicodeWidthStr::width(raw) as u16,
+            ClickAction::SetStructuredPreviewMode(StructuredPreviewMode::Raw),
+        );
+    } else {
+        f.render_widget(
+            Line::from(Span::styled(path, header_title_style(theme, focused))),
+            Rect::new(area.x, y, area.width, 1),
+        );
+    }
+
+    y += 1;
+    if y < max_y {
+        let sep_color = if focused {
+            theme.accent
+        } else {
+            theme.fg_secondary
+        };
+        f.render_widget(
+            Line::from(Span::styled(
+                "─".repeat(area.width as usize),
+                Style::default().fg(sep_color),
+            )),
+            Rect::new(area.x, y, area.width, 1),
+        );
+        y += 1;
+    }
+    y
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StructuredHeaderOptions {
+    pub match_count: Option<(usize, usize)>,
+    pub mode: StructuredPreviewMode,
 }

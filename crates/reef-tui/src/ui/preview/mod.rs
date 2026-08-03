@@ -2,6 +2,7 @@ pub mod binary;
 pub mod chrome;
 pub mod image;
 pub mod markdown;
+pub mod structured;
 pub mod text;
 
 use crate::TuiApp as App;
@@ -28,6 +29,12 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     };
 
     match &preview.body {
+        PreviewBody::Text(_)
+            if app.engine.structured_preview_mode() == reef_app::StructuredPreviewMode::Tree
+                && app.engine.structured_preview_document().is_some() =>
+        {
+            structured::render(f, app, inner, &preview, focused);
+        }
         PreviewBody::Text(_) => text::render(f, app, inner, &preview, focused),
         PreviewBody::Markdown(markdown) => {
             markdown::render(f, app, inner, &preview, markdown, focused);

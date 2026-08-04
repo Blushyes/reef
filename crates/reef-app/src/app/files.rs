@@ -1,6 +1,32 @@
 use super::*;
+use crate::tasks::FileTreeRebuildIdentity;
 
 impl AppState {
+    pub fn select_file_tree_entry_and_schedule_preview(&mut self, idx: usize) {
+        let Some(entry) = self.file_tree.entries.get(idx).cloned() else {
+            return;
+        };
+        self.file_tree.selected = idx;
+        if !entry.is_dir {
+            self.preview_schedule = Some((entry.path.clone(), Instant::now()));
+        }
+    }
+
+    /// Selects a path that is already present in the renderer's current tree.
+    /// This is intentionally selection-only: callers resolving an external
+    /// path must reveal and rebuild the tree before selecting it.
+    pub fn select_visible_file_tree_path(&mut self, path: &Path) {
+        let Some(idx) = self
+            .file_tree
+            .entries
+            .iter()
+            .position(|entry| entry.path == path)
+        else {
+            return;
+        };
+        self.select_file_tree_entry_and_schedule_preview(idx);
+    }
+
     pub fn reconcile_file_tree_scroll(
         &mut self,
         visible_rows: usize,
@@ -26,20 +52,13 @@ impl AppState {
         if !entry.is_dir {
             return;
         }
-        let load_in_flight = self.file_tree_load.loading;
         self.file_tree.toggle_expand(idx);
+        self.file_tree_revision = self.file_tree_revision.wrapping_add(1).max(1);
         if entry.is_expanded {
             self.file_tree.collapse_visible_descendants(idx);
+            self.file_tree_subtree_requests
+                .retain(|path, _| !path.starts_with(&entry.path));
             self.revalidate_tree_edit_anchor();
-            if load_in_flight {
-                self.refresh_file_tree_with_target(self.file_tree.selected_path());
-            }
-        } else if load_in_flight {
-            // The shared files worker may already be building either a full
-            // tree or another subtree. Supersede it with one full request that
-            // captures every currently-expanded path, so rapid expansion never
-            // leaves the earlier branch visually expanded but unpopulated.
-            self.refresh_file_tree_with_target(self.file_tree.selected_path());
         } else {
             self.load_file_tree_subtree(entry.path, entry.depth);
         }
@@ -301,7 +320,10 @@ impl AppState {
     pub fn refresh_file_tree_with_target(&mut self, selected_path: Option<PathBuf>) {
         let generation = self.file_tree_load.begin();
         self.tasks.rebuild_tree(
-            generation,
+            FileTreeRebuildIdentity {
+                generation,
+                tree_revision: self.file_tree_revision,
+            },
             Arc::clone(&self.backend),
             self.file_tree.expanded_paths(),
             self.file_tree.git_statuses(),
@@ -311,25 +333,31 @@ impl AppState {
     }
 
     fn load_file_tree_subtree(&mut self, parent_path: PathBuf, parent_depth: usize) {
-        let generation = self.file_tree_load.begin();
+        self.next_file_tree_subtree_request_id = self
+            .next_file_tree_subtree_request_id
+            .wrapping_add(1)
+            .max(1);
+        let request_id = self.next_file_tree_subtree_request_id;
+        self.file_tree_subtree_requests
+            .insert(parent_path.clone(), request_id);
         self.tasks.load_tree_subtree(
-            generation,
+            request_id,
             Arc::clone(&self.backend),
             parent_path,
             parent_depth,
             self.file_tree.expanded_paths(),
-            self.file_tree.git_statuses(),
         );
     }
 
     pub fn collapse_all_file_tree_entries(&mut self) {
-        let refresh_pending = self.file_tree_load.loading || self.file_tree_load.stale;
+        let had_expanded_entries = self.file_tree.entries.iter().any(|entry| entry.is_expanded);
         self.file_tree.collapse_all();
+        self.file_tree_subtree_requests.clear();
+        if had_expanded_entries {
+            self.file_tree_revision = self.file_tree_revision.wrapping_add(1).max(1);
+        }
         self.tree_scroll = 0;
         self.revalidate_tree_edit_anchor();
-        if refresh_pending {
-            self.refresh_file_tree_with_target(self.file_tree.selected_path());
-        }
     }
 
     pub fn enter_place_mode(&mut self, sources: Vec<PathBuf>) -> Vec<AppRuntimeEvent> {

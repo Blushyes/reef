@@ -35,6 +35,9 @@ pub struct ReefApp {
 #[derive(Debug, Default)]
 pub struct AppStepOutcome {
     pub changed: bool,
+    /// True when this step only applied file-tree worker results. Renderers can
+    /// refresh the tree projection without rebuilding unrelated panel state.
+    pub file_tree_only: bool,
     pub runtime_events: Vec<AppRuntimeEvent>,
     pub next_deadline: Option<Instant>,
 }
@@ -506,12 +509,10 @@ impl ReefApp {
                 self.state.activate_file_tree_entry_at_index(idx);
             }
             AppCommand::SelectFileTreeEntry(idx) => {
-                self.state.file_tree.state.selected = idx;
-                if let Some(entry) = self.state.file_tree.selected_entry()
-                    && !entry.is_dir
-                {
-                    self.state.preview_schedule = Some((entry.path.clone(), Instant::now()));
-                }
+                self.state.select_file_tree_entry_and_schedule_preview(idx);
+            }
+            AppCommand::SelectVisibleFileTreePath(path) => {
+                self.state.select_visible_file_tree_path(&path);
             }
             AppCommand::ActivateSelectedFileTreeEntry => {
                 self.state.activate_selected_file_tree_entry();
@@ -1334,64 +1335,72 @@ impl ReefApp {
     }
 
     pub fn step(&mut self, now: Instant, options: TickOptions) -> AppStepOutcome {
-        let mut changed = self.state.has_step_work_due(now) || !self.runtime_events.is_empty();
+        let mut file_tree_changed = false;
+        let mut other_changed =
+            self.state.has_step_work_due(now) || !self.runtime_events.is_empty();
         loop {
             match self.state.tasks.try_recv() {
-                Ok(result) => {
-                    changed = true;
-                    match result {
-                        WorkerResult::Preview { generation, result } => {
-                            self.runtime_events
-                                .push(AppRuntimeEvent::PreviewResultForAdapter {
-                                    generation,
-                                    result,
-                                });
-                        }
-                        WorkerResult::LspRefineDone {
+                Ok(result) => match result {
+                    result @ (WorkerResult::FileTree { .. }
+                    | WorkerResult::FileTreeSubtree { .. }) => {
+                        file_tree_changed = true;
+                        let events = self.state.apply_worker_result_core(result, now);
+                        other_changed |= !events.is_empty();
+                        self.runtime_events.extend(events);
+                    }
+                    WorkerResult::Preview { generation, result } => {
+                        other_changed = true;
+                        self.runtime_events
+                            .push(AppRuntimeEvent::PreviewResultForAdapter { generation, result });
+                    }
+                    WorkerResult::LspRefineDone {
+                        generation,
+                        epoch,
+                        lang,
+                        identifier,
+                        rel_location,
+                        server_returned_location,
+                    } => {
+                        other_changed = true;
+                        if let Some(outcome) = self.apply_lsp_refine_done_command(
                             generation,
                             epoch,
                             lang,
                             identifier,
                             rel_location,
                             server_returned_location,
-                        } => {
-                            if let Some(outcome) = self.apply_lsp_refine_done_command(
-                                generation,
-                                epoch,
-                                lang,
-                                identifier,
-                                rel_location,
-                                server_returned_location,
-                            ) {
-                                self.runtime_events
-                                    .push(AppRuntimeEvent::LspRefineJump(outcome));
-                            }
-                        }
-                        result => {
-                            let events = self.state.apply_worker_result_core(result, now);
-                            self.runtime_events.extend(events);
+                        ) {
+                            self.runtime_events
+                                .push(AppRuntimeEvent::LspRefineJump(outcome));
                         }
                     }
-                }
+                    result => {
+                        other_changed = true;
+                        let events = self.state.apply_worker_result_core(result, now);
+                        self.runtime_events.extend(events);
+                    }
+                },
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
             }
         }
         self.state.maybe_kick_global_search(now);
         if self.state.drain_fs_watcher_events() {
-            changed = true;
+            other_changed = true;
         }
         if self.state.nav_workspace_load.should_request() {
-            changed = true;
+            other_changed = true;
             self.state.dispatch_nav_workspace_build();
         }
         self.state.drain_preview_schedule(now, options);
         self.state.drain_prefetch_schedule(now, options);
         self.state.kick_active_tab_work(now, options);
         let runtime_events = std::mem::take(&mut self.runtime_events);
-        changed |= !runtime_events.is_empty();
+        other_changed |= !runtime_events.is_empty();
+        let changed = file_tree_changed || other_changed;
         AppStepOutcome {
             changed,
+            file_tree_only: file_tree_changed && !other_changed,
             runtime_events,
             next_deadline: self.state.next_deadline(),
         }
@@ -1750,6 +1759,14 @@ impl ReefApp {
 
     pub fn file_tree_entries(&self) -> &[TreeEntry] {
         &self.state.file_tree.entries
+    }
+
+    pub fn file_tree_rows_revision(&self) -> u64 {
+        self.state.file_tree.rows_revision()
+    }
+
+    pub fn file_tree_rows_splice(&self) -> Option<crate::FileTreeRowsSplice> {
+        self.state.file_tree.rows_splice()
     }
 
     pub fn tree_scroll(&self) -> usize {
@@ -2324,6 +2341,33 @@ mod tests {
         app.dispatch(AppCommand::SetActiveTab(AppTab::Files));
 
         assert!(app.drain_runtime_events().is_empty());
+    }
+
+    #[test]
+    fn selecting_visible_file_does_not_rebuild_file_tree() {
+        let mut app = test_app();
+        app.state.file_tree.state.entries = vec![crate::TreeEntry {
+            path: PathBuf::from("src/main.rs"),
+            name: "main.rs".to_string(),
+            depth: 1,
+            is_dir: false,
+            has_children: false,
+            is_expanded: false,
+            git_status: None,
+        }];
+        let tree_generation = app.state.file_tree_load.generation;
+
+        app.dispatch(AppCommand::SelectVisibleFileTreePath(PathBuf::from(
+            "src/main.rs",
+        )));
+
+        assert_eq!(app.state.file_tree.state.selected, 0);
+        assert_eq!(app.state.file_tree_load.generation, tree_generation);
+        assert!(!app.state.file_tree_load.loading);
+        assert_eq!(
+            app.state.preview_schedule.as_ref().map(|(path, _)| path),
+            Some(&PathBuf::from("src/main.rs"))
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-pub use reef_core::file_tree::{FileTreeState, TreeEntry};
+pub use reef_core::file_tree::{FileTreeRowsSplice, FileTreeState, TreeEntry};
 
 pub struct FileTree {
     pub root: PathBuf,
@@ -56,12 +56,24 @@ impl FileTree {
         self.state.selected_path()
     }
 
+    pub fn rows_revision(&self) -> u64 {
+        self.state.rows_revision()
+    }
+
+    pub fn rows_splice(&self) -> Option<FileTreeRowsSplice> {
+        self.state.rows_splice()
+    }
+
     pub fn expanded_paths(&self) -> Vec<PathBuf> {
         self.state.expanded_paths()
     }
 
     pub fn git_statuses(&self) -> std::collections::HashMap<String, char> {
         self.state.git_statuses_map()
+    }
+
+    pub fn decorate_entries_with_git_statuses(&self, entries: &mut [TreeEntry]) {
+        self.state.decorate_entries_with_git_statuses(entries);
     }
 
     pub fn replace_entries(&mut self, entries: Vec<TreeEntry>, selected_idx: usize) {

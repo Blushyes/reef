@@ -637,13 +637,15 @@ impl Backend for LocalBackend {
         for entry in std::fs::read_dir(&abs).map_err(|e| BackendError::Io(e.to_string()))? {
             let entry = entry.map_err(|e| BackendError::Io(e.to_string()))?;
             let name = entry.file_name().to_string_lossy().to_string();
-            let path = entry.path();
-            let is_dir = path.is_dir();
-            let has_children = is_dir && dir_has_visible_child(&path);
+            let is_dir = dir_entry_is_dir(&entry);
             entries.push(crate::DirEntry {
                 name,
                 is_dir,
-                has_children,
+                // Child directories are resolved lazily when expanded. Probing
+                // each one here turns a single directory listing into N+1
+                // `read_dir` calls and makes expansion latency proportional to
+                // the number of sibling directories.
+                has_children: is_dir,
             });
         }
         entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
@@ -1058,7 +1060,7 @@ fn walk_dir(
     out: &mut Vec<TreeEntry>,
     depth: usize,
 ) {
-    let mut children: Vec<(String, PathBuf, bool, bool)> = Vec::new();
+    let mut children: Vec<(String, PathBuf, bool)> = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => return,
@@ -1070,9 +1072,8 @@ fn walk_dir(
             continue;
         }
         let path = entry.path();
-        let is_dir = path.is_dir();
-        let has_children = is_dir && dir_has_visible_child(&path);
-        children.push((name, path, is_dir, has_children));
+        let is_dir = dir_entry_is_dir(&entry);
+        children.push((name, path, is_dir));
     }
 
     children.sort_by(|a, b| match (a.2, b.2) {
@@ -1081,7 +1082,7 @@ fn walk_dir(
         _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
     });
 
-    for (name, full_path, is_dir, has_children) in children {
+    for (name, full_path, is_dir) in children {
         let rel = full_path
             .strip_prefix(root)
             .unwrap_or(&full_path)
@@ -1095,7 +1096,7 @@ fn walk_dir(
             name,
             depth,
             is_dir,
-            has_children,
+            has_children: is_dir,
             is_expanded,
             git_status,
         });
@@ -1106,14 +1107,15 @@ fn walk_dir(
     }
 }
 
-fn dir_has_visible_child(dir: &Path) -> bool {
-    std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .any(|entry| entry.file_name().to_string_lossy() != ".git")
-        })
-        .unwrap_or(false)
+fn dir_entry_is_dir(entry: &std::fs::DirEntry) -> bool {
+    let Ok(file_type) = entry.file_type() else {
+        return false;
+    };
+    if file_type.is_symlink() {
+        entry.metadata().is_ok_and(|metadata| metadata.is_dir())
+    } else {
+        file_type.is_dir()
+    }
 }
 
 /// Recursive directory copy, DFS walk. Mirrors the legacy helper in
@@ -1501,7 +1503,7 @@ mod tests {
     }
 
     #[test]
-    fn build_entries_marks_only_non_empty_dirs_as_having_children() {
+    fn build_entries_defers_directory_child_discovery_until_expansion() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("empty")).unwrap();
         std::fs::create_dir_all(temp.path().join("non-empty")).unwrap();
@@ -1515,7 +1517,7 @@ mod tests {
             .unwrap();
 
         assert!(empty.is_dir);
-        assert!(!empty.has_children);
+        assert!(empty.has_children);
         assert!(non_empty.is_dir);
         assert!(non_empty.has_children);
     }

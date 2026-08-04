@@ -35,7 +35,7 @@ pub use features::confirm::{ConfirmRequest, ConfirmTone, TreeDeleteConfirm};
 pub use features::db_preview::{DbCellPreviewState, DbNav, DbPreviewState, max_page_for_object};
 pub use features::file_clipboard::FileClipboard;
 pub use features::file_selection::SelectionSet;
-pub use features::file_tree::{FileTree, FileTreeState, TreeEntry};
+pub use features::file_tree::{FileTree, FileTreeRowsSplice, FileTreeState, TreeEntry};
 pub use features::find_widget::{
     FindTarget, FindWidgetState, FindWidgetToggle, diff_target_from_layout,
 };

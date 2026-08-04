@@ -51,8 +51,9 @@ pub struct PendingConfirmSnapshot {
     pub tone: ConfirmTone,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AsyncSnapshot {
+    pub generation: u64,
     pub loading: bool,
     pub stale: bool,
     pub error: Option<String>,
@@ -61,6 +62,7 @@ pub struct AsyncSnapshot {
 impl AsyncSnapshot {
     pub(crate) fn from_state(state: &crate::AsyncState) -> Self {
         Self {
+            generation: state.generation,
             loading: state.loading,
             stale: state.stale,
             error: state.error.clone(),
@@ -93,7 +95,7 @@ pub enum PreviewKindSnapshot {
     Database,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlobalSearchPanelSnapshot {
     pub active: bool,
     pub query: String,
@@ -132,7 +134,7 @@ pub struct GlobalSearchRowSnapshot {
     pub included: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitPanelSnapshot {
     pub staged_count: usize,
     pub unstaged_count: usize,
@@ -165,7 +167,7 @@ pub struct GraphPanelSnapshot {
     pub file_diff_load: AsyncSnapshot,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuickOpenSnapshot {
     pub active: bool,
     pub query: String,

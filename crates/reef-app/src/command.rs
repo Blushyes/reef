@@ -98,6 +98,7 @@ pub enum AppCommand {
     RefreshFileTreeWithTarget(Option<PathBuf>),
     RevealFileTreePath(PathBuf),
     SelectFileTreeEntry(usize),
+    SelectVisibleFileTreePath(PathBuf),
     NavigateFileTree(i32),
     NavigateGitFiles(i32),
     ScrollFileTree(i32),

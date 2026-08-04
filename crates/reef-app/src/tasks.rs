@@ -184,10 +184,12 @@ pub struct PastePlanPayload {
 pub enum WorkerResult {
     FileTree {
         generation: u64,
+        tree_revision: u64,
         result: Result<FileTreePayload, String>,
     },
     FileTreeSubtree {
-        generation: u64,
+        request_id: u64,
+        parent_path: PathBuf,
         result: Result<FileTreeSubtreePayload, String>,
     },
     Preview {
@@ -449,23 +451,30 @@ pub enum FsMutationKind {
     CopiedMulti { count: usize },
 }
 
+struct FileTreeRebuildTask {
+    identity: FileTreeRebuildIdentity,
+    backend: Arc<dyn Backend>,
+    expanded: Vec<PathBuf>,
+    git_statuses: HashMap<String, char>,
+    selected_path: Option<PathBuf>,
+    fallback_selected: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileTreeRebuildIdentity {
+    pub generation: u64,
+    pub tree_revision: u64,
+}
+
+struct FileTreeSubtreeTask {
+    request_id: u64,
+    backend: Arc<dyn Backend>,
+    parent_path: PathBuf,
+    parent_depth: usize,
+    expanded: Vec<PathBuf>,
+}
+
 enum FilesTask {
-    RebuildTree {
-        generation: u64,
-        backend: Arc<dyn Backend>,
-        expanded: Vec<PathBuf>,
-        git_statuses: HashMap<String, char>,
-        selected_path: Option<PathBuf>,
-        fallback_selected: usize,
-    },
-    LoadTreeSubtree {
-        generation: u64,
-        backend: Arc<dyn Backend>,
-        parent_path: PathBuf,
-        parent_depth: usize,
-        expanded: Vec<PathBuf>,
-        git_statuses: HashMap<String, char>,
-    },
     LoadPreview {
         generation: u64,
         backend: Arc<dyn Backend>,
@@ -761,6 +770,8 @@ enum GraphContentTask {
 }
 
 pub struct TaskCoordinator {
+    file_tree_rebuild_tx: mpsc::Sender<FileTreeRebuildTask>,
+    file_tree_subtree_tx: mpsc::Sender<FileTreeSubtreeTask>,
     files_tx: mpsc::Sender<FilesTask>,
     /// Dedicated channel for `FilesTask::LoadPreview`. Keeping previews
     /// on their own worker thread means a slow directory rebuild or an
@@ -806,6 +817,8 @@ impl TaskCoordinator {
             worker_wake_tx,
         };
         Self {
+            file_tree_rebuild_tx: spawn_file_tree_rebuild_worker(result_tx.clone()),
+            file_tree_subtree_tx: spawn_file_tree_subtree_workers(result_tx.clone()),
             files_tx: spawn_files_worker(result_tx.clone()),
             preview_tx: spawn_preview_worker(result_tx.clone()),
             db_cell_tx: spawn_db_cell_worker(result_tx.clone()),
@@ -871,15 +884,15 @@ impl TaskCoordinator {
 
     pub fn rebuild_tree(
         &self,
-        generation: u64,
+        identity: FileTreeRebuildIdentity,
         backend: Arc<dyn Backend>,
         expanded: Vec<PathBuf>,
         git_statuses: HashMap<String, char>,
         selected_path: Option<PathBuf>,
         fallback_selected: usize,
     ) {
-        let _ = self.files_tx.send(FilesTask::RebuildTree {
-            generation,
+        let _ = self.file_tree_rebuild_tx.send(FileTreeRebuildTask {
+            identity,
             backend,
             expanded,
             git_statuses,
@@ -890,20 +903,18 @@ impl TaskCoordinator {
 
     pub fn load_tree_subtree(
         &self,
-        generation: u64,
+        request_id: u64,
         backend: Arc<dyn Backend>,
         parent_path: PathBuf,
         parent_depth: usize,
         expanded: Vec<PathBuf>,
-        git_statuses: HashMap<String, char>,
     ) {
-        let _ = self.files_tx.send(FilesTask::LoadTreeSubtree {
-            generation,
+        let _ = self.file_tree_subtree_tx.send(FileTreeSubtreeTask {
+            request_id,
             backend,
             parent_path,
             parent_depth,
             expanded,
-            git_statuses,
         });
     }
 
@@ -1331,6 +1342,71 @@ impl TaskCoordinator {
     }
 }
 
+fn spawn_file_tree_rebuild_worker(
+    result_tx: WorkerResultSender,
+) -> mpsc::Sender<FileTreeRebuildTask> {
+    let (tx, rx) = mpsc::unbounded::<FileTreeRebuildTask>();
+    let _ = thread::Builder::new()
+        .name("reef-file-tree-rebuild".into())
+        .spawn(move || {
+            while let Ok(task) = recv_latest_file_tree_rebuild_task(&rx) {
+                let result = build_file_tree_payload(
+                    task.backend.as_ref(),
+                    task.expanded,
+                    task.git_statuses,
+                    task.selected_path,
+                    task.fallback_selected,
+                );
+                let _ = result_tx.send(WorkerResult::FileTree {
+                    generation: task.identity.generation,
+                    tree_revision: task.identity.tree_revision,
+                    result,
+                });
+            }
+        });
+    tx
+}
+
+fn recv_latest_file_tree_rebuild_task(
+    rx: &mpsc::Receiver<FileTreeRebuildTask>,
+) -> Result<FileTreeRebuildTask, mpsc::RecvError> {
+    let mut latest = rx.recv()?;
+    while let Ok(task) = rx.try_recv() {
+        latest = task;
+    }
+    Ok(latest)
+}
+
+fn spawn_file_tree_subtree_workers(
+    result_tx: WorkerResultSender,
+) -> mpsc::Sender<FileTreeSubtreeTask> {
+    const WORKER_COUNT: usize = 2;
+    let (tx, rx) = mpsc::unbounded::<FileTreeSubtreeTask>();
+    for index in 0..WORKER_COUNT {
+        let rx = rx.clone();
+        let result_tx = result_tx.clone();
+        let _ = thread::Builder::new()
+            .name(format!("reef-file-tree-subtree-{index}"))
+            .spawn(move || {
+                while let Ok(task) = rx.recv() {
+                    let parent_path = task.parent_path.clone();
+                    let result = build_file_tree_subtree_payload(
+                        task.backend.as_ref(),
+                        task.parent_path,
+                        task.parent_depth,
+                        task.expanded,
+                    );
+                    let _ = result_tx.send(WorkerResult::FileTreeSubtree {
+                        request_id: task.request_id,
+                        parent_path,
+                        result,
+                    });
+                }
+            });
+    }
+    tx
+}
+
 fn spawn_files_worker(result_tx: WorkerResultSender) -> mpsc::Sender<FilesTask> {
     let (tx, rx) = mpsc::unbounded::<FilesTask>();
     let _ = thread::Builder::new()
@@ -1338,41 +1414,6 @@ fn spawn_files_worker(result_tx: WorkerResultSender) -> mpsc::Sender<FilesTask> 
         .spawn(move || {
             while let Ok(task) = rx.recv() {
                 match task {
-                    FilesTask::RebuildTree {
-                        generation,
-                        backend,
-                        expanded,
-                        git_statuses,
-                        selected_path,
-                        fallback_selected,
-                    } => {
-                        let result = build_file_tree_payload(
-                            backend.as_ref(),
-                            expanded,
-                            git_statuses,
-                            selected_path,
-                            fallback_selected,
-                        );
-                        let _ = result_tx.send(WorkerResult::FileTree { generation, result });
-                    }
-                    FilesTask::LoadTreeSubtree {
-                        generation,
-                        backend,
-                        parent_path,
-                        parent_depth,
-                        expanded,
-                        git_statuses,
-                    } => {
-                        let result = build_file_tree_subtree_payload(
-                            backend.as_ref(),
-                            parent_path,
-                            parent_depth,
-                            expanded,
-                            git_statuses,
-                        );
-                        let _ =
-                            result_tx.send(WorkerResult::FileTreeSubtree { generation, result });
-                    }
                     FilesTask::BuildQuickOpenIndex {
                         generation,
                         backend,
@@ -1382,15 +1423,6 @@ fn spawn_files_worker(result_tx: WorkerResultSender) -> mpsc::Sender<FilesTask> 
                             .map(|resp| reef_core::quick_open::build_candidates(resp.paths))
                             .map_err(|e| e.to_string());
                         let _ = result_tx.send(WorkerResult::QuickOpenIndex { generation, result });
-                    }
-                    FilesTask::LoadPreview {
-                        generation,
-                        backend,
-                        rel_path,
-                        wants_decoded_image,
-                    } => {
-                        let result = Ok(backend.load_preview(&rel_path, wants_decoded_image));
-                        let _ = result_tx.send(WorkerResult::Preview { generation, result });
                     }
                     FilesTask::CopyFiles {
                         generation,
@@ -1565,9 +1597,10 @@ fn spawn_files_worker(result_tx: WorkerResultSender) -> mpsc::Sender<FilesTask> 
                             &result_tx,
                         );
                     }
-                    // These routes belong to the preview worker; these
-                    // arms only satisfy exhaustiveness.
-                    FilesTask::LoadDbPage { .. }
+                    // These routes belong to dedicated workers; these arms
+                    // only satisfy exhaustiveness.
+                    FilesTask::LoadPreview { .. }
+                    | FilesTask::LoadDbPage { .. }
                     | FilesTask::LoadDbDetail { .. }
                     | FilesTask::PrefetchPreview { .. } => {}
                 }
@@ -2980,7 +3013,6 @@ fn build_file_tree_subtree_payload(
     parent_path: PathBuf,
     parent_depth: usize,
     expanded: Vec<PathBuf>,
-    git_statuses: HashMap<String, char>,
 ) -> Result<FileTreeSubtreePayload, String> {
     let expanded: HashSet<PathBuf> = expanded.into_iter().collect();
     let mut entries = Vec::new();
@@ -2989,7 +3021,6 @@ fn build_file_tree_subtree_payload(
         &parent_path,
         parent_depth + 1,
         &expanded,
-        &git_statuses,
         &mut entries,
     )?;
     Ok(FileTreeSubtreePayload {
@@ -3003,7 +3034,6 @@ fn collect_file_tree_subtree(
     parent_path: &Path,
     depth: usize,
     expanded: &HashSet<PathBuf>,
-    git_statuses: &HashMap<String, char>,
     entries: &mut Vec<TreeEntry>,
 ) -> Result<(), String> {
     let mut children = backend
@@ -3018,7 +3048,6 @@ fn collect_file_tree_subtree(
 
     for child in children {
         let path = parent_path.join(&child.name);
-        let path_key = path.to_string_lossy();
         let is_expanded = child.is_dir && expanded.contains(&path);
         entries.push(TreeEntry {
             path: path.clone(),
@@ -3027,10 +3056,10 @@ fn collect_file_tree_subtree(
             is_dir: child.is_dir,
             has_children: child.has_children,
             is_expanded,
-            git_status: git_statuses.get(path_key.as_ref()).copied(),
+            git_status: None,
         });
         if is_expanded {
-            collect_file_tree_subtree(backend, &path, depth + 1, expanded, git_statuses, entries)?;
+            collect_file_tree_subtree(backend, &path, depth + 1, expanded, entries)?;
         }
     }
     Ok(())
@@ -3054,14 +3083,11 @@ mod file_tree_subtree_tests {
         fs::write(tmp.path().join("src/nested/b.rs"), "b").unwrap();
         fs::write(tmp.path().join("outside/c.rs"), "c").unwrap();
         let backend = LocalBackend::open_at(tmp.path().to_path_buf());
-        let statuses = HashMap::from([("src/a.rs".to_string(), 'M')]);
-
         let payload = build_file_tree_subtree_payload(
             &backend,
             PathBuf::from("src"),
             0,
             vec![PathBuf::from("src"), PathBuf::from("src/nested")],
-            statuses,
         )
         .unwrap();
 
@@ -3078,7 +3104,53 @@ mod file_tree_subtree_tests {
                 (Path::new("src/a.rs"), 1, false),
             ]
         );
-        assert_eq!(payload.entries[2].git_status, Some('M'));
+        assert_eq!(payload.entries[2].git_status, None);
+    }
+}
+
+#[cfg(test)]
+mod file_tree_worker_coalescing_tests {
+    use super::*;
+
+    fn backend() -> Arc<dyn Backend> {
+        Arc::new(reef_io::LocalBackend::open_at(std::env::temp_dir()))
+    }
+
+    fn rebuild(generation: u64) -> FileTreeRebuildTask {
+        FileTreeRebuildTask {
+            identity: FileTreeRebuildIdentity {
+                generation,
+                tree_revision: generation,
+            },
+            backend: backend(),
+            expanded: Vec::new(),
+            git_statuses: HashMap::new(),
+            selected_path: None,
+            fallback_selected: 0,
+        }
+    }
+
+    #[test]
+    fn queued_full_tree_rebuilds_coalesce_to_latest_generation() {
+        let (tx, rx) = mpsc::unbounded();
+        tx.send(rebuild(1)).unwrap();
+        tx.send(rebuild(3)).unwrap();
+
+        let task = recv_latest_file_tree_rebuild_task(&rx).unwrap();
+
+        assert_eq!(task.identity.generation, 3);
+        assert_eq!(task.identity.tree_revision, 3);
+        assert!(rx.is_empty());
+    }
+
+    #[test]
+    fn single_full_tree_rebuild_is_preserved() {
+        let (tx, rx) = mpsc::unbounded();
+        tx.send(rebuild(4)).unwrap();
+
+        let task = recv_latest_file_tree_rebuild_task(&rx).unwrap();
+
+        assert_eq!(task.identity.generation, 4);
     }
 }
 
@@ -4225,14 +4297,10 @@ mod preview_worker_coalescing_tests {
         }
     }
 
-    fn rebuild_tree(generation: u64) -> FilesTask {
-        FilesTask::RebuildTree {
+    fn build_quick_open_index(generation: u64) -> FilesTask {
+        FilesTask::BuildQuickOpenIndex {
             generation,
             backend: backend(),
-            expanded: Vec::new(),
-            git_statuses: HashMap::new(),
-            selected_path: None,
-            fallback_selected: 0,
         }
     }
 
@@ -4306,15 +4374,15 @@ mod preview_worker_coalescing_tests {
         let mut backlog = VecDeque::new();
         tx.send(prefetch_preview("prefetched.md")).unwrap();
         tx.send(load_preview(2, "latest.html")).unwrap();
-        tx.send(rebuild_tree(9)).unwrap();
+        tx.send(build_quick_open_index(9)).unwrap();
 
         let selected = coalesce_preview_worker_task(load_preview(1, "old.html"), &rx, &mut backlog);
 
         assert_load_preview(selected, 2, "latest.html");
         assert_eq!(backlog.len(), 1);
         match backlog.pop_front().unwrap() {
-            FilesTask::RebuildTree { generation, .. } => assert_eq!(generation, 9),
-            _ => panic!("expected backlogged RebuildTree"),
+            FilesTask::BuildQuickOpenIndex { generation, .. } => assert_eq!(generation, 9),
+            _ => panic!("expected backlogged BuildQuickOpenIndex"),
         }
     }
 
@@ -4334,7 +4402,7 @@ mod preview_worker_coalescing_tests {
     #[test]
     fn pending_load_preview_jumps_ahead_of_backlogged_non_preview_work() {
         let (tx, rx) = mpsc::unbounded();
-        let mut backlog = VecDeque::from([rebuild_tree(11)]);
+        let mut backlog = VecDeque::from([build_quick_open_index(11)]);
         tx.send(load_preview(4, "clicked.html")).unwrap();
 
         let selected = recv_preview_worker_task(&rx, &mut backlog).unwrap();
@@ -4342,8 +4410,8 @@ mod preview_worker_coalescing_tests {
         assert_load_preview(selected, 4, "clicked.html");
         assert_eq!(backlog.len(), 1);
         match backlog.pop_front().unwrap() {
-            FilesTask::RebuildTree { generation, .. } => assert_eq!(generation, 11),
-            _ => panic!("expected RebuildTree to stay queued"),
+            FilesTask::BuildQuickOpenIndex { generation, .. } => assert_eq!(generation, 11),
+            _ => panic!("expected BuildQuickOpenIndex to stay queued"),
         }
     }
 
@@ -4370,7 +4438,7 @@ mod preview_worker_coalescing_tests {
         let mut backlog = VecDeque::new();
         tx.send(load_db_detail(2)).unwrap();
         tx.send(load_db_page(3)).unwrap();
-        tx.send(rebuild_tree(9)).unwrap();
+        tx.send(build_quick_open_index(9)).unwrap();
 
         let selected = coalesce_preview_worker_task(load_db_page(1), &rx, &mut backlog);
 
@@ -4381,7 +4449,7 @@ mod preview_worker_coalescing_tests {
         assert_eq!(backlog.len(), 1);
         assert!(matches!(
             backlog.pop_front(),
-            Some(FilesTask::RebuildTree { generation: 9, .. })
+            Some(FilesTask::BuildQuickOpenIndex { generation: 9, .. })
         ));
     }
 

@@ -213,9 +213,18 @@ impl AppState {
     ) -> Vec<AppRuntimeEvent> {
         let mut events = Vec::new();
         match result {
-            WorkerResult::FileTree { generation, result } => match result {
+            WorkerResult::FileTree {
+                generation,
+                tree_revision,
+                result,
+            } => match result {
                 Ok(payload) => {
-                    if self.file_tree_load.complete_ok(generation) {
+                    if generation == self.file_tree_load.generation
+                        && tree_revision != self.file_tree_revision
+                    {
+                        self.file_tree_load.complete_ok(generation);
+                        self.file_tree_load.mark_stale();
+                    } else if self.file_tree_load.complete_ok(generation) {
                         let before = self.file_tree.selected_path();
                         self.file_tree
                             .replace_entries(payload.entries, payload.selected_idx);
@@ -229,18 +238,39 @@ impl AppState {
                     }
                 }
                 Err(error) => {
-                    self.file_tree_load.complete_err(generation, error);
+                    if generation == self.file_tree_load.generation
+                        && tree_revision != self.file_tree_revision
+                    {
+                        self.file_tree_load.complete_ok(generation);
+                        self.file_tree_load.mark_stale();
+                    } else {
+                        self.file_tree_load.complete_err(generation, error);
+                    }
                 }
             },
-            WorkerResult::FileTreeSubtree { generation, result } => match result {
+            WorkerResult::FileTreeSubtree {
+                request_id,
+                parent_path,
+                result,
+            } => match result {
                 Ok(payload) => {
-                    if self.file_tree_load.complete_ok(generation) {
+                    if self.file_tree_subtree_requests.get(&parent_path) == Some(&request_id) {
+                        self.file_tree_subtree_requests.remove(&parent_path);
+                        let parent_is_expanded = self
+                            .file_tree
+                            .entries
+                            .iter()
+                            .find(|entry| entry.path == parent_path)
+                            .is_some_and(|entry| entry.is_dir && entry.is_expanded);
+                        if !parent_is_expanded {
+                            return events;
+                        }
                         let before = self.file_tree.selected_path();
+                        let mut entries = payload.entries;
                         self.file_tree
-                            .replace_visible_descendants(&payload.parent_path, payload.entries);
-                        let staged = self.staged_files.clone();
-                        let unstaged = self.unstaged_files.clone();
-                        self.file_tree.refresh_git_statuses(&staged, &unstaged);
+                            .decorate_entries_with_git_statuses(&mut entries);
+                        self.file_tree
+                            .replace_visible_descendants(&payload.parent_path, entries);
                         self.revalidate_tree_edit_anchor();
                         if before != self.file_tree.selected_path() {
                             events.push(AppRuntimeEvent::LoadPreviewSelected);
@@ -248,7 +278,10 @@ impl AppState {
                     }
                 }
                 Err(error) => {
-                    self.file_tree_load.complete_err(generation, error);
+                    if self.file_tree_subtree_requests.get(&parent_path) == Some(&request_id) {
+                        self.file_tree_subtree_requests.remove(&parent_path);
+                        self.file_tree_load.error = Some(error);
+                    }
                 }
             },
             WorkerResult::GitStatus { generation, result } => match result {

@@ -540,6 +540,9 @@ pub struct AppState {
 
     pub tasks: TaskCoordinator,
     pub file_tree_load: AsyncState,
+    file_tree_revision: u64,
+    next_file_tree_subtree_request_id: u64,
+    file_tree_subtree_requests: HashMap<PathBuf, u64>,
     pub preview_load: AsyncState,
     pub db_page_load: AsyncState,
     pub db_detail_load: AsyncState,
@@ -773,6 +776,9 @@ impl AppState {
             pending_confirm: None,
             tasks: TaskCoordinator::new(),
             file_tree_load: AsyncState::default(),
+            file_tree_revision: 0,
+            next_file_tree_subtree_request_id: 0,
+            file_tree_subtree_requests: HashMap::new(),
             preview_load: AsyncState::default(),
             db_page_load: AsyncState::default(),
             db_detail_load: AsyncState::default(),
@@ -1527,12 +1533,13 @@ mod tests {
             FileTreeState::with_entries(vec![parent.clone(), tree_entry("src/a.rs", 1, false)]);
         app.file_tree.toggle_expand(0);
         let stale_generation = app.file_tree_load.begin();
+        let stale_tree_revision = app.file_tree_revision;
 
         app.toggle_file_tree_expand_and_refresh(0);
-        let current_generation = app.file_tree_load.generation;
         app.apply_worker_result_core(
             WorkerResult::FileTree {
                 generation: stale_generation,
+                tree_revision: stale_tree_revision,
                 result: Ok(FileTreePayload {
                     entries: vec![parent, tree_entry("src/a.rs", 1, false)],
                     selected_idx: 0,
@@ -1541,7 +1548,9 @@ mod tests {
             Instant::now(),
         );
 
-        assert_ne!(stale_generation, current_generation);
+        assert_eq!(stale_generation, app.file_tree_load.generation);
+        assert!(!app.file_tree_load.loading);
+        assert!(app.file_tree_load.stale);
         assert_eq!(
             app.file_tree
                 .entries
@@ -1554,7 +1563,7 @@ mod tests {
     }
 
     #[test]
-    fn collapse_all_during_tree_load_schedules_root_refresh() {
+    fn collapse_all_during_tree_load_invalidates_the_pending_tree_shape() {
         use crate::FileTreeState;
 
         let mut app = minimal_app_state();
@@ -1563,12 +1572,14 @@ mod tests {
             tree_entry("src/a.rs", 1, false),
         ]);
         app.file_tree.toggle_expand(0);
-        let superseded_generation = app.file_tree_load.begin();
+        let tree_revision = app.file_tree_revision;
+        let generation = app.file_tree_load.begin();
 
         app.collapse_all_file_tree_entries();
 
         assert!(app.file_tree_load.loading);
-        assert_ne!(app.file_tree_load.generation, superseded_generation);
+        assert_eq!(app.file_tree_load.generation, generation);
+        assert_ne!(app.file_tree_revision, tree_revision);
         assert_eq!(
             app.file_tree
                 .entries
@@ -1593,13 +1604,18 @@ mod tests {
             additions: 1,
             deletions: 0,
         }];
-        let generation = app.file_tree_load.begin();
+        app.file_tree
+            .refresh_git_statuses(&[], &app.unstaged_files);
+        let request_id = 1;
+        app.file_tree_subtree_requests
+            .insert(PathBuf::from("src"), request_id);
         let mut stale_child = tree_entry("src/a.rs", 1, false);
         stale_child.git_status = Some('M');
 
         app.apply_worker_result_core(
             WorkerResult::FileTreeSubtree {
-                generation,
+                request_id,
+                parent_path: PathBuf::from("src"),
                 result: Ok(FileTreeSubtreePayload {
                     parent_path: PathBuf::from("src"),
                     entries: vec![stale_child],
@@ -1609,6 +1625,90 @@ mod tests {
         );
 
         assert_eq!(app.file_tree.entries[1].git_status, Some('A'));
+    }
+
+    #[test]
+    fn sibling_subtree_results_apply_independently_out_of_order() {
+        use crate::FileTreeState;
+        use crate::tasks::FileTreeSubtreePayload;
+
+        let mut app = minimal_app_state();
+        app.file_tree.state = FileTreeState::with_entries(vec![
+            tree_entry("alpha", 0, true),
+            tree_entry("beta", 0, true),
+        ]);
+        app.file_tree.toggle_expand(0);
+        app.file_tree.toggle_expand(1);
+        app.file_tree_subtree_requests
+            .insert(PathBuf::from("alpha"), 1);
+        app.file_tree_subtree_requests
+            .insert(PathBuf::from("beta"), 2);
+
+        app.apply_worker_result_core(
+            WorkerResult::FileTreeSubtree {
+                request_id: 2,
+                parent_path: PathBuf::from("beta"),
+                result: Ok(FileTreeSubtreePayload {
+                    parent_path: PathBuf::from("beta"),
+                    entries: vec![tree_entry("beta/b.rs", 1, false)],
+                }),
+            },
+            Instant::now(),
+        );
+        app.apply_worker_result_core(
+            WorkerResult::FileTreeSubtree {
+                request_id: 1,
+                parent_path: PathBuf::from("alpha"),
+                result: Ok(FileTreeSubtreePayload {
+                    parent_path: PathBuf::from("alpha"),
+                    entries: vec![tree_entry("alpha/a.rs", 1, false)],
+                }),
+            },
+            Instant::now(),
+        );
+
+        assert_eq!(
+            app.file_tree
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_path())
+                .collect::<Vec<_>>(),
+            vec![
+                Path::new("alpha"),
+                Path::new("alpha/a.rs"),
+                Path::new("beta"),
+                Path::new("beta/b.rs"),
+            ]
+        );
+        assert!(app.file_tree_subtree_requests.is_empty());
+    }
+
+    #[test]
+    fn collapsed_parent_rejects_its_in_flight_subtree_result() {
+        use crate::FileTreeState;
+        use crate::tasks::FileTreeSubtreePayload;
+
+        let mut app = minimal_app_state();
+        app.file_tree.state = FileTreeState::with_entries(vec![tree_entry("src", 0, true)]);
+        app.file_tree.toggle_expand(0);
+        app.file_tree_subtree_requests
+            .insert(PathBuf::from("src"), 7);
+        app.toggle_file_tree_expand_and_refresh(0);
+
+        app.apply_worker_result_core(
+            WorkerResult::FileTreeSubtree {
+                request_id: 7,
+                parent_path: PathBuf::from("src"),
+                result: Ok(FileTreeSubtreePayload {
+                    parent_path: PathBuf::from("src"),
+                    entries: vec![tree_entry("src/a.rs", 1, false)],
+                }),
+            },
+            Instant::now(),
+        );
+
+        assert_eq!(app.file_tree.entries.len(), 1);
+        assert!(!app.file_tree.entries[0].is_expanded);
     }
 
     #[test]

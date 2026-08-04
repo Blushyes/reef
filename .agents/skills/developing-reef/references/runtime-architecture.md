@@ -94,8 +94,28 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
 
 ### Files
 
-- Tree structure changes (expand/collapse/reveal/fs events) may rebuild the tree through the files worker.
+- Tree structure changes from filesystem events or external reveal requests use the full-tree
+  rebuild worker. Its queued rebuilds coalesce to the newest generation.
+- Interactive directory expansion uses a separate bounded subtree worker pool. Each parent path
+  owns an independent request ID, so expanding one directory never cancels or waits behind a
+  sibling expansion. Collapsing or re-expanding a parent invalidates only that parent's old result.
+  Expansion publishes the parent presentation and inserted descendants as one structural update;
+  collapse remains immediate because its visible descendants are already resident.
+- Directory children are resolved lazily. Listing one level must perform one directory enumeration;
+  it must not open every child directory merely to decide whether to draw a disclosure indicator.
+  Directory rows remain potentially expandable until their own subtree result proves they are
+  empty, at which point the shared tree model resolves the row to a leaf.
+- Quick Open indexing and filesystem mutations use the general files worker, while Preview uses
+  its own latest-wins worker; none of those queues may delay an interactive tree expansion or file
+  Preview.
+- Selecting an entry already present in the visible file-tree projection uses
+  `SelectVisibleFileTreePath`: it updates selection and schedules Preview without revealing or
+  rebuilding the tree. Commands that originate outside the visible tree, such as Quick Open and
+  navigation history, use the reveal path so their target can be materialized first.
 - Git decorations update visible entries in place; they must not rebuild the tree by themselves.
+  Subtree workers return structure only; accepted children are decorated from the current cached
+  status map in O(inserted rows), rather than cloning or rebuilding the repository-wide status
+  snapshot for every expansion.
 - Preview loads run through the `reef-app` task coordinator. The preview worker publishes the base document first; only after that result is accepted does a separate enrichment worker add syntax highlighting and tree-sitter data. Renderers must accept the plain snapshot immediately and treat enrichment as an in-place revision update. Adapter actions that need enrichment, such as TUI code navigation or deferred UTF-16 highlights, must retain a generation/path-bound intent and retry it from `RetryDeferredPreviewActions`; they must not discard the input while the enrichment request is pending.
 - Preview snapshots expose separate content and presentation revisions. `source_revision` changes only when accepted raw preview content changes; `revision` may also change when asynchronous enrichment arrives. Content-relative state such as find, selection, and navigation uses `source_revision`, while renderer caches that include styling use `revision`.
 - OS drag-and-drop and place-mode sources use `CopyFiles`. A remote backend treats every such path

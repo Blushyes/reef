@@ -404,10 +404,7 @@ mod tests {
     #[test]
     fn decorate_entries_uses_the_current_git_status_snapshot() {
         let mut tree = FileTreeState::default();
-        tree.refresh_git_statuses(
-            &[],
-            &[make_entry("src/main.rs", FileStatus::Modified)],
-        );
+        tree.refresh_git_statuses(&[], &[make_entry("src/main.rs", FileStatus::Modified)]);
         let mut entries = vec![dummy_entry("src/main.rs"), dummy_entry("src/lib.rs")];
         entries[0].git_status = Some('A');
 

@@ -663,16 +663,6 @@ enum GitTask {
         generation: u64,
         backend: Arc<dyn Backend>,
     },
-    LoadDiff {
-        generation: u64,
-        backend: Arc<dyn Backend>,
-        path: String,
-        staged: bool,
-        context_lines: u32,
-        /// Picks the syntect theme (dark vs light) — same role as
-        /// `LoadCommitFileDiff.dark` / `LoadPreview.dark`.
-        dark: bool,
-    },
     Mutate {
         generation: u64,
         backend: Arc<dyn Backend>,
@@ -687,6 +677,19 @@ enum GitTask {
         generation: u64,
         backend: Arc<dyn Backend>,
         force: bool,
+    },
+}
+
+enum GitDiffTask {
+    Load {
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        path: String,
+        staged: bool,
+        context_lines: u32,
+        /// Picks the syntect theme (dark vs light) — same role as
+        /// `LoadCommitFileDiff.dark` / `LoadPreview.dark`.
+        dark: bool,
     },
 }
 
@@ -782,6 +785,7 @@ pub struct TaskCoordinator {
     db_cell_tx: mpsc::Sender<DbCellTask>,
     preview_enrichment_tx: mpsc::Sender<PreviewEnrichmentTask>,
     git_tx: mpsc::Sender<GitTask>,
+    git_diff_tx: mpsc::Sender<GitDiffTask>,
     git_status_stats_tx: mpsc::Sender<GitStatusStatsTask>,
     graph_refresh_tx: mpsc::Sender<GraphRefreshTask>,
     graph_content_tx: mpsc::Sender<GraphContentTask>,
@@ -824,6 +828,7 @@ impl TaskCoordinator {
             db_cell_tx: spawn_db_cell_worker(result_tx.clone()),
             preview_enrichment_tx: spawn_preview_enrichment_worker(result_tx.clone()),
             git_tx: spawn_git_worker(result_tx.clone()),
+            git_diff_tx: spawn_git_diff_worker(result_tx.clone()),
             git_status_stats_tx: spawn_git_status_stats_worker(result_tx.clone()),
             graph_refresh_tx: spawn_graph_refresh_worker(result_tx.clone()),
             graph_content_tx: spawn_graph_content_worker(result_tx.clone()),
@@ -1202,7 +1207,7 @@ impl TaskCoordinator {
         context_lines: u32,
         dark: bool,
     ) {
-        let _ = self.git_tx.send(GitTask::LoadDiff {
+        let _ = self.git_diff_tx.send(GitDiffTask::Load {
             generation,
             backend,
             path,
@@ -2243,26 +2248,6 @@ fn spawn_git_worker(result_tx: WorkerResultSender) -> mpsc::Sender<GitTask> {
                             .map_err(|e| e.to_string());
                         let _ = result_tx.send(WorkerResult::GitStatus { generation, result });
                     }
-                    GitTask::LoadDiff {
-                        generation,
-                        backend,
-                        path,
-                        staged,
-                        context_lines,
-                        dark,
-                    } => {
-                        // Merge: diff data via backend (remote-aware),
-                        // then apply v0.14.0's syntect highlighting on
-                        // the client side.
-                        let result = if staged {
-                            backend.staged_diff(&path, context_lines)
-                        } else {
-                            backend.unstaged_diff(&path, context_lines)
-                        }
-                        .map_err(|e| e.to_string())
-                        .map(|opt| opt.map(|diff| build_highlighted_diff(&path, diff, dark)));
-                        let _ = result_tx.send(WorkerResult::Diff { generation, result });
-                    }
                     GitTask::Mutate {
                         generation,
                         backend,
@@ -2290,6 +2275,36 @@ fn spawn_git_worker(result_tx: WorkerResultSender) -> mpsc::Sender<GitTask> {
                             force,
                             result,
                         });
+                    }
+                }
+            }
+        });
+    tx
+}
+
+fn spawn_git_diff_worker(result_tx: WorkerResultSender) -> mpsc::Sender<GitDiffTask> {
+    let (tx, rx) = mpsc::unbounded();
+    let _ = thread::Builder::new()
+        .name("reef-git-diff-worker".into())
+        .spawn(move || {
+            while let Ok(task) = recv_latest(&rx) {
+                match task {
+                    GitDiffTask::Load {
+                        generation,
+                        backend,
+                        path,
+                        staged,
+                        context_lines,
+                        dark,
+                    } => {
+                        let result = if staged {
+                            backend.staged_diff(&path, context_lines)
+                        } else {
+                            backend.unstaged_diff(&path, context_lines)
+                        }
+                        .map_err(|e| e.to_string())
+                        .map(|opt| opt.map(|diff| build_highlighted_diff(&path, diff, dark)));
+                        let _ = result_tx.send(WorkerResult::Diff { generation, result });
                     }
                 }
             }

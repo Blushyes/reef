@@ -82,26 +82,35 @@ impl AppState {
     }
 
     pub(super) fn apply_git_status_stats(&mut self, stats: reef_core::git::GitStatusStats) {
+        let mut rows_changed = false;
         for entry in &mut self.staged_files {
-            entry.additions = 0;
-            entry.deletions = 0;
-            if let Some((additions, deletions)) = stats.staged.get(&entry.path) {
-                entry.additions = *additions;
-                entry.deletions = *deletions;
-            }
+            let next = stats.staged.get(&entry.path).copied().unwrap_or_default();
+            rows_changed |= (entry.additions, entry.deletions) != next;
+            (entry.additions, entry.deletions) = next;
         }
         for entry in &mut self.unstaged_files {
-            entry.additions = 0;
-            entry.deletions = 0;
-            if let Some((additions, deletions)) = stats.unstaged.get(&entry.path) {
-                entry.additions = *additions;
-                entry.deletions = *deletions;
-            }
+            let next = stats.unstaged.get(&entry.path).copied().unwrap_or_default();
+            rows_changed |= (entry.additions, entry.deletions) != next;
+            (entry.additions, entry.deletions) = next;
+        }
+        if rows_changed {
+            self.mark_git_status_rows_changed();
         }
         self.rebuild_git_status_tree_rows();
     }
 
-    pub fn select_file(&mut self, path: String, is_staged: bool, dark: bool) {
+    pub(super) fn mark_git_status_rows_changed(&mut self) {
+        self.git_status_rows_revision = self.git_status_rows_revision.wrapping_add(1).max(1);
+    }
+
+    pub fn select_file(&mut self, path: String, is_staged: bool, dark: bool) -> bool {
+        if self
+            .selected_file
+            .as_ref()
+            .is_some_and(|selected| selected.path == path && selected.is_staged == is_staged)
+        {
+            return false;
+        }
         self.selected_file = Some(SelectedFile { path, is_staged });
         self.git_status.confirm_discard = None;
         self.diff_scroll = 0;
@@ -109,6 +118,7 @@ impl AppState {
         self.sbs_left_h_scroll = 0;
         self.sbs_right_h_scroll = 0;
         self.load_diff(dark);
+        true
     }
 
     pub fn select_git_file_for_discard(&mut self, path: String, is_staged: bool, dark: bool) {

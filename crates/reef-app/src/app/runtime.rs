@@ -150,8 +150,13 @@ impl AppState {
             self.graph_load.invalidate();
             self.commit_detail_load.invalidate();
             self.commit_file_diff_load.invalidate();
+            let had_git_status_rows =
+                !self.staged_files.is_empty() || !self.unstaged_files.is_empty();
             self.staged_files.clear();
             self.unstaged_files.clear();
+            if had_git_status_rows {
+                self.mark_git_status_rows_changed();
+            }
             self.rebuild_git_status_tree_rows();
             self.selected_file = None;
             self.diff_content = None;
@@ -292,10 +297,16 @@ impl AppState {
                         let mut unstaged = payload.unstaged;
                         Self::retain_cached_git_status_stats(&mut staged, &self.staged_files);
                         Self::retain_cached_git_status_stats(&mut unstaged, &self.unstaged_files);
+                        let status_rows_changed =
+                            !same_git_status_entries(&self.staged_files, &staged)
+                                || !same_git_status_entries(&self.unstaged_files, &unstaged);
                         let tree_needs_rebuild =
                             self.git_status_tree_needs_rebuild(&staged, &unstaged);
                         self.staged_files = staged;
                         self.unstaged_files = unstaged;
+                        if status_rows_changed {
+                            self.mark_git_status_rows_changed();
+                        }
                         self.git_status.ahead_behind = payload.ahead_behind;
                         self.branch_name = payload.branch_name;
                         if tree_needs_rebuild {
@@ -673,6 +684,16 @@ fn preview_dependencies_changed(dependency_paths: &[PathBuf], changed_paths: &[P
             changed_path == dependency_path || dependency_path.starts_with(changed_path)
         })
     })
+}
+
+fn same_git_status_entries(left: &[FileEntry], right: &[FileEntry]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.path == right.path
+                && left.status == right.status
+                && left.additions == right.additions
+                && left.deletions == right.deletions
+        })
 }
 
 fn push_min_deadline(target: &mut Option<Instant>, candidate: Option<Instant>) {

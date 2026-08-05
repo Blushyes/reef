@@ -550,6 +550,7 @@ pub struct AppState {
     pub db_cell_cancellation: Option<reef_io::CancellationToken>,
     pub git_status_load: AsyncState,
     pub git_status_stats_load: AsyncState,
+    pub(crate) git_status_rows_revision: u64,
     pub git_mutation_load: AsyncState,
     pub commit_load: AsyncState,
     pub push_load: AsyncState,
@@ -786,6 +787,7 @@ impl AppState {
             db_cell_cancellation: None,
             git_status_load: AsyncState::default(),
             git_status_stats_load: AsyncState::default(),
+            git_status_rows_revision: 0,
             git_mutation_load: AsyncState::default(),
             commit_load: AsyncState::default(),
             push_load: AsyncState::default(),
@@ -1110,11 +1112,13 @@ mod tests {
             unstaged_files: vec![git_entry("src/b.rs")],
             ..minimal_app_state()
         };
+        let initial_revision = app.git_status_rows_revision;
 
-        app.apply_git_status_stats(reef_core::git::GitStatusStats {
+        let stats = reef_core::git::GitStatusStats {
             staged: HashMap::from([("src/a.rs".to_string(), (2, 1))]),
             unstaged: HashMap::new(),
-        });
+        };
+        app.apply_git_status_stats(stats.clone());
 
         assert_eq!(
             (app.staged_files[0].additions, app.staged_files[0].deletions),
@@ -1127,6 +1131,11 @@ mod tests {
             ),
             (0, 0)
         );
+        assert!(app.git_status_rows_revision > initial_revision);
+
+        let updated_revision = app.git_status_rows_revision;
+        app.apply_git_status_stats(stats);
+        assert_eq!(app.git_status_rows_revision, updated_revision);
     }
 
     #[test]
@@ -1604,8 +1613,7 @@ mod tests {
             additions: 1,
             deletions: 0,
         }];
-        app.file_tree
-            .refresh_git_statuses(&[], &app.unstaged_files);
+        app.file_tree.refresh_git_statuses(&[], &app.unstaged_files);
         let request_id = 1;
         app.file_tree_subtree_requests
             .insert(PathBuf::from("src"), request_id);

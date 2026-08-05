@@ -147,14 +147,16 @@ impl ReefApp {
     ) {
         match row.source {
             crate::FocusedPreviewFileSource::GitStaged => {
-                self.state.select_file(row.path, true, dark);
-                self.runtime_events
-                    .push(AppRuntimeEvent::ClearDiffSelection);
+                if self.state.select_file(row.path, true, dark) {
+                    self.runtime_events
+                        .push(AppRuntimeEvent::ClearDiffSelection);
+                }
             }
             crate::FocusedPreviewFileSource::GitUnstaged => {
-                self.state.select_file(row.path, false, dark);
-                self.runtime_events
-                    .push(AppRuntimeEvent::ClearDiffSelection);
+                if self.state.select_file(row.path, false, dark) {
+                    self.runtime_events
+                        .push(AppRuntimeEvent::ClearDiffSelection);
+                }
             }
             crate::FocusedPreviewFileSource::GraphCommit => {
                 let outcome = self
@@ -946,9 +948,10 @@ impl ReefApp {
                 is_staged,
                 dark,
             } => {
-                self.state.select_file(path, is_staged, dark);
-                self.runtime_events
-                    .push(AppRuntimeEvent::ClearDiffSelection);
+                if self.state.select_file(path, is_staged, dark) {
+                    self.runtime_events
+                        .push(AppRuntimeEvent::ClearDiffSelection);
+                }
             }
             AppCommand::SelectGitFileForDiscard {
                 path,
@@ -1942,6 +1945,10 @@ impl ReefApp {
         &self.state.unstaged_files
     }
 
+    pub fn git_status_rows_revision(&self) -> u64 {
+        self.state.git_status_rows_revision
+    }
+
     pub fn selected_file(&self) -> Option<&SelectedFile> {
         self.state.selected_file.as_ref()
     }
@@ -2368,6 +2375,29 @@ mod tests {
             app.state.preview_schedule.as_ref().map(|(path, _)| path),
             Some(&PathBuf::from("src/main.rs"))
         );
+    }
+
+    #[test]
+    fn reselecting_current_git_file_does_not_enqueue_diff() {
+        let mut app = test_app();
+        let command = AppCommand::SelectGitFile {
+            path: "src/main.rs".to_string(),
+            is_staged: false,
+            dark: false,
+        };
+
+        app.dispatch(command.clone());
+        let first_generation = app.state.diff_load.generation;
+        assert!(
+            app.drain_runtime_events()
+                .iter()
+                .any(|event| matches!(event, AppRuntimeEvent::ClearDiffSelection))
+        );
+
+        app.dispatch(command);
+
+        assert_eq!(app.state.diff_load.generation, first_generation);
+        assert!(app.drain_runtime_events().is_empty());
     }
 
     #[test]

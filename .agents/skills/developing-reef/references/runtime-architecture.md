@@ -141,8 +141,19 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
 
 ### Git
 
-- Git status, ahead/behind, and branch label are cached from the git worker.
-- Selecting a file requests a diff asynchronously.
+- Git status, ahead/behind, branch label, and mutations use the general Git worker. Interactive
+  file diffs use a separate latest-wins worker, so repository-wide status refreshes and queued
+  obsolete selections cannot delay the current preview.
+- Selecting a different file requests a diff asynchronously. Re-selecting the same staged/path
+  identity is a no-op and must not enqueue another diff or clear renderer selection.
+- Renderer bridges expose Git diff content and its loading/error state through a dedicated,
+  revisioned payload. File selection and diff completion must not serialize the application
+  snapshot or unrelated Graph rows; keep the previously accepted diff visible until the new
+  payload arrives.
+- Renderer bridges publish Git status row structure and Git status selection independently.
+  Selecting a file updates only the selected row identity and requests its diff; it must not
+  rebuild, fetch, or reload the status-row window. Diff renderers prepare highlighting off the
+  main thread and replace the visible document once per accepted payload.
 - Stage and unstage submit the selected paths as one logical batch. Local backends pass NUL-delimited
   literal pathspecs to one native mutating Git process. Remote backends stream frame-bounded path
   chunks under one operation id; the agent accumulates them and invokes one native Git mutation

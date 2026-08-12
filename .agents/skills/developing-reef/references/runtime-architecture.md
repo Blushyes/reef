@@ -105,9 +105,11 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
   it must not open every child directory merely to decide whether to draw a disclosure indicator.
   Directory rows remain potentially expandable until their own subtree result proves they are
   empty, at which point the shared tree model resolves the row to a leaf.
-- Quick Open indexing and filesystem mutations use the general files worker, while Preview uses
-  its own latest-wins worker; none of those queues may delay an interactive tree expansion or file
-  Preview.
+- Quick Open indexing and filesystem mutations use the general files worker. Quick Open filtering
+  uses its own latest-wins worker over the shared immutable candidate index, and Preview uses a
+  separate latest-wins worker; none of those queues may delay an interactive tree expansion or
+  file Preview. Adapters receive Quick Open changes as a narrow projection event rather than as a
+  full application snapshot.
 - Selecting an entry already present in the visible file-tree projection uses
   `SelectVisibleFileTreePath`: it updates selection and schedules Preview without revealing or
   rebuilding the tree. Commands that originate outside the visible tree, such as Quick Open and

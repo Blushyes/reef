@@ -162,6 +162,7 @@ pub enum AppCommand {
     },
     OpenQuickOpen,
     CloseQuickOpen,
+    SetQuickOpenQuery(String),
     ApplyQuickOpenPickerInput {
         input: PickerInput,
         visible_rows: usize,

@@ -513,6 +513,14 @@ impl AppState {
                     }
                 }
             },
+            WorkerResult::QuickOpenFilter {
+                generation,
+                matches,
+            } => {
+                if self.quick_open_filter_load.complete_ok(generation) {
+                    crate::features::quick_open::apply_matches(&mut self.quick_open, matches);
+                }
+            }
             WorkerResult::TreeEditPlan { generation, result } => {
                 self.apply_tree_edit_plan_result(generation, result, &mut events);
             }

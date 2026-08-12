@@ -618,6 +618,7 @@ impl ReefApp {
                 .scroll_horizontal_at_column(column, total_width, delta),
             AppCommand::OpenQuickOpen => self.state.open_quick_open(),
             AppCommand::CloseQuickOpen => self.state.close_quick_open(),
+            AppCommand::SetQuickOpenQuery(query) => self.state.set_quick_open_query(query),
             AppCommand::ApplyQuickOpenPickerInput {
                 input,
                 visible_rows,

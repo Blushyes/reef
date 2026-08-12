@@ -394,7 +394,11 @@ impl QuickOpenSnapshot {
             match_count: state.quick_open.matches.len(),
             recent: state.quick_open.core.filter.is_empty() && !state.quick_open.mru.is_empty(),
             scroll: state.quick_open.scroll,
-            load: AsyncSnapshot::from_state(&state.quick_open_load),
+            load: AsyncSnapshot::from_state(if state.quick_open_load.loading {
+                &state.quick_open_load
+            } else {
+                &state.quick_open_filter_load
+            }),
         }
     }
 }

@@ -2,9 +2,9 @@ use super::*;
 
 impl AppState {
     pub fn rebuild_quick_open_index(&mut self, index: Vec<crate::features::quick_open::Candidate>) {
-        self.quick_open.index = index;
+        self.quick_open.index = index.into();
         self.quick_open.index_stale = false;
-        crate::features::quick_open::filter(&mut self.quick_open);
+        self.filter_quick_open();
     }
 
     fn request_quick_open_index_if_needed(&mut self) {
@@ -20,7 +20,24 @@ impl AppState {
     }
 
     pub fn filter_quick_open(&mut self) {
-        crate::features::quick_open::filter(&mut self.quick_open);
+        self.quick_open.core.selected_idx = 0;
+        self.quick_open.scroll = 0;
+        let generation = self.quick_open_filter_load.begin();
+        self.tasks.filter_quick_open(
+            generation,
+            Arc::clone(&self.quick_open.index),
+            self.quick_open.core.filter.clone(),
+            self.quick_open.mru.clone(),
+        );
+    }
+
+    pub fn set_quick_open_query(&mut self, query: String) {
+        if self.quick_open.core.filter == query {
+            return;
+        }
+        self.quick_open.core.filter = query;
+        self.quick_open.core.cursor = self.quick_open.core.filter.len();
+        self.filter_quick_open();
     }
 
     pub fn apply_quick_open_picker_input(

@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
 use crossbeam_channel as mpsc;
@@ -216,6 +216,10 @@ pub enum WorkerResult {
     QuickOpenIndex {
         generation: u64,
         result: Result<Vec<crate::features::quick_open::Candidate>, String>,
+    },
+    QuickOpenFilter {
+        generation: u64,
+        matches: Vec<crate::features::quick_open::MatchEntry>,
     },
     TreeEditPlan {
         generation: u64,
@@ -625,6 +629,13 @@ enum FilesTask {
     },
 }
 
+struct QuickOpenFilterTask {
+    generation: u64,
+    index: Arc<[crate::features::quick_open::Candidate]>,
+    query: String,
+    mru: VecDeque<PathBuf>,
+}
+
 struct PreviewEnrichmentTask {
     generation: u64,
     path: String,
@@ -776,6 +787,8 @@ pub struct TaskCoordinator {
     file_tree_rebuild_tx: mpsc::Sender<FileTreeRebuildTask>,
     file_tree_subtree_tx: mpsc::Sender<FileTreeSubtreeTask>,
     files_tx: mpsc::Sender<FilesTask>,
+    quick_open_filter_tx: mpsc::Sender<QuickOpenFilterTask>,
+    quick_open_filter_generation: Arc<AtomicU64>,
     /// Dedicated channel for `FilesTask::LoadPreview`. Keeping previews
     /// on their own worker thread means a slow directory rebuild or an
     /// in-flight copy never queues in front of the image the user just
@@ -820,10 +833,16 @@ impl TaskCoordinator {
             result_tx,
             worker_wake_tx,
         };
+        let quick_open_filter_generation = Arc::new(AtomicU64::new(0));
         Self {
             file_tree_rebuild_tx: spawn_file_tree_rebuild_worker(result_tx.clone()),
             file_tree_subtree_tx: spawn_file_tree_subtree_workers(result_tx.clone()),
             files_tx: spawn_files_worker(result_tx.clone()),
+            quick_open_filter_tx: spawn_quick_open_filter_worker(
+                result_tx.clone(),
+                Arc::clone(&quick_open_filter_generation),
+            ),
+            quick_open_filter_generation,
             preview_tx: spawn_preview_worker(result_tx.clone()),
             db_cell_tx: spawn_db_cell_worker(result_tx.clone()),
             preview_enrichment_tx: spawn_preview_enrichment_worker(result_tx.clone()),
@@ -976,6 +995,23 @@ impl TaskCoordinator {
         let _ = self.files_tx.send(FilesTask::BuildQuickOpenIndex {
             generation,
             backend,
+        });
+    }
+
+    pub fn filter_quick_open(
+        &self,
+        generation: u64,
+        index: Arc<[crate::features::quick_open::Candidate]>,
+        query: String,
+        mru: VecDeque<PathBuf>,
+    ) {
+        self.quick_open_filter_generation
+            .store(generation, Ordering::Release);
+        let _ = self.quick_open_filter_tx.send(QuickOpenFilterTask {
+            generation,
+            index,
+            query,
+            mru,
         });
     }
 
@@ -1608,6 +1644,32 @@ fn spawn_files_worker(result_tx: WorkerResultSender) -> mpsc::Sender<FilesTask> 
                     | FilesTask::LoadDbPage { .. }
                     | FilesTask::LoadDbDetail { .. }
                     | FilesTask::PrefetchPreview { .. } => {}
+                }
+            }
+        });
+    tx
+}
+
+fn spawn_quick_open_filter_worker(
+    result_tx: WorkerResultSender,
+    latest_generation: Arc<AtomicU64>,
+) -> mpsc::Sender<QuickOpenFilterTask> {
+    let (tx, rx) = mpsc::unbounded::<QuickOpenFilterTask>();
+    let _ = thread::Builder::new()
+        .name("reef-quick-open-filter".into())
+        .spawn(move || {
+            while let Ok(task) = recv_latest(&rx) {
+                let matches = reef_core::quick_open::filter_candidates_interruptible(
+                    &task.index,
+                    &task.query,
+                    &task.mru,
+                    || latest_generation.load(Ordering::Acquire) != task.generation,
+                );
+                if let Some(matches) = matches {
+                    let _ = result_tx.send(WorkerResult::QuickOpenFilter {
+                        generation: task.generation,
+                        matches,
+                    });
                 }
             }
         });

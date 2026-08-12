@@ -293,7 +293,7 @@ mod tests {
     fn mk_state(paths: &[&str]) -> QuickOpenState {
         let index = reef_core::quick_open::build_candidates(paths.iter().map(|p| p.to_string()));
         QuickOpenState {
-            index,
+            index: index.into(),
             index_stale: false,
             ..QuickOpenState::default()
         }

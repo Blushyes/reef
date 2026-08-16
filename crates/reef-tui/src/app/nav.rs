@@ -372,8 +372,10 @@ impl App {
                     return;
                 };
                 let (anchor_col, anchor_row) = self.compute_nav_popup_anchor(anchor);
-                let max_row_width =
-                    crate::ui::nav_candidates_popup::candidates_max_width(&candidates);
+                let max_row_width = crate::ui::nav_candidates_popup::candidates_max_width(
+                    &candidates,
+                    &current_path,
+                );
                 self.engine
                     .dispatch(AppCommand::OpenNavCandidates(NavCandidatesPopup {
                         anchor_col,
@@ -944,7 +946,8 @@ impl App {
         let Some(origin) = self.snapshot_location() else {
             return;
         };
-        let max_row_width = crate::ui::nav_candidates_popup::candidates_max_width(&candidates);
+        let max_row_width =
+            crate::ui::nav_candidates_popup::candidates_max_width(&candidates, &current_path);
         self.engine
             .dispatch(AppCommand::OpenNavCandidates(NavCandidatesPopup {
                 anchor_col,
@@ -1075,7 +1078,7 @@ impl App {
                     return;
                 };
                 let max_row_width =
-                    crate::ui::nav_candidates_popup::candidates_max_width(&candidates);
+                    crate::ui::nav_candidates_popup::candidates_max_width(&candidates, &c.path);
                 self.engine
                     .dispatch(AppCommand::OpenNavCandidates(NavCandidatesPopup {
                         anchor_col: c.anchor_col,
@@ -1116,7 +1119,8 @@ impl App {
         let Some(origin) = self.snapshot_location() else {
             return;
         };
-        let max_row_width = crate::ui::nav_candidates_popup::candidates_max_width(&candidates);
+        let max_row_width =
+            crate::ui::nav_candidates_popup::candidates_max_width(&candidates, &c.path);
         self.engine
             .dispatch(AppCommand::OpenNavCandidates(NavCandidatesPopup {
                 anchor_col: c.anchor_col,

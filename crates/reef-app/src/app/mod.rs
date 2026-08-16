@@ -403,7 +403,7 @@ fn sbs_cursor_on_left(panel_start: u16, panel_w: u16, column: u16) -> bool {
 pub const GLOBAL_SEARCH_MAX_RESULTS: usize = 1000;
 pub const GLOBAL_SEARCH_MAX_LINE_CHARS: usize = 250;
 pub const GLOBAL_SEARCH_MAX_H_SCROLL: usize = GLOBAL_SEARCH_MAX_LINE_CHARS;
-pub const GLOBAL_SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
+pub const GLOBAL_SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
 pub const GLOBAL_SEARCH_PREVIEW_SYNC_DEBOUNCE: std::time::Duration =
     std::time::Duration::from_millis(100);
 pub const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(80);
@@ -1360,6 +1360,32 @@ mod tests {
     }
 
     #[test]
+    fn workspace_change_during_quick_open_build_schedules_a_follow_up_generation() {
+        let mut app = minimal_app_state();
+        app.quick_open.core.active = true;
+        let stale_generation = app.quick_open_load.begin();
+
+        app.apply_fs_change(reef_io::FsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from("new.rs")],
+            git_metadata_changed: false,
+            repo_presence_changed: false,
+        });
+        app.apply_worker_result_core(
+            WorkerResult::QuickOpenIndex {
+                generation: stale_generation,
+                result: Ok(reef_core::quick_open::build_candidates([
+                    "old.rs".to_string()
+                ])),
+            },
+            Instant::now(),
+        );
+
+        assert!(app.quick_open_load.loading);
+        assert_ne!(app.quick_open_load.generation, stale_generation);
+    }
+
+    #[test]
     fn scheduled_preview_target_controls_workspace_invalidation() {
         let mut app = minimal_app_state();
         app.preview_content = Some(Arc::new(global_search_text_preview("old.json")));
@@ -1811,7 +1837,7 @@ mod tests {
 
         assert_eq!(app.global_search.core.filter, "needle");
         assert_eq!(app.global_search.core.cursor, "needle".len());
-        assert_eq!(app.global_search.core.selected_idx, 0);
+        assert_eq!(app.global_search.core.selected_idx, 1);
         assert!(app.global_search.excluded.is_empty());
         assert_eq!(app.global_search.last_keystroke_at, Some(now));
     }
@@ -1830,6 +1856,67 @@ mod tests {
         assert_eq!(app.global_search.excluded.len(), 1);
         assert!(app.global_search.excluded.contains(&excluded));
         assert!(app.global_search.last_keystroke_at.is_none());
+    }
+
+    #[test]
+    fn editing_global_search_keeps_the_presented_generation_selection() {
+        let mut app = minimal_app_state();
+        app.global_search.results = vec![dummy_hit("a"), dummy_hit("b")];
+        app.global_search.core.selected_idx = 1;
+
+        app.edit_global_search_find_input(crate::TextEditOp::InsertChar('x'), Instant::now());
+
+        assert_eq!(app.global_search.core.selected_idx, 1);
+    }
+
+    #[test]
+    fn starting_a_new_global_search_keeps_the_presented_generation_visible() {
+        let mut app = minimal_app_state();
+        app.global_search.results = vec![dummy_hit("old.rs")];
+        app.global_search.last_searched_query = "old".to_string();
+        app.global_search.core.filter = "new".to_string();
+        app.global_search.results_generation = app.global_search_load.generation;
+        let now = Instant::now();
+        app.global_search.last_keystroke_at = Some(now - GLOBAL_SEARCH_DEBOUNCE);
+
+        app.maybe_kick_global_search(now);
+
+        assert_eq!(app.global_search.results.len(), 1);
+        assert_eq!(app.global_search.results[0].path, PathBuf::from("old.rs"));
+        assert!(app.global_search_load.loading);
+        assert_ne!(
+            app.global_search.results_generation,
+            app.global_search_load.generation
+        );
+    }
+
+    #[test]
+    fn replace_in_files_rejects_results_from_an_older_query() {
+        let mut app = minimal_app_state();
+        app.global_search.replace_open = true;
+        app.global_search.results = vec![dummy_hit("old.rs")];
+        app.global_search.core.filter = "new".to_string();
+        app.global_search.last_searched_query = "old".to_string();
+        app.global_search.results_generation = app.global_search_load.generation;
+
+        app.commit_replace_in_files();
+
+        assert!(!app.replace_load.loading);
+    }
+
+    #[test]
+    fn replace_in_files_waits_for_the_complete_search_generation() {
+        let mut app = minimal_app_state();
+        app.global_search.replace_open = true;
+        app.global_search.results = vec![dummy_hit("partial.rs")];
+        app.global_search.core.filter = "needle".to_string();
+        app.global_search.last_searched_query = "needle".to_string();
+        let generation = app.global_search_load.begin();
+        app.global_search.results_generation = generation;
+
+        app.commit_replace_in_files();
+
+        assert!(!app.replace_load.loading);
     }
 
     #[test]

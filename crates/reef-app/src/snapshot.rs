@@ -306,7 +306,11 @@ impl GlobalSearchPanelSnapshot {
             .global_search
             .results
             .get(selected_index)
-            .filter(|_| !state.global_search.core.filter.is_empty())
+            .filter(|_| {
+                !state.global_search.core.filter.is_empty()
+                    && state.global_search.core.filter == state.global_search.last_searched_query
+                    && state.global_search.results_generation == state.global_search_load.generation
+            })
             .map(|hit| GlobalSearchPreviewMatchSnapshot {
                 path: hit.path.clone(),
                 query: state.global_search.core.filter.clone(),
@@ -488,6 +492,8 @@ mod tests {
             subscribe_fs_events: false,
         });
         state.global_search.core.filter = "reef".to_string();
+        state.global_search.last_searched_query = "reef".to_string();
+        state.global_search.results_generation = state.global_search_load.generation;
         state.global_search.results = vec![
             search_hit("src/a.rs", 3, 0..4),
             search_hit("src/b.rs", 1, 2..6),

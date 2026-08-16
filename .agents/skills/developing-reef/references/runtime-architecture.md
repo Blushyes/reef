@@ -84,7 +84,12 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
 - Confirming a global-search hit validates the selected path through the preview worker before changing tabs or recording navigation history. A missing target keeps search open and removes that path's stale hits.
 - Renderers send full-value semantic commands for query and replacement edits. They do not mutate search cursors or result state directly.
 - Hosts pass a preview viewport height to `SyncGlobalSearchPreviewToSelected` and `SyncGlobalSearchPreviewIfStale`; `reef-app` keeps the target path and request generation aligned, then reveals the selected match even when the preview content is reused.
-- Large result sets are exposed through paged row snapshots. Renderers request visible windows and keep previously loaded rows visible while a newer generation is loading.
+- Large result sets are exposed through paged row snapshots. Renderers request visible windows and keep previously loaded rows and their preview visible while a newer generation is loading. The app swaps generations atomically when the first new chunk arrives, or clears the old generation when an empty search completes; query/progress events alone must not publish an empty row window.
+- Streamed hits are frame-batched before publication and merged into the existing path/line order;
+  do not re-sort the complete accumulated result set for every backend chunk.
+- Host adapters expose search panel state and visible search rows as narrow projections. Search
+  progress must not invalidate the full application snapshot, and syntax enrichment for result
+  rows must not run on the command/event runtime thread.
 - Every search request carries a cancellation token into the backend. Remote agents run content
   scans on a dedicated worker so their connection thread can process `CancelSearch`; obsolete
   queued or active scans stop during the current file read instead of delaying the newest query.
@@ -109,7 +114,9 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
   uses its own latest-wins worker over the shared immutable candidate index, and Preview uses a
   separate latest-wins worker; none of those queues may delay an interactive tree expansion or
   file Preview. Adapters receive Quick Open changes as a narrow projection event rather than as a
-  full application snapshot.
+  full application snapshot. Workspace changes mark both the candidate index and its active load
+  stale; an open palette immediately schedules the newest generation, while a change observed
+  during a build survives that completion and schedules one follow-up build.
 - Selecting an entry already present in the visible file-tree projection uses
   `SelectVisibleFileTreePath`: it updates selection and schedules Preview without revealing or
   rebuilding the tree. Commands that originate outside the visible tree, such as Quick Open and

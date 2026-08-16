@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel as mpsc;
 
@@ -3485,6 +3486,9 @@ fn run_global_search_via_backend(
     query: &str,
     result_tx: &WorkerResultSender,
 ) -> bool {
+    const PUBLISH_BATCH_SIZE: usize = 64;
+    const PUBLISH_INTERVAL: Duration = Duration::from_millis(16);
+
     if query.is_empty() {
         return false;
     }
@@ -3497,6 +3501,21 @@ fn run_global_search_via_backend(
         cancellation: reef_io::CancellationToken::from_flag(Arc::clone(&cancel)),
     };
 
+    let mut pending = Vec::with_capacity(PUBLISH_BATCH_SIZE);
+    let mut last_publish = Instant::now();
+    let publish = |pending: &mut Vec<MatchHit>| -> std::ops::ControlFlow<()> {
+        if pending.is_empty() {
+            return std::ops::ControlFlow::Continue(());
+        }
+        let hits = std::mem::replace(pending, Vec::with_capacity(PUBLISH_BATCH_SIZE));
+        if result_tx
+            .send(WorkerResult::GlobalSearchChunk { generation, hits })
+            .is_err()
+        {
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    };
     let mut on_chunk = |hits: Vec<reef_io::ContentMatchHit>| -> std::ops::ControlFlow<()> {
         if cancel.load(Ordering::Relaxed) {
             return std::ops::ControlFlow::Break(());
@@ -3504,36 +3523,27 @@ fn run_global_search_via_backend(
         if hits.is_empty() {
             return std::ops::ControlFlow::Continue(());
         }
-        let ui_hits: Vec<MatchHit> = hits
-            .into_iter()
-            .map(|h| MatchHit {
-                path: h.path,
-                display: h.display,
-                line: h.line,
-                line_text: h.line_text,
-                line_revision: h.line_revision,
-                byte_range: h.byte_range,
-            })
-            .collect();
-        // If the result channel is gone the App has torn down; stop
-        // trying to push chunks but let the backend tidy up on its
-        // own schedule.
-        if result_tx
-            .send(WorkerResult::GlobalSearchChunk {
-                generation,
-                hits: ui_hits,
-            })
-            .is_err()
-        {
-            return std::ops::ControlFlow::Break(());
+        pending.extend(hits.into_iter().map(|h| MatchHit {
+            path: h.path,
+            display: h.display,
+            line: h.line,
+            line_text: h.line_text,
+            line_revision: h.line_revision,
+            byte_range: h.byte_range,
+        }));
+        if pending.len() >= PUBLISH_BATCH_SIZE || last_publish.elapsed() >= PUBLISH_INTERVAL {
+            let flow = publish(&mut pending);
+            last_publish = Instant::now();
+            return flow;
         }
         std::ops::ControlFlow::Continue(())
     };
 
-    match backend.search_content(&request, &mut on_chunk) {
-        Ok(completed) => completed.truncated,
-        Err(_) => false,
+    let completed = backend.search_content(&request, &mut on_chunk);
+    if !cancel.load(Ordering::Relaxed) {
+        let _ = publish(&mut pending);
     }
+    completed.map(|result| result.truncated).unwrap_or(false)
 }
 
 /// Run one `FilesTask::ReplaceInFiles` batch. Streams a

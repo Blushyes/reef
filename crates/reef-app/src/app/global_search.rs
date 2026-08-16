@@ -199,12 +199,14 @@ impl AppState {
         now: Instant,
     ) -> crate::PickerInputOutcome {
         let visible = self.global_search.results.len();
+        let selected_idx = self.global_search.core.selected_idx;
         let outcome = crate::features::picker::apply_picker_input(
             &mut self.global_search.core,
             input,
             visible,
         );
         if outcome == crate::PickerInputOutcome::Edited {
+            self.global_search.core.selected_idx = selected_idx;
             self.mark_global_search_query_edited(now);
         }
         outcome
@@ -261,7 +263,6 @@ impl AppState {
 
         self.global_search.core.filter = query;
         self.global_search.core.cursor = self.global_search.core.filter.len();
-        self.reset_global_search_selection();
         self.mark_global_search_query_edited(now);
     }
 
@@ -281,7 +282,6 @@ impl AppState {
             &mut self.global_search.core.cursor,
         );
         if outcome == crate::TextEditOutcome::Edited {
-            self.reset_global_search_selection();
             self.mark_global_search_query_edited(now);
         }
         outcome
@@ -378,16 +378,17 @@ impl AppState {
         let new_cancel = Arc::new(AtomicBool::new(false));
         self.global_search.cancel = new_cancel.clone();
 
-        self.global_search.results.clear();
-        self.global_search.truncated = false;
-        self.global_search.core.selected_idx = 0;
-        self.global_search.scroll = 0;
-        self.global_search.results_h_scroll = 0;
         self.global_search.last_searched_query = self.global_search.core.filter.clone();
         self.global_search.last_keystroke_at = None;
 
         if self.global_search.core.filter.is_empty() {
             let generation = self.global_search_load.begin();
+            self.global_search.results.clear();
+            self.global_search.results_generation = generation;
+            self.global_search.truncated = false;
+            self.reset_global_search_selection();
+            self.global_search.scroll = 0;
+            self.global_search.results_h_scroll = 0;
             self.global_search_load.complete_ok(generation);
             self.preview_highlight = None;
             return;
@@ -403,7 +404,13 @@ impl AppState {
     }
 
     pub fn commit_replace_in_files(&mut self) {
-        if !self.global_search.replace_open || self.replace_load.loading {
+        if !self.global_search.replace_open
+            || self.replace_load.loading
+            || self.global_search_load.loading
+            || self.global_search.core.filter.is_empty()
+            || self.global_search.core.filter != self.global_search.last_searched_query
+            || self.global_search.results_generation != self.global_search_load.generation
+        {
             return;
         }
         if self.global_search.results.is_empty() || self.global_search.included_count() == 0 {

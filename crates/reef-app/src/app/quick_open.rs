@@ -1,13 +1,16 @@
 use super::*;
 
 impl AppState {
-    pub fn rebuild_quick_open_index(&mut self, index: Vec<crate::features::quick_open::Candidate>) {
+    pub(super) fn rebuild_quick_open_index(
+        &mut self,
+        index: Vec<crate::features::quick_open::Candidate>,
+    ) {
         self.quick_open.index = index.into();
-        self.quick_open.index_stale = false;
+        self.quick_open.index_stale = self.quick_open_load.stale;
         self.filter_quick_open();
     }
 
-    fn request_quick_open_index_if_needed(&mut self) {
+    pub(super) fn request_quick_open_index_if_needed(&mut self) {
         if self.quick_open_load.loading {
             return;
         }

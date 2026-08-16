@@ -190,6 +190,10 @@ impl AppState {
         }
         if workspace_refresh_needed {
             crate::features::quick_open::mark_stale(&mut self.quick_open);
+            self.quick_open_load.mark_stale();
+            if self.quick_open.core.active {
+                self.request_quick_open_index_if_needed();
+            }
             self.nav_workspace_load.mark_stale();
             self.nav_refine_cache.clear();
             self.nav_refine_epoch = self.nav_refine_epoch.wrapping_add(1);
@@ -505,11 +509,17 @@ impl AppState {
                 Ok(index) => {
                     if self.quick_open_load.complete_ok(generation) {
                         self.rebuild_quick_open_index(index);
+                        if self.quick_open.core.active {
+                            self.request_quick_open_index_if_needed();
+                        }
                     }
                 }
                 Err(error) => {
                     if self.quick_open_load.complete_err(generation, error.clone()) {
                         self.push_toast(Toast::warn(format!("quick open index failed: {error}")));
+                        if self.quick_open.core.active && self.quick_open_load.should_request() {
+                            self.request_quick_open_index_if_needed();
+                        }
                     }
                 }
             },
@@ -565,10 +575,18 @@ impl AppState {
             },
             WorkerResult::GlobalSearchChunk { generation, hits } => {
                 if generation == self.global_search_load.generation {
-                    self.global_search.results.extend(hits);
-                    self.global_search
-                        .results
-                        .sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+                    if self.global_search.results_generation != generation {
+                        self.global_search.results.clear();
+                        self.global_search.results_generation = generation;
+                        self.global_search.truncated = false;
+                        self.global_search.core.selected_idx = 0;
+                        self.global_search.scroll = 0;
+                        self.global_search.results_h_scroll = 0;
+                    }
+                    crate::features::global_search::merge_hits(
+                        &mut self.global_search.results,
+                        hits,
+                    );
                     events.push(AppRuntimeEvent::SyncSearchPreviewIfStale);
                 }
             }
@@ -577,6 +595,13 @@ impl AppState {
                 truncated,
             } => {
                 if self.global_search_load.complete_ok(generation) {
+                    if self.global_search.results_generation != generation {
+                        self.global_search.results.clear();
+                        self.global_search.results_generation = generation;
+                        self.global_search.core.selected_idx = 0;
+                        self.global_search.scroll = 0;
+                        self.global_search.results_h_scroll = 0;
+                    }
                     self.global_search.truncated = truncated;
                     if self.global_search.results.is_empty() && self.active_tab == AppTab::Search {
                         self.preview_highlight = None;

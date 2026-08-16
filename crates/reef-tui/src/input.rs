@@ -9,7 +9,6 @@
 use crate::TuiApp as App;
 use crate::find_widget;
 use crate::global_search;
-use crate::i18n::{Msg, t};
 use crate::keymap::{Command, InputScope, Keymap, scope_for_app};
 use crate::quick_open;
 use crate::search;
@@ -23,19 +22,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
-use reef_app::{AppCommand, AppPanel as Panel, AppTab as Tab, DbNav, NavAnchor, Toast, ViewMode};
+use reef_app::{AppCommand, AppPanel as Panel, AppTab as Tab, DbNav, NavAnchor, ViewMode};
 use reef_core::diff::{DiffLayout, DiffSide};
 use std::time::{Duration, Instant};
 
 pub const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
-
-fn dispatch_clipboard_copy(app: &mut App, text: String) {
-    app.engine.dispatch(AppCommand::CopyToClipboard {
-        text,
-        success: Some(Toast::info(t(Msg::ClipboardCopied))),
-        failure: Toast::error(t(Msg::ClipboardCopyFailed)),
-    });
-}
 
 fn input_modifiers(mods: KeyModifiers) -> reef_app::InputModifiers {
     reef_app::InputModifiers {
@@ -217,6 +208,11 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // accidentally leaving a menu lingering).
     if scope == InputScope::TreeContextMenu {
         handle_key_tree_context_menu(key, app);
+        return;
+    }
+
+    if scope == InputScope::PreviewContextMenu {
+        handle_key_preview_context_menu(key, app);
         return;
     }
 
@@ -1997,6 +1993,19 @@ fn handle_key_tree_context_menu(key: KeyEvent, app: &mut App) {
     }
 }
 
+fn handle_key_preview_context_menu(key: KeyEvent, app: &mut App) {
+    match Keymap::resolve(InputScope::PreviewContextMenu, &key) {
+        Some(Command::Close) | Some(Command::Quit) => app.close_preview_context_menu(),
+        Some(Command::MoveUp) => app.navigate_preview_context_menu(-1),
+        Some(Command::MoveDown) => app.navigate_preview_context_menu(1),
+        Some(Command::Confirm) => {
+            let item = app.preview_context_menu.current();
+            app.dispatch_preview_context_menu_item(item);
+        }
+        _ => app.close_preview_context_menu(),
+    }
+}
+
 /// Keyboard handler for the multi-candidate goto-definition popup.
 /// Same UX shape as the tree context menu: arrow keys / `j`/`k` move,
 /// Enter picks, Esc / `q` / Ctrl+C / any other key dismisses without
@@ -2374,6 +2383,27 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
         return;
     }
 
+    if app.preview_context_menu.active {
+        match mouse.kind {
+            MouseEventKind::Moved => {
+                app.hover_row = Some(mouse.row);
+                app.hover_col = Some(mouse.column);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                match app.hit_registry.hit_test(mouse.column, mouse.row) {
+                    Some(action @ ui::mouse::ClickAction::PreviewContextMenuItem(_))
+                    | Some(action @ ui::mouse::ClickAction::PreviewContextMenuClose) => {
+                        app.handle_action(action);
+                    }
+                    _ => app.close_preview_context_menu(),
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) => app.close_preview_context_menu(),
+            _ => {}
+        }
+        return;
+    }
+
     // Intra-tree drag in progress: route Drag→hover-update,
     // Up→commit, Right-click→cancel. Scroll wheel falls through so
     // the user can scroll the tree to reach a deep destination
@@ -2410,6 +2440,17 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
     // scroll keep working while the user types.
     if app.engine.tree_edit_active() && matches!(mouse.kind, MouseEventKind::Down(_)) {
         app.cancel_tree_edit();
+    }
+
+    if let MouseEventKind::Down(MouseButton::Right) = mouse.kind
+        && !app.engine.tree_context_menu_active()
+        && !app.engine.nav_candidates_active()
+        && let Some(rect) = app.last_preview_rect
+        && point_in_rect(rect, mouse.column, mouse.row)
+        && app.preview_has_selectable_text()
+    {
+        app.open_preview_context_menu((mouse.column, mouse.row));
+        return;
     }
 
     // Right-click on the Files tab's tree panel → open context menu.
@@ -2961,7 +3002,7 @@ fn handle_preview_selection(mouse: &MouseEvent, app: &mut App) -> bool {
                     if preview.is_text() {
                         let text = collect_preview_selected_text(preview, &sel_snapshot);
                         if !text.is_empty() {
-                            dispatch_clipboard_copy(app, text);
+                            app.copy_text_to_clipboard(text);
                         }
                     }
                 }
@@ -3087,7 +3128,7 @@ fn handle_diff_selection(mouse: &MouseEvent, app: &mut App) -> bool {
                 if let Some(hit) = app.last_diff_hit.as_ref() {
                     let text = collect_diff_selected_text(hit, &snap);
                     if !text.is_empty() {
-                        dispatch_clipboard_copy(app, text);
+                        app.copy_text_to_clipboard(text);
                     }
                 }
             }
@@ -3189,7 +3230,7 @@ fn handle_commit_detail_selection(mouse: &MouseEvent, app: &mut App) -> bool {
             {
                 let text = collect_commit_detail_selected_text(hit, &snap);
                 if !text.is_empty() {
-                    dispatch_clipboard_copy(app, text);
+                    app.copy_text_to_clipboard(text);
                 }
             }
             true
@@ -4004,6 +4045,7 @@ pub fn handle_paste(s: String, app: &mut App) {
     // textarea, Tab::Search input) and silently mutate a buffer the
     // user can't see behind the modal.
     if app.engine.tree_context_menu_active()
+        || app.preview_context_menu.active
         || app.engine.confirm_request().is_some()
         || app.engine.paste_conflict_active()
         || app.engine.place_mode_active()

@@ -130,6 +130,7 @@ pub struct TuiApp {
     pub preview_image_protocol_builds: u64,
 
     pub preview_selection: Option<crate::ui::selection::PreviewSelection>,
+    pub preview_context_menu: crate::preview_context_menu::PreviewContextMenuState,
     pending_preview_nav: Option<PendingPreviewNav>,
     pub last_preview_rect: Option<ratatui::layout::Rect>,
     pub db_preview_layout: Option<DbPreviewLayoutCache>,
@@ -182,6 +183,25 @@ pub struct TuiApp {
 }
 
 use self::TuiApp as App;
+
+fn preview_text_extent(
+    preview: Option<&reef_core::preview::PreviewDocument>,
+) -> Option<(usize, usize)> {
+    let body = &preview?.body;
+    match body {
+        reef_core::preview::PreviewBody::Text(text) => text
+            .lines
+            .last()
+            .map(|line| (text.lines.len() - 1, line.len())),
+        reef_core::preview::PreviewBody::Markdown(markdown) => {
+            let last_row = markdown.line_count().checked_sub(1)?;
+            markdown
+                .text_for_row(last_row)
+                .map(|line| (last_row, line.len()))
+        }
+        _ => None,
+    }
+}
 
 impl App {
     /// Local-backend entry point. Threads `image_picker` straight through
@@ -276,6 +296,7 @@ impl App {
             preview_build_rx,
             preview_image_protocol_builds: 0,
             preview_selection: None,
+            preview_context_menu: crate::preview_context_menu::PreviewContextMenuState::default(),
             pending_preview_nav: None,
             last_preview_rect: None,
             db_preview_layout: None,
@@ -399,6 +420,97 @@ impl App {
         self.engine.dispatch(reef_app::AppCommand::CyclePanel {
             reverse,
             uses_three_col: self.graph_uses_three_col(),
+        });
+    }
+
+    pub fn clear_preview_selection(&mut self) {
+        self.preview_selection = None;
+        self.preview_click_state = None;
+        self.preview_context_menu.close();
+    }
+
+    pub fn preview_has_selectable_text(&self) -> bool {
+        if self.engine.structured_preview_mode() == reef_app::StructuredPreviewMode::Tree
+            && self.engine.structured_preview_document().is_some()
+        {
+            return false;
+        }
+        preview_text_extent(self.engine.preview_content_ref()).is_some()
+    }
+
+    pub fn preview_context_copy_enabled(&self) -> bool {
+        self.preview_selection
+            .is_some_and(|selection| !selection.is_empty())
+            && self.preview_has_selectable_text()
+    }
+
+    pub fn open_preview_context_menu(&mut self, anchor: (u16, u16)) {
+        if !self.preview_has_selectable_text() {
+            return;
+        }
+        self.close_tree_context_menu();
+        self.nav_close_candidates();
+        self.preview_context_menu.open(anchor);
+    }
+
+    pub fn close_preview_context_menu(&mut self) {
+        self.preview_context_menu.close();
+    }
+
+    pub fn navigate_preview_context_menu(&mut self, delta: i32) {
+        self.preview_context_menu.navigate(delta);
+    }
+
+    pub fn dispatch_preview_context_menu_item(
+        &mut self,
+        item: crate::preview_context_menu::PreviewContextMenuItem,
+    ) {
+        use crate::preview_context_menu::PreviewContextMenuItem as Item;
+
+        self.close_preview_context_menu();
+        match item {
+            Item::Copy => {
+                let Some(selection) = self.preview_selection else {
+                    return;
+                };
+                if selection.is_empty() {
+                    return;
+                }
+                let Some(preview) = self.engine.preview_content_ref() else {
+                    return;
+                };
+                let rows = preview.body.display_text_rows();
+                let text = crate::ui::selection::collect_selected_text_from_rows(
+                    rows.iter().map(|row| row.as_ref()),
+                    rows.len(),
+                    &selection,
+                );
+                if !text.is_empty() {
+                    self.copy_text_to_clipboard(text);
+                }
+            }
+            Item::SelectAll => {
+                let Some((last_row, last_byte)) =
+                    preview_text_extent(self.engine.preview_content_ref())
+                else {
+                    return;
+                };
+                self.preview_selection = Some(crate::ui::selection::PreviewSelection {
+                    anchor: (0, 0),
+                    active: (last_row, last_byte),
+                    dragging: false,
+                });
+            }
+        }
+    }
+
+    pub(crate) fn copy_text_to_clipboard(&mut self, text: String) {
+        self.engine.dispatch(reef_app::AppCommand::CopyToClipboard {
+            text,
+            success: Some(Toast::info(crate::i18n::t(
+                crate::i18n::Msg::ClipboardCopied,
+            ))),
+            failure: Toast::error(crate::i18n::t(crate::i18n::Msg::ClipboardCopyFailed)),
         });
     }
 
@@ -1260,7 +1372,7 @@ impl App {
         self.engine
             .dispatch(reef_app::AppCommand::SetStructuredPreviewMode(mode));
         crate::prefs::set(reef_core::prefs::STRUCTURED_PREVIEW_MODE, mode.pref_str());
-        self.preview_selection = None;
+        self.clear_preview_selection();
     }
 
     pub fn toggle_structured_preview_mode(&mut self) {
@@ -1270,7 +1382,7 @@ impl App {
             reef_core::prefs::STRUCTURED_PREVIEW_MODE,
             self.engine.structured_preview_mode().pref_str(),
         );
-        self.preview_selection = None;
+        self.clear_preview_selection();
     }
 
     pub fn stage_file(&mut self, path: &str) {
@@ -1643,9 +1755,8 @@ impl App {
                     }
                 }
                 reef_app::AppRuntimeEvent::ClearPreviewSelection => {
-                    self.preview_selection = None;
+                    self.clear_preview_selection();
                     self.pending_preview_nav = None;
-                    self.preview_click_state = None;
                     self.db_preview_layout = None;
                 }
                 reef_app::AppRuntimeEvent::LspRefineJump(outcome) => {
@@ -1995,8 +2106,7 @@ impl App {
             self.dismiss_confirm();
         }
         if outcome.clear_preview_selection {
-            self.preview_selection = None;
-            self.preview_click_state = None;
+            self.clear_preview_selection();
         }
         if outcome.clear_commit_detail_selection {
             self.clear_commit_detail_selection();
@@ -2159,6 +2269,12 @@ impl App {
             ClickAction::TreeContextMenuClose => {
                 self.close_tree_context_menu();
             }
+            ClickAction::PreviewContextMenuItem(item) => {
+                self.dispatch_preview_context_menu_item(item);
+            }
+            ClickAction::PreviewContextMenuClose => {
+                self.close_preview_context_menu();
+            }
             ClickAction::NavCandidateSelect(idx) => {
                 // Move selection to the clicked row, then commit. A
                 // double-click semantics here would be safer (single
@@ -2180,7 +2296,7 @@ impl App {
             ClickAction::ToggleStructuredPreviewNode(node_id) => {
                 self.engine
                     .dispatch(reef_app::AppCommand::ToggleStructuredPreviewNode(node_id));
-                self.preview_selection = None;
+                self.clear_preview_selection();
             }
             ClickAction::HostsPickerSelect(idx) => {
                 // Mouse click on a hosts-picker row: move selection to

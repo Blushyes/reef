@@ -19,6 +19,7 @@ pub(crate) mod input_edit_multi;
 pub mod keymap;
 pub(crate) mod picker_core;
 pub mod prefs;
+pub mod preview_context_menu;
 pub mod quick_open;
 pub mod reveal;
 pub mod search;

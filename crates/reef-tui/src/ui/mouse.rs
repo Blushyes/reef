@@ -92,6 +92,10 @@ pub enum ClickAction {
     /// left-click that misses a menu row falls through to this and
     /// just closes the menu.
     TreeContextMenuClose,
+    /// Pick from the read-only Preview text context menu.
+    PreviewContextMenuItem(crate::preview_context_menu::PreviewContextMenuItem),
+    /// Registered screen-wide beneath the Preview context menu.
+    PreviewContextMenuClose,
     /// Left-click on the Files-tab tree panel that missed every
     /// entry row (i.e. clicked on the empty area below the last
     /// entry). Clears the selection so a subsequent toolbar New

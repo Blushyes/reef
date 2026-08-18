@@ -24,6 +24,12 @@ pub(crate) struct ContextMenuRow {
     pub action: ClickAction,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ContextMenuPlacement {
+    Below((u16, u16)),
+    Adjacent((u16, u16)),
+}
+
 pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     if !app.engine.tree_context_menu_active() {
         return;
@@ -45,10 +51,10 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
         f,
         app,
         screen,
-        anchor,
         selected,
         &rows,
         ClickAction::TreeContextMenuClose,
+        ContextMenuPlacement::Below(anchor),
     );
 }
 
@@ -56,10 +62,10 @@ pub(crate) fn render_rows(
     f: &mut Frame,
     app: &mut App,
     screen: Rect,
-    anchor: (u16, u16),
     selected: usize,
     rows: &[ContextMenuRow],
     close_action: ClickAction,
+    placement: ContextMenuPlacement,
 ) {
     let th = app.theme;
     let max_label_w = rows
@@ -69,7 +75,7 @@ pub(crate) fn render_rows(
         .unwrap_or(0);
     let popup_w = (max_label_w as u16 + 6).min(screen.width);
     let popup_h = (rows.len() as u16 + 2).min(screen.height);
-    let area = context_menu_area(screen, anchor, popup_w, popup_h);
+    let area = context_menu_area(screen, popup_w, popup_h, placement);
 
     for screen_y in screen.y..screen.y + screen.height {
         app.hit_registry
@@ -132,15 +138,39 @@ pub(crate) fn render_rows(
     }
 }
 
-fn context_menu_area(screen: Rect, anchor: (u16, u16), popup_w: u16, popup_h: u16) -> Rect {
-    let max_x = screen.x + screen.width.saturating_sub(popup_w);
-    let x = anchor.0.clamp(screen.x, max_x);
+fn context_menu_area(
+    screen: Rect,
+    popup_w: u16,
+    popup_h: u16,
+    placement: ContextMenuPlacement,
+) -> Rect {
+    let anchor = match placement {
+        ContextMenuPlacement::Below(anchor) | ContextMenuPlacement::Adjacent(anchor) => anchor,
+    };
+    let screen_right = screen.x + screen.width;
     let screen_bottom = screen.y + screen.height;
-    let below = anchor.1.saturating_add(1);
+    let anchor_x = anchor.0.clamp(screen.x, screen_right.saturating_sub(1));
+    let anchor_y = anchor.1.clamp(screen.y, screen_bottom.saturating_sub(1));
+    let x = match placement {
+        ContextMenuPlacement::Below(_) => {
+            anchor_x.clamp(screen.x, screen_right.saturating_sub(popup_w))
+        }
+        ContextMenuPlacement::Adjacent(_) => {
+            let right = anchor_x.saturating_add(1);
+            if right.saturating_add(popup_w) <= screen_right {
+                right
+            } else if anchor_x >= screen.x.saturating_add(popup_w) {
+                anchor_x - popup_w
+            } else {
+                right.clamp(screen.x, screen_right.saturating_sub(popup_w))
+            }
+        }
+    };
+    let below = anchor_y.saturating_add(1);
     let y = if below.saturating_add(popup_h) <= screen_bottom {
         below
-    } else if anchor.1 >= screen.y.saturating_add(popup_h) {
-        anchor.1 - popup_h
+    } else if anchor_y >= screen.y.saturating_add(popup_h) {
+        anchor_y - popup_h
     } else {
         below.clamp(screen.y, screen_bottom.saturating_sub(popup_h))
     };
@@ -153,22 +183,61 @@ mod tests {
 
     #[test]
     fn context_menu_prefers_row_below_anchor() {
-        let area = context_menu_area(Rect::new(0, 0, 80, 24), (12, 7), 18, 4);
+        let area = context_menu_area(
+            Rect::new(0, 0, 80, 24),
+            18,
+            4,
+            ContextMenuPlacement::Below((12, 7)),
+        );
 
         assert_eq!(area, Rect::new(12, 8, 18, 4));
     }
 
     #[test]
     fn context_menu_flips_above_anchor_near_bottom() {
-        let area = context_menu_area(Rect::new(0, 0, 80, 24), (12, 22), 18, 4);
+        let area = context_menu_area(
+            Rect::new(0, 0, 80, 24),
+            18,
+            4,
+            ContextMenuPlacement::Adjacent((12, 22)),
+        );
 
-        assert_eq!(area, Rect::new(12, 18, 18, 4));
+        assert_eq!(area, Rect::new(13, 18, 18, 4));
     }
 
     #[test]
     fn context_menu_clamps_to_offset_screen_bounds() {
-        let area = context_menu_area(Rect::new(5, 3, 20, 10), (30, 12), 8, 4);
+        let area = context_menu_area(
+            Rect::new(5, 3, 20, 10),
+            8,
+            4,
+            ContextMenuPlacement::Adjacent((30, 12)),
+        );
 
-        assert_eq!(area, Rect::new(17, 8, 8, 4));
+        assert_eq!(area, Rect::new(16, 8, 8, 4));
+    }
+
+    #[test]
+    fn context_menu_flips_left_of_anchor_near_right_edge() {
+        let area = context_menu_area(
+            Rect::new(0, 0, 80, 24),
+            18,
+            4,
+            ContextMenuPlacement::Adjacent((78, 7)),
+        );
+
+        assert_eq!(area, Rect::new(60, 8, 18, 4));
+    }
+
+    #[test]
+    fn adjacent_menu_offsets_from_anchor() {
+        let area = context_menu_area(
+            Rect::new(0, 0, 80, 24),
+            18,
+            4,
+            ContextMenuPlacement::Adjacent((12, 7)),
+        );
+
+        assert_eq!(area, Rect::new(13, 8, 18, 4));
     }
 }

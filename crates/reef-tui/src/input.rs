@@ -211,8 +211,8 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         return;
     }
 
-    if scope == InputScope::PreviewContextMenu {
-        handle_key_preview_context_menu(key, app);
+    if scope == InputScope::SelectionContextMenu {
+        handle_key_selection_context_menu(key, app);
         return;
     }
 
@@ -1993,16 +1993,16 @@ fn handle_key_tree_context_menu(key: KeyEvent, app: &mut App) {
     }
 }
 
-fn handle_key_preview_context_menu(key: KeyEvent, app: &mut App) {
-    match Keymap::resolve(InputScope::PreviewContextMenu, &key) {
-        Some(Command::Close) | Some(Command::Quit) => app.close_preview_context_menu(),
-        Some(Command::MoveUp) => app.navigate_preview_context_menu(-1),
-        Some(Command::MoveDown) => app.navigate_preview_context_menu(1),
+fn handle_key_selection_context_menu(key: KeyEvent, app: &mut App) {
+    match Keymap::resolve(InputScope::SelectionContextMenu, &key) {
+        Some(Command::Close) | Some(Command::Quit) => app.close_selection_context_menu(),
+        Some(Command::MoveUp) => app.navigate_selection_context_menu(-1),
+        Some(Command::MoveDown) => app.navigate_selection_context_menu(1),
         Some(Command::Confirm) => {
-            let item = app.preview_context_menu.current();
-            app.dispatch_preview_context_menu_item(item);
+            let item = app.selection_context_menu.current();
+            app.dispatch_selection_context_menu_item(item);
         }
-        _ => app.close_preview_context_menu(),
+        _ => app.close_selection_context_menu(),
     }
 }
 
@@ -2383,7 +2383,7 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
         return;
     }
 
-    if app.preview_context_menu.active {
+    if app.selection_context_menu.is_active() {
         match mouse.kind {
             MouseEventKind::Moved => {
                 app.hover_row = Some(mouse.row);
@@ -2391,14 +2391,14 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 match app.hit_registry.hit_test(mouse.column, mouse.row) {
-                    Some(action @ ui::mouse::ClickAction::PreviewContextMenuItem(_))
-                    | Some(action @ ui::mouse::ClickAction::PreviewContextMenuClose) => {
+                    Some(action @ ui::mouse::ClickAction::SelectionContextMenuItem(_))
+                    | Some(action @ ui::mouse::ClickAction::SelectionContextMenuClose) => {
                         app.handle_action(action);
                     }
-                    _ => app.close_preview_context_menu(),
+                    _ => app.close_selection_context_menu(),
                 }
             }
-            MouseEventKind::Down(MouseButton::Right) => app.close_preview_context_menu(),
+            MouseEventKind::Down(MouseButton::Right) => app.close_selection_context_menu(),
             _ => {}
         }
         return;
@@ -2449,7 +2449,27 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
         && point_in_rect(rect, mouse.column, mouse.row)
         && app.preview_has_selectable_text()
     {
-        app.open_preview_context_menu((mouse.column, mouse.row));
+        app.open_selection_context_menu(
+            crate::selection_context_menu::SelectionContextTarget::Preview,
+            (mouse.column, mouse.row),
+        );
+        return;
+    }
+
+    if let MouseEventKind::Down(MouseButton::Right) = mouse.kind
+        && !app.engine.tree_context_menu_active()
+        && !app.engine.nav_candidates_active()
+        && let Some(rect) = app.last_diff_rect
+        && point_in_rect(rect, mouse.column, mouse.row)
+        && let Some(hit) = app.last_diff_hit.as_ref()
+        && !hit.rows.is_empty()
+    {
+        let side = hit.side_for_column(mouse.column);
+        app.set_active_panel(Panel::Diff);
+        app.open_selection_context_menu(
+            crate::selection_context_menu::SelectionContextTarget::Diff(side),
+            (mouse.column, mouse.row),
+        );
         return;
     }
 
@@ -4045,7 +4065,7 @@ pub fn handle_paste(s: String, app: &mut App) {
     // textarea, Tab::Search input) and silently mutate a buffer the
     // user can't see behind the modal.
     if app.engine.tree_context_menu_active()
-        || app.preview_context_menu.active
+        || app.selection_context_menu.is_active()
         || app.engine.confirm_request().is_some()
         || app.engine.paste_conflict_active()
         || app.engine.place_mode_active()

@@ -1,6 +1,6 @@
 ---
 source: crates/reef-tui/tests/ui_snapshots.rs
-assertion_line: 230
+assertion_line: 227
 expression: output
 ---
  reef  [TMPDIR]  ⎇ master
@@ -8,13 +8,12 @@ expression: output
  +   +   ⊟             │
  ▸ src ●               │
    README.md           │
-                       │
     ┌──────────────────────┐
     │  Cut                 │
     │  Copy                │
     │  Paste               │
-    │  Duplicate           │              Select a file to preview
-    │  New File            │
+    │  Duplicate           │
+    │  New File            │              Select a file to preview
     │  New Folder          │
     │  Rename              │
     │  Delete              │
@@ -22,4 +21,5 @@ expression: output
     │  Copy Relative Path  │
     │  Reveal in Finder    │
     └──────────────────────┘
+                       │
  SSH           ⚙  q:quit Tab:switch s:stage u:unstage r:refresh h:help  [Files]

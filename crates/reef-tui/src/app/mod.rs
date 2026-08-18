@@ -130,7 +130,7 @@ pub struct TuiApp {
     pub preview_image_protocol_builds: u64,
 
     pub preview_selection: Option<crate::ui::selection::PreviewSelection>,
-    pub preview_context_menu: crate::preview_context_menu::PreviewContextMenuState,
+    pub selection_context_menu: crate::selection_context_menu::SelectionContextMenuState,
     pending_preview_nav: Option<PendingPreviewNav>,
     pub last_preview_rect: Option<ratatui::layout::Rect>,
     pub db_preview_layout: Option<DbPreviewLayoutCache>,
@@ -296,7 +296,8 @@ impl App {
             preview_build_rx,
             preview_image_protocol_builds: 0,
             preview_selection: None,
-            preview_context_menu: crate::preview_context_menu::PreviewContextMenuState::default(),
+            selection_context_menu:
+                crate::selection_context_menu::SelectionContextMenuState::default(),
             pending_preview_nav: None,
             last_preview_rect: None,
             db_preview_layout: None,
@@ -426,7 +427,11 @@ impl App {
     pub fn clear_preview_selection(&mut self) {
         self.preview_selection = None;
         self.preview_click_state = None;
-        self.preview_context_menu.close();
+        if self.selection_context_menu.target()
+            == Some(crate::selection_context_menu::SelectionContextTarget::Preview)
+        {
+            self.selection_context_menu.close();
+        }
     }
 
     pub fn preview_has_selectable_text(&self) -> bool {
@@ -438,44 +443,82 @@ impl App {
         preview_text_extent(self.engine.preview_content_ref()).is_some()
     }
 
-    pub fn preview_context_copy_enabled(&self) -> bool {
-        self.preview_selection
-            .is_some_and(|selection| !selection.is_empty())
-            && self.preview_has_selectable_text()
+    pub fn selection_context_menu_has_text(&self) -> bool {
+        self.selection_context_menu
+            .target()
+            .is_some_and(|target| self.selection_context_target_has_text(target))
     }
 
-    pub fn open_preview_context_menu(&mut self, anchor: (u16, u16)) {
-        if !self.preview_has_selectable_text() {
+    pub fn selection_context_copy_enabled(&self) -> bool {
+        use crate::selection_context_menu::SelectionContextTarget as Target;
+
+        match self.selection_context_menu.target() {
+            Some(Target::Preview) => self
+                .preview_selection
+                .is_some_and(|selection| !selection.is_empty()),
+            Some(Target::Diff(_)) => self
+                .diff_selection
+                .is_some_and(|selection| !selection.sel.is_empty()),
+            None => false,
+        }
+    }
+
+    pub fn open_selection_context_menu(
+        &mut self,
+        target: crate::selection_context_menu::SelectionContextTarget,
+        anchor: (u16, u16),
+    ) {
+        if !self.selection_context_target_has_text(target) {
             return;
         }
         self.close_tree_context_menu();
         self.nav_close_candidates();
-        self.preview_context_menu.open(anchor);
+        self.selection_context_menu.open(target, anchor);
     }
 
-    pub fn close_preview_context_menu(&mut self) {
-        self.preview_context_menu.close();
+    fn selection_context_target_has_text(
+        &self,
+        target: crate::selection_context_menu::SelectionContextTarget,
+    ) -> bool {
+        use crate::selection_context_menu::SelectionContextTarget as Target;
+
+        match target {
+            Target::Preview => self.preview_has_selectable_text(),
+            Target::Diff(_) => self
+                .last_diff_hit
+                .as_ref()
+                .is_some_and(|hit| !hit.rows.is_empty()),
+        }
     }
 
-    pub fn navigate_preview_context_menu(&mut self, delta: i32) {
-        self.preview_context_menu.navigate(delta);
+    pub fn close_selection_context_menu(&mut self) {
+        self.selection_context_menu.close();
     }
 
-    pub fn dispatch_preview_context_menu_item(
+    pub fn navigate_selection_context_menu(&mut self, delta: i32) {
+        self.selection_context_menu.navigate(delta);
+    }
+
+    pub fn dispatch_selection_context_menu_item(
         &mut self,
-        item: crate::preview_context_menu::PreviewContextMenuItem,
+        item: crate::selection_context_menu::SelectionContextMenuItem,
     ) {
-        use crate::preview_context_menu::PreviewContextMenuItem as Item;
+        use crate::selection_context_menu::{
+            SelectionContextMenuItem as Item, SelectionContextTarget as Target,
+        };
 
-        self.close_preview_context_menu();
-        match item {
-            Item::Copy => {
-                let Some(selection) = self.preview_selection else {
+        let Some(target) = self.selection_context_menu.target() else {
+            return;
+        };
+        self.close_selection_context_menu();
+        match (item, target) {
+            (Item::Copy, Target::Preview) => {
+                let Some(selection) = self
+                    .preview_selection
+                    .filter(|selection| !selection.is_empty())
+                else {
                     return;
                 };
-                if selection.is_empty() {
-                    return;
-                }
                 let Some(preview) = self.engine.preview_content_ref() else {
                     return;
                 };
@@ -489,7 +532,22 @@ impl App {
                     self.copy_text_to_clipboard(text);
                 }
             }
-            Item::SelectAll => {
+            (Item::Copy, Target::Diff(_)) => {
+                let Some(selection) = self
+                    .diff_selection
+                    .filter(|selection| !selection.sel.is_empty())
+                else {
+                    return;
+                };
+                let Some(hit) = self.last_diff_hit.as_ref() else {
+                    return;
+                };
+                let text = crate::ui::selection::collect_diff_selected_text(hit, &selection);
+                if !text.is_empty() {
+                    self.copy_text_to_clipboard(text);
+                }
+            }
+            (Item::SelectAll, Target::Preview) => {
                 let Some((last_row, last_byte)) =
                     preview_text_extent(self.engine.preview_content_ref())
                 else {
@@ -499,6 +557,23 @@ impl App {
                     anchor: (0, 0),
                     active: (last_row, last_byte),
                     dragging: false,
+                });
+            }
+            (Item::SelectAll, Target::Diff(side)) => {
+                let Some(hit) = self.last_diff_hit.as_ref() else {
+                    return;
+                };
+                let Some(last_row) = hit.rows.len().checked_sub(1) else {
+                    return;
+                };
+                let last_byte = hit.rows[last_row].text_for(side).len();
+                self.diff_selection = Some(crate::ui::selection::DiffSelection {
+                    sel: crate::ui::selection::PreviewSelection {
+                        anchor: (0, 0),
+                        active: (last_row, last_byte),
+                        dragging: false,
+                    },
+                    side,
                 });
             }
         }
@@ -522,6 +597,14 @@ impl App {
     pub fn clear_diff_selection(&mut self) {
         self.diff_selection = None;
         self.diff_click_state = None;
+        if matches!(
+            self.selection_context_menu.target(),
+            Some(crate::selection_context_menu::SelectionContextTarget::Diff(
+                _
+            ))
+        ) {
+            self.selection_context_menu.close();
+        }
     }
 
     pub fn clear_commit_detail_selection(&mut self) {
@@ -2269,11 +2352,11 @@ impl App {
             ClickAction::TreeContextMenuClose => {
                 self.close_tree_context_menu();
             }
-            ClickAction::PreviewContextMenuItem(item) => {
-                self.dispatch_preview_context_menu_item(item);
+            ClickAction::SelectionContextMenuItem(item) => {
+                self.dispatch_selection_context_menu_item(item);
             }
-            ClickAction::PreviewContextMenuClose => {
-                self.close_preview_context_menu();
+            ClickAction::SelectionContextMenuClose => {
+                self.close_selection_context_menu();
             }
             ClickAction::NavCandidateSelect(idx) => {
                 // Move selection to the clicked row, then commit. A

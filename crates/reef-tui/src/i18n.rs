@@ -1153,10 +1153,10 @@ pub fn tree_context_menu_label(item: &reef_app::ContextMenuItem) -> &'static str
     }
 }
 
-pub fn preview_context_menu_label(
-    item: crate::preview_context_menu::PreviewContextMenuItem,
+pub fn selection_context_menu_label(
+    item: crate::selection_context_menu::SelectionContextMenuItem,
 ) -> &'static str {
-    use crate::preview_context_menu::PreviewContextMenuItem as Item;
+    use crate::selection_context_menu::SelectionContextMenuItem as Item;
     match (lang(), item) {
         (Lang::Zh, Item::Copy) => "复制",
         (Lang::En, Item::Copy) => "Copy",

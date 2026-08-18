@@ -215,9 +215,7 @@ pub enum AppCommand {
         target: FindTarget,
         query: String,
     },
-    CloseFindWidget {
-        dark: bool,
-    },
+    CloseFindWidget,
     EditFindWidgetInput(TextEditOp),
     PasteFindWidgetInput(String),
     ToggleFindWidgetOption(FindWidgetToggle),

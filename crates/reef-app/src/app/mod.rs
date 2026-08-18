@@ -2036,6 +2036,29 @@ mod tests {
     }
 
     #[test]
+    fn closing_find_widget_keeps_current_match_scroll() {
+        let mut app = minimal_app_state();
+        let viewport = crate::SearchViewport {
+            preview_view_h: 10,
+            ..Default::default()
+        };
+        app.begin_find_widget(crate::FindTarget::FilePreview, "needle".to_string());
+        app.recompute_find_widget(
+            (0..40).map(|row| if row == 10 || row == 30 { "needle" } else { "" }),
+            false,
+            viewport,
+        );
+        app.step_find_widget(false, viewport);
+        assert_eq!(app.preview_scroll, 25);
+
+        app.close_find_widget();
+
+        assert_eq!(app.preview_scroll, 25);
+        assert!(!app.find_widget.active);
+        assert!(app.find_widget.matches.is_empty());
+    }
+
+    #[test]
     fn failed_global_search_accept_does_not_retry_preview() {
         let mut app = minimal_app_state();
         let hit = dummy_hit("Cargo.toml");

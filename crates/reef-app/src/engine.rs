@@ -713,7 +713,7 @@ impl ReefApp {
                 self.runtime_events
                     .push(AppRuntimeEvent::RecomputeFindWidget);
             }
-            AppCommand::CloseFindWidget { dark } => self.state.close_find_widget(dark),
+            AppCommand::CloseFindWidget => self.state.close_find_widget(),
             AppCommand::EditFindWidgetInput(op) => {
                 if self.state.edit_find_widget_input(op) == TextEditOutcome::Edited {
                     self.runtime_events

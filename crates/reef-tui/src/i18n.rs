@@ -133,6 +133,24 @@ pub enum Msg {
     NavReferences,
     NavPreviewLoading,
     NavPreviewUnavailable,
+    /// Help popup: the video preview play / pause key.
+    HelpVideoPlayPause,
+    /// Video preview: hint on a paused clip, before playback starts.
+    PreviewVideoPlayHint,
+    /// Video preview: hint while a clip is playing.
+    PreviewVideoPauseHint,
+    /// Video preview: hint on a clip that reached its end.
+    PreviewVideoReplayHint,
+    /// Video preview: shown when ffmpeg / ffprobe are missing.
+    PreviewVideoNeedsFfmpeg,
+    /// Video preview: shown on terminals with no protocol we can animate.
+    PreviewVideoUnsupportedTerminal,
+    /// Video preview: shown inside tmux, where inline graphics are off.
+    PreviewVideoTmux,
+    /// Video preview: shown for a file on the remote side of an SSH session.
+    PreviewVideoRemote,
+    /// Video preview: shown when ffprobe found no playable video stream.
+    PreviewVideoUnreadable,
     /// SQLite preview: header for the left-side tables list column.
     DbTablesHeader,
     /// SQLite preview: shown when the database has zero user tables.
@@ -375,6 +393,15 @@ fn t_zh(m: Msg) -> &'static str {
         NavReferences => "引用",
         NavPreviewLoading => "正在加载预览…",
         NavPreviewUnavailable => "预览不可用",
+        HelpVideoPlayPause => "播放 / 暂停视频预览",
+        PreviewVideoPlayHint => "p 播放",
+        PreviewVideoPauseHint => "p 暂停",
+        PreviewVideoReplayHint => "p 重播",
+        PreviewVideoNeedsFfmpeg => "安装 ffmpeg 后可在终端内播放",
+        PreviewVideoUnsupportedTerminal => "当前终端不支持内联播放",
+        PreviewVideoTmux => "tmux 内不支持内联播放",
+        PreviewVideoRemote => "远程文件不支持内联播放",
+        PreviewVideoUnreadable => "无法读取视频流",
         DbTablesHeader => "表",
         DbEmpty => "(空数据库)",
         DbNoRows => "(无数据)",
@@ -568,6 +595,15 @@ fn t_en(m: Msg) -> &'static str {
         NavReferences => "references",
         NavPreviewLoading => "Loading preview…",
         NavPreviewUnavailable => "Preview unavailable",
+        HelpVideoPlayPause => "play / pause a video preview",
+        PreviewVideoPlayHint => "p to play",
+        PreviewVideoPauseHint => "p to pause",
+        PreviewVideoReplayHint => "p to replay",
+        PreviewVideoNeedsFfmpeg => "install ffmpeg to play inline",
+        PreviewVideoUnsupportedTerminal => "inline playback unavailable in this terminal",
+        PreviewVideoTmux => "inline playback is disabled inside tmux",
+        PreviewVideoRemote => "inline playback is unavailable for remote files",
+        PreviewVideoUnreadable => "no readable video stream",
         DbTablesHeader => "tables",
         DbEmpty => "(empty database)",
         DbNoRows => "(no rows)",

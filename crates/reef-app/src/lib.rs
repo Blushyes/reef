@@ -66,7 +66,7 @@ pub use preview_snapshot::{
     DatabasePageSnapshot, DatabaseSchemaSnapshot, MarkdownCodeHighlightSnapshot,
     MarkdownCodeTokenSnapshot, PreviewBodySnapshot, PreviewDetectedKindSnapshot,
     PreviewDocumentSnapshot, PreviewSourceSnapshot, RgbSnapshot, StructuredDataFormatSnapshot,
-    TextStyleSnapshot, TextStyleSpanSnapshot, structured_format_for_path,
+    TextStyleSnapshot, TextStyleSpanSnapshot, preview_is_video, structured_format_for_path,
 };
 pub use reef_sqlite_preview::{
     DbObjectDetail, DbObjectKey, DbObjectKind, SqliteValue, TriggerEvent, TriggerTiming,

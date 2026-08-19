@@ -955,6 +955,7 @@ fn render_help(f: &mut Frame, app: &App, screen: Rect) {
         ("d → y", t(Msg::HelpDiscard)),
         ("m", t(Msg::HelpDiffLayout)),
         ("f", t(Msg::HelpDiffMode)),
+        ("p", t(Msg::HelpVideoPlayPause)),
         ("t", t(Msg::HelpToggleView)),
         ("r", t(Msg::HelpRefresh)),
         ("h", t(Msg::HelpShowHelp)),

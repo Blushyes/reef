@@ -26,3 +26,4 @@ pub mod selection_context_menu;
 pub mod settings;
 pub mod shell_integration;
 pub mod ui;
+pub mod video;

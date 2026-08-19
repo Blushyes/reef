@@ -815,6 +815,15 @@ fn handle_key_focused_preview(key: KeyEvent, app: &mut App) -> bool {
             app.toggle_focused_preview_files();
             return true;
         }
+        // Video preview: `p` plays / pauses. Handled here rather than
+        // through the fallthrough allowlist below, because bare `p` on the
+        // Files tab is paste — a key that must not fire against a tree the
+        // user cannot see. The leader guard keeps Space+p (QuickOpen)
+        // reachable.
+        KeyCode::Char('p') if !ctrl && app.space_leader_at.is_none() && app.preview_is_video() => {
+            app.toggle_video_playback();
+            return true;
+        }
         // Ctrl+, would otherwise reach the global keymap and call
         // open_settings(), stomping view_mode from FocusedPreview to
         // Settings — and close_settings always returns to Main, so the
@@ -1805,6 +1814,15 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 }
             }
         },
+        // Video preview only — `p` plays / pauses the clip. Safe as a bare
+        // key here because the paste binding above is gated on the tree
+        // panel holding focus, so `p` is unclaimed once focus is on the
+        // preview.
+        KeyCode::Char('p')
+            if !ctrl && app.engine.active_panel() == Panel::Diff && app.preview_is_video() =>
+        {
+            app.toggle_video_playback();
+        }
         // SQLite preview only — `[` / `]` cycle tables. Bare keys, no
         // modifier guard beyond `!ctrl` (Ctrl+[ is the terminal Esc
         // sequence on most terms; we don't want to swallow it).

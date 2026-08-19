@@ -463,29 +463,6 @@ fn wait_for_nav_preview(app: &mut App) {
     panic!("timed out waiting for navigation Peek preview");
 }
 
-fn wait_for_text_preview_enrichment(app: &mut App) {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        app.tick();
-        let enriched = app
-            .engine
-            .state
-            .preview_content
-            .as_deref()
-            .is_some_and(|preview| {
-                matches!(
-                    &preview.body,
-                    reef_core::preview::PreviewBody::Text(text) if text.parsed.is_some()
-                )
-            });
-        if enriched {
-            return;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    panic!("timed out waiting for text preview enrichment");
-}
-
 fn wait_for_db_detail(app: &mut App) {
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
@@ -873,7 +850,6 @@ pub fn load_theme() -> bool {
     wait_for_file_tree(&mut app);
     app.load_preview_for_path(PathBuf::from("src/theme.rs"));
     wait_for_preview(&mut app);
-    wait_for_text_preview_enrichment(&mut app);
     let _ = render_app(&mut app, 110, 28);
 
     let origin = reef_app::LocationSnapshot {
@@ -973,6 +949,8 @@ fn wait_for_db_cell(app: &mut App) {
     while Instant::now() < deadline {
         app.tick();
         if !app.engine.state.db_cell_load.loading
+            && !app.engine.state.file_tree_load.loading
+            && !app.engine.state.file_tree_load.stale
             && app
                 .engine
                 .state

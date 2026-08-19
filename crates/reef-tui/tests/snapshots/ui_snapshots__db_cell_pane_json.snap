@@ -1,0 +1,29 @@
+---
+source: crates/reef-tui/tests/ui_snapshots.rs
+assertion_line: 922
+expression: output
+---
+ reef  [TMPDIR]  ⎇ (detached)
+ 📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph                                      ⊟  1:Files 2:Search 3:Git 4:Graph
+ + New File   + New Folder   ⊟  │ cells.db
+   cells.db U                   │ ───────────────────────────────────────────────────────────────────────────
+                                │ sqlite · 1 tables · 8.0 KB
+                                │
+                                │ ▾ main · cells.db  payload                     payload
+                                │   Tables (1)       TEXT                        TEXT · 97 B · JSON
+                                │ ▎   step_run     2 {"shot_id":"s0412","duratio ────────────────────────────
+                                │                    {"shot_id":"s0413","duratio {
+                                │                                                  "shot_id" : "s0412",
+                                │                                                  "duration" : 3.5,
+                                │                                                  "tags" : [
+                                │                                                    "近 景 ",
+                                │                                                    "手 持 "
+                                │                                                  ],
+                                │                                                  "meta" : {
+                                │                                                    "seed" : 88201,
+                                │                                                    "retry" : false
+                                │                                                  }
+                                │                                                }
+                                │                                                Esc close · y copy · ↑↓←→ c…
+                                │ page  ‹  [1]  › ·  row 1-2 / 2  ·  step_run (1/1)
+ SSH                                         ⚙  q:quit Tab:switch s:stage u:unstage r:refresh h:help  [Files]

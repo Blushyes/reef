@@ -444,7 +444,31 @@ impl AppState {
                     state.current_rows = payload.rows;
                     state.current_row_locators = payload.row_locators;
                     state.detail = None;
-                    self.reset_preview_scroll(payload.reset_h_scroll);
+                    // A preserved cell points at rows that were just
+                    // replaced: re-read it against the fresh page (its
+                    // locator may have moved), or drop it when the row
+                    // or column is gone.
+                    let reopen = state.cell.as_ref().map(|cell| (cell.row, cell.column));
+                    let reopen = reopen.filter(|(row, column)| {
+                        state
+                            .current_rows
+                            .get(*row)
+                            .and_then(|cells| cells.get(*column))
+                            .is_some()
+                    });
+                    if reopen.is_none() {
+                        state.cell = None;
+                    }
+                    // A refresh re-reads what is already on screen;
+                    // yanking the grid back to the first row every time
+                    // something writes to the database would make a live
+                    // database impossible to read.
+                    if !payload.refresh {
+                        self.reset_preview_scroll(payload.reset_h_scroll);
+                    }
+                    if let Some((row, column)) = reopen {
+                        self.dispatch_db_cell_load(row, column);
+                    }
                 }
                 Err(error) => {
                     if self.db_page_load.complete_err(generation, error.clone()) {
@@ -498,6 +522,7 @@ impl AppState {
                         return events;
                     }
                     cell.value = Some(payload.value);
+                    cell.value_revision = cell.value_revision.wrapping_add(1);
                 }
                 Err(error) => {
                     if self.db_cell_load.complete_err(generation, error) {

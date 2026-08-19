@@ -598,6 +598,15 @@ impl ReefApp {
             AppCommand::DbLoadCell { row, column } => {
                 self.state.dispatch_db_cell_load(row, column);
             }
+            AppCommand::DbCloseCell => self.state.db_close_cell(),
+            AppCommand::DbMoveCell { d_row, d_col } => self.state.db_move_cell(d_row, d_col),
+            AppCommand::DbScrollCell(delta) => self.state.db_scroll_cell(delta),
+            AppCommand::ClampDbCellScroll(max_scroll) => {
+                self.state.clamp_db_cell_scroll(max_scroll)
+            }
+            AppCommand::EnsureDbCellRowVisible { visible_rows } => {
+                self.state.ensure_db_cell_row_visible(visible_rows)
+            }
             AppCommand::EditDbGoto(op) => {
                 let _ = self.state.edit_db_goto_input(op);
             }

@@ -526,7 +526,12 @@ fn row_bg(
         .then_some(code_block_bg(th))
 }
 
-fn span_style(span: &reef_core::markdown::MarkdownSpan, th: &crate::ui::theme::Theme) -> Style {
+/// Shared with the SQLite value pane, which lays Markdown cells out
+/// with the same colors this panel uses.
+pub(in crate::ui) fn span_style(
+    span: &reef_core::markdown::MarkdownSpan,
+    th: &crate::ui::theme::Theme,
+) -> Style {
     use reef_core::markdown::MarkdownRole;
 
     let mut style = match span.style.role {

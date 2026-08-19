@@ -211,11 +211,34 @@ fn classify_event(
         {
             continue;
         }
+        if is_sqlite_sidecar(&path) {
+            continue;
+        }
         if let Ok(relative) = path.strip_prefix(workdir) {
             change.push_workspace_path(relative.to_path_buf());
         }
     }
     change.into_change()
+}
+
+/// `true` for a SQLite journal / WAL sidecar sitting next to its
+/// database. SQLite rewrites the `-shm` index whenever a WAL database
+/// is opened — including the read-only opens a preview does — so
+/// treating these as workspace changes makes a reader trigger the
+/// reload that makes it read again, without end. Recognised only when
+/// the database they belong to is actually there, so an unrelated file
+/// that happens to end in `-journal` still counts as a change.
+fn is_sqlite_sidecar(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    ["-wal", "-shm", "-journal"].iter().any(|suffix| {
+        name.len() > suffix.len()
+            && name.ends_with(suffix)
+            && path
+                .with_file_name(&name[..name.len() - suffix.len()])
+                .is_file()
+    })
 }
 
 fn normalize_event_path(path: &Path) -> PathBuf {
@@ -239,6 +262,24 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use test_support::{commit_file, tempdir_repo};
+
+    #[test]
+    fn sqlite_sidecars_next_to_their_database_are_not_workspace_changes() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("qb.db"), b"").unwrap();
+        for sidecar in ["qb.db-wal", "qb.db-shm", "qb.db-journal"] {
+            assert!(
+                super::is_sqlite_sidecar(&tmp.path().join(sidecar)),
+                "{sidecar} should be ignored"
+            );
+        }
+        // The database itself is a real change.
+        assert!(!super::is_sqlite_sidecar(&tmp.path().join("qb.db")));
+        // A file that merely ends in one of the suffixes, with no
+        // database beside it, stays a real change.
+        assert!(!super::is_sqlite_sidecar(&tmp.path().join("notes-journal")));
+        assert!(!super::is_sqlite_sidecar(&tmp.path().join("-wal")));
+    }
 
     #[test]
     fn linked_worktree_uses_common_gitdir_as_metadata_root() {

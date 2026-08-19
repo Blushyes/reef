@@ -86,6 +86,9 @@ pub struct DbPagePayload {
     pub rows: Vec<Vec<reef_sqlite_preview::SqliteValue>>,
     pub row_locators: Vec<reef_sqlite_preview::DbRowLocator>,
     pub reset_h_scroll: bool,
+    /// An in-place reload of the same object and page: keep the cell
+    /// and the scroll the user left behind.
+    pub refresh: bool,
 }
 
 #[derive(Debug)]
@@ -95,6 +98,9 @@ pub struct DbPageRequest {
     pub page: u64,
     pub rows_per_page: u32,
     pub reset_h_scroll: bool,
+    /// An in-place reload of the same object and page: keep the cell
+    /// and the scroll the user left behind.
+    pub refresh: bool,
 }
 
 #[derive(Debug)]
@@ -2206,6 +2212,7 @@ fn spawn_preview_worker(result_tx: WorkerResultSender) -> mpsc::Sender<FilesTask
                                 rows: page_data.rows,
                                 row_locators: page_data.row_locators,
                                 reset_h_scroll: request.reset_h_scroll,
+                                refresh: request.refresh,
                             })
                             .map_err(|e| e.to_string());
                         let _ = result_tx.send(WorkerResult::DbPage { generation, result });
@@ -4405,6 +4412,7 @@ mod preview_worker_coalescing_tests {
                 page: 0,
                 rows_per_page: 100,
                 reset_h_scroll: false,
+                refresh: false,
             },
         }
     }

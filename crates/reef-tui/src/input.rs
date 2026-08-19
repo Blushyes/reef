@@ -525,6 +525,13 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
             app.engine.dispatch(AppCommand::ClearVimSearch);
             return;
         }
+        // An open SQLite cell pane is the innermost thing Esc can
+        // back out of — closing it returns the arrows to plain row
+        // scrolling without giving up the preview panel.
+        KeyCode::Esc if db_cell_open(app) => {
+            app.engine.dispatch(AppCommand::DbCloseCell);
+            return;
+        }
         KeyCode::Esc if app.engine.active_panel() != Panel::Files => {
             app.set_active_panel(Panel::Files);
             app.engine.dispatch(AppCommand::ClearVimSearch);
@@ -1716,6 +1723,13 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
         return;
     }
 
+    // SQLite data grid: once a cell is open the arrows drive the cell
+    // cursor instead of the row scroll, so this sub-handler runs before
+    // the generic nav arms below.
+    if handle_key_db_cell(key, app, ctrl, shift) {
+        return;
+    }
+
     match key.code {
         KeyCode::Up | KeyCode::Char('k') if !ctrl => match app.engine.active_panel() {
             Panel::Files => {
@@ -1871,6 +1885,15 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 && app.engine.preview_is_database() =>
         {
             app.db_navigate(DbNav::LastPage);
+        }
+        // Keyboard entry into the data grid's cell cursor. Lands on
+        // the first column of the topmost visible row; the arrows take
+        // over from there.
+        KeyCode::Enter if db_grid_active(app) => {
+            app.engine.dispatch(AppCommand::DbLoadCell {
+                row: app.engine.preview_scroll(),
+                column: 0,
+            });
         }
         KeyCode::Enter => {
             app.engine
@@ -2207,6 +2230,68 @@ fn handle_key_paste_conflict(key: KeyEvent, app: &mut App) {
         // No-op for any other key — keeps the prompt up so the user
         // doesn't accidentally cancel by pressing the wrong letter.
         _ => {}
+    }
+}
+
+/// `true` when the preview panel is showing a SQLite data grid — the
+/// gate every cell-cursor binding shares.
+fn db_grid_active(app: &App) -> bool {
+    app.engine.active_panel() == Panel::Diff && app.engine.preview_is_database()
+}
+
+/// `true` when a cell is open in that grid.
+fn db_cell_open(app: &App) -> bool {
+    app.engine
+        .db_preview()
+        .is_some_and(|state| state.cell.is_some())
+}
+
+/// Keys that belong to an open SQLite cell: the arrows walk the cell
+/// cursor, Shift+arrows scroll the value pane, `y` copies the complete
+/// value. Returns `true` when the key was consumed, leaving every other
+/// key to `handle_key_files`.
+fn handle_key_db_cell(key: KeyEvent, app: &mut App, ctrl: bool, shift: bool) -> bool {
+    if ctrl || !db_grid_active(app) || !db_cell_open(app) {
+        return false;
+    }
+    let (d_row, d_col) = match key.code {
+        KeyCode::Up | KeyCode::Char('k') => (-1, 0),
+        KeyCode::Down | KeyCode::Char('j') => (1, 0),
+        KeyCode::Left | KeyCode::Char('h') => (0, -1),
+        KeyCode::Right | KeyCode::Char('l') => (0, 1),
+        // Enter is the way into the cell cursor, Esc the way out.
+        // Swallowed here so it can't fall through to "open the file
+        // tree's selection in $EDITOR" while the pane is up.
+        KeyCode::Enter => return true,
+        KeyCode::Char('y') => {
+            if let Some(text) = db_cell_clipboard_text(app) {
+                app.copy_text_to_clipboard(text);
+            }
+            return true;
+        }
+        _ => return false,
+    };
+    // Shift on the vertical axis scrolls the value pane instead —
+    // a long value needs its own scroll, and the cell cursor already
+    // owns the bare arrows.
+    if shift && d_row != 0 {
+        app.engine.dispatch(AppCommand::DbScrollCell(d_row));
+    } else {
+        app.engine.dispatch(AppCommand::DbMoveCell { d_row, d_col });
+    }
+    true
+}
+
+/// Text form of the open cell's complete value, or `None` while it is
+/// still loading or when it has no text form (BLOB).
+fn db_cell_clipboard_text(app: &App) -> Option<String> {
+    use reef_sqlite_preview::SqliteValue;
+    match app.engine.db_preview()?.cell.as_ref()?.value.as_ref()? {
+        SqliteValue::Text { value, .. } => Some(value.clone()),
+        SqliteValue::Integer(n) => Some(n.to_string()),
+        SqliteValue::Real(r) => Some(r.to_string()),
+        SqliteValue::Null => Some("NULL".to_string()),
+        SqliteValue::Blob { .. } => None,
     }
 }
 
@@ -3759,6 +3844,16 @@ fn dispatch_vertical_scroll<B: Backend>(
     app: &mut App,
     terminal: &Terminal<B>,
 ) {
+    // The SQLite value pane owns the wheel while the pointer is over
+    // it — otherwise the wheel would page the grid underneath while
+    // the user is reading the value.
+    if let Some(rect) = app.last_db_cell_rect
+        && point_in_rect(rect, mouse.column, mouse.row)
+        && db_cell_open(app)
+    {
+        app.engine.dispatch(AppCommand::DbScrollCell(sign));
+        return;
+    }
     let total_width = terminal.size().map(|s| s.width).unwrap_or(80);
     // Drop bare vertical events that arrive during the tail of an
     // in-progress horizontal swipe (trackpad noise on the orthogonal

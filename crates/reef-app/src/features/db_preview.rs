@@ -29,13 +29,26 @@ pub struct DbPreviewState {
     pub cell: Option<DbCellPreviewState>,
 }
 
+/// The cell the user opened in the data grid: which cell it is, its
+/// complete (untruncated) value once the reader returns it, and where
+/// the value pane is scrolled to.
 #[derive(Debug, Clone)]
 pub struct DbCellPreviewState {
     pub object_key: DbObjectKey,
+    /// Index into [`DbPreviewState::current_rows`] — the highlighted
+    /// row on the page currently loaded.
+    pub row: usize,
     pub row_offset: u64,
     pub row_locator: DbRowLocator,
     pub column: usize,
+    /// `None` while the complete value is still in flight.
     pub value: Option<SqliteValue>,
+    /// Bumped every time a read lands, so a renderer caching derived
+    /// layout can tell a re-read that changed the value from one that
+    /// merely re-confirmed it.
+    pub value_revision: u64,
+    /// First displayed line of the value pane.
+    pub scroll: usize,
 }
 
 impl DbPreviewState {

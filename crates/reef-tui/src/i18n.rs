@@ -147,6 +147,14 @@ pub enum Msg {
     DbGotoPagePrompt,
     /// Hint text shown alongside the goto-page prompt.
     DbGotoPageHint,
+    /// Value pane: the complete cell is still being read.
+    DbCellLoading,
+    /// Value pane: only the first slice of a very large value is laid out.
+    DbCellClipped,
+    /// Value pane: BLOB cells have no text form to show.
+    DbCellBinary,
+    /// Value pane: the keys that drive the opened cell.
+    DbCellHint,
     LayoutUnified,
     LayoutSideBySide,
     ModeCompact,
@@ -362,6 +370,10 @@ fn t_zh(m: Msg) -> &'static str {
         DbRowsLabel => "行",
         DbGotoPagePrompt => "跳到页",
         DbGotoPageHint => "(Enter 确认 · Esc 取消)",
+        DbCellLoading => "读取中…",
+        DbCellClipped => "(仅显示开头部分)",
+        DbCellBinary => "(二进制内容)",
+        DbCellHint => "Esc 关闭 · y 复制 · ↑↓←→ 单元格 · ⇧↑↓ 滚动",
         LayoutUnified => "上下",
         LayoutSideBySide => "左右",
         ModeCompact => "局部",
@@ -543,6 +555,10 @@ fn t_en(m: Msg) -> &'static str {
         DbRowsLabel => "row",
         DbGotoPagePrompt => "go to page",
         DbGotoPageHint => "(Enter to jump · Esc to cancel)",
+        DbCellLoading => "Loading…",
+        DbCellClipped => "(showing the first part only)",
+        DbCellBinary => "(binary content)",
+        DbCellHint => "Esc close · y copy · ↑↓←→ cell · ⇧↑↓ scroll",
         LayoutUnified => "unified",
         LayoutSideBySide => "split",
         ModeCompact => "compact",

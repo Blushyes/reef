@@ -1,0 +1,29 @@
+---
+source: crates/reef-tui/tests/ui_snapshots.rs
+assertion_line: 911
+expression: output
+---
+ reef  [TMPDIR]  ⎇ (detached)
+ 📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph                                      ⊟  1:Files 2:Search 3:Git 4:Graph
+ + New File   + New Folder   ⊟  │ cells.db
+   cells.db U                   │ ───────────────────────────────────────────────────────────────────────────
+                                │ sqlite · 1 tables · 8.0 KB
+                                │
+                                │ ▾ main · cells.db  id   prompt                 prompt
+                                │   Tables (1)       INT  TEXT                   TEXT · 152 B
+                                │ ▎   step_run     2   1  06,不 得 遗 漏 中 间 任 何 一   ────────────────────────────
+                                │                      2  08,把 本 段 的 动 作 拆 成 六   06,不 得 遗 漏 中 间 任 何 一 条 。 相
+                                │                                                邻 两 条 之 间 必 须 保 持 连 续 ,不 得
+                                │                                                跳 跃 。 把 本 段 的 动 作 拆 成 六 个 镜
+                                │                                                头 ,每 个 镜 头 单 独 描 述 。
+                                │
+                                │
+                                │
+                                │
+                                │
+                                │
+                                │
+                                │
+                                │                                                Esc close · y copy · ↑↓←→ c…
+                                │ page  ‹  [1]  › ·  row 1-2 / 2  ·  step_run (1/1)
+ SSH                                         ⚙  q:quit Tab:switch s:stage u:unstage r:refresh h:help  [Files]

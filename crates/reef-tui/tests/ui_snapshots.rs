@@ -14,7 +14,7 @@ use reef::TuiApp as App;
 use reef::ui;
 use reef::ui::theme::Theme;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use test_support::{
@@ -449,20 +449,6 @@ fn wait_for_preview(app: &mut App) {
     panic!("timed out waiting for preview worker");
 }
 
-fn wait_for_nav_preview(app: &mut App) {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        app.tick();
-        if !app.engine.state.nav_preview_load.loading
-            && app.engine.state.nav_preview_content.is_some()
-        {
-            return;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    panic!("timed out waiting for navigation Peek preview");
-}
-
 fn wait_for_db_detail(app: &mut App) {
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
@@ -850,6 +836,29 @@ pub fn load_theme() -> bool {
     wait_for_file_tree(&mut app);
     app.load_preview_for_path(PathBuf::from("src/theme.rs"));
     wait_for_preview(&mut app);
+    let preview = Arc::make_mut(
+        app.engine
+            .state
+            .preview_content
+            .as_mut()
+            .expect("theme preview loaded"),
+    );
+    let reef_core::preview::PreviewBody::Text(text) = &mut preview.body else {
+        panic!("theme preview is text");
+    };
+    let source: Arc<[u8]> = Arc::from(text.lines.join("\n").into_bytes().into_boxed_slice());
+    text.parsed = reef_core::nav::parse_file_if_supported(reef_core::nav::NavLang::Rust, source)
+        .map(Arc::new);
+    app.engine
+        .state
+        .lsp_installed
+        .insert(reef_core::nav::NavLang::Rust, true);
+    let nav_preview_content = app
+        .engine
+        .state
+        .preview_content
+        .clone()
+        .expect("theme preview loaded");
     let _ = render_app(&mut app, 110, 28);
 
     let origin = reef_app::LocationSnapshot {
@@ -880,6 +889,7 @@ pub fn load_theme() -> bool {
     ];
     app.nav_peek_anchor_col = 44;
     app.nav_peek_anchor_row = 8;
+    app.engine.state.settings.nav_peek_mode = reef_app::NavPeekMode::Compact;
     app.engine.state.open_nav_candidates(
         reef_app::NavCandidatesPopup::new(
             candidates,
@@ -891,7 +901,8 @@ pub fn load_theme() -> bool {
         true,
         12,
     );
-    wait_for_nav_preview(&mut app);
+    app.engine.state.settings.nav_peek_mode = reef_app::NavPeekMode::Expanded;
+    app.engine.state.nav_preview_content = Some(nav_preview_content);
 
     let output = render_app(&mut app, 110, 28);
     with_filters(&[], || insta::assert_snapshot!("navigation_peek", output));

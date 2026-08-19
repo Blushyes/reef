@@ -53,12 +53,13 @@ pub struct AppCommandOutcome {
 
 impl ReefApp {
     pub fn new(config: AppConfig) -> Self {
-        let state = AppState::new(AppStateConfig {
+        let mut state = AppState::new(AppStateConfig {
             backend: config.backend,
             prefs: config.prefs,
             now: Instant::now(),
             subscribe_fs_events: config.subscribe_fs_events,
         });
+        state.nav_workspace_load.mark_stale();
         Self {
             state,
             effects: Vec::new(),
@@ -359,6 +360,13 @@ impl ReefApp {
                     crate::text_input::paste_single_line(&text, &mut edit.buffer, &mut edit.cursor);
                 }
             }
+            AppCommand::ToggleNavPeekMode { viewport_rows } => {
+                self.state.toggle_nav_peek_mode(viewport_rows);
+            }
+            AppCommand::SetNavPeekMode {
+                mode,
+                viewport_rows,
+            } => self.state.set_nav_peek_mode(mode, viewport_rows),
             AppCommand::CloseActivePalettes => self.state.close_active_palettes(),
             AppCommand::SetActiveTab(tab) => {
                 let outcome = self.state.set_active_tab(tab);
@@ -1101,24 +1109,62 @@ impl ReefApp {
                 self.state.apply_lsp_state_change(lang, state);
             }
             AppCommand::RefreshLspInstalled => self.state.refresh_lsp_installed(),
-            AppCommand::OpenNavCandidates(popup) => {
-                self.state.open_nav_candidates(popup);
+            AppCommand::OpenNavCandidates {
+                popup,
+                dark,
+                viewport_rows,
+            } => {
+                self.state.open_nav_candidates(popup, dark, viewport_rows);
             }
             AppCommand::SetNavPendingLspJump(jump) => {
                 self.state.set_nav_pending_lsp_jump(jump);
             }
-            AppCommand::SelectNavCandidate(idx) => {
-                if let Some(popup) = self.state.nav_candidates.as_mut()
-                    && idx < popup.candidates.len()
-                {
-                    popup.selected = idx;
-                }
+            AppCommand::SelectNavCandidate {
+                index,
+                viewport_rows,
+            } => {
+                self.state.select_nav_candidate(index, viewport_rows);
+            }
+            AppCommand::ToggleNavCandidateGroup {
+                index,
+                viewport_rows,
+            } => {
+                self.state.toggle_nav_candidate_group(index, viewport_rows);
             }
             AppCommand::CloseNavCandidates => self.state.close_nav_candidates(),
-            AppCommand::MoveNavCandidatesSelection(delta) => {
-                self.state.move_nav_candidates_selection(delta);
+            AppCommand::MoveNavCandidatesSelection {
+                delta,
+                viewport_rows,
+            } => {
+                self.state
+                    .move_nav_candidates_selection(delta, viewport_rows);
             }
-            AppCommand::ScrollNavCandidates(delta) => self.state.scroll_nav_candidates(delta),
+            AppCommand::ScrollNavCandidates {
+                delta,
+                viewport_rows,
+            } => self.state.scroll_nav_candidates(delta, viewport_rows),
+            AppCommand::NavigatePreviewDefinitionAt {
+                cursor,
+                dark,
+                view_height,
+                peek_viewport_rows,
+            } => {
+                let before = self.state.active_tab;
+                self.state.navigate_preview_definition_at(
+                    cursor,
+                    dark,
+                    view_height,
+                    peek_viewport_rows,
+                );
+                let after = self.state.active_tab;
+                self.push_tab_changed_for_state_transition(before, after);
+            }
+            AppCommand::ConfirmNavCandidate { view_height } => {
+                let before = self.state.active_tab;
+                self.state.confirm_nav_candidate(view_height);
+                let after = self.state.active_tab;
+                self.push_tab_changed_for_state_transition(before, after);
+            }
             AppCommand::PushLocationHistory(snapshot) => {
                 self.state.push_location_history(snapshot);
             }
@@ -1169,7 +1215,6 @@ impl ReefApp {
                 line,
                 utf16_col,
             ),
-            AppCommand::DispatchNavWorkspaceBuild => self.state.dispatch_nav_workspace_build(),
             AppCommand::OpenFocusedPreviewFiles => self.state.open_focused_preview_files(),
             AppCommand::CloseFocusedPreviewFiles => self.state.close_focused_preview_files(),
             AppCommand::ToggleFocusedPreviewFiles => self.state.toggle_focused_preview_files(),
@@ -1425,6 +1470,10 @@ impl ReefApp {
 
     pub fn settings(&self) -> &SettingsState {
         &self.state.settings
+    }
+
+    pub fn nav_peek_mode(&self) -> crate::NavPeekMode {
+        self.state.settings.nav_peek_mode
     }
 
     pub fn active_tab(&self) -> AppTab {
@@ -2062,6 +2111,18 @@ impl ReefApp {
         self.state.nav_candidates.clone()
     }
 
+    pub fn nav_preview_content(&self) -> Option<Arc<reef_core::preview::PreviewDocument>> {
+        self.state.nav_preview_content.clone()
+    }
+
+    pub fn nav_preview_loading(&self) -> bool {
+        self.state.nav_preview_load.loading
+    }
+
+    pub fn nav_preview_error(&self) -> Option<&str> {
+        self.state.nav_preview_load.error.as_deref()
+    }
+
     pub fn paste_conflict_prompt(&self) -> Option<&reef_core::file_ops::PasteConflictPrompt> {
         self.state.paste_conflict.as_ref()
     }
@@ -2104,13 +2165,6 @@ impl ReefApp {
 
     pub fn nav_refine_epoch(&self) -> u64 {
         self.state.nav_refine_epoch
-    }
-
-    pub fn nav_candidates_opened_by_ctrl_click(&self) -> bool {
-        self.state
-            .nav_candidates
-            .as_ref()
-            .is_some_and(|popup| popup.opened_by_ctrl_click)
     }
 
     pub fn lsp_badge(&self, lang: reef_core::nav::NavLang) -> reef_core::nav::LspBadge {
@@ -2287,6 +2341,45 @@ mod tests {
             prefs: AppPrefs::default(),
             subscribe_fs_events: false,
         })
+    }
+
+    #[test]
+    fn new_app_builds_initial_navigation_workspace_index() {
+        let (temp, repo) = test_support::tempdir_repo();
+        test_support::write_file(&repo, "__init__.py", "from .subtitles import SubtitleCue\n");
+        test_support::write_file(&repo, "subtitles.py", "class SubtitleCue:\n    pass\n");
+        let backend = Arc::new(LocalBackend::open_at(
+            std::fs::canonicalize(temp.path()).expect("canonical temp workspace"),
+        ));
+        let mut app = ReefApp::new(AppConfig {
+            backend,
+            prefs: AppPrefs::default(),
+            subscribe_fs_events: false,
+        });
+        let wake = app.worker_wake_receiver();
+
+        assert!(app.state.nav_workspace_load.should_request());
+        app.step(
+            Instant::now(),
+            TickOptions {
+                dark: false,
+                wants_decoded_image: false,
+                uses_three_col: false,
+            },
+        );
+
+        assert!(app.state.nav_workspace_load.loading);
+        wake.recv_timeout(Duration::from_secs(3))
+            .expect("navigation workspace worker wake");
+        app.step(
+            Instant::now(),
+            TickOptions {
+                dark: false,
+                wants_decoded_image: false,
+                uses_three_col: false,
+            },
+        );
+        assert!(app.nav_workspace().is_some());
     }
 
     fn global_search_hit(path: &str) -> MatchHit {

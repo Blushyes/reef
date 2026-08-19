@@ -22,11 +22,11 @@ pub use app::{
     GLOBAL_SEARCH_MAX_RESULTS, GLOBAL_SEARCH_PREVIEW_SYNC_DEBOUNCE, GRAPH_RECENT_BRANCHES_MAX,
     GRAPH_THREE_COL_MIN_WIDTH, GitGraphState, GitStatusState, GraphBranchPickerOpenOutcome,
     GraphScopeChangeOutcome, HighlightFade, HighlightedDiff, LineTokens, LspRefineOutcome,
-    MatchHit, NavAnchor, NavCandidatesPopup, NavPendingJump, NormalizeActivePanelOutcome,
-    PREFETCH_DELAY, PREVIEW_DEBOUNCE, PreviewHighlight, PreviewMergeOutcome, PushError,
-    RangeDetail, SearchPanelFocus, SelectedFile, StructuredPreviewMode, TabChangeOutcome,
-    TickOptions, ToggleSidebarOutcome, ViewMode, center_scroll, compute_sidebar_width,
-    compute_three_col_widths, compute_uses_three_col,
+    MatchHit, NavAnchor, NavCandidateGroup, NavCandidateKind, NavCandidatesPopup, NavPendingJump,
+    NormalizeActivePanelOutcome, PREFETCH_DELAY, PREVIEW_DEBOUNCE, PreviewHighlight,
+    PreviewMergeOutcome, PushError, RangeDetail, SearchPanelFocus, SelectedFile,
+    StructuredPreviewMode, TabChangeOutcome, TickOptions, ToggleSidebarOutcome, ViewMode,
+    center_scroll, compute_sidebar_width, compute_three_col_widths, compute_uses_three_col,
 };
 pub use command::AppCommand;
 pub use effect::{AppEffect, Toast, ToastLevel};
@@ -56,7 +56,7 @@ pub use features::quick_open::{
 pub use features::search::{
     MatchLoc, SearchSnapshot, SearchState, SearchTarget, SearchViewport, WrapMsg,
 };
-pub use features::settings::{EditorEdit, SettingItem, SettingSection, SettingsState};
+pub use features::settings::{EditorEdit, NavPeekMode, SettingItem, SettingSection, SettingsState};
 pub use features::tree_context_menu::{ContextMenuItem, ContextMenuState};
 pub use features::tree_drag::{DragPress, InputModifiers, TreeDragState};
 pub use features::tree_edit::{TreeEditMode, TreeEditState};

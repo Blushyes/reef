@@ -173,6 +173,10 @@ pub enum ClickAction {
     /// popup owns mouse input panel-wide while visible — same scheme
     /// as `TreeContextMenuItem` / `TreeContextMenuClose`.
     NavCandidateSelect(usize),
+    /// Click a file header in the references tree.
+    NavCandidateGroupToggle(usize),
+    /// Captures clicks inside the Peek surface that do not target a row.
+    NavCandidatesCapture,
     /// Registered panel-wide beneath the open candidates popup; a
     /// click that misses every row dismisses without picking.
     NavCandidatesClose,

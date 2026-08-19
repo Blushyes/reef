@@ -2641,20 +2641,39 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
         return;
     }
 
-    // Nav candidates popup owns mouse input while open. Scroll wheel
-    // moves the visible window; left-clicks on a row or the
-    // fallthrough-close zone dispatch via the registry. Both must
+    // Nav candidates popup owns mouse input while open. In expanded mode the
+    // scroll wheel targets the code preview or result tree under the pointer;
+    // compact mode registers its candidate list as the tree target. Clicks on
+    // a row or the fallthrough-close zone dispatch via the registry. Both must
     // preempt the preview drag-select fast-path, which only checks
     // `point_in_rect(last_preview_rect, ...)` and would otherwise
     // start a text selection on the pane underneath.
     if app.engine.nav_candidates_active() {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                app.nav_candidates_scroll(-1);
+                match nav_peek_scroll_target(
+                    mouse.column,
+                    mouse.row,
+                    app.nav_peek_preview_rect,
+                    app.nav_peek_tree_rect,
+                ) {
+                    Some(NavPeekScrollTarget::Preview) => app.nav_peek_preview_scroll(-1),
+                    Some(NavPeekScrollTarget::Tree) => app.nav_candidates_scroll(-1),
+                    None => {}
+                }
                 return;
             }
             MouseEventKind::ScrollDown => {
-                app.nav_candidates_scroll(1);
+                match nav_peek_scroll_target(
+                    mouse.column,
+                    mouse.row,
+                    app.nav_peek_preview_rect,
+                    app.nav_peek_tree_rect,
+                ) {
+                    Some(NavPeekScrollTarget::Preview) => app.nav_peek_preview_scroll(1),
+                    Some(NavPeekScrollTarget::Tree) => app.nav_candidates_scroll(1),
+                    None => {}
+                }
                 return;
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -2662,10 +2681,38 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
                     && matches!(
                         action,
                         ui::mouse::ClickAction::NavCandidateSelect(_)
+                            | ui::mouse::ClickAction::NavCandidateGroupToggle(_)
+                            | ui::mouse::ClickAction::NavCandidatesCapture
                             | ui::mouse::ClickAction::NavCandidatesClose
                     )
                 {
+                    if !matches!(action, ui::mouse::ClickAction::NavCandidateSelect(_)) {
+                        app.handle_action(action);
+                        app.last_click = None;
+                        return;
+                    }
+                    if app.engine.nav_peek_mode() == reef_app::NavPeekMode::Compact {
+                        app.handle_action(action);
+                        app.nav_pick_candidate();
+                        app.last_click = None;
+                        return;
+                    }
+                    let now = Instant::now();
+                    let is_double = matches!(
+                        app.last_click,
+                        Some((at, col, row))
+                            if col == mouse.column
+                                && row == mouse.row
+                                && now.duration_since(at) < DOUBLE_CLICK_WINDOW
+                    );
+                    if is_double {
+                        app.handle_action(action);
+                        app.nav_pick_candidate();
+                        app.last_click = None;
+                        return;
+                    }
                     app.handle_action(action);
+                    app.last_click = Some((now, mouse.column, mouse.row));
                     return;
                 }
             }
@@ -2935,12 +2982,6 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
             app.hover_col = Some(mouse.column);
 
             let has_ctrl = mouse.modifiers.contains(KeyModifiers::CONTROL);
-            // UX: a popup opened by Ctrl+click closes the moment the
-            // user releases Ctrl. Popups opened by keyboard `gd` are
-            // left alone — mouse motion shouldn't dismiss them.
-            if !has_ctrl && app.engine.nav_candidates_opened_by_ctrl_click() {
-                app.nav_close_candidates();
-            }
             // Track the identifier under a Ctrl+hover for the
             // underline-on-hover affordance. Cleared whenever Ctrl
             // isn't held or the cursor leaves the preview pane —
@@ -3358,6 +3399,27 @@ fn clamp_col_to_side(hit: &crate::ui::selection::DiffHit, col: u16, side: DiffSi
             col.min(hit.right_start_x.saturating_sub(1))
         }
         (DiffLayout::SideBySide, DiffSide::SbsRight) => col.max(hit.right_start_x),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NavPeekScrollTarget {
+    Preview,
+    Tree,
+}
+
+fn nav_peek_scroll_target(
+    col: u16,
+    row: u16,
+    preview: Option<Rect>,
+    tree: Option<Rect>,
+) -> Option<NavPeekScrollTarget> {
+    if preview.is_some_and(|rect| point_in_rect(rect, col, row)) {
+        Some(NavPeekScrollTarget::Preview)
+    } else if tree.is_some_and(|rect| point_in_rect(rect, col, row)) {
+        Some(NavPeekScrollTarget::Tree)
+    } else {
+        None
     }
 }
 
@@ -4367,6 +4429,38 @@ fn hex_digit(b: u8) -> Option<u8> {
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod nav_peek_scroll_tests {
+    use super::*;
+
+    const PREVIEW: Rect = Rect::new(10, 5, 40, 12);
+    const TREE: Rect = Rect::new(50, 5, 20, 12);
+
+    #[test]
+    fn pointer_over_preview_targets_preview_scroll() {
+        assert_eq!(
+            nav_peek_scroll_target(20, 10, Some(PREVIEW), Some(TREE)),
+            Some(NavPeekScrollTarget::Preview)
+        );
+    }
+
+    #[test]
+    fn pointer_over_tree_targets_tree_scroll() {
+        assert_eq!(
+            nav_peek_scroll_target(60, 10, Some(PREVIEW), Some(TREE)),
+            Some(NavPeekScrollTarget::Tree)
+        );
+    }
+
+    #[test]
+    fn pointer_outside_peek_has_no_scroll_target() {
+        assert_eq!(
+            nav_peek_scroll_target(5, 2, Some(PREVIEW), Some(TREE)),
+            None
+        );
+    }
+}
 
 /// Anchor every time-injection test on a single base instant so
 /// durations line up with module constants. `Instant` has no public

@@ -126,6 +126,20 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
   status map in O(inserted rows), rather than cloning or rebuilding the repository-wide status
   snapshot for every expansion.
 - Preview loads run through the `reef-app` task coordinator. The preview worker publishes the base document first; only after that result is accepted does a separate enrichment worker add syntax highlighting and tree-sitter data. Renderers must accept the plain snapshot immediately and treat enrichment as an in-place revision update. Adapter actions that need enrichment, such as TUI code navigation or deferred UTF-16 highlights, must retain a generation/path-bound intent and retry it from `RetryDeferredPreviewActions`; they must not discard the input while the enrichment request is pending.
+- Multi-result code navigation keeps the candidate model and selected file preview in `reef-app`.
+  Candidates are sorted and grouped by workspace-relative file; changing the selection dispatches a
+  latest-wins navigation-preview request on its own worker when the expanded Peek mode is active.
+  Compact mode renders candidates without requesting that preview. The main Preview document
+  remains untouched until the user confirms a jump. Renderers may own the Peek anchor and hit
+  geometry and pass the current candidate viewport row count with navigation open, selection,
+  group-toggle, mode-toggle, and scroll commands. The app uses that row count to keep selection and
+  scroll bounds valid without owning terminal geometry. Renderers must render the cached navigation
+  document and never read the selected file themselves.
+- Native renderers map their platform navigation modifier-click to a typed file cursor and dispatch
+  `NavigatePreviewDefinitionAt`. `reef-app` schedules the initial workspace-index build from its
+  stale async state, retains a generation/path-bound request while preview
+  enrichment or the workspace index is pending, resolves definitions with the workspace index, falls through to
+  references at declarations, and owns candidate confirmation plus navigation history.
 - Preview snapshots expose separate content and presentation revisions. `source_revision` changes only when accepted raw preview content changes; `revision` may also change when asynchronous enrichment arrives. Content-relative state such as find, selection, and navigation uses `source_revision`, while renderer caches that include styling use `revision`.
 - OS drag-and-drop and place-mode sources use `CopyFiles`. A remote backend treats every such path
   as host-local and uploads it; workdir-internal clipboard copies use `CopyPaths`. Placement uses

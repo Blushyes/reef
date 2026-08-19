@@ -7,6 +7,7 @@ pub const COMMIT_DIFF_LAYOUT: &str = "commit.diff_layout";
 pub const COMMIT_DIFF_MODE: &str = "commit.diff_mode";
 pub const COMMIT_FILES_TREE_MODE: &str = "commit.files_tree_mode";
 pub const STRUCTURED_PREVIEW_MODE: &str = "preview.structured_mode";
+pub const NAV_PEEK_MODE: &str = "nav.peek_mode";
 pub const UI_THEME: &str = "ui.theme";
 pub const EDITOR_COMMAND: &str = "editor.command";
 pub const HOSTS_RECENT: &str = "hosts.recent";

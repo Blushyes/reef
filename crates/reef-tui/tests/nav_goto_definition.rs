@@ -262,7 +262,10 @@ fn main() { let a = A; a.run(); }
         popup.candidates.len() >= 2,
         "popup contains the impl candidates"
     );
-    assert_eq!(popup.selected, 0, "popup defaults to row 0");
+    assert_eq!(
+        popup.candidates[popup.selected].line, 3,
+        "popup initially selects the definition nearest the call site"
+    );
     assert!(
         app.engine.state.location_history.is_empty(),
         "back-stack NOT pushed yet — pick commits, not open"
@@ -433,7 +436,7 @@ fn candidates_popup_scrolls_to_keep_selection_visible() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp, _g) = fresh_app();
     // 20 same-named methods across impl blocks → 20 candidates,
-    // well past MAX_VISIBLE_ROWS (8).
+    // well past MAX_VISIBLE_ROWS.
     let mut src = String::new();
     for i in 0..20 {
         src.push_str(&format!("impl S{i} {{ fn run(&self) {{}} }}\n"));
@@ -451,20 +454,29 @@ fn candidates_popup_scrolls_to_keep_selection_visible() {
         .as_ref()
         .expect("popup for 20 defs");
     assert!(popup.candidates.len() >= 8, "many candidates");
-    assert_eq!(popup.selected, 0);
-    assert_eq!(popup.scroll, 0, "starts un-scrolled");
+    let initial_selected = popup.selected;
+    let initial_row = popup.selected_tree_row();
+    assert!(
+        initial_row >= popup.scroll
+            && initial_row < popup.scroll + reef_app::NavCandidatesPopup::MAX_VISIBLE_ROWS,
+        "nearest candidate starts inside the visible tree window"
+    );
 
     // Walk selection down past the visible window; scroll must follow.
     for _ in 0..10 {
         app.nav_candidates_move(1);
     }
     let popup = app.engine.state.nav_candidates.as_ref().unwrap();
-    assert_eq!(popup.selected, 10);
-    assert!(
-        popup.selected >= popup.scroll
-            && popup.selected < popup.scroll + reef_app::NavCandidatesPopup::MAX_VISIBLE_ROWS,
-        "selection {} must be within window [{}, {}+{})",
+    assert_eq!(
         popup.selected,
+        (initial_selected + 10) % popup.candidates.len()
+    );
+    let selected_row = popup.selected_tree_row();
+    assert!(
+        selected_row >= popup.scroll
+            && selected_row < popup.scroll + reef_app::NavCandidatesPopup::MAX_VISIBLE_ROWS,
+        "selection {} must be within window [{}, {}+{})",
+        selected_row,
         popup.scroll,
         popup.scroll,
         reef_app::NavCandidatesPopup::MAX_VISIBLE_ROWS
@@ -485,10 +497,16 @@ fn candidates_popup_wheel_scrolls_without_moving_selection() {
     set_keyboard_cursor(&mut app, cursor.0, cursor.1);
     app.goto_definition_at_cursor(NavAnchor::Keyboard);
 
-    let before_sel = app.engine.state.nav_candidates.as_ref().unwrap().selected;
-    app.nav_candidates_scroll(3);
+    let before = app.engine.state.nav_candidates.as_ref().unwrap();
+    let before_sel = before.selected;
+    let before_scroll = before.scroll;
+    app.nav_candidates_scroll(-3);
     let popup = app.engine.state.nav_candidates.as_ref().unwrap();
-    assert_eq!(popup.scroll, 3, "wheel moved the window");
+    assert_eq!(
+        popup.scroll,
+        before_scroll.saturating_sub(3),
+        "wheel moved the window"
+    );
     assert_eq!(
         popup.selected, before_sel,
         "wheel scroll must not move the highlighted row"

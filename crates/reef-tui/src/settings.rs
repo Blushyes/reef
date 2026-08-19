@@ -30,6 +30,7 @@ pub(crate) fn item_label(item: SettingItem) -> crate::i18n::Msg {
         SettingItem::CommitDiffLayout => Msg::SettingsItemCommitDiffLayout,
         SettingItem::CommitDiffMode => Msg::SettingsItemCommitDiffMode,
         SettingItem::CommitFilesTreeMode => Msg::SettingsItemCommitFilesTreeMode,
+        SettingItem::NavPeekMode => Msg::SettingsItemNavPeekMode,
         SettingItem::Lsp(_) => Msg::SettingsItemLsp,
     }
 }
@@ -45,6 +46,7 @@ pub(crate) fn item_description(item: SettingItem) -> crate::i18n::Msg {
         SettingItem::CommitDiffLayout => Msg::SettingsDescCommitDiffLayout,
         SettingItem::CommitDiffMode => Msg::SettingsDescCommitDiffMode,
         SettingItem::CommitFilesTreeMode => Msg::SettingsDescCommitFilesTreeMode,
+        SettingItem::NavPeekMode => Msg::SettingsDescNavPeekMode,
         SettingItem::Lsp(_) => Msg::SettingsDescLsp,
     }
 }
@@ -119,6 +121,10 @@ pub(crate) fn current_value(item: SettingItem, app: &App) -> ItemValue {
             ItemValue::Choice(diff_mode_label(app.engine.commit_diff_mode()))
         }
         SettingItem::CommitFilesTreeMode => ItemValue::Bool(app.engine.commit_files_tree_mode()),
+        SettingItem::NavPeekMode => ItemValue::Choice(match app.engine.nav_peek_mode() {
+            reef_app::NavPeekMode::Expanded => t(crate::i18n::Msg::SettingsValuePeekExpanded),
+            reef_app::NavPeekMode::Compact => t(crate::i18n::Msg::SettingsValuePeekCompact),
+        }),
         SettingItem::Lsp(lang) => ItemValue::LspStatus {
             lang,
             state: app.lsp_view_for(lang),
@@ -154,6 +160,7 @@ pub fn cycle(app: &mut App, item: SettingItem) {
         SettingItem::CommitDiffLayout => app.toggle_commit_diff_layout(),
         SettingItem::CommitDiffMode => app.toggle_commit_diff_mode(),
         SettingItem::CommitFilesTreeMode => app.toggle_commit_files_tree_mode(),
+        SettingItem::NavPeekMode => app.toggle_nav_peek_mode(),
         SettingItem::Lsp(lang) => {
             app.activate_lsp_row(lang);
             return;
@@ -281,6 +288,33 @@ mod tests {
             Some("side_by_side")
         );
         assert_eq!(crate::prefs::get("diff.layout"), None);
+    }
+
+    #[test]
+    fn cycle_nav_peek_mode_updates_app_and_prefs() {
+        let (_lock, _h, _g, _home, _cwd, mut app) = isolated_app();
+
+        cycle(&mut app, SettingItem::NavPeekMode);
+
+        assert_eq!(app.engine.nav_peek_mode(), reef_app::NavPeekMode::Compact);
+        assert_eq!(
+            crate::prefs::get(reef_core::prefs::NAV_PEEK_MODE).as_deref(),
+            Some("compact")
+        );
+    }
+
+    #[test]
+    fn saved_nav_peek_mode_is_loaded_at_startup() {
+        let _lock = HOME_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let _home_guard = HomeGuard::enter(home.path());
+        let _cwd_guard = CwdGuard::enter(cwd.path());
+        crate::prefs::set(reef_core::prefs::NAV_PEEK_MODE, "compact");
+
+        let app = App::new(Theme::dark(), None);
+
+        assert_eq!(app.engine.nav_peek_mode(), reef_app::NavPeekMode::Compact);
     }
 
     #[test]

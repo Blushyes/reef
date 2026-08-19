@@ -174,6 +174,14 @@ pub struct TuiApp {
     pub hover_row: Option<u16>,
     pub hover_col: Option<u16>,
     pub last_click: Option<(Instant, u16, u16)>,
+    pub nav_peek_anchor_col: u16,
+    pub nav_peek_anchor_row: u16,
+    pub(crate) nav_peek_preview_rect: Option<ratatui::layout::Rect>,
+    pub(crate) nav_peek_tree_rect: Option<ratatui::layout::Rect>,
+    pub(crate) nav_peek_preview_scroll: usize,
+    pub(crate) nav_peek_preview_max_scroll: usize,
+    pub(crate) nav_peek_preview_target: Option<(String, usize, usize)>,
+    pub(crate) nav_peek_visible_rows: usize,
 
     /// Active color theme. Chosen in `main.rs` before raw-mode entry.
     pub theme: Theme,
@@ -294,6 +302,10 @@ impl App {
                     .as_deref()
                     .map(reef_app::StructuredPreviewMode::from_pref_str)
                     .unwrap_or_default(),
+                    nav_peek_mode: crate::prefs::get(reef_core::prefs::NAV_PEEK_MODE)
+                        .as_deref()
+                        .map(reef_app::NavPeekMode::from_pref_str)
+                        .unwrap_or_default(),
                     quick_open: crate::quick_open::from_prefs(),
                 },
                 subscribe_fs_events: true,
@@ -342,6 +354,14 @@ impl App {
             hover_row: None,
             hover_col: None,
             last_click: None,
+            nav_peek_anchor_col: 0,
+            nav_peek_anchor_row: 0,
+            nav_peek_preview_rect: None,
+            nav_peek_tree_rect: None,
+            nav_peek_preview_scroll: 0,
+            nav_peek_preview_max_scroll: 0,
+            nav_peek_preview_target: None,
+            nav_peek_visible_rows: reef_app::NavCandidatesPopup::MAX_VISIBLE_ROWS,
             theme,
             space_leader_at: None,
             g_pending_at: None,
@@ -356,10 +376,6 @@ impl App {
         };
         app.refresh_status();
         app.refresh_file_tree();
-        // Build the workspace symbol index immediately on repo open. SSH
-        // sessions skip this because the index walks local files and is not
-        // useful for remote-only paths.
-        app.dispatch_nav_workspace_build();
         // Probe which LSP binaries are installed ONCE here (off the
         // render path) so the status-bar badge / Settings rows read a
         // cached map instead of walking PATH every frame.
@@ -1465,6 +1481,17 @@ impl App {
         );
     }
 
+    pub fn toggle_nav_peek_mode(&mut self) {
+        self.engine
+            .dispatch(reef_app::AppCommand::ToggleNavPeekMode {
+                viewport_rows: self.nav_peek_visible_rows,
+            });
+        crate::prefs::set(
+            reef_core::prefs::NAV_PEEK_MODE,
+            self.engine.nav_peek_mode().pref_str(),
+        );
+    }
+
     pub fn set_structured_preview_mode(&mut self, mode: reef_app::StructuredPreviewMode) {
         self.engine
             .dispatch(reef_app::AppCommand::SetStructuredPreviewMode(mode));
@@ -2373,17 +2400,23 @@ impl App {
                 self.close_selection_context_menu();
             }
             ClickAction::NavCandidateSelect(idx) => {
-                // Move selection to the clicked row, then commit. A
-                // double-click semantics here would be safer (single
-                // = move, double = pick), but the tree context menu
-                // commits on single click too — keep them consistent.
                 self.engine
-                    .dispatch(reef_app::AppCommand::SelectNavCandidate(idx));
-                self.nav_pick_candidate();
+                    .dispatch(reef_app::AppCommand::SelectNavCandidate {
+                        index: idx,
+                        viewport_rows: self.nav_peek_visible_rows,
+                    });
+            }
+            ClickAction::NavCandidateGroupToggle(idx) => {
+                self.engine
+                    .dispatch(reef_app::AppCommand::ToggleNavCandidateGroup {
+                        index: idx,
+                        viewport_rows: self.nav_peek_visible_rows,
+                    });
             }
             ClickAction::NavCandidatesClose => {
                 self.nav_close_candidates();
             }
+            ClickAction::NavCandidatesCapture => {}
             ClickAction::OpenMarkdownLink(target) => {
                 self.open_markdown_link(&target);
             }

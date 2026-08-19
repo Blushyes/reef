@@ -13,6 +13,7 @@ use ratatui_image::picker::Picker;
 use reef::TuiApp as App;
 use reef::ui;
 use reef::ui::theme::Theme;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -448,6 +449,43 @@ fn wait_for_preview(app: &mut App) {
     panic!("timed out waiting for preview worker");
 }
 
+fn wait_for_nav_preview(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        app.tick();
+        if !app.engine.state.nav_preview_load.loading
+            && app.engine.state.nav_preview_content.is_some()
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for navigation Peek preview");
+}
+
+fn wait_for_text_preview_enrichment(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        app.tick();
+        let enriched = app
+            .engine
+            .state
+            .preview_content
+            .as_deref()
+            .is_some_and(|preview| {
+                matches!(
+                    &preview.body,
+                    reef_core::preview::PreviewBody::Text(text) if text.parsed.is_some()
+                )
+            });
+        if enriched {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for text preview enrichment");
+}
+
 fn wait_for_db_detail(app: &mut App) {
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
@@ -781,6 +819,111 @@ fn snapshot_find_widget_on_preview() {
     let output = render_app(&mut app, 100, 24);
     with_filters(&[], || {
         insta::assert_snapshot!("find_widget_on_preview", output)
+    });
+}
+
+#[test]
+fn snapshot_navigation_peek() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    force_en_lang();
+    let (tmp, raw) = tempdir_repo();
+    commit_file(
+        &raw,
+        "src/theme.rs",
+        r#"pub const DARK_THEME: &str = "dark";
+pub const LIGHT_THEME: &str = "light";
+
+pub fn parse_theme(value: &str) -> bool {
+    value == DARK_THEME || value == LIGHT_THEME
+}
+
+fn normalize_theme(value: &str) -> &str {
+    value.trim()
+}
+
+fn system_theme() -> &'static str {
+    DARK_THEME
+}
+
+pub fn theme_label(value: &str) -> &'static str {
+    match normalize_theme(value) {
+        DARK_THEME => "Dark",
+        LIGHT_THEME => "Light",
+        _ => "System",
+    }
+}
+
+pub fn load_theme() -> bool {
+    let stored = system_theme();
+    parse_theme(stored)
+}
+"#,
+        "theme helpers",
+    );
+    write_file(
+        &raw,
+        "src/main.rs",
+        "mod theme;\n\nfn main() {\n    let dark = theme::parse_theme(\"light\");\n    println!(\"{dark}\");\n}\n",
+    );
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _home = HomeGuard::enter(home.path());
+    let _cwd = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    wait_for_file_tree(&mut app);
+    app.load_preview_for_path(PathBuf::from("src/theme.rs"));
+    wait_for_preview(&mut app);
+    wait_for_text_preview_enrichment(&mut app);
+    let _ = render_app(&mut app, 110, 28);
+
+    let origin = reef_app::LocationSnapshot {
+        surface: reef_app::LocationSurface::FilePreview,
+        path: PathBuf::from("src/theme.rs"),
+        cursor: reef_app::CursorPosition {
+            line: 0,
+            byte_col: 7,
+        },
+        scroll: reef_app::ScrollPosition {
+            vertical: 0,
+            horizontal: 0,
+        },
+    };
+    let candidates = vec![
+        reef_core::nav::Location {
+            path: Some(PathBuf::from("src/theme.rs")),
+            line: 24,
+            byte_range: 4..15,
+            snippet: "parse_theme(stored)".to_owned(),
+        },
+        reef_core::nav::Location {
+            path: Some(PathBuf::from("src/main.rs")),
+            line: 3,
+            byte_range: 22..33,
+            snippet: "let dark = theme::parse_theme(\"light\");".to_owned(),
+        },
+    ];
+    app.nav_peek_anchor_col = 44;
+    app.nav_peek_anchor_row = 8;
+    app.engine.state.open_nav_candidates(
+        reef_app::NavCandidatesPopup::new(
+            candidates,
+            PathBuf::from("src/theme.rs"),
+            origin,
+            "parse_theme".to_owned(),
+            reef_app::NavCandidateKind::References,
+        ),
+        true,
+        12,
+    );
+    wait_for_nav_preview(&mut app);
+
+    let output = render_app(&mut app, 110, 28);
+    with_filters(&[], || insta::assert_snapshot!("navigation_peek", output));
+
+    app.toggle_nav_peek_mode();
+    let compact_output = render_app(&mut app, 110, 28);
+    with_filters(&[], || {
+        insta::assert_snapshot!("navigation_peek_compact", compact_output)
     });
 }
 

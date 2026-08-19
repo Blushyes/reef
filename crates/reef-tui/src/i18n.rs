@@ -129,6 +129,10 @@ pub enum Msg {
     PreviewBinaryTooLarge,
     PreviewBinaryDecodeError,
     PreviewBinaryEmpty,
+    NavDefinitions,
+    NavReferences,
+    NavPreviewLoading,
+    NavPreviewUnavailable,
     /// SQLite preview: header for the left-side tables list column.
     DbTablesHeader,
     /// SQLite preview: shown when the database has zero user tables.
@@ -262,6 +266,7 @@ pub enum Msg {
     SettingsItemCommitDiffLayout,
     SettingsItemCommitDiffMode,
     SettingsItemCommitFilesTreeMode,
+    SettingsItemNavPeekMode,
     SettingsDescTheme,
     SettingsDescEditor,
     SettingsDescDiffLayout,
@@ -270,11 +275,14 @@ pub enum Msg {
     SettingsDescCommitDiffLayout,
     SettingsDescCommitDiffMode,
     SettingsDescCommitFilesTreeMode,
+    SettingsDescNavPeekMode,
     SettingsValueThemeAuto,
     SettingsValueThemeDark,
     SettingsValueThemeLight,
     SettingsValueOn,
     SettingsValueOff,
+    SettingsValuePeekExpanded,
+    SettingsValuePeekCompact,
     SettingsEditorPlaceholder,
     /// Toast for cycling `ui.theme` to `auto` — the OSC 11 probe only
     /// runs at startup before raw mode, so the live theme keeps its
@@ -363,6 +371,10 @@ fn t_zh(m: Msg) -> &'static str {
         PreviewBinaryTooLarge => "文件过大，跳过解码",
         PreviewBinaryDecodeError => "解码失败",
         PreviewBinaryEmpty => "空文件",
+        NavDefinitions => "定义",
+        NavReferences => "引用",
+        NavPreviewLoading => "正在加载预览…",
+        NavPreviewUnavailable => "预览不可用",
         DbTablesHeader => "表",
         DbEmpty => "(空数据库)",
         DbNoRows => "(无数据)",
@@ -459,6 +471,7 @@ fn t_zh(m: Msg) -> &'static str {
         SettingsItemCommitDiffLayout => "提交 Diff 布局",
         SettingsItemCommitDiffMode => "提交 Diff 模式",
         SettingsItemCommitFilesTreeMode => "提交文件列表树形视图",
+        SettingsItemNavPeekMode => "导航 Peek 模式",
         SettingsDescTheme => "auto 自动检测终端背景；显式指定可避免误判（重启后生效一次）",
         SettingsDescEditor => {
             "Enter 打开文件时调用的命令；留空则按 $VISUAL → $EDITOR → vi 顺序回退"
@@ -469,11 +482,14 @@ fn t_zh(m: Msg) -> &'static str {
         SettingsDescCommitDiffLayout => "图表 tab commit 详情中的 diff 显示方式",
         SettingsDescCommitDiffMode => "图表 tab commit 详情中的 diff 显示范围",
         SettingsDescCommitFilesTreeMode => "图表 tab commit 变更文件用树形或列表呈现",
+        SettingsDescNavPeekMode => "完整模式显示代码预览和引用树；紧凑模式只显示候选列表",
         SettingsValueThemeAuto => "自动",
         SettingsValueThemeDark => "深色",
         SettingsValueThemeLight => "浅色",
         SettingsValueOn => "开",
         SettingsValueOff => "关",
+        SettingsValuePeekExpanded => "完整",
+        SettingsValuePeekCompact => "紧凑",
         SettingsEditorPlaceholder => "(未设置 — 使用 $VISUAL / $EDITOR / vi)",
         SettingsAutoThemeOnNextLaunch => "已切换到 auto 主题，下次启动生效",
         SettingsSectionNav => "代码导航",
@@ -548,6 +564,10 @@ fn t_en(m: Msg) -> &'static str {
         PreviewBinaryTooLarge => "file too large to decode",
         PreviewBinaryDecodeError => "decode failed",
         PreviewBinaryEmpty => "empty file",
+        NavDefinitions => "definitions",
+        NavReferences => "references",
+        NavPreviewLoading => "Loading preview…",
+        NavPreviewUnavailable => "Preview unavailable",
         DbTablesHeader => "tables",
         DbEmpty => "(empty database)",
         DbNoRows => "(no rows)",
@@ -644,6 +664,7 @@ fn t_en(m: Msg) -> &'static str {
         SettingsItemCommitDiffLayout => "Commit diff layout",
         SettingsItemCommitDiffMode => "Commit diff mode",
         SettingsItemCommitFilesTreeMode => "Commit files — tree view",
+        SettingsItemNavPeekMode => "Navigation Peek mode",
         SettingsDescTheme => {
             "auto detects terminal background; pick dark / light to override (takes effect on next launch)"
         }
@@ -656,11 +677,16 @@ fn t_en(m: Msg) -> &'static str {
         SettingsDescCommitDiffLayout => "Graph tab commit-detail diff layout",
         SettingsDescCommitDiffMode => "Graph tab commit-detail diff body",
         SettingsDescCommitFilesTreeMode => "Graph tab commit changed files — tree or flat list",
+        SettingsDescNavPeekMode => {
+            "Expanded shows code preview and the reference tree; compact shows only candidates"
+        }
         SettingsValueThemeAuto => "auto",
         SettingsValueThemeDark => "dark",
         SettingsValueThemeLight => "light",
         SettingsValueOn => "on",
         SettingsValueOff => "off",
+        SettingsValuePeekExpanded => "expanded",
+        SettingsValuePeekCompact => "compact",
         SettingsEditorPlaceholder => "(unset — uses $VISUAL / $EDITOR / vi)",
         SettingsAutoThemeOnNextLaunch => "Theme set to auto — takes effect on next launch",
         SettingsSectionNav => "Code Navigation",
@@ -1222,6 +1248,10 @@ mod tests {
             Msg::PushSuccess,
             Msg::HelpQuit,
             Msg::DiffEmpty,
+            Msg::NavDefinitions,
+            Msg::NavReferences,
+            Msg::NavPreviewLoading,
+            Msg::NavPreviewUnavailable,
         ] {
             assert!(!t_zh(m).is_empty());
             assert!(!t_en(m).is_empty());

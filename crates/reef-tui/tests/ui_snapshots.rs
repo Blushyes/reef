@@ -13,7 +13,8 @@ use ratatui_image::picker::Picker;
 use reef::TuiApp as App;
 use reef::ui;
 use reef::ui::theme::Theme;
-use std::sync::Mutex;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use test_support::{
@@ -784,6 +785,135 @@ fn snapshot_find_widget_on_preview() {
     });
 }
 
+#[test]
+fn snapshot_navigation_peek() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    force_en_lang();
+    let (tmp, raw) = tempdir_repo();
+    commit_file(
+        &raw,
+        "src/theme.rs",
+        r#"pub const DARK_THEME: &str = "dark";
+pub const LIGHT_THEME: &str = "light";
+
+pub fn parse_theme(value: &str) -> bool {
+    value == DARK_THEME || value == LIGHT_THEME
+}
+
+fn normalize_theme(value: &str) -> &str {
+    value.trim()
+}
+
+fn system_theme() -> &'static str {
+    DARK_THEME
+}
+
+pub fn theme_label(value: &str) -> &'static str {
+    match normalize_theme(value) {
+        DARK_THEME => "Dark",
+        LIGHT_THEME => "Light",
+        _ => "System",
+    }
+}
+
+pub fn load_theme() -> bool {
+    let stored = system_theme();
+    parse_theme(stored)
+}
+"#,
+        "theme helpers",
+    );
+    write_file(
+        &raw,
+        "src/main.rs",
+        "mod theme;\n\nfn main() {\n    let dark = theme::parse_theme(\"light\");\n    println!(\"{dark}\");\n}\n",
+    );
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _home = HomeGuard::enter(home.path());
+    let _cwd = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    wait_for_file_tree(&mut app);
+    app.load_preview_for_path(PathBuf::from("src/theme.rs"));
+    wait_for_preview(&mut app);
+    let preview = Arc::make_mut(
+        app.engine
+            .state
+            .preview_content
+            .as_mut()
+            .expect("theme preview loaded"),
+    );
+    let reef_core::preview::PreviewBody::Text(text) = &mut preview.body else {
+        panic!("theme preview is text");
+    };
+    let source: Arc<[u8]> = Arc::from(text.lines.join("\n").into_bytes().into_boxed_slice());
+    text.parsed = reef_core::nav::parse_file_if_supported(reef_core::nav::NavLang::Rust, source)
+        .map(Arc::new);
+    app.engine
+        .state
+        .lsp_installed
+        .insert(reef_core::nav::NavLang::Rust, true);
+    let nav_preview_content = app
+        .engine
+        .state
+        .preview_content
+        .clone()
+        .expect("theme preview loaded");
+    let _ = render_app(&mut app, 110, 28);
+
+    let origin = reef_app::LocationSnapshot {
+        surface: reef_app::LocationSurface::FilePreview,
+        path: PathBuf::from("src/theme.rs"),
+        cursor: reef_app::CursorPosition {
+            line: 0,
+            byte_col: 7,
+        },
+        scroll: reef_app::ScrollPosition {
+            vertical: 0,
+            horizontal: 0,
+        },
+    };
+    let candidates = vec![
+        reef_core::nav::Location {
+            path: Some(PathBuf::from("src/theme.rs")),
+            line: 24,
+            byte_range: 4..15,
+            snippet: "parse_theme(stored)".to_owned(),
+        },
+        reef_core::nav::Location {
+            path: Some(PathBuf::from("src/main.rs")),
+            line: 3,
+            byte_range: 22..33,
+            snippet: "let dark = theme::parse_theme(\"light\");".to_owned(),
+        },
+    ];
+    app.nav_peek_anchor_col = 44;
+    app.nav_peek_anchor_row = 8;
+    app.engine.state.settings.nav_peek_mode = reef_app::NavPeekMode::Compact;
+    app.engine.state.open_nav_candidates(
+        reef_app::NavCandidatesPopup::new(
+            candidates,
+            PathBuf::from("src/theme.rs"),
+            origin,
+            "parse_theme".to_owned(),
+            reef_app::NavCandidateKind::References,
+        ),
+        true,
+        12,
+    );
+    app.engine.state.settings.nav_peek_mode = reef_app::NavPeekMode::Expanded;
+    app.engine.state.nav_preview_content = Some(nav_preview_content);
+
+    let output = render_app(&mut app, 110, 28);
+    with_filters(&[], || insta::assert_snapshot!("navigation_peek", output));
+
+    app.toggle_nav_peek_mode();
+    let compact_output = render_app(&mut app, 110, 28);
+    with_filters(&[], || {
+        insta::assert_snapshot!("navigation_peek_compact", compact_output)
+    });
+}
+
 /// Build a SQLite fixture with the four object kinds + a virtual table
 /// so the new grouped sidebar has something to render. Returns the
 /// path within `tmp` that the file tree will pick up.
@@ -830,6 +960,8 @@ fn wait_for_db_cell(app: &mut App) {
     while Instant::now() < deadline {
         app.tick();
         if !app.engine.state.db_cell_load.loading
+            && !app.engine.state.file_tree_load.loading
+            && !app.engine.state.file_tree_load.stale
             && app
                 .engine
                 .state

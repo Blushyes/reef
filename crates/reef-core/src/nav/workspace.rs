@@ -37,6 +37,7 @@ pub const MAX_FILE_BYTES_INDEX: u64 = 512 * 1024;
 
 /// Bounded snippet length for the candidate / refs UI.
 pub(crate) const SNIPPET_MAX_W: usize = 80;
+const SNIPPET_LEADING_CONTEXT: usize = 16;
 
 /// In-memory workspace symbol index. Keyed by identifier text; each
 /// value is the list of definition sites across the workspace.
@@ -203,25 +204,64 @@ fn extract_symbols(
                 path: rel_path.to_path_buf(),
                 line: start.row,
                 byte_range: start.column..end.column,
-                snippet: snippet_for(source, start.row),
+                snippet: snippet_for(source, start.row, start.column..end.column),
                 lang,
             });
         }
     }
 }
 
-pub(crate) fn snippet_for(source: &[u8], line: usize) -> String {
-    snippet_from_line(super::line_bytes_at(source, line))
+pub(crate) fn snippet_for(source: &[u8], line: usize, target_byte_range: Range<usize>) -> String {
+    snippet_from_line(super::line_bytes_at(source, line), target_byte_range)
 }
 
-pub(crate) fn snippet_from_line(line: &[u8]) -> String {
+pub(crate) fn snippet_from_line(line: &[u8], target_byte_range: Range<usize>) -> String {
     let s = String::from_utf8_lossy(line);
     let trimmed = s.trim_start();
     if trimmed.chars().count() > SNIPPET_MAX_W {
-        trimmed.chars().take(SNIPPET_MAX_W).collect::<String>() + "…"
+        focused_snippet(&s, target_byte_range).unwrap_or_else(|| leading_snippet(trimmed))
     } else {
         trimmed.to_string()
     }
+}
+
+fn focused_snippet(line: &str, target_byte_range: Range<usize>) -> Option<String> {
+    let leading_bytes = line.len() - line.trim_start().len();
+    let target_start = target_byte_range.start.checked_sub(leading_bytes)?;
+    let target_end = target_byte_range.end.checked_sub(leading_bytes)?;
+    let trimmed = line.trim_start();
+    if target_start > target_end
+        || target_end > trimmed.len()
+        || !trimmed.is_char_boundary(target_start)
+        || !trimmed.is_char_boundary(target_end)
+    {
+        return None;
+    }
+
+    let target_start_chars = trimmed[..target_start].chars().count();
+    let target_end_chars = target_start_chars + trimmed[target_start..target_end].chars().count();
+    let total_chars = trimmed.chars().count();
+    let window_start = target_start_chars.saturating_sub(SNIPPET_LEADING_CONTEXT);
+    let window_end = total_chars.min(window_start.saturating_add(SNIPPET_MAX_W));
+    let window_end = window_end.max(target_end_chars);
+    let mut snippet = String::new();
+    if window_start > 0 {
+        snippet.push('…');
+    }
+    snippet.extend(
+        trimmed
+            .chars()
+            .skip(window_start)
+            .take(window_end - window_start),
+    );
+    if window_end < total_chars {
+        snippet.push('…');
+    }
+    Some(snippet)
+}
+
+fn leading_snippet(line: &str) -> String {
+    line.chars().take(SNIPPET_MAX_W).collect::<String>() + "…"
 }
 
 /// Per-language reference query. Matches every identifier-shaped node
@@ -362,5 +402,38 @@ mod tests {
 
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].path.as_deref(), Some(Path::new("src/b.rs")));
+    }
+
+    #[test]
+    fn long_navigation_snippet_keeps_target_near_the_front() {
+        let line = concat!(
+            "from pipeline.shared.script_v4 import CharacterImageRequest, ",
+            "GeneratedCharacterImage, parse_script_v4, TargetSpec"
+        );
+        let target_start = line.find("parse_script_v4").unwrap();
+
+        let snippet = snippet_from_line(
+            line.as_bytes(),
+            target_start..target_start + "parse_script_v4".len(),
+        );
+
+        assert!(snippet.starts_with('…'));
+        assert!(snippet.contains("parse_script_v4"));
+        let snippet_target_start = snippet.find("parse_script_v4").unwrap();
+        assert!(snippet[..snippet_target_start].chars().count() <= SNIPPET_LEADING_CONTEXT + 1);
+        assert!(snippet.chars().count() <= SNIPPET_MAX_W + 2);
+    }
+
+    #[test]
+    fn short_navigation_snippet_preserves_trimmed_line() {
+        let line = "    let value = parse_script_v4();";
+        let target_start = line.find("parse_script_v4").unwrap();
+
+        let snippet = snippet_from_line(
+            line.as_bytes(),
+            target_start..target_start + "parse_script_v4".len(),
+        );
+
+        assert_eq!(snippet, "let value = parse_script_v4();");
     }
 }

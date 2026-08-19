@@ -332,27 +332,123 @@ pub struct LspRefineOutcome {
 }
 
 #[derive(Debug, Clone)]
+pub struct NavCandidateGroup {
+    pub path: PathBuf,
+    pub candidate_range: Range<usize>,
+    pub expanded: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavCandidateKind {
+    Definitions,
+    References,
+}
+
+#[derive(Debug, Clone)]
 pub struct NavCandidatesPopup {
-    pub anchor_col: u16,
-    pub anchor_row: u16,
     pub candidates: Vec<reef_core::nav::Location>,
+    pub groups: Vec<NavCandidateGroup>,
     pub selected: usize,
     pub scroll: usize,
     pub current_path: PathBuf,
     pub origin: crate::LocationSnapshot,
-    pub opened_by_ctrl_click: bool,
-    pub max_row_width: u16,
+    pub symbol: String,
+    pub kind: NavCandidateKind,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPreviewDefinition {
+    cursor: crate::CursorPosition,
+    path: PathBuf,
+    preview_generation: u64,
+    dark: bool,
+    view_height: usize,
+    peek_viewport_rows: usize,
+}
+
+struct ResolvedPreviewNavigation {
+    current_path: PathBuf,
+    cursor: crate::CursorPosition,
+    symbol: String,
+    kind: NavCandidateKind,
+    dark: bool,
+    view_height: usize,
+    peek_viewport_rows: usize,
 }
 
 impl NavCandidatesPopup {
-    pub const MAX_VISIBLE_ROWS: usize = 8;
+    pub const MAX_VISIBLE_ROWS: usize = 12;
 
-    pub fn visible_rows(&self) -> usize {
-        self.candidates.len().min(Self::MAX_VISIBLE_ROWS)
+    pub fn new(
+        mut candidates: Vec<reef_core::nav::Location>,
+        current_path: PathBuf,
+        origin: crate::LocationSnapshot,
+        symbol: String,
+        kind: NavCandidateKind,
+    ) -> Self {
+        candidates.sort_by(|left, right| {
+            candidate_path(left, &current_path)
+                .cmp(candidate_path(right, &current_path))
+                .then_with(|| left.line.cmp(&right.line))
+                .then_with(|| left.byte_range.start.cmp(&right.byte_range.start))
+        });
+        let selected = candidates
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, candidate)| {
+                (
+                    candidate_path(candidate, &current_path) != current_path,
+                    candidate.line.abs_diff(origin.cursor.line),
+                )
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        let groups = candidate_groups(&candidates, &current_path, selected);
+        let mut popup = Self {
+            candidates,
+            groups,
+            selected,
+            scroll: 0,
+            current_path,
+            origin,
+            symbol,
+            kind,
+        };
+        popup.clamp_scroll(Self::MAX_VISIBLE_ROWS);
+        popup
     }
 
-    pub fn clamp_scroll(&mut self) {
-        let visible = self.visible_rows();
+    pub fn visible_rows(&self, viewport_rows: usize) -> usize {
+        self.tree_row_count()
+            .min(Self::MAX_VISIBLE_ROWS)
+            .min(viewport_rows)
+    }
+
+    pub fn compact_visible_rows(&self, viewport_rows: usize) -> usize {
+        self.candidates
+            .len()
+            .min(Self::MAX_VISIBLE_ROWS)
+            .min(viewport_rows)
+    }
+
+    pub fn clamp_scroll(&mut self, viewport_rows: usize) {
+        let visible = self.visible_rows(viewport_rows);
+        if visible == 0 {
+            self.scroll = 0;
+            return;
+        }
+        let selected_row = self.selected_tree_row();
+        let max_scroll = self.tree_row_count().saturating_sub(visible);
+        if selected_row < self.scroll {
+            self.scroll = selected_row;
+        } else if selected_row >= self.scroll + visible {
+            self.scroll = selected_row + 1 - visible;
+        }
+        self.scroll = self.scroll.min(max_scroll);
+    }
+
+    pub fn clamp_compact_scroll(&mut self, viewport_rows: usize) {
+        let visible = self.compact_visible_rows(viewport_rows);
         if visible == 0 {
             self.scroll = 0;
             return;
@@ -365,6 +461,94 @@ impl NavCandidatesPopup {
         }
         self.scroll = self.scroll.min(max_scroll);
     }
+
+    pub fn selected_path(&self) -> &Path {
+        self.candidates
+            .get(self.selected)
+            .map(|candidate| candidate_path(candidate, &self.current_path))
+            .unwrap_or(&self.current_path)
+    }
+
+    pub fn select(&mut self, index: usize) -> bool {
+        if index >= self.candidates.len() {
+            return false;
+        }
+        self.selected = index;
+        if let Some(group) = self
+            .groups
+            .iter_mut()
+            .find(|group| group.candidate_range.contains(&index))
+        {
+            group.expanded = true;
+        }
+        true
+    }
+
+    pub fn toggle_group(&mut self, group_index: usize) -> bool {
+        let Some(group) = self.groups.get_mut(group_index) else {
+            return false;
+        };
+        if group.candidate_range.contains(&self.selected) {
+            group.expanded = true;
+            return false;
+        }
+        group.expanded = !group.expanded;
+        true
+    }
+
+    pub fn tree_row_count(&self) -> usize {
+        self.groups
+            .iter()
+            .map(|group| {
+                1 + if group.expanded {
+                    group.candidate_range.len()
+                } else {
+                    0
+                }
+            })
+            .sum()
+    }
+
+    pub fn selected_tree_row(&self) -> usize {
+        let mut row = 0;
+        for group in &self.groups {
+            if group.candidate_range.contains(&self.selected) {
+                return row + 1 + self.selected.saturating_sub(group.candidate_range.start);
+            }
+            row += 1;
+            if group.expanded {
+                row += group.candidate_range.len();
+            }
+        }
+        0
+    }
+}
+
+fn candidate_path<'a>(candidate: &'a reef_core::nav::Location, current_path: &'a Path) -> &'a Path {
+    candidate.path.as_deref().unwrap_or(current_path)
+}
+
+fn candidate_groups(
+    candidates: &[reef_core::nav::Location],
+    current_path: &Path,
+    selected: usize,
+) -> Vec<NavCandidateGroup> {
+    let mut groups = Vec::new();
+    let mut start = 0;
+    while start < candidates.len() {
+        let path = candidate_path(&candidates[start], current_path).to_path_buf();
+        let mut end = start + 1;
+        while end < candidates.len() && candidate_path(&candidates[end], current_path) == path {
+            end += 1;
+        }
+        groups.push(NavCandidateGroup {
+            path,
+            candidate_range: start..end,
+            expanded: (start..end).contains(&selected),
+        });
+        start = end;
+    }
+    groups
 }
 
 pub fn compute_uses_three_col(
@@ -519,6 +703,11 @@ pub struct AppState {
     pub preview_highlight: Option<PreviewHighlight>,
     pub location_history: reef_core::history::History<LocationSnapshot>,
     pub nav_candidates: Option<NavCandidatesPopup>,
+    pub nav_preview_content: Option<Arc<PreviewContent>>,
+    pub nav_preview_load: AsyncState,
+    pub nav_preview_target_path: Option<PathBuf>,
+    pub nav_preview_dark: bool,
+    pending_preview_definition: Option<PendingPreviewDefinition>,
     pub ctrl_hover_target: Option<(usize, Range<usize>)>,
     pub nav_workspace: Option<Arc<reef_core::nav::WorkspaceIndex>>,
     pub nav_workspace_load: AsyncState,
@@ -578,6 +767,7 @@ pub struct AppPrefs {
     pub commit_diff_mode: DiffMode,
     pub commit_files_tree_mode: bool,
     pub structured_preview_mode: StructuredPreviewMode,
+    pub nav_peek_mode: crate::NavPeekMode,
     pub quick_open: QuickOpenState,
 }
 
@@ -593,6 +783,7 @@ impl Default for AppPrefs {
             commit_diff_mode: DiffMode::Compact,
             commit_files_tree_mode: false,
             structured_preview_mode: StructuredPreviewMode::Tree,
+            nav_peek_mode: crate::NavPeekMode::Expanded,
             quick_open: QuickOpenState::default(),
         }
     }
@@ -747,7 +938,10 @@ impl AppState {
             fs_watcher_rx,
             show_help: false,
             pending_edit: None,
-            settings: SettingsState::default(),
+            settings: SettingsState {
+                nav_peek_mode: prefs.nav_peek_mode,
+                ..SettingsState::default()
+            },
             quick_open: prefs.quick_open,
             global_search: GlobalSearchState::default(),
             pending_global_search_accept: None,
@@ -759,6 +953,11 @@ impl AppState {
             preview_highlight: None,
             location_history: reef_core::history::History::new(Self::NAV_HISTORY_CAP),
             nav_candidates: None,
+            nav_preview_content: None,
+            nav_preview_load: AsyncState::default(),
+            nav_preview_target_path: None,
+            nav_preview_dark: false,
+            pending_preview_definition: None,
             ctrl_hover_target: None,
             nav_workspace: None,
             nav_workspace_load: AsyncState::default(),
@@ -1767,6 +1966,7 @@ mod tests {
                 commit_diff_mode: DiffMode::FullFile,
                 commit_files_tree_mode: true,
                 structured_preview_mode: StructuredPreviewMode::Raw,
+                nav_peek_mode: crate::NavPeekMode::Compact,
                 quick_open: crate::QuickOpenState::default(),
             },
             now: Instant::now(),
@@ -1785,6 +1985,7 @@ mod tests {
         assert_eq!(app.commit_detail.diff_mode, DiffMode::FullFile);
         assert!(app.commit_detail.files_tree_mode);
         assert_eq!(app.structured_preview_mode, StructuredPreviewMode::Raw);
+        assert_eq!(app.settings.nav_peek_mode, crate::NavPeekMode::Compact);
         assert!(app.fs_watcher_rx.is_none());
     }
 
@@ -2200,6 +2401,208 @@ mod tests {
         assert!(app.next_deadline().is_none());
     }
 
+    #[test]
+    fn nav_candidates_group_by_sorted_file_path() {
+        let popup = nav_popup(vec![
+            nav_location("src/b.rs", 4),
+            nav_location("src/a.rs", 2),
+        ]);
+
+        let paths = popup
+            .groups
+            .iter()
+            .map(|group| group.path.as_path())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec![Path::new("src/a.rs"), Path::new("src/b.rs")]);
+    }
+
+    #[test]
+    fn nav_candidate_selection_expands_target_group() {
+        let mut popup = nav_popup(vec![
+            nav_location("src/a.rs", 2),
+            nav_location("src/b.rs", 4),
+        ]);
+
+        popup.select(1);
+
+        assert!(popup.groups[1].expanded);
+    }
+
+    #[test]
+    fn nav_candidates_initially_select_current_file() {
+        let popup = NavCandidatesPopup::new(
+            vec![
+                nav_location("src/a.rs", 2),
+                nav_location("src/current.rs", 8),
+            ],
+            PathBuf::from("src/current.rs"),
+            LocationSnapshot {
+                surface: LocationSurface::FilePreview,
+                path: PathBuf::from("src/current.rs"),
+                cursor: crate::CursorPosition {
+                    line: 7,
+                    byte_col: 0,
+                },
+                scroll: crate::ScrollPosition {
+                    vertical: 0,
+                    horizontal: 0,
+                },
+            },
+            "target".to_owned(),
+            NavCandidateKind::References,
+        );
+
+        assert_eq!(popup.selected_path(), Path::new("src/current.rs"));
+    }
+
+    #[test]
+    fn selected_tree_row_accounts_for_file_headers() {
+        let mut popup = nav_popup(vec![
+            nav_location("src/a.rs", 2),
+            nav_location("src/b.rs", 4),
+        ]);
+        popup.select(1);
+
+        assert_eq!(popup.selected_tree_row(), 3);
+    }
+
+    #[test]
+    fn compact_candidate_scroll_keeps_selection_visible() {
+        let mut popup = nav_popup(
+            (0..20)
+                .map(|line| nav_location("src/current.rs", line))
+                .collect(),
+        );
+
+        popup.select(15);
+        popup.clamp_compact_scroll(4);
+
+        assert!(
+            (popup.scroll..popup.scroll + popup.compact_visible_rows(4)).contains(&popup.selected)
+        );
+    }
+
+    #[test]
+    fn compact_candidate_scroll_reaches_last_row_in_short_viewport() {
+        let mut app = minimal_app_state();
+        app.settings.nav_peek_mode = crate::NavPeekMode::Compact;
+        app.open_nav_candidates(
+            nav_popup(
+                (0..20)
+                    .map(|line| nav_location("src/current.rs", line))
+                    .collect(),
+            ),
+            true,
+            4,
+        );
+
+        app.scroll_nav_candidates(100, 4);
+
+        let popup = app.nav_candidates.as_ref().unwrap();
+        assert_eq!(popup.scroll + popup.compact_visible_rows(4), 20);
+    }
+
+    #[test]
+    fn expanded_nav_candidates_request_selected_preview() {
+        let mut app = minimal_app_state();
+
+        app.open_nav_candidates(nav_popup(vec![nav_location("src/current.rs", 2)]), true, 12);
+
+        assert!(app.nav_preview_load.loading);
+    }
+
+    #[test]
+    fn compact_nav_candidates_skip_selected_preview_request() {
+        let mut app = minimal_app_state();
+        app.settings.nav_peek_mode = crate::NavPeekMode::Compact;
+
+        app.open_nav_candidates(nav_popup(vec![nav_location("src/current.rs", 2)]), true, 12);
+
+        assert!(!app.nav_preview_load.loading);
+    }
+
+    #[test]
+    fn compact_nav_candidates_skip_preview_reload_after_workspace_change() {
+        let mut app = minimal_app_state();
+        app.settings.nav_peek_mode = crate::NavPeekMode::Compact;
+        app.open_nav_candidates(nav_popup(vec![nav_location("src/current.rs", 2)]), true, 4);
+
+        app.apply_fs_change(reef_io::FsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from("src/current.rs")],
+            git_metadata_changed: false,
+            repo_presence_changed: false,
+        });
+
+        assert!(!app.nav_preview_load.loading);
+    }
+
+    #[test]
+    fn set_nav_peek_mode_uses_requested_mode() {
+        let mut app = minimal_app_state();
+
+        app.set_nav_peek_mode(crate::NavPeekMode::Compact, 6);
+
+        assert_eq!(app.settings.nav_peek_mode, crate::NavPeekMode::Compact);
+    }
+
+    #[test]
+    fn confirming_same_file_navigation_candidate_closes_popup_and_recenters_preview() {
+        use reef_core::preview::{PreviewBody, TextPreview};
+
+        let mut app = minimal_app_state();
+        app.preview_content = Some(Arc::new(PreviewContent {
+            path: "src/current.rs".to_string(),
+            resolved_path: None,
+            local_path: None,
+            bytes_on_disk: 0,
+            mime: Some("text/x-rust".to_string()),
+            body: PreviewBody::Text(TextPreview {
+                lines: vec![String::new(); 80],
+                source: None,
+                highlighted: None,
+                parsed: None,
+            }),
+        }));
+        app.open_nav_candidates(nav_popup(vec![nav_location("src/current.rs", 50)]), true, 8);
+
+        app.confirm_nav_candidate(20);
+
+        assert!(app.nav_candidates.is_none());
+        assert_eq!(app.preview_scroll, center_scroll(50, 20));
+        assert_eq!(app.location_history.back_items().len(), 1);
+    }
+
+    fn nav_popup(candidates: Vec<reef_core::nav::Location>) -> NavCandidatesPopup {
+        NavCandidatesPopup::new(
+            candidates,
+            PathBuf::from("src/current.rs"),
+            LocationSnapshot {
+                surface: LocationSurface::FilePreview,
+                path: PathBuf::from("src/current.rs"),
+                cursor: crate::CursorPosition {
+                    line: 0,
+                    byte_col: 0,
+                },
+                scroll: crate::ScrollPosition {
+                    vertical: 0,
+                    horizontal: 0,
+                },
+            },
+            "target".to_owned(),
+            NavCandidateKind::References,
+        )
+    }
+
+    fn nav_location(path: &str, line: usize) -> reef_core::nav::Location {
+        reef_core::nav::Location {
+            path: Some(PathBuf::from(path)),
+            line,
+            byte_range: 0..6,
+            snippet: "target();".to_owned(),
+        }
+    }
+
     fn minimal_app_state() -> AppState {
         use reef_io::LocalBackend;
         use std::path::PathBuf;
@@ -2242,5 +2645,126 @@ mod tests {
                 parsed: None,
             }),
         }
+    }
+
+    #[test]
+    fn preview_navigation_replays_after_workspace_index_arrives() {
+        use reef_core::nav::{
+            NavLang, WorkspaceIndexFile, build_workspace_index, parse_file_if_supported,
+        };
+        use reef_core::preview::{PreviewBody, TextPreview};
+
+        let mut app = minimal_app_state();
+        app.active_tab = AppTab::Files;
+        let source = "fn main() { target(); }\n";
+        let source_bytes: Arc<[u8]> = Arc::from(source.as_bytes());
+        let source_text: Arc<str> = Arc::from(source);
+        let parsed =
+            parse_file_if_supported(NavLang::Rust, Arc::clone(&source_bytes)).map(Arc::new);
+        app.preview_content = Some(Arc::new(PreviewContent {
+            path: "src/main.rs".to_string(),
+            resolved_path: None,
+            local_path: None,
+            bytes_on_disk: source.len() as u64,
+            mime: Some("text/plain".to_string()),
+            body: PreviewBody::Text(TextPreview {
+                lines: source.lines().map(str::to_owned).collect(),
+                source: Some(source_text),
+                highlighted: None,
+                parsed,
+            }),
+        }));
+        let generation = app.nav_workspace_load.begin();
+
+        app.navigate_preview_definition_at(
+            crate::CursorPosition {
+                line: 0,
+                byte_col: 12,
+            },
+            false,
+            20,
+            8,
+        );
+
+        let target_source: Arc<[u8]> = Arc::from(b"pub fn target() {}\n".as_slice());
+        let workspace = build_workspace_index(
+            PathBuf::from("."),
+            [WorkspaceIndexFile {
+                path: PathBuf::from("src/target.rs"),
+                source: target_source,
+            }],
+        );
+        app.apply_worker_result_core(
+            WorkerResult::NavWorkspaceBuilt {
+                generation,
+                result: Ok(workspace),
+            },
+            Instant::now(),
+        );
+
+        assert_eq!(
+            app.preview_highlight
+                .as_ref()
+                .map(|highlight| &highlight.path),
+            Some(&PathBuf::from("src/target.rs"))
+        );
+    }
+
+    #[test]
+    fn preview_navigation_resolves_python_imported_symbol() {
+        use reef_core::nav::{
+            NavLang, WorkspaceIndexFile, build_workspace_index, parse_file_if_supported,
+        };
+        use reef_core::preview::{PreviewBody, TextPreview};
+
+        let mut app = minimal_app_state();
+        app.active_tab = AppTab::Files;
+        let source = "from .subtitles import SubtitleCue\n";
+        let source_bytes: Arc<[u8]> = Arc::from(source.as_bytes());
+        let parsed =
+            parse_file_if_supported(NavLang::Python, Arc::clone(&source_bytes)).map(Arc::new);
+        app.preview_content = Some(Arc::new(PreviewContent {
+            path: "__init__.py".to_string(),
+            resolved_path: None,
+            local_path: None,
+            bytes_on_disk: source.len() as u64,
+            mime: Some("text/x-python".to_string()),
+            body: PreviewBody::Text(TextPreview {
+                lines: source.lines().map(str::to_owned).collect(),
+                source: None,
+                highlighted: None,
+                parsed,
+            }),
+        }));
+        app.nav_workspace = Some(Arc::new(build_workspace_index(
+            PathBuf::from("."),
+            [
+                WorkspaceIndexFile {
+                    path: PathBuf::from("__init__.py"),
+                    source: source_bytes,
+                },
+                WorkspaceIndexFile {
+                    path: PathBuf::from("subtitles.py"),
+                    source: Arc::from(b"class SubtitleCue:\n    pass\n".as_slice()),
+                },
+            ],
+        )));
+
+        app.navigate_preview_definition_at(
+            crate::CursorPosition {
+                line: 0,
+                byte_col: 27,
+            },
+            false,
+            20,
+            8,
+        );
+
+        assert_eq!(
+            app.preview_highlight
+                .as_ref()
+                .map(|highlight| &highlight.path),
+            Some(&PathBuf::from("subtitles.py"))
+        );
     }
 }

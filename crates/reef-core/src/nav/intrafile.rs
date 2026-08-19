@@ -68,7 +68,7 @@ pub fn resolve_definition_intrafile(parse: &FileParse, cursor: Cursor) -> Vec<Lo
                 path: None,
                 line: start.row,
                 byte_range: start.column..end.column,
-                snippet: snippet_for(source, start.row),
+                snippet: snippet_for(source, start.row, start.column..end.column),
             });
         }
     }
@@ -81,8 +81,8 @@ pub fn resolve_definition_intrafile(parse: &FileParse, cursor: Cursor) -> Vec<Lo
     out
 }
 
-fn snippet_for(source: &[u8], line: usize) -> String {
-    super::workspace::snippet_for(source, line)
+fn snippet_for(source: &[u8], line: usize, target_byte_range: std::ops::Range<usize>) -> String {
+    super::workspace::snippet_for(source, line, target_byte_range)
 }
 
 /// Sibling-module wrapper so `crate::nav::workspace` can share the

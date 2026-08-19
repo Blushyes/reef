@@ -9,8 +9,8 @@
 
 use super::*;
 use reef_app::{
-    AppCommand, CursorPosition, LocationSnapshot, LocationSurface, NavAnchor, NavCandidatesPopup,
-    NavPendingJump, ScrollPosition,
+    AppCommand, CursorPosition, LocationSnapshot, LocationSurface, NavAnchor, NavCandidateKind,
+    NavCandidatesPopup, NavPendingJump, ScrollPosition,
 };
 
 // ─── Code navigation (gd / Ctrl+click / Ctrl-o-Ctrl-i) ────────────────
@@ -371,23 +371,19 @@ impl App {
                 let Some(origin) = origin else {
                     return;
                 };
-                let (anchor_col, anchor_row) = self.compute_nav_popup_anchor(anchor);
-                let max_row_width = crate::ui::nav_candidates_popup::candidates_max_width(
-                    &candidates,
-                    &current_path,
-                );
-                self.engine
-                    .dispatch(AppCommand::OpenNavCandidates(NavCandidatesPopup {
-                        anchor_col,
-                        anchor_row,
+                (self.nav_peek_anchor_col, self.nav_peek_anchor_row) =
+                    self.compute_nav_popup_anchor(anchor);
+                self.engine.dispatch(AppCommand::OpenNavCandidates {
+                    popup: NavCandidatesPopup::new(
                         candidates,
-                        selected: 0,
-                        scroll: 0,
                         current_path,
                         origin,
-                        opened_by_ctrl_click: matches!(anchor, NavAnchor::Mouse { .. }),
-                        max_row_width,
-                    }));
+                        needle.unwrap_or_else(|| "Definitions".to_owned()),
+                        NavCandidateKind::Definitions,
+                    ),
+                    dark: self.theme.is_dark,
+                    viewport_rows: self.nav_peek_visible_rows,
+                });
             }
         }
     }
@@ -821,6 +817,7 @@ impl App {
             return;
         };
         self.engine.dispatch(AppCommand::CloseNavCandidates);
+        self.clear_nav_peek_terminal_state();
         let Some(target) = popup.candidates.into_iter().nth(popup.selected) else {
             return;
         };
@@ -834,6 +831,16 @@ impl App {
     pub fn nav_close_candidates(&mut self) {
         self.engine
             .dispatch(reef_app::AppCommand::CloseNavCandidates);
+        self.clear_nav_peek_terminal_state();
+    }
+
+    fn clear_nav_peek_terminal_state(&mut self) {
+        self.nav_peek_preview_rect = None;
+        self.nav_peek_tree_rect = None;
+        self.nav_peek_preview_scroll = 0;
+        self.nav_peek_preview_max_scroll = 0;
+        self.nav_peek_preview_target = None;
+        self.nav_peek_visible_rows = reef_app::NavCandidatesPopup::MAX_VISIBLE_ROWS;
     }
 
     /// Resolve the per-language Settings row state.
@@ -879,7 +886,10 @@ impl App {
     /// Cursor key handlers for the popup. Up/Down wrap.
     pub fn nav_candidates_move(&mut self, delta: i32) {
         self.engine
-            .dispatch(reef_app::AppCommand::MoveNavCandidatesSelection(delta));
+            .dispatch(reef_app::AppCommand::MoveNavCandidatesSelection {
+                delta,
+                viewport_rows: self.nav_peek_visible_rows,
+            });
     }
 
     /// Mouse-wheel scroll over the candidates popup. Moves the visible
@@ -888,14 +898,19 @@ impl App {
     /// last full page.
     pub fn nav_candidates_scroll(&mut self, delta: i32) {
         self.engine
-            .dispatch(reef_app::AppCommand::ScrollNavCandidates(delta));
+            .dispatch(reef_app::AppCommand::ScrollNavCandidates {
+                delta,
+                viewport_rows: self.nav_peek_visible_rows,
+            });
     }
 
-    /// Kick a workspace symbol index build. Skipped when:
-    /// - we're already loading (one build at a time),
-    /// - the backend is remote (SSH mode = intra-file only).
-    pub fn dispatch_nav_workspace_build(&mut self) {
-        self.engine.dispatch(AppCommand::DispatchNavWorkspaceBuild);
+    /// Mouse-wheel scroll inside the code side of the Peek view.
+    pub fn nav_peek_preview_scroll(&mut self, delta: i32) {
+        self.nav_peek_preview_scroll = scroll_offset(
+            self.nav_peek_preview_scroll,
+            delta,
+            self.nav_peek_preview_max_scroll,
+        );
     }
 
     /// `gr` entry point. Looks up every reference site for the
@@ -942,24 +957,22 @@ impl App {
             return;
         }
 
-        let (anchor_col, anchor_row) = self.compute_nav_popup_anchor(anchor);
+        (self.nav_peek_anchor_col, self.nav_peek_anchor_row) =
+            self.compute_nav_popup_anchor(anchor);
         let Some(origin) = self.snapshot_location() else {
             return;
         };
-        let max_row_width =
-            crate::ui::nav_candidates_popup::candidates_max_width(&candidates, &current_path);
-        self.engine
-            .dispatch(AppCommand::OpenNavCandidates(NavCandidatesPopup {
-                anchor_col,
-                anchor_row,
+        self.engine.dispatch(AppCommand::OpenNavCandidates {
+            popup: NavCandidatesPopup::new(
                 candidates,
-                selected: 0,
-                scroll: 0,
                 current_path,
                 origin,
-                opened_by_ctrl_click: matches!(anchor, NavAnchor::Mouse { .. }),
-                max_row_width,
-            }));
+                needle,
+                NavCandidateKind::References,
+            ),
+            dark: self.theme.is_dark,
+            viewport_rows: self.nav_peek_visible_rows,
+        });
     }
 
     // ─── Code navigation FROM a diff view ─────────────────────────────────
@@ -976,8 +989,7 @@ impl App {
 
     /// Identifier + location resolved from a click / cursor inside the
     /// active diff panel. `line` is the 0-based file line (new side
-    /// preferred); `anchor_col/row` position a candidates popup below the
-    /// hit.
+    /// preferred); the anchor positions the Peek view below the hit.
     fn resolve_diff_nav(&self, anchor: NavAnchor) -> Option<DiffNavCursor> {
         // Pick the diff that's currently rendered (Git working-tree/staged
         // vs Graph commit). Only one renders at a time, and it owns
@@ -1077,20 +1089,19 @@ impl App {
                 let Some(origin) = origin else {
                     return;
                 };
-                let max_row_width =
-                    crate::ui::nav_candidates_popup::candidates_max_width(&candidates, &c.path);
-                self.engine
-                    .dispatch(AppCommand::OpenNavCandidates(NavCandidatesPopup {
-                        anchor_col: c.anchor_col,
-                        anchor_row: c.anchor_row,
+                self.nav_peek_anchor_col = c.anchor_col;
+                self.nav_peek_anchor_row = c.anchor_row;
+                self.engine.dispatch(AppCommand::OpenNavCandidates {
+                    popup: NavCandidatesPopup::new(
                         candidates,
-                        selected: 0,
-                        scroll: 0,
-                        current_path: c.path,
+                        c.path,
                         origin,
-                        opened_by_ctrl_click: matches!(anchor, NavAnchor::Mouse { .. }),
-                        max_row_width,
-                    }));
+                        c.identifier,
+                        NavCandidateKind::Definitions,
+                    ),
+                    dark: self.theme.is_dark,
+                    viewport_rows: self.nav_peek_visible_rows,
+                });
             }
         }
     }
@@ -1119,20 +1130,19 @@ impl App {
         let Some(origin) = self.snapshot_location() else {
             return;
         };
-        let max_row_width =
-            crate::ui::nav_candidates_popup::candidates_max_width(&candidates, &c.path);
-        self.engine
-            .dispatch(AppCommand::OpenNavCandidates(NavCandidatesPopup {
-                anchor_col: c.anchor_col,
-                anchor_row: c.anchor_row,
+        self.nav_peek_anchor_col = c.anchor_col;
+        self.nav_peek_anchor_row = c.anchor_row;
+        self.engine.dispatch(AppCommand::OpenNavCandidates {
+            popup: NavCandidatesPopup::new(
                 candidates,
-                selected: 0,
-                scroll: 0,
-                current_path: c.path,
+                c.path,
                 origin,
-                opened_by_ctrl_click: matches!(anchor, NavAnchor::Mouse { .. }),
-                max_row_width,
-            }));
+                c.identifier,
+                NavCandidateKind::References,
+            ),
+            dark: self.theme.is_dark,
+            viewport_rows: self.nav_peek_visible_rows,
+        });
     }
 }
 
@@ -1145,4 +1155,25 @@ struct DiffNavCursor {
     line: usize,
     anchor_col: u16,
     anchor_row: u16,
+}
+
+fn scroll_offset(current: usize, delta: i32, maximum: usize) -> usize {
+    if delta < 0 {
+        current.saturating_sub(delta.unsigned_abs() as usize)
+    } else {
+        current.saturating_add(delta as usize).min(maximum)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scroll_offset;
+
+    #[test]
+    fn peek_preview_scroll_offset_moves_and_clamps() {
+        assert_eq!(scroll_offset(5, -1, 12), 4);
+        assert_eq!(scroll_offset(5, 1, 12), 6);
+        assert_eq!(scroll_offset(0, -1, 12), 0);
+        assert_eq!(scroll_offset(12, 1, 12), 12);
+    }
 }

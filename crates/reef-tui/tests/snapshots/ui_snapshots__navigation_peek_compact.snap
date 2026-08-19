@@ -1,0 +1,32 @@
+---
+source: crates/reef-tui/tests/ui_snapshots.rs
+expression: compact_output
+---
+ reef  [TMPDIR]  ⎇ master
+ 📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph                                      ⊟  1:Files 2:Search 3:Git 4:Graph
+ + New File   + New Folder   ⊟  │ src/theme.rs
+ ▸ src ●                        │ ───────────────────────────────────────────────────────────────────────────
+                                │     1 pub const DARK_THEME: &str = "dark";
+                                │     2 pub const LIGHT_THEME: &str = "light";
+                                │     3
+                                │     4 pub fn parse_theme(value: &str) -> bool {
+                            ┌ parse_theme — references (2) ──────────────────────────────────────────────────┐
+                            │ src/main.rs:4  let dark = theme::parse_theme("light");                         │
+                            │ src/theme.rs:25  parse_theme(stored)                                           │
+                            └────────────────────────────────────────────────────────────────────────────────┘
+                                │     9     value.trim()
+                                │    10 }
+                                │    11
+                                │    12 fn system_theme() -> &'static str {
+                                │    13     DARK_THEME
+                                │    14 }
+                                │    15
+                                │    16 pub fn theme_label(value: &str) -> &'static str {
+                                │    17     match normalize_theme(value) {
+                                │    18         DARK_THEME => "Dark",
+                                │    19         LIGHT_THEME => "Light",
+                                │    20         _ => "System",
+                                │    21     }
+                                │    22 }
+                                │    23
+ SSH                                    ⚙  q:quit Tab:switch s:stage u:unstage r:refresh h:help  RA○  [Files]

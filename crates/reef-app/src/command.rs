@@ -1,7 +1,8 @@
 use crate::{
-    AppPanel, AppTab, ConfirmRequest, DbNav, DiffMode, FindTarget, FindWidgetToggle,
-    InputModifiers, LocationSnapshot, MatchHit, NavCandidatesPopup, NavPendingJump, PickerInput,
-    SearchTarget, SearchViewport, SshTarget, TextEditOp, Toast, ViewMode,
+    AppPanel, AppTab, ConfirmRequest, CursorPosition, DbNav, DiffMode, FindTarget,
+    FindWidgetToggle, InputModifiers, LocationSnapshot, MatchHit, NavCandidatesPopup, NavPeekMode,
+    NavPendingJump, PickerInput, SearchTarget, SearchViewport, SshTarget, TextEditOp, Toast,
+    ViewMode,
 };
 use reef_core::diff::DiffLayout;
 use reef_core::git::GraphScope;
@@ -31,6 +32,13 @@ pub enum AppCommand {
     CancelSettingsEditorCommandEdit,
     EditSettingsEditorCommand(TextEditOp),
     PasteSettingsEditorCommand(String),
+    ToggleNavPeekMode {
+        viewport_rows: usize,
+    },
+    SetNavPeekMode {
+        mode: NavPeekMode,
+        viewport_rows: usize,
+    },
     CloseActivePalettes,
     SetActiveTab(AppTab),
     SetActivePanel(AppPanel),
@@ -455,12 +463,38 @@ pub enum AppCommand {
         state: LspBadge,
     },
     RefreshLspInstalled,
-    OpenNavCandidates(NavCandidatesPopup),
+    OpenNavCandidates {
+        popup: NavCandidatesPopup,
+        dark: bool,
+        viewport_rows: usize,
+    },
     SetNavPendingLspJump(NavPendingJump),
-    SelectNavCandidate(usize),
+    SelectNavCandidate {
+        index: usize,
+        viewport_rows: usize,
+    },
+    ToggleNavCandidateGroup {
+        index: usize,
+        viewport_rows: usize,
+    },
     CloseNavCandidates,
-    MoveNavCandidatesSelection(i32),
-    ScrollNavCandidates(i32),
+    MoveNavCandidatesSelection {
+        delta: i32,
+        viewport_rows: usize,
+    },
+    ScrollNavCandidates {
+        delta: i32,
+        viewport_rows: usize,
+    },
+    NavigatePreviewDefinitionAt {
+        cursor: CursorPosition,
+        dark: bool,
+        view_height: usize,
+        peek_viewport_rows: usize,
+    },
+    ConfirmNavCandidate {
+        view_height: usize,
+    },
     PushLocationHistory(LocationSnapshot),
     JumpToLocation {
         target: LocationSnapshot,
@@ -488,7 +522,6 @@ pub enum AppCommand {
         line: u32,
         utf16_col: u32,
     },
-    DispatchNavWorkspaceBuild,
     OpenFocusedPreviewFiles,
     CloseFocusedPreviewFiles,
     ToggleFocusedPreviewFiles,

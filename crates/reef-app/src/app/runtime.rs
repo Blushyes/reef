@@ -137,6 +137,17 @@ impl AppState {
             {
                 self.preview_load.mark_stale();
             }
+            let nav_preview_changed = self.nav_candidates.as_ref().is_some_and(|popup| {
+                change.workspace_paths.is_empty()
+                    || change.workspace_paths.iter().any(|changed_path| {
+                        popup.selected_path() == changed_path
+                            || popup.selected_path().starts_with(changed_path)
+                    })
+            });
+            if nav_preview_changed {
+                self.nav_preview_load.mark_stale();
+                self.request_selected_nav_preview_if_expanded();
+            }
         }
         let has_repo = self.backend.has_repo();
         if change.repo_presence_changed {
@@ -713,7 +724,27 @@ impl AppState {
                     return events;
                 }
                 self.nav_workspace = result.ok().map(Arc::new);
+                self.retry_pending_preview_definition();
             }
+            WorkerResult::NavPreview {
+                generation,
+                path,
+                result,
+            } => match result {
+                Ok(content) => {
+                    if self.nav_preview_load.complete_ok(generation)
+                        && self
+                            .nav_candidates
+                            .as_ref()
+                            .is_some_and(|popup| popup.selected_path() == path)
+                    {
+                        self.nav_preview_content = content.map(Arc::new);
+                    }
+                }
+                Err(error) => {
+                    self.nav_preview_load.complete_err(generation, error);
+                }
+            },
             WorkerResult::LspStateChange { lang, state } => {
                 self.apply_lsp_state_change(lang, state);
             }
@@ -723,6 +754,7 @@ impl AppState {
                 enrichment,
             } => {
                 if self.complete_preview_enrichment(generation, &path, enrichment) {
+                    self.retry_pending_preview_definition();
                     events.push(AppRuntimeEvent::RetryDeferredPreviewActions);
                 }
             }

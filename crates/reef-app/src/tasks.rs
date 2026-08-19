@@ -208,6 +208,11 @@ pub enum WorkerResult {
         path: String,
         enrichment: Option<PreviewEnrichment>,
     },
+    NavPreview {
+        generation: u64,
+        path: PathBuf,
+        result: Result<Option<PreviewContent>, String>,
+    },
     DbPage {
         generation: u64,
         result: Result<DbPagePayload, String>,
@@ -650,6 +655,13 @@ struct PreviewEnrichmentTask {
     dark: bool,
 }
 
+struct NavPreviewTask {
+    generation: u64,
+    backend: Arc<dyn Backend>,
+    path: PathBuf,
+    dark: bool,
+}
+
 enum PreviewEnrichmentInput {
     Text {
         bytes_on_disk: u64,
@@ -804,6 +816,7 @@ pub struct TaskCoordinator {
     preview_tx: mpsc::Sender<FilesTask>,
     db_cell_tx: mpsc::Sender<DbCellTask>,
     preview_enrichment_tx: mpsc::Sender<PreviewEnrichmentTask>,
+    nav_preview_tx: mpsc::Sender<NavPreviewTask>,
     git_tx: mpsc::Sender<GitTask>,
     git_diff_tx: mpsc::Sender<GitDiffTask>,
     git_status_stats_tx: mpsc::Sender<GitStatusStatsTask>,
@@ -853,6 +866,7 @@ impl TaskCoordinator {
             preview_tx: spawn_preview_worker(result_tx.clone()),
             db_cell_tx: spawn_db_cell_worker(result_tx.clone()),
             preview_enrichment_tx: spawn_preview_enrichment_worker(result_tx.clone()),
+            nav_preview_tx: spawn_nav_preview_worker(result_tx.clone()),
             git_tx: spawn_git_worker(result_tx.clone()),
             git_diff_tx: spawn_git_diff_worker(result_tx.clone()),
             git_status_stats_tx: spawn_git_status_stats_worker(result_tx.clone()),
@@ -964,6 +978,21 @@ impl TaskCoordinator {
             backend,
             rel_path,
             wants_decoded_image,
+        });
+    }
+
+    pub fn load_nav_preview(
+        &self,
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        path: PathBuf,
+        dark: bool,
+    ) {
+        let _ = self.nav_preview_tx.send(NavPreviewTask {
+            generation,
+            backend,
+            path,
+            dark,
         });
     }
 
@@ -2247,6 +2276,46 @@ fn spawn_preview_worker(result_tx: WorkerResultSender) -> mpsc::Sender<FilesTask
             }
         });
     tx
+}
+
+fn spawn_nav_preview_worker(result_tx: WorkerResultSender) -> mpsc::Sender<NavPreviewTask> {
+    let (tx, rx) = mpsc::unbounded::<NavPreviewTask>();
+    let _ = thread::Builder::new()
+        .name("reef-nav-preview".into())
+        .spawn(move || {
+            reef_core::highlight::warm_up_common_syntaxes();
+            while let Ok(mut task) = rx.recv() {
+                while let Ok(newer) = rx.try_recv() {
+                    task = newer;
+                }
+                let result = run_preview_with_panic_guard(&task.path, || {
+                    task.backend.load_preview(&task.path, false)
+                })
+                .map(|content| content.map(|content| enrich_nav_preview(content, task.dark)));
+                let _ = result_tx.send(WorkerResult::NavPreview {
+                    generation: task.generation,
+                    path: task.path,
+                    result,
+                });
+            }
+        });
+    tx
+}
+
+fn enrich_nav_preview(mut content: PreviewContent, dark: bool) -> PreviewContent {
+    if let PreviewBody::Text(text) = &mut content.body
+        && let Some(enrichment) = reef_core::preview::build_text_preview_enrichment(
+            &content.path,
+            content.bytes_on_disk,
+            &text.lines,
+            text.source.as_deref(),
+            dark,
+        )
+    {
+        text.highlighted = enrichment.highlighted;
+        text.parsed = enrichment.parsed;
+    }
+    content
 }
 
 fn spawn_db_cell_worker(result_tx: WorkerResultSender) -> mpsc::Sender<DbCellTask> {
@@ -4609,6 +4678,34 @@ mod preview_worker_coalescing_tests {
         };
         assert!(enrichment.highlighted.is_some());
         assert!(enrichment.parsed.is_some());
+    }
+
+    #[test]
+    fn nav_preview_worker_publishes_enriched_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let tasks = TaskCoordinator::new();
+        let wake = tasks.worker_wake_receiver();
+        tasks.load_nav_preview(
+            1,
+            Arc::new(reef_io::LocalBackend::open_at(tmp.path().to_path_buf())),
+            PathBuf::from("main.rs"),
+            false,
+        );
+
+        let result = recv_worker_result(&tasks, &wake);
+
+        assert!(matches!(
+            result,
+            WorkerResult::NavPreview {
+                generation: 1,
+                result: Ok(Some(PreviewContent {
+                    body: PreviewBody::Text(ref text),
+                    ..
+                })),
+                ..
+            } if text.highlighted.is_some() && text.parsed.is_some()
+        ));
     }
 
     #[test]

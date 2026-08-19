@@ -20,6 +20,7 @@ pub enum SettingItem {
     CommitDiffLayout,
     CommitDiffMode,
     CommitFilesTreeMode,
+    NavPeekMode,
     Lsp(NavLang),
 }
 
@@ -33,6 +34,7 @@ impl SettingItem {
         SettingItem::CommitDiffLayout,
         SettingItem::CommitDiffMode,
         SettingItem::CommitFilesTreeMode,
+        SettingItem::NavPeekMode,
         SettingItem::Lsp(NavLang::Rust),
         SettingItem::Lsp(NavLang::TypeScript),
         SettingItem::Lsp(NavLang::Tsx),
@@ -51,7 +53,37 @@ impl SettingItem {
             SettingItem::CommitDiffLayout
             | SettingItem::CommitDiffMode
             | SettingItem::CommitFilesTreeMode => SettingSection::Graph,
-            SettingItem::Lsp(_) => SettingSection::Nav,
+            SettingItem::NavPeekMode | SettingItem::Lsp(_) => SettingSection::Nav,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NavPeekMode {
+    #[default]
+    Expanded,
+    Compact,
+}
+
+impl NavPeekMode {
+    pub fn pref_str(self) -> &'static str {
+        match self {
+            Self::Expanded => "expanded",
+            Self::Compact => "compact",
+        }
+    }
+
+    pub fn from_pref_str(value: &str) -> Self {
+        match value {
+            "compact" => Self::Compact,
+            _ => Self::Expanded,
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Expanded => Self::Compact,
+            Self::Compact => Self::Expanded,
         }
     }
 }
@@ -68,6 +100,7 @@ pub struct SettingsState {
     pub editor_edit: Option<EditorEdit>,
     pub theme_pref: ThemePref,
     pub editor_command: String,
+    pub nav_peek_mode: NavPeekMode,
 }
 
 impl SettingsState {
@@ -147,6 +180,18 @@ mod tests {
         for item in SettingItem::ALL {
             let _ = item.section();
         }
+    }
+
+    #[test]
+    fn nav_peek_mode_defaults_to_expanded_and_round_trips_preferences() {
+        assert_eq!(
+            (
+                NavPeekMode::default(),
+                NavPeekMode::from_pref_str("compact"),
+                NavPeekMode::Compact.pref_str(),
+            ),
+            (NavPeekMode::Expanded, NavPeekMode::Compact, "compact",)
+        );
     }
 
     #[test]

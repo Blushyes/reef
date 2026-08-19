@@ -1,0 +1,32 @@
+---
+source: crates/reef-tui/tests/ui_snapshots.rs
+expression: output
+---
+ reef  [TMPDIR]  ⎇ master
+ 📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph                                      ⊟  1:Files 2:Search 3:Git 4:Graph
+ + New File   + New Folder   ⊟  │ src/theme.rs
+ ▸ src ●                        │ ───────────────────────────────────────────────────────────────────────────
+                                │     1 pub const DARK_THEME: &str = "dark";
+                                │     2 pub const LIGHT_THEME: &str = "light";
+                                │     3
+                                │     4 pub fn parse_theme(value: &str) -> bool {
+                                │ ┌─────────────────────────────────────────────────────────────────────────┐
+                                │ │ theme.rs  src  › parse_theme — references (2)                         × │
+                                │ │──────────────────────────────────────────────────┌──────────────────────│
+                                │ │14 }                                             ││ › main.rs  src  1    │
+                                │ │15                                               ││ ⌄ theme.rs  src  1   │
+                                │ │16 pub fn theme_label(value: &str) -> &'static st││    25  parse_theme(s…│
+                                │ │17     match normalize_theme(value) {            ││                      │
+                                │ │18         DARK_THEME => "Dark",                 ││                      │
+                                │ │19         LIGHT_THEME => "Light",               ││                      │
+                                │ │20         _ => "System",                        ││                      │
+                                │ │21     }                                         █│                      │
+                                │ │22 }                                             █│                      │
+                                │ │23                                               █│                      │
+                                │ │24 pub fn load_theme() -> bool {                 █│                      │
+                                │ │25     let stored = system_theme();              █│                      │
+                                │ │26     parse_theme(stored)                       █│                      │
+                                │ │27 }                                             █│                      │
+                                │ └─────────────────────────────────────────────────────────────────────────┘
+                                │    23
+ SSH                                    ⚙  q:quit Tab:switch s:stage u:unstage r:refresh h:help  RA○  [Files]

@@ -1,0 +1,29 @@
+---
+source: crates/reef-tui/tests/ui_snapshots.rs
+assertion_line: 935
+expression: output
+---
+ reef  [TMPDIR]  ⎇ (detached)
+ 📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph                                      ⊟  1:Files 2:Search 3:Git 4:Graph
+ + New File   + New Folder   ⊟  │ cells.db
+   cells.db U                   │ ───────────────────────────────────────────────────────────────────────────
+                                │ sqlite · 1 tables · 8.0 KB
+                                │
+                                │ ▾ main · cells.db  system_prompt               system_prompt
+                                │   Tables (1)       TEXT                        TEXT · 192 B · TAGS
+                                │ ▎   step_run     2 <role>你 是 短 剧 分 镜 师 。 把 一   ────────────────────────────
+                                │                    NULL                        <role>
+                                │                                                你 是 短 剧 分 镜 师 。 把 一 个 视 频 片
+                                │                                                段 展 开 成 片 段 内 部 的 镜 头 序 列 。
+                                │                                                </role>
+                                │
+                                │                                                <source_contract>
+                                │                                                本 片 段 覆 盖  action 编 号  013
+                                │                                                至  013,共  1 条 。
+                                │                                                </source_contract>
+                                │
+                                │
+                                │
+                                │                                                Esc close · y copy · ↑↓←→ c…
+                                │ page  ‹  [1]  › ·  row 1-2 / 2  ·  step_run (1/1)
+ SSH                                         ⚙  q:quit Tab:switch s:stage u:unstage r:refresh h:help  [Files]

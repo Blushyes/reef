@@ -152,6 +152,24 @@ pub enum AppCommand {
         row: usize,
         column: usize,
     },
+    /// Drop the opened cell and return the arrow keys to plain row
+    /// scrolling.
+    DbCloseCell,
+    /// Move the cell cursor by a signed row / column delta within the
+    /// loaded page and open whatever it lands on.
+    DbMoveCell {
+        d_row: i32,
+        d_col: i32,
+    },
+    /// Scroll the opened cell's value pane by a signed line delta.
+    DbScrollCell(i32),
+    ClampDbCellScroll(usize),
+    /// Scroll the data grid so the highlighted row stays on screen.
+    /// `visible_rows` is the grid's body height, which only the
+    /// renderer knows.
+    EnsureDbCellRowVisible {
+        visible_rows: usize,
+    },
     EditDbGoto(TextEditOp),
     PasteDbGoto(String),
     ConfirmDbGoto,

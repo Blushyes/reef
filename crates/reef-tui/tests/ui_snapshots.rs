@@ -825,6 +825,116 @@ fn seed_sqlite_fixture_full(tmp_path: &std::path::Path) -> std::path::PathBuf {
     db_path
 }
 
+fn wait_for_db_cell(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        app.tick();
+        if !app.engine.state.db_cell_load.loading
+            && app
+                .engine
+                .state
+                .db_preview
+                .as_ref()
+                .and_then(|state| state.cell.as_ref())
+                .and_then(|cell| cell.value.as_ref())
+                .is_some()
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for sqlite cell worker");
+}
+
+/// A table whose TEXT columns are far longer than any column width —
+/// the case the value pane exists for. One column holds CJK prose, the
+/// other a JSON document.
+fn seed_sqlite_fixture_wide_cells(tmp_path: &std::path::Path) -> std::path::PathBuf {
+    let db_path = tmp_path.join("cells.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE step_run (id INTEGER PRIMARY KEY, prompt TEXT, payload TEXT, system_prompt TEXT);
+        INSERT INTO step_run(id, prompt, payload, system_prompt) VALUES
+            (1,
+             '06,不得遗漏中间任何一条。相邻两条之间必须保持连续,不得跳跃。把本段的动作拆成六个镜头,每个镜头单独描述。',
+             '{"shot_id":"s0412","duration":3.5,"tags":["近景","手持"],"meta":{"seed":88201,"retry":false}}',
+             '<role>' || char(10) || '你是短剧分镜师。把一个视频片段展开成片段内部的镜头序列。' || char(10) || '</role>' || char(10) || char(10) || '<source_contract>' || char(10) || '本片段覆盖 action 编号 013 至 013,共 1 条。' || char(10) || '</source_contract>'),
+            (2,
+             '08,把本段的动作拆成六个镜头。',
+             '{"shot_id":"s0413","duration":2.0,"tags":[],"meta":{"seed":11,"retry":true}}',
+             NULL);
+        "#,
+    )
+    .unwrap();
+    drop(conn);
+    db_path
+}
+
+/// Open a cell in a freshly-loaded `cells.db` preview and render.
+fn render_db_cell_pane(column: usize) -> String {
+    let (tmp, _raw) = tempdir_repo();
+    seed_sqlite_fixture_wide_cells(tmp.path());
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    app.refresh_file_tree();
+    wait_for_file_tree(&mut app);
+
+    let idx = app
+        .engine
+        .state
+        .file_tree
+        .entries
+        .iter()
+        .position(|e| e.name == "cells.db")
+        .expect("cells.db in tree");
+    app.engine.state.file_tree.selected = idx;
+    app.load_preview();
+    wait_for_preview(&mut app);
+
+    app.engine
+        .dispatch(reef_app::AppCommand::DbLoadCell { row: 0, column });
+    wait_for_db_cell(&mut app);
+
+    render_app(&mut app, 110, 24)
+}
+
+#[test]
+fn snapshot_db_cell_pane_text() {
+    // Clicking a truncated TEXT cell opens the value pane beside the
+    // grid: column name + TEXT/size meta + the complete value wrapped
+    // to the pane width, with the opened cell highlighted in the grid.
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
+    let output = render_db_cell_pane(1);
+    with_filters(&[], || insta::assert_snapshot!("db_cell_pane_text", output));
+}
+
+#[test]
+fn snapshot_db_cell_pane_json() {
+    // A cell whose text parses as JSON is laid out with the same
+    // structured outline the JSON file preview uses — indented, one
+    // key per line — rather than as a single wrapped string.
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
+    let output = render_db_cell_pane(2);
+    with_filters(&[], || insta::assert_snapshot!("db_cell_pane_json", output));
+}
+
+#[test]
+fn snapshot_db_cell_pane_tags() {
+    // A stored prompt: standalone `<role>` / `<source_contract>` lines
+    // are picked out, the prose between them is untouched. Not an XML
+    // parse — prompts leave tags unclosed and use `<` in prose.
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
+    let output = render_db_cell_pane(3);
+    with_filters(&[], || insta::assert_snapshot!("db_cell_pane_tags", output));
+}
+
 #[test]
 fn snapshot_db_preview_grouped_sidebar() {
     // The redesigned SQLite preview: grouped objects sidebar

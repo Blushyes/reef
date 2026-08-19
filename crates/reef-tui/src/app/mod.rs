@@ -134,6 +134,17 @@ pub struct TuiApp {
     pending_preview_nav: Option<PendingPreviewNav>,
     pub last_preview_rect: Option<ratatui::layout::Rect>,
     pub db_preview_layout: Option<DbPreviewLayoutCache>,
+    /// Wrapped + colored lines for the opened SQLite cell, rebuilt
+    /// when the cell or the pane width changes.
+    pub(crate) db_cell_view: Option<crate::ui::db_preview::DbCellViewCache>,
+    /// Screen rect of the cell value pane, so the wheel can scroll the
+    /// pane the pointer is actually over.
+    pub last_db_cell_rect: Option<ratatui::layout::Rect>,
+    /// Cell cursor the grid has already scrolled into view. Reveal runs
+    /// once per cursor move; re-running it every frame would drag the
+    /// grid back under the user whenever they scroll away from the
+    /// opened cell.
+    pub(crate) last_db_cell_reveal: Option<(usize, usize)>,
     pub vertical_scroll_lock: crate::input::AxisLock,
     pub horizontal_scroll_lock: crate::input::AxisLock,
     pub vertical_scroll_pacer: crate::input::ScrollPacer,
@@ -301,6 +312,9 @@ impl App {
             pending_preview_nav: None,
             last_preview_rect: None,
             db_preview_layout: None,
+            db_cell_view: None,
+            last_db_cell_rect: None,
+            last_db_cell_reveal: None,
             vertical_scroll_lock: crate::input::AxisLock::new(),
             horizontal_scroll_lock: crate::input::AxisLock::new(),
             vertical_scroll_pacer: crate::input::ScrollPacer::new(),
@@ -2414,6 +2428,10 @@ impl App {
             }
             ClickAction::DbToggleSchema(name) => {
                 self.db_toggle_schema(&name);
+            }
+            ClickAction::DbSelectCell { row, column } => {
+                self.engine
+                    .dispatch(reef_app::AppCommand::DbLoadCell { row, column });
             }
             ClickAction::FindWidgetClose => {
                 crate::find_widget::close(self);

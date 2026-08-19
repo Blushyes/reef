@@ -45,6 +45,22 @@ const COL_SEP: &str = "  ";
 /// and the `1.2k` / `10.5k` shortened forms.
 const SIDEBAR_COUNT_WIDTH: usize = 5;
 
+/// Width band for the cell value pane. It only exists while a cell is
+/// open, so the grid keeps the full data area until the user asks for
+/// a value.
+const CELL_PANE_MIN_WIDTH: u16 = 26;
+const CELL_PANE_MAX_WIDTH: u16 = 56;
+/// Data-area width below which the grid can't keep a usable width
+/// beside the pane — the pane takes over the whole area instead.
+/// Sized so the narrowest split still leaves the grid ~20 columns:
+/// enough for a key column plus the head of the next one.
+const CELL_PANE_TAKEOVER_WIDTH: u16 = CELL_PANE_MIN_WIDTH + 21;
+/// Characters of a cell value laid out for display. Beyond this the
+/// pane says how much it is showing: wrapping megabytes of text every
+/// time the pane rebuilds would stall the render loop, and nobody
+/// reads a megabyte through a 40-column pane.
+const MAX_CELL_DISPLAY_CHARS: usize = 64 * 1024;
+
 /// SQLite preview body. Layout (panel width permitting):
 ///
 /// ```text
@@ -156,7 +172,6 @@ pub(in crate::ui) fn render(
     let max_scroll = rows.len().saturating_sub(1);
     app.engine
         .dispatch(AppCommand::ClampPreviewVerticalScroll(max_scroll));
-    let row_offset = app.engine.preview_scroll();
 
     // Reserve last row for the page footer; the body sits between
     // `y` and `body_max_y`. Skipping the footer if there's only one
@@ -195,12 +210,15 @@ pub(in crate::ui) fn render(
 
     match selected_object {
         Some(o) if o.kind.has_rows() => {
+            // The value pane only claims width while a cell is open,
+            // so the grid is never permanently narrowed.
+            let cell = state_ref.and_then(|state| state.cell.as_ref());
+            let (grid_rect, cell_rect) = split_data_area(data_rect, cell.is_some());
+
             // Column widths are TUI-only derived layout. The app engine
             // owns the rows and selection; the renderer caches widths
             // keyed by that state so horizontal scrolling stays cheap.
-            let owned_widths: Vec<usize>;
-            let owned_total_w: usize;
-            let (col_widths, total_table_w) = match state_ref {
+            let (col_widths, total_table_w): (Vec<usize>, usize) = match state_ref {
                 Some(s) => {
                     let needs_rebuild = app
                         .db_preview_layout
@@ -216,28 +234,62 @@ pub(in crate::ui) fn render(
                         .db_preview_layout
                         .as_ref()
                         .expect("db preview layout cache was just built");
-                    (cache.col_widths.as_slice(), cache.total_table_w)
+                    (cache.col_widths.clone(), cache.total_table_w)
                 }
                 _ => {
-                    owned_widths = natural_column_widths(&o.columns, rows);
-                    owned_total_w = total_table_width(&owned_widths);
-                    (owned_widths.as_slice(), owned_total_w)
+                    let widths = natural_column_widths(&o.columns, rows);
+                    let total = total_table_width(&widths);
+                    (widths, total)
                 }
             };
-            let max_h_scroll = total_table_w.saturating_sub(data_w as usize);
+            let max_h_scroll = total_table_w.saturating_sub(grid_rect.width as usize);
             app.engine
                 .dispatch(AppCommand::ClampPreviewHorizontalScroll(max_h_scroll));
+
+            // Follow the cell cursor when it moves. The renderer is the
+            // only layer that knows the grid's body height and the
+            // column spans, so scroll-to-cursor is computed here and
+            // applied through commands — but only on a move. Revealing
+            // every frame would pull the grid back to the opened cell
+            // each time the user scrolls away from it.
+            let cursor = cell.map(|cell| (cell.row, cell.column));
+            if cursor != app.last_db_cell_reveal {
+                app.last_db_cell_reveal = cursor;
+                if let Some((_, column)) = cursor {
+                    app.engine.dispatch(AppCommand::EnsureDbCellRowVisible {
+                        visible_rows: grid_body_height(grid_rect),
+                    });
+                    if let Some(h_scroll) = h_scroll_for_column(
+                        &col_widths,
+                        column,
+                        grid_rect.width as usize,
+                        app.engine.preview_h_scroll(),
+                    ) {
+                        app.engine
+                            .dispatch(AppCommand::SetPreviewHorizontalScroll(h_scroll));
+                    }
+                }
+            }
+            // Re-read after the follow dispatches above moved them.
+            let row_offset = app.engine.preview_scroll();
             let h_scroll = app.engine.preview_h_scroll();
 
             render_data_pane(
                 f,
+                app,
                 &th,
-                data_rect,
+                grid_rect,
                 &o.columns,
-                col_widths,
+                &col_widths,
                 &rows[row_offset.min(rows.len())..],
                 h_scroll,
+                row_offset,
+                cell.map(|cell| (cell.row, cell.column)),
             );
+            app.last_db_cell_rect = cell_rect;
+            if let (Some(rect), Some(cell)) = (cell_rect, cell) {
+                render_cell_pane(f, app, &th, rect, &o.columns, cell);
+            }
 
             // Pagination footer.
             if body_max_y < max_y {
@@ -1170,14 +1222,19 @@ fn scroll_offset_for(selected: usize, total: usize, viewport: usize) -> usize {
 /// - NULL: italic dim, left-aligned. BLOB: italic dim `<blob N B>`.
 /// - Reader-truncated TEXT preserves its trailing `…` from the wire
 ///   payload.
+/// - Opened cell: reverse-video highlight; clicking any cell opens it.
+#[allow(clippy::too_many_arguments)]
 fn render_data_pane(
     f: &mut Frame,
+    app: &mut App,
     theme: &crate::ui::theme::Theme,
     area: Rect,
     columns: &[ColumnInfo],
     col_widths: &[usize],
     rows: &[Vec<SqliteValue>],
     h_scroll: usize,
+    row_offset: usize,
+    selected: Option<(usize, usize)>,
 ) {
     if area.width < 4 || area.height < 1 || columns.is_empty() {
         return;
@@ -1284,15 +1341,42 @@ fn render_data_pane(
             );
         }
 
+        let absolute_row = row_offset + i;
+        let screen_y = body_y + i as u16;
         let mut tokens: Vec<(Style, std::borrow::Cow<'_, str>)> = Vec::with_capacity(row.len() * 2);
+        let mut table_x = 0usize;
         for (c_idx, value) in row.iter().enumerate() {
             if c_idx > 0 {
                 tokens.push((bg_style, std::borrow::Cow::Borrowed(COL_SEP)));
+                table_x += COL_SEP.len();
             }
             let w = col_widths.get(c_idx).copied().unwrap_or(0);
+            // Every cell is a click target — the grid only holds a
+            // bounded prefix, so a click is how the user asks for the
+            // complete value.
+            if let Some((x, width)) =
+                visible_span(table_x, w, h_scroll, area.width as usize).filter(|(_, w)| *w > 0)
+            {
+                app.hit_registry.register_row(
+                    area.x + x as u16,
+                    screen_y,
+                    width as u16,
+                    crate::ui::mouse::ClickAction::DbSelectCell {
+                        row: absolute_row,
+                        column: c_idx,
+                    },
+                );
+            }
+            table_x += w;
             let mut cell_style_v = cell_style(value, theme);
             if let Some(bg) = row_bg {
                 cell_style_v = cell_style_v.bg(bg);
+            }
+            if selected == Some((absolute_row, c_idx)) {
+                cell_style_v = cell_style_v
+                    .bg(theme.selection_bg)
+                    .fg(theme.fg_primary)
+                    .add_modifier(Modifier::BOLD);
             }
             // Right-align numerics so digits stack cleanly down the
             // column; left-align text / null / blob.
@@ -1306,7 +1390,7 @@ fn render_data_pane(
         let spans = clip_spans(&tokens, h_scroll, area.width as usize);
         f.render_widget(
             Line::from(spans),
-            Rect::new(area.x, body_y + i as u16, area.width, 1),
+            Rect::new(area.x, screen_y, area.width, 1),
         );
     }
 }
@@ -1541,6 +1625,882 @@ fn clip_or_pad(s: &str, width: usize) -> String {
         acc += 1;
     }
     out
+}
+
+// ─── Cell value pane ────────────────────────────────────────────────
+//
+// The grid carries only a bounded prefix of every TEXT cell, so a
+// truncated cell is a dead end on its own. Opening a cell asks the
+// reader for the complete value and parks it in this pane: full width
+// for wrapping, JSON laid out with the same colors the JSON file
+// preview uses, and a hint row for the keys that drive it.
+
+/// Split the data area into grid + value pane. The pane exists only
+/// while a cell is open; on a narrow panel it takes the area over
+/// rather than squeezing both into unreadable columns.
+fn split_data_area(area: Rect, cell_open: bool) -> (Rect, Option<Rect>) {
+    if !cell_open || area.width < CELL_PANE_MIN_WIDTH {
+        return (area, None);
+    }
+    if area.width < CELL_PANE_TAKEOVER_WIDTH {
+        return (Rect::new(area.x, area.y, 0, area.height), Some(area));
+    }
+    // Half the area, so the value the user just asked for gets as
+    // much wrapping width as the grid it came from.
+    let pane_w = (area.width / 2).clamp(CELL_PANE_MIN_WIDTH, CELL_PANE_MAX_WIDTH);
+    // One blank column between the two so the grid's last cell doesn't
+    // touch the pane's first character.
+    let grid_w = area.width - pane_w - 1;
+    (
+        Rect::new(area.x, area.y, grid_w, area.height),
+        Some(Rect::new(area.x + grid_w + 1, area.y, pane_w, area.height)),
+    )
+}
+
+/// Data rows that fit in the grid, i.e. its height minus the two
+/// header rows.
+fn grid_body_height(grid: Rect) -> usize {
+    grid.height.saturating_sub(2) as usize
+}
+
+/// Start column and width of `column` inside the virtual table, both
+/// in display cells. `None` when the index is past the last column.
+fn column_span(col_widths: &[usize], column: usize) -> Option<(usize, usize)> {
+    let width = *col_widths.get(column)?;
+    let start: usize = col_widths[..column].iter().map(|w| w + COL_SEP.len()).sum();
+    Some((start, width))
+}
+
+/// The horizontal scroll needed to bring `column` into a
+/// `view_width`-wide grid, or `None` when part of it is already on
+/// screen. Long TEXT columns are routinely wider than the whole grid,
+/// so "fully visible" is not a reachable goal — a column whose start
+/// is showing is left alone, and one that isn't pins to its left edge
+/// rather than its right.
+fn h_scroll_for_column(
+    col_widths: &[usize],
+    column: usize,
+    view_width: usize,
+    current: usize,
+) -> Option<usize> {
+    let (start, _) = column_span(col_widths, column)?;
+    if view_width == 0 {
+        return None;
+    }
+    let next = if start < current || start >= current + view_width {
+        start
+    } else {
+        current
+    };
+    (next != current).then_some(next)
+}
+
+/// Screen offset and width of a `width`-wide span starting at
+/// `table_x`, clipped to a `view_width`-wide viewport scrolled to
+/// `h_scroll`. `None` when the span is entirely off-screen.
+fn visible_span(
+    table_x: usize,
+    width: usize,
+    h_scroll: usize,
+    view_width: usize,
+) -> Option<(usize, usize)> {
+    let start = table_x.max(h_scroll);
+    let end = (table_x + width).min(h_scroll + view_width);
+    (end > start).then(|| (start - h_scroll, end - start))
+}
+
+/// One laid-out line of the value pane: styled runs, already wrapped
+/// to the pane width.
+type CellLine = Vec<(Style, String)>;
+
+/// Identity of a laid-out value. The pane rebuilds when any part of
+/// it changes; everything else is a cheap redraw of cached lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DbCellViewKey {
+    object: reef_sqlite_preview::DbObjectKey,
+    row_offset: u64,
+    column: usize,
+    width: u16,
+    value_revision: u64,
+}
+
+/// Wrapped, colored lines for the opened cell. Terminal-only derived
+/// layout, so it lives with the renderer rather than in app state —
+/// same contract as [`crate::tui_app::DbPreviewLayoutCache`].
+#[derive(Debug, Clone)]
+pub(crate) struct DbCellViewCache {
+    key: DbCellViewKey,
+    lines: Vec<CellLine>,
+    /// Value kind + size, rendered in the pane's second header row.
+    meta: String,
+    /// `true` when only the first [`MAX_CELL_DISPLAY_CHARS`] are laid out.
+    clipped: bool,
+}
+
+/// Render the opened cell's complete value beside the grid.
+fn render_cell_pane(
+    f: &mut Frame,
+    app: &mut App,
+    theme: &crate::ui::theme::Theme,
+    area: Rect,
+    columns: &[ColumnInfo],
+    cell: &reef_app::DbCellPreviewState,
+) {
+    if area.width < 4 || area.height < 1 {
+        return;
+    }
+    let name = columns
+        .get(cell.column)
+        .map(|column| column.name.as_str())
+        .unwrap_or("");
+    let mut y = area.y;
+    let max_y = area.y + area.height;
+
+    // Row 0 / 1 mirror the grid's name + type header pair so the pane
+    // reads as the same table's continuation.
+    f.render_widget(
+        Line::from(Span::styled(
+            pad_to_width(name, area.width as usize),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Rect::new(area.x, y, area.width, 1),
+    );
+    y += 1;
+
+    let Some(value) = cell.value.as_ref() else {
+        if y < max_y {
+            let error = app.engine.db_cell_load_snapshot().error;
+            let (text, style) = match error {
+                Some(error) => (error, Style::default().fg(theme.removed_accent)),
+                None => (
+                    t(Msg::DbCellLoading).to_string(),
+                    Style::default()
+                        .fg(theme.fg_secondary)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            };
+            f.render_widget(
+                Line::from(Span::styled(text, style)),
+                Rect::new(area.x, y, area.width, 1),
+            );
+        }
+        return;
+    };
+
+    let key = DbCellViewKey {
+        object: cell.object_key.clone(),
+        row_offset: cell.row_offset,
+        column: cell.column,
+        width: area.width,
+        value_revision: cell.value_revision,
+    };
+    if app
+        .db_cell_view
+        .as_ref()
+        .is_none_or(|cache| cache.key != key)
+    {
+        app.db_cell_view = Some(build_cell_view(key, value, area.width as usize, theme));
+    }
+    let cache = app
+        .db_cell_view
+        .as_ref()
+        .expect("cell view cache was just built");
+
+    if y < max_y {
+        f.render_widget(
+            Line::from(Span::styled(
+                cache.meta.clone(),
+                Style::default().fg(theme.fg_secondary),
+            )),
+            Rect::new(area.x, y, area.width, 1),
+        );
+        y += 1;
+    }
+    if y < max_y {
+        f.render_widget(
+            Line::from(Span::styled(
+                "─".repeat(area.width as usize),
+                Style::default().fg(theme.fg_secondary),
+            )),
+            Rect::new(area.x, y, area.width, 1),
+        );
+        y += 1;
+    }
+
+    // Last row is the key hint; the body gets whatever is left.
+    let hint_y = max_y.saturating_sub(1);
+    let body_h = hint_y.saturating_sub(y) as usize;
+    app.engine.dispatch(AppCommand::ClampDbCellScroll(
+        cache.lines.len().saturating_sub(body_h),
+    ));
+    let scroll = app
+        .engine
+        .db_preview()
+        .and_then(|state| state.cell.as_ref())
+        .map(|cell| cell.scroll)
+        .unwrap_or(0);
+
+    for line in cache.lines.iter().skip(scroll).take(body_h) {
+        let spans: Vec<Span> = line
+            .iter()
+            .map(|(style, text)| Span::styled(text.clone(), *style))
+            .collect();
+        f.render_widget(Line::from(spans), Rect::new(area.x, y, area.width, 1));
+        y += 1;
+    }
+    if cache.clipped && y < hint_y {
+        f.render_widget(
+            Line::from(Span::styled(
+                t(Msg::DbCellClipped),
+                Style::default()
+                    .fg(theme.fg_secondary)
+                    .add_modifier(Modifier::ITALIC),
+            )),
+            Rect::new(area.x, y, area.width, 1),
+        );
+    }
+
+    if hint_y > area.y {
+        let more = cache.lines.len().saturating_sub(scroll + body_h);
+        let hint = if more > 0 {
+            format!("{}  ↓{more}", t(Msg::DbCellHint))
+        } else {
+            t(Msg::DbCellHint).to_string()
+        };
+        f.render_widget(
+            Line::from(Span::styled(
+                clip_to_width(&hint, area.width as usize),
+                Style::default().fg(theme.fg_secondary),
+            )),
+            Rect::new(area.x, hint_y, area.width, 1),
+        );
+    }
+}
+
+/// Lay a complete cell value out for a `width`-wide pane: JSON gets
+/// the structured outline treatment, everything else wraps as text.
+fn build_cell_view(
+    key: DbCellViewKey,
+    value: &SqliteValue,
+    width: usize,
+    theme: &crate::ui::theme::Theme,
+) -> DbCellViewCache {
+    let width = width.max(1);
+    let plain = Style::default().fg(theme.fg_primary);
+    let dim = Style::default()
+        .fg(theme.fg_secondary)
+        .add_modifier(Modifier::ITALIC);
+
+    let (meta, lines, clipped) = match value {
+        SqliteValue::Null => (
+            "NULL".to_string(),
+            vec![vec![(dim, "NULL".to_string())]],
+            false,
+        ),
+        SqliteValue::Integer(n) => (
+            "INTEGER".to_string(),
+            wrap_styled(&styled_chars(&n.to_string(), plain), width, 0),
+            false,
+        ),
+        SqliteValue::Real(r) => (
+            "REAL".to_string(),
+            wrap_styled(&styled_chars(&r.to_string(), plain), width, 0),
+            false,
+        ),
+        SqliteValue::Blob { len } => (
+            format!(
+                "BLOB · {}",
+                reef_core::preview::binary::human_bytes(*len as u64)
+            ),
+            vec![vec![(dim, t(Msg::DbCellBinary).to_string())]],
+            false,
+        ),
+        SqliteValue::Text { value, .. } => {
+            let (shown, clipped) = clip_chars(value, MAX_CELL_DISPLAY_CHARS);
+            let bytes = reef_core::preview::binary::human_bytes(value.len() as u64);
+            let (format, lines) = text_cell_lines(shown, width, theme);
+            let meta = match format.label() {
+                Some(label) => format!("TEXT · {bytes} · {label}"),
+                None => format!("TEXT · {bytes}"),
+            };
+            (meta, lines, clipped)
+        }
+    };
+    DbCellViewCache {
+        key,
+        lines,
+        meta,
+        clipped,
+    }
+}
+
+/// What a TEXT cell turns out to hold. A database gives the renderer
+/// no filename to key a format off, so this is decided from the value
+/// itself — strongest, least ambiguous signals first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CellFormat {
+    Json,
+    JsonLines,
+    /// Tag-delimited sections (`<role>` … `</role>`), the usual shape of
+    /// a stored prompt.
+    Tags,
+    Markdown,
+    Plain,
+}
+
+impl CellFormat {
+    /// Tail tag for the pane's meta row. `None` reads as "just text".
+    fn label(self) -> Option<&'static str> {
+        match self {
+            CellFormat::Json => Some("JSON"),
+            CellFormat::JsonLines => Some("JSONL"),
+            CellFormat::Tags => Some("TAGS"),
+            CellFormat::Markdown => Some("MD"),
+            CellFormat::Plain => None,
+        }
+    }
+}
+
+/// Detect and lay out a TEXT value in one pass — each candidate proves
+/// itself by parsing, so a failed guess costs a parse and nothing else.
+///
+/// Tags are checked before Markdown on purpose: a line that is nothing
+/// but `<source_contract>` is unambiguous, while Markdown's weaker
+/// signals (a leading `-`, a stray `*`) fire readily on ordinary CJK
+/// prose, and mis-reading a prompt as Markdown would eat its
+/// punctuation.
+fn text_cell_lines(
+    text: &str,
+    width: usize,
+    theme: &crate::ui::theme::Theme,
+) -> (CellFormat, Vec<CellLine>) {
+    if let Some(lines) = json_lines(text, width, theme) {
+        return (CellFormat::Json, lines);
+    }
+    if let Some(lines) = json_lines_lines(text, width, theme) {
+        return (CellFormat::JsonLines, lines);
+    }
+    if text.lines().any(is_tag_line) {
+        return (CellFormat::Tags, tagged_lines(text, width, theme));
+    }
+    if let Some(lines) = markdown_lines(text, width, theme) {
+        return (CellFormat::Markdown, lines);
+    }
+    (
+        CellFormat::Plain,
+        plain_lines(text, width, Style::default().fg(theme.fg_primary)),
+    )
+}
+
+/// Wrap plain text, honouring the newlines already in the value.
+fn plain_lines(text: &str, width: usize, style: Style) -> Vec<CellLine> {
+    text.split('\n')
+        .flat_map(|line| wrap_styled(&styled_chars(line.trim_end_matches('\r'), style), width, 0))
+        .collect()
+}
+
+/// Plain text with standalone tag lines picked out, so the sections of
+/// a prompt are scannable without reflowing a single character of it.
+/// Deliberately not an XML parse: stored prompts routinely leave tags
+/// unclosed and use `<` in prose, and a parser would either fail or
+/// misplace the content.
+fn tagged_lines(text: &str, width: usize, theme: &crate::ui::theme::Theme) -> Vec<CellLine> {
+    let body = Style::default().fg(theme.fg_primary);
+    let tag = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    text.split('\n')
+        .flat_map(|line| {
+            let line = line.trim_end_matches('\r');
+            let style = if is_tag_line(line) { tag } else { body };
+            wrap_styled(&styled_chars(line, style), width, 0)
+        })
+        .collect()
+}
+
+/// `true` for a line that is nothing but one tag: `<role>`, `</role>`,
+/// `<shot id="4">`, `<br/>`.
+fn is_tag_line(line: &str) -> bool {
+    let Some(inner) = line
+        .trim()
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+    else {
+        return false;
+    };
+    if inner.contains('<') || inner.contains('>') {
+        return false;
+    }
+    let name = inner.strip_prefix('/').unwrap_or(inner);
+    let name = name.strip_suffix('/').unwrap_or(name);
+    let Some(name) = name.split_whitespace().next() else {
+        return false;
+    };
+    name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+}
+
+/// Lay Markdown out with the colors the Markdown preview panel uses.
+/// `None` unless the text carries a signal strong enough to be worth
+/// the risk of reading prose as markup.
+fn markdown_lines(
+    text: &str,
+    width: usize,
+    theme: &crate::ui::theme::Theme,
+) -> Option<Vec<CellLine>> {
+    if !looks_like_markdown(text) {
+        return None;
+    }
+    // The builder keys off the extension; a cell has no name, so give
+    // it one. Syntax highlighting inside fences is skipped — the pane
+    // is a value viewer, not a code editor.
+    let preview = reef_core::markdown::build_markdown_preview("cell.md", text)?;
+    let mut lines = Vec::new();
+    for row in preview.rows()? {
+        let chars: Vec<(Style, char)> = row
+            .iter()
+            .flat_map(|span| {
+                let style = crate::ui::preview::markdown::span_style(span, theme);
+                span.text.chars().map(move |c| (style, c))
+            })
+            .collect();
+        lines.extend(wrap_styled(&chars, width, 2.min(width / 3)));
+    }
+    Some(lines)
+}
+
+/// Markdown signals that prose doesn't produce by accident: an ATX
+/// heading, a fence, a blockquote, a bold pair, or a second list item.
+fn looks_like_markdown(text: &str) -> bool {
+    let mut list_items = 0;
+    for line in text.lines() {
+        let line = line.trim_start();
+        if line.starts_with("```") || line.starts_with("> ") {
+            return true;
+        }
+        let hashes = line.chars().take_while(|c| *c == '#').count();
+        if (1..=6).contains(&hashes) && line[hashes..].starts_with(' ') {
+            return true;
+        }
+        if line.matches("**").count() >= 2 {
+            return true;
+        }
+        if is_list_item(line) {
+            list_items += 1;
+            if list_items >= 2 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_list_item(line: &str) -> bool {
+    if let Some(rest) = line.strip_prefix(['-', '*', '+']) {
+        return rest.starts_with(' ');
+    }
+    let digits = line.chars().take_while(char::is_ascii_digit).count();
+    digits > 0 && line[digits..].starts_with(". ")
+}
+
+/// Lay a JSON value out with the same segment colors the JSON file
+/// preview uses. `None` when the text isn't JSON — the common case for
+/// a TEXT cell.
+fn json_lines(text: &str, width: usize, theme: &crate::ui::theme::Theme) -> Option<Vec<CellLine>> {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
+        return None;
+    }
+    let document = reef_core::structured_data::StructuredDataDocument::from_json(text).ok()?;
+    Some(outline_lines(document.outline(), width, theme))
+}
+
+/// One JSON document per line — the shape a log or an export takes.
+/// Needs at least two of them, so a single object stays plain JSON.
+fn json_lines_lines(
+    text: &str,
+    width: usize,
+    theme: &crate::ui::theme::Theme,
+) -> Option<Vec<CellLine>> {
+    let mut documents = 0;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !line.starts_with('{') && !line.starts_with('[') {
+            return None;
+        }
+        documents += 1;
+    }
+    if documents < 2 {
+        return None;
+    }
+    let document =
+        reef_core::structured_data::StructuredDataDocument::from_json_lines(text).ok()?;
+    Some(outline_lines(document.outline(), width, theme))
+}
+
+/// Wrap a structured-data outline into the pane, indenting by depth and
+/// hanging wrapped text under its key.
+fn outline_lines(
+    outline: &reef_core::structured_data::JsonOutline,
+    width: usize,
+    theme: &crate::ui::theme::Theme,
+) -> Vec<CellLine> {
+    let mut lines = Vec::new();
+    for row in outline.rows() {
+        let indent = (row.depth * 2).min(width / 2);
+        let mut chars: Vec<(Style, char)> = " "
+            .repeat(indent)
+            .chars()
+            .map(|c| (Style::default(), c))
+            .collect();
+        for segment in row.prefix_segments.iter().chain(row.suffix_segments.iter()) {
+            let style = Style::default().fg(json_segment_color(segment.role, theme));
+            chars.extend(segment.text.chars().map(|c| (style, c)));
+        }
+        lines.extend(wrap_styled(&chars, width, (indent + 2).min(width / 2)));
+    }
+    lines
+}
+
+fn json_segment_color(
+    role: reef_core::structured_data::JsonSegmentRole,
+    theme: &crate::ui::theme::Theme,
+) -> ratatui::style::Color {
+    use ratatui::style::Color;
+    use reef_core::structured_data::JsonSegmentRole as Role;
+    match role {
+        Role::Key => theme.accent,
+        Role::String => Color::Green,
+        Role::Number => Color::Yellow,
+        Role::Boolean => Color::Magenta,
+        Role::Null => theme.fg_secondary,
+        Role::Punctuation => theme.fg_primary,
+    }
+}
+
+fn styled_chars(text: &str, style: Style) -> Vec<(Style, char)> {
+    text.chars().map(|c| (style, c)).collect()
+}
+
+/// First `max` characters of `text`, plus whether anything was cut.
+fn clip_chars(text: &str, max: usize) -> (&str, bool) {
+    match text.char_indices().nth(max) {
+        Some((idx, _)) => (&text[..idx], true),
+        None => (text, false),
+    }
+}
+
+/// Truncate to a display width, appending `…` when it doesn't fit.
+fn clip_to_width(text: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in text.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w + 1 > width {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
+/// Wrap a styled character stream into pane-width lines, breaking at
+/// an ASCII space when one is close enough to the edge and mid-run
+/// otherwise — CJK prose has no spaces to break at, and a JSON blob
+/// may be one unbroken run.
+fn wrap_styled(chars: &[(Style, char)], width: usize, hanging: usize) -> Vec<CellLine> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let hanging = hanging.min(width.saturating_sub(1));
+    let mut lines: Vec<Vec<(Style, char)>> = Vec::new();
+    let mut current: Vec<(Style, char)> = Vec::new();
+    let mut used = 0usize;
+    let mut first = true;
+
+    for &(style, c) in chars {
+        let limit = if first { width } else { width - hanging };
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + cw > limit && !current.is_empty() {
+            // Prefer breaking after the last space, but only when it
+            // doesn't strand more than half the line.
+            let carry_at = current
+                .iter()
+                .rposition(|(_, c)| *c == ' ')
+                .map(|idx| idx + 1)
+                .filter(|idx| *idx > limit / 2 && *idx < current.len());
+            let carry: Vec<(Style, char)> = match carry_at {
+                Some(idx) => current.split_off(idx),
+                None => Vec::new(),
+            };
+            while current.last().is_some_and(|(_, c)| *c == ' ') {
+                current.pop();
+            }
+            lines.push(std::mem::take(&mut current));
+            first = false;
+            used = carry
+                .iter()
+                .map(|(_, c)| UnicodeWidthChar::width(*c).unwrap_or(0))
+                .sum();
+            current = carry;
+        }
+        current.push((style, c));
+        used += cw;
+    }
+    lines.push(current);
+
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(idx, line)| {
+            let mut out: CellLine = Vec::new();
+            if idx > 0 && hanging > 0 {
+                out.push((Style::default(), " ".repeat(hanging)));
+            }
+            for (style, c) in line {
+                match out.last_mut() {
+                    Some((last_style, text)) if *last_style == style => text.push(c),
+                    _ => out.push((style, c.to_string())),
+                }
+            }
+            out
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod cell_pane_tests {
+    use super::*;
+
+    fn line_text(line: &CellLine) -> String {
+        line.iter().map(|(_, text)| text.as_str()).collect()
+    }
+
+    fn lines_text(lines: &[CellLine]) -> Vec<String> {
+        lines.iter().map(line_text).collect()
+    }
+
+    #[test]
+    fn closed_cell_leaves_the_grid_the_whole_data_area() {
+        let area = Rect::new(0, 0, 100, 20);
+        let (grid, pane) = split_data_area(area, false);
+        assert_eq!(grid, area);
+        assert!(pane.is_none());
+    }
+
+    #[test]
+    fn open_cell_splits_with_a_one_column_gutter() {
+        let (grid, pane) = split_data_area(Rect::new(4, 1, 100, 20), true);
+        let pane = pane.expect("pane on a wide data area");
+        assert_eq!(grid.width + 1 + pane.width, 100);
+        assert_eq!(pane.x, grid.x + grid.width + 1);
+    }
+
+    #[test]
+    fn narrow_data_area_hands_the_whole_pane_to_the_value() {
+        let area = Rect::new(0, 0, CELL_PANE_TAKEOVER_WIDTH - 1, 20);
+        let (grid, pane) = split_data_area(area, true);
+        assert_eq!(grid.width, 0);
+        assert_eq!(pane, Some(area));
+    }
+
+    #[test]
+    fn narrowest_split_still_leaves_the_grid_room() {
+        let (grid, _) = split_data_area(Rect::new(0, 0, CELL_PANE_TAKEOVER_WIDTH, 20), true);
+        assert!(grid.width >= 20, "grid collapsed to {}", grid.width);
+    }
+
+    #[test]
+    fn column_span_accounts_for_the_separators_before_it() {
+        // widths 3, 5, 4 with a 2-space separator between each.
+        assert_eq!(column_span(&[3, 5, 4], 0), Some((0, 3)));
+        assert_eq!(column_span(&[3, 5, 4], 1), Some((5, 5)));
+        assert_eq!(column_span(&[3, 5, 4], 2), Some((12, 4)));
+        assert_eq!(column_span(&[3, 5, 4], 3), None);
+    }
+
+    #[test]
+    fn partly_visible_column_does_not_move_the_grid() {
+        // A 200-wide TEXT column can never fit; as long as its start is
+        // on screen the cursor must not yank the view sideways.
+        assert_eq!(h_scroll_for_column(&[4, 200], 1, 30, 6), None);
+    }
+
+    #[test]
+    fn offscreen_column_pins_its_left_edge() {
+        assert_eq!(h_scroll_for_column(&[4, 200, 5], 2, 30, 0), Some(208));
+        assert_eq!(h_scroll_for_column(&[4, 200], 0, 30, 40), Some(0));
+    }
+
+    #[test]
+    fn visible_span_clips_to_the_scrolled_viewport() {
+        assert_eq!(visible_span(0, 10, 0, 30), Some((0, 10)));
+        assert_eq!(visible_span(20, 10, 5, 20), Some((15, 5)));
+        assert_eq!(visible_span(2, 10, 6, 30), Some((0, 6)));
+        assert_eq!(visible_span(40, 10, 0, 30), None);
+    }
+
+    #[test]
+    fn wrapping_breaks_cjk_at_the_pane_edge() {
+        // No spaces to break at, and every glyph is two cells wide.
+        let chars = styled_chars("甲乙丙丁戊己", Style::default());
+        assert_eq!(
+            lines_text(&wrap_styled(&chars, 4, 0)),
+            ["甲乙", "丙丁", "戊己"]
+        );
+    }
+
+    #[test]
+    fn wrapping_prefers_a_space_over_splitting_a_word() {
+        let chars = styled_chars("alpha beta gamma", Style::default());
+        assert_eq!(
+            lines_text(&wrap_styled(&chars, 11, 0)),
+            ["alpha beta", "gamma"]
+        );
+    }
+
+    #[test]
+    fn wrapping_splits_a_word_too_long_to_ever_fit() {
+        let chars = styled_chars("aaaaaaaa", Style::default());
+        assert_eq!(lines_text(&wrap_styled(&chars, 3, 0)), ["aaa", "aaa", "aa"]);
+    }
+
+    #[test]
+    fn continuation_lines_carry_the_hanging_indent() {
+        let chars = styled_chars("甲乙丙丁", Style::default());
+        let lines = wrap_styled(&chars, 6, 2);
+        // First line gets the full width; the rest lose it to the indent.
+        assert_eq!(lines_text(&lines), ["甲乙丙", "  丁"]);
+    }
+
+    #[test]
+    fn json_text_lays_out_as_an_outline() {
+        let lines = json_lines(
+            r#"{"b":1,"a":[true]}"#,
+            40,
+            &crate::ui::theme::Theme::dark(),
+        )
+        .expect("object text is JSON");
+        let text = lines_text(&lines);
+        assert_eq!(text.first().map(String::as_str), Some("{"));
+        assert_eq!(text.last().map(String::as_str), Some("}"));
+        // Key order follows the document, not the alphabet.
+        let b = text.iter().position(|line| line.contains("\"b\"")).unwrap();
+        let a = text.iter().position(|line| line.contains("\"a\"")).unwrap();
+        assert!(b < a, "keys reordered: {text:?}");
+    }
+
+    #[test]
+    fn a_standalone_tag_line_is_recognised() {
+        assert!(is_tag_line("<role>"));
+        assert!(is_tag_line("</role>"));
+        assert!(is_tag_line("  <source_contract>  "));
+        assert!(is_tag_line("<shot id=\"4\">"));
+        assert!(is_tag_line("<br/>"));
+    }
+
+    #[test]
+    fn prose_containing_angle_brackets_is_not_a_tag_line() {
+        assert!(!is_tag_line("本片段覆盖 action 编号 013"));
+        assert!(!is_tag_line("<role>你是短剧分镜师"));
+        assert!(!is_tag_line("a < b and c > d"));
+        assert!(!is_tag_line("<>"));
+        assert!(!is_tag_line("<3>"));
+        assert!(!is_tag_line("<a><b>"));
+    }
+
+    #[test]
+    fn tag_delimited_prompt_colors_only_its_tag_lines() {
+        let theme = crate::ui::theme::Theme::dark();
+        let prompt = "<role>\n你是短剧分镜师。\n</role>";
+        let (format, lines) = text_cell_lines(prompt, 40, &theme);
+        assert_eq!(format, CellFormat::Tags);
+        assert_eq!(
+            lines_text(&lines),
+            ["<role>", "你是短剧分镜师。", "</role>"]
+        );
+        // The tag lines carry the accent; the prose does not.
+        assert_eq!(lines[0][0].0.fg, Some(theme.accent));
+        assert_eq!(lines[1][0].0.fg, Some(theme.fg_primary));
+    }
+
+    #[test]
+    fn markdown_needs_a_signal_prose_does_not_produce() {
+        assert!(looks_like_markdown("# 标题\n正文"));
+        assert!(looks_like_markdown("```\ncode\n```"));
+        assert!(looks_like_markdown("- 一\n- 二"));
+        assert!(looks_like_markdown("这里有 **重点** 内容"));
+        // A single dash-led line is ordinary prose, not a list.
+        assert!(!looks_like_markdown("- 只有一条\n后面是正文"));
+        assert!(!looks_like_markdown("本片段覆盖 action 编号 013 至 013。"));
+        assert!(!looks_like_markdown("3.5 秒,不超过 6 秒。"));
+    }
+
+    #[test]
+    fn markdown_text_uses_the_markdown_path() {
+        let theme = crate::ui::theme::Theme::dark();
+        let (format, lines) = text_cell_lines("# 标题\n\n正文一段。", 40, &theme);
+        assert_eq!(format, CellFormat::Markdown);
+        assert!(
+            lines_text(&lines).iter().any(|line| line.contains("标题")),
+            "heading text missing"
+        );
+    }
+
+    #[test]
+    fn one_json_document_per_line_reads_as_json_lines() {
+        let theme = crate::ui::theme::Theme::dark();
+        let (format, _) = text_cell_lines("{\"a\":1}\n{\"a\":2}", 40, &theme);
+        assert_eq!(format, CellFormat::JsonLines);
+        // A single object stays plain JSON.
+        let (format, _) = text_cell_lines("{\"a\":1}", 40, &theme);
+        assert_eq!(format, CellFormat::Json);
+    }
+
+    #[test]
+    fn plain_prose_stays_plain() {
+        let theme = crate::ui::theme::Theme::dark();
+        let (format, _) = text_cell_lines("06,不得遗漏中间任何一条。", 40, &theme);
+        assert_eq!(format, CellFormat::Plain);
+        assert_eq!(format.label(), None);
+    }
+
+    #[test]
+    fn non_json_text_is_left_to_the_text_path() {
+        let theme = crate::ui::theme::Theme::dark();
+        assert!(json_lines("06,不得遗漏中间任何一条。", 40, &theme).is_none());
+        // Looks like JSON, isn't.
+        assert!(json_lines("{not json", 40, &theme).is_none());
+    }
+
+    #[test]
+    fn oversized_values_are_clipped_on_a_character_boundary() {
+        let (shown, clipped) = clip_chars("甲乙丙丁", 2);
+        assert_eq!(shown, "甲乙");
+        assert!(clipped);
+        let (shown, clipped) = clip_chars("甲乙", 8);
+        assert_eq!(shown, "甲乙");
+        assert!(!clipped);
+    }
+
+    #[test]
+    fn hint_clipping_counts_display_width() {
+        assert_eq!(clip_to_width("abcdef", 10), "abcdef");
+        assert_eq!(clip_to_width("abcdef", 4), "abc…");
+        assert_eq!(clip_to_width("甲乙丙", 4), "甲…");
+    }
 }
 
 #[cfg(test)]

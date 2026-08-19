@@ -64,7 +64,11 @@ Read `references/runtime-architecture.md` before changing `crates/reef-app/src/*
   requests its complete value through `DbLoadCell` using the locator returned with its page.
   Remote TEXT delivery streams frame-bounded chunks from that one read and validates the
   terminal full-cell revision. A newer cell selection cancels the previous local or remote read;
-  cell work runs separately from ordinary file and database-page previews. Table row counts
+  cell work runs separately from ordinary file and database-page previews. The opened cell is
+  also the grid's cell cursor: hosts move it, close it, and scroll its value through commands,
+  and report the grid's body height so `reef-app` can keep the cursor row on screen. Laying the
+  value out — pane width, wrapping, JSON coloring — is renderer-owned derived layout and must
+  stay out of `reef-app`. Table row counts
   provide a known last page; views keep an unknown last page until a short or empty follow-up page
   establishes the boundary. Schema expansion,
   object selection, paging, typed rows, and details must not be reimplemented by a renderer adapter.

@@ -119,6 +119,14 @@ pub enum ClickAction {
     /// (`▾ main` / `▸ temp` / …). Toggles the expanded / collapsed
     /// state for that schema's object list.
     DbToggleSchema(String),
+    /// Click on a cell in the SQLite data grid. `row` indexes into the
+    /// loaded page's rows, `column` into the object's columns. Opens
+    /// the value pane and requests the cell's complete value — grid
+    /// cells carry only a bounded prefix.
+    DbSelectCell {
+        row: usize,
+        column: usize,
+    },
 
     // ── Find widget (VSCode-style floating find, src/find_widget.rs) ──
     /// Click the `×` close button on the find widget.

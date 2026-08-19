@@ -69,17 +69,22 @@ impl AppState {
                     .retain(|schema| info.schemas.iter().any(|item| item.name == *schema));
                 state.expanded.insert(state.selection.schema.clone());
                 state.detail = None;
-                state.cell = None;
                 if object.kind.has_rows() {
                     state.last_page = max_page_for_object(object, state.rows_per_page);
                     if let Some(last_page) = state.last_page {
                         state.page = state.page.min(last_page);
                     }
+                    // The cell survives: anything writing to the
+                    // database refreshes the preview, and slamming the
+                    // value pane shut on every write would make an open
+                    // cell unusable on a live database. The reloaded
+                    // page re-opens it with a fresh locator.
                     DbPreviewSyncAction::LoadPage {
                         key: state.selection.clone(),
                         page: state.page,
                     }
                 } else {
+                    state.cell = None;
                     state.last_page = None;
                     DbPreviewSyncAction::LoadDetail(state.selection.clone())
                 }
@@ -93,7 +98,7 @@ impl AppState {
         match action {
             DbPreviewSyncAction::None => {}
             DbPreviewSyncAction::LoadPage { key, page } => {
-                self.dispatch_db_page_load(key, page, false);
+                self.dispatch_db_page_load(key, page, false, true);
             }
             DbPreviewSyncAction::LoadDetail(key) => self.dispatch_db_detail_load(key),
         }
@@ -140,7 +145,7 @@ impl AppState {
             return;
         }
         if key.kind.has_rows() {
-            self.dispatch_db_page_load(key, 0, true);
+            self.dispatch_db_page_load(key, 0, true, false);
         } else {
             self.dispatch_db_detail_load(key);
         }
@@ -199,7 +204,12 @@ impl AppState {
         if new_idx == cur_idx && new_page == cur_page {
             return;
         }
-        self.dispatch_db_page_load(visible[new_idx].clone(), new_page, new_idx != cur_idx);
+        self.dispatch_db_page_load(
+            visible[new_idx].clone(),
+            new_page,
+            new_idx != cur_idx,
+            false,
+        );
     }
 
     pub fn db_navigate_to_page(&mut self, page_one_based: u64) {
@@ -228,14 +238,19 @@ impl AppState {
         if target_page == cur_page {
             return;
         }
-        self.dispatch_db_page_load(selection, target_page, false);
+        self.dispatch_db_page_load(selection, target_page, false, false);
     }
 
+    /// `preserve_cell` keeps the opened cell across the load — true for
+    /// an in-place refresh of the same object and page, false when the
+    /// user moves to a different object or page and the old cell no
+    /// longer means anything.
     fn dispatch_db_page_load(
         &mut self,
         key: reef_sqlite_preview::DbObjectKey,
         page: u64,
         reset_h_scroll: bool,
+        preserve_cell: bool,
     ) {
         let Some((path, rows_per_page)) = self
             .db_preview
@@ -246,8 +261,13 @@ impl AppState {
         };
         let generation = self.db_page_load.begin();
         self.db_detail_load.invalidate();
+        // The in-flight read is against rows that are about to be
+        // replaced either way; the merge re-issues it when the cell
+        // is being kept.
         self.invalidate_db_cell_load();
-        if let Some(state) = self.db_preview.as_mut() {
+        if let Some(state) = self.db_preview.as_mut()
+            && !preserve_cell
+        {
             state.cell = None;
         }
         self.tasks.load_db_page(
@@ -259,6 +279,7 @@ impl AppState {
                 page,
                 rows_per_page,
                 reset_h_scroll,
+                refresh: preserve_cell,
             },
         );
     }
@@ -300,12 +321,27 @@ impl AppState {
         let cancellation = reef_io::CancellationToken::default();
         self.db_cell_cancellation = Some(cancellation.clone());
         if let Some(state) = self.db_preview.as_mut() {
+            // Re-reading the cell already on screen (a refresh) keeps
+            // the current value and scroll until the new value lands,
+            // so the pane updates in place instead of blinking through
+            // a loading state.
+            let carried = state
+                .cell
+                .as_ref()
+                .filter(|cell| {
+                    cell.object_key == object_key && cell.row == row && cell.column == column
+                })
+                .map(|cell| (cell.value.clone(), cell.scroll, cell.value_revision));
+            let (value, scroll, value_revision) = carried.unwrap_or((None, 0, 0));
             state.cell = Some(crate::DbCellPreviewState {
                 object_key: object_key.clone(),
+                row,
                 row_offset,
                 row_locator: row_locator.clone(),
                 column,
-                value: None,
+                value,
+                value_revision,
+                scroll,
             });
         }
         self.tasks.load_db_cell(
@@ -320,6 +356,69 @@ impl AppState {
                 cancellation,
             },
         );
+    }
+
+    /// Close the opened cell. The arrow keys go back to scrolling the
+    /// grid, and any in-flight read for that cell is cancelled.
+    pub fn db_close_cell(&mut self) {
+        if self.db_preview.as_ref().is_none_or(|s| s.cell.is_none()) {
+            return;
+        }
+        self.invalidate_db_cell_load();
+        if let Some(state) = self.db_preview.as_mut() {
+            state.cell = None;
+        }
+    }
+
+    /// Move the cell cursor within the loaded page and open the cell
+    /// it lands on. Clamped at the page edges — paging stays on
+    /// PgUp / PgDn so a cursor move never triggers a page load.
+    pub fn db_move_cell(&mut self, d_row: i32, d_col: i32) {
+        let Some((row, column)) = self.db_preview.as_ref().and_then(|state| {
+            let cell = state.cell.as_ref()?;
+            let last_row = state.current_rows.len().checked_sub(1)?;
+            let last_column = state.current_rows.get(cell.row)?.len().checked_sub(1)?;
+            let row = step_index(cell.row, d_row, last_row);
+            let column = step_index(cell.column, d_col, last_column);
+            (row != cell.row || column != cell.column).then_some((row, column))
+        }) else {
+            return;
+        };
+        self.dispatch_db_cell_load(row, column);
+    }
+
+    pub fn db_scroll_cell(&mut self, delta: i32) {
+        if let Some(cell) = self.db_preview.as_mut().and_then(|s| s.cell.as_mut()) {
+            cell.scroll = cell.scroll.saturating_add_signed(delta as isize);
+        }
+    }
+
+    pub fn clamp_db_cell_scroll(&mut self, max_scroll: usize) {
+        if let Some(cell) = self.db_preview.as_mut().and_then(|s| s.cell.as_mut()) {
+            cell.scroll = cell.scroll.min(max_scroll);
+        }
+    }
+
+    /// Keep the highlighted row inside the grid viewport after a
+    /// cursor move. Scrolls by the minimum needed so the surrounding
+    /// rows stay put whenever they can.
+    pub fn ensure_db_cell_row_visible(&mut self, visible_rows: usize) {
+        if visible_rows == 0 {
+            return;
+        }
+        let Some(row) = self
+            .db_preview
+            .as_ref()
+            .and_then(|state| state.cell.as_ref())
+            .map(|cell| cell.row)
+        else {
+            return;
+        };
+        if row < self.preview_scroll {
+            self.preview_scroll = row;
+        } else if row >= self.preview_scroll + visible_rows {
+            self.preview_scroll = row + 1 - visible_rows;
+        }
     }
 
     pub fn open_db_goto(&mut self) {
@@ -358,5 +457,23 @@ impl AppState {
             return;
         };
         let _ = crate::text_input::paste_ascii_digits_capped(s, buf, &mut self.db_goto_cursor, 18);
+    }
+}
+
+/// Apply a signed step to a cursor index, saturating at 0 and `last`.
+fn step_index(current: usize, delta: i32, last: usize) -> usize {
+    current.saturating_add_signed(delta as isize).min(last)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::step_index;
+
+    #[test]
+    fn step_index_saturates_at_both_edges() {
+        assert_eq!(step_index(0, -1, 4), 0);
+        assert_eq!(step_index(4, 1, 4), 4);
+        assert_eq!(step_index(2, -2, 4), 0);
+        assert_eq!(step_index(2, 5, 4), 4);
     }
 }

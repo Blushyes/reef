@@ -142,7 +142,7 @@ fn step_after_seed_advances_current() {
 }
 
 #[test]
-fn close_restores_pre_find_scroll_and_clears_state() {
+fn close_keeps_current_match_scroll_and_clears_state() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp, _g) = fresh_app();
     install_text_preview(
@@ -158,23 +158,25 @@ fn close_restores_pre_find_scroll_and_clears_state() {
 
     find_widget::begin_with_selection(&mut app);
     // Match landed on row 3 — center-scroll pushes preview_scroll
-    // away from 0.
+    // away from 0, and closing Find keeps that position visible.
     assert!(app.engine.find_widget().active);
+    let current_match_scroll = app.engine.state.preview_scroll;
+    assert_ne!(current_match_scroll, 0);
 
     find_widget::close(&mut app);
     assert!(!app.engine.find_widget().active);
     assert_eq!(app.engine.find_widget().query, "");
     assert_eq!(
-        app.engine.state.preview_scroll, 0,
-        "snapshot should restore scroll"
+        app.engine.state.preview_scroll, current_match_scroll,
+        "closing Find keeps the current match visible"
     );
 }
 
 #[test]
-fn tab_switch_closes_widget_and_restores_scroll() {
+fn tab_switch_closes_widget_and_keeps_current_match_scroll() {
     // `App::set_active_tab` calls `find_widget::close` so a widget
     // anchored on one tab's panel doesn't bleed into another. Verifies
-    // both halves: `active` flips off and pre-find scroll is restored.
+    // both halves: `active` flips off and the current match stays visible.
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _tmp, _g) = fresh_app();
     install_text_preview(
@@ -190,6 +192,8 @@ fn tab_switch_closes_widget_and_restores_scroll() {
 
     find_widget::begin_with_selection(&mut app);
     assert!(app.engine.find_widget().active);
+    let current_match_scroll = app.engine.state.preview_scroll;
+    assert_ne!(current_match_scroll, 0);
 
     // Switch away — should auto-close.
     app.set_active_tab(Tab::Git);
@@ -198,8 +202,8 @@ fn tab_switch_closes_widget_and_restores_scroll() {
     assert_eq!(app.engine.find_widget().query, "");
     assert_eq!(app.engine.find_widget().target, None);
     assert_eq!(
-        app.engine.state.preview_scroll, 0,
-        "tab switch must restore pre-find scroll via the same snapshot path as Esc",
+        app.engine.state.preview_scroll, current_match_scroll,
+        "tab switch must preserve the current match position via the same close path as Esc",
     );
 }
 

@@ -1,9 +1,7 @@
-//! Local vs Remote parity — numstat fields on `FileEntry`.
+//! Local vs Remote parity — asynchronously loaded Git numstat.
 //!
-//! v0.12.0 added `additions` / `deletions` to `FileEntry` for the Git tab
-//! `+N -M` column. Pre-M4 those never crossed the wire (RemoteBackend
-//! always returned zero). This test checks both backends see the same
-//! per-file numbers after a modification.
+//! Status classification stays cheap; a separate request carries content
+//! statistics. This test pins that request across the remote boundary.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -38,25 +36,10 @@ fn unstaged_numstat_crosses_wire() {
     let local = LocalBackend::open_at(tmp.path().to_path_buf());
     let remote = spawn_remote(tmp.path());
 
-    let l = local.git_status().expect("local status");
-    let r = remote.git_status().expect("remote status");
+    let local_stats = local.git_status_stats().expect("local status stats");
+    let remote_stats = remote.git_status_stats().expect("remote status stats");
 
-    // Index + sort by path so the zip pairs the same file on both sides.
-    let mut l_unstaged = l.unstaged.clone();
-    let mut r_unstaged = r.unstaged.clone();
-    l_unstaged.sort_by(|a, b| a.path.cmp(&b.path));
-    r_unstaged.sort_by(|a, b| a.path.cmp(&b.path));
-    assert_eq!(l_unstaged.len(), r_unstaged.len());
-    for (a, b) in l_unstaged.iter().zip(r_unstaged.iter()) {
-        assert_eq!(a.path, b.path);
-        assert_eq!(a.additions, b.additions, "additions mismatch on {}", a.path);
-        assert_eq!(a.deletions, b.deletions, "deletions mismatch on {}", a.path);
-        // Also assert remote non-zero so we catch the pre-M4 "always 0"
-        // regression if the numstat wiring breaks again.
-        assert!(
-            b.additions > 0 || b.deletions > 0,
-            "remote lost numstat for {}",
-            b.path
-        );
-    }
+    assert_eq!(local_stats, remote_stats);
+    assert_eq!(remote_stats.unstaged.get("a.txt"), Some(&(2, 2)));
+    assert_eq!(remote_stats.unstaged.get("b.txt"), Some(&(3, 0)));
 }

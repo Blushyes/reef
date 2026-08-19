@@ -2,7 +2,7 @@
 //!
 //! UI code should render cached snapshots only. Anything that can touch git,
 //! the filesystem, diff generation, or syntax highlighting is routed through
-//! these workers and merged back into `App` from `tick()`.
+//! these workers and merged back into `ReefApp` from `step()`.
 
 use crate::app::{
     CommitFileDiff, DiffHighlighted, GLOBAL_SEARCH_MAX_LINE_CHARS, GLOBAL_SEARCH_MAX_RESULTS,
@@ -11,17 +11,19 @@ use crate::app::{
 use reef_core::diff::DiffContent;
 use reef_core::file_ops::Resolution;
 use reef_core::git::graph::GraphRow;
-use reef_core::git::{CommitDetail, FileEntry, GraphScope, RefLabel};
-use reef_core::preview::PreviewDocument as PreviewContent;
+use reef_core::git::{CommitDetail, FileEntry, GitStatusStats, GraphScope, RefLabel};
+use reef_core::preview::{PreviewBody, PreviewDocument as PreviewContent, PreviewEnrichment};
 use reef_io::TreeEntry;
 use reef_io::{Backend, BackendError, WalkOpts};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
+
+use crossbeam_channel as mpsc;
 
 #[derive(Debug)]
 pub struct GitStatusPayload {
@@ -35,6 +37,12 @@ pub struct GitStatusPayload {
 pub struct FileTreePayload {
     pub entries: Vec<TreeEntry>,
     pub selected_idx: usize,
+}
+
+#[derive(Debug)]
+pub struct FileTreeSubtreePayload {
+    pub parent_path: PathBuf,
+    pub entries: Vec<TreeEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +84,7 @@ pub struct DbPagePayload {
     pub key: reef_sqlite_preview::DbObjectKey,
     pub page: u64,
     pub rows: Vec<Vec<reef_sqlite_preview::SqliteValue>>,
+    pub row_locators: Vec<reef_sqlite_preview::DbRowLocator>,
     pub reset_h_scroll: bool,
 }
 
@@ -93,6 +102,32 @@ pub struct DbDetailPayload {
     pub path: PathBuf,
     pub key: reef_sqlite_preview::DbObjectKey,
     pub detail: reef_sqlite_preview::DbObjectDetail,
+}
+
+#[derive(Debug)]
+pub struct DbCellPayload {
+    pub path: PathBuf,
+    pub key: reef_sqlite_preview::DbObjectKey,
+    pub row_offset: u64,
+    pub row_locator: reef_sqlite_preview::DbRowLocator,
+    pub column: usize,
+    pub value: reef_sqlite_preview::SqliteValue,
+}
+
+#[derive(Debug)]
+pub struct DbCellRequest {
+    pub path: PathBuf,
+    pub key: reef_sqlite_preview::DbObjectKey,
+    pub row_offset: u64,
+    pub row_locator: reef_sqlite_preview::DbRowLocator,
+    pub column: usize,
+    pub cancellation: reef_io::CancellationToken,
+}
+
+struct DbCellTask {
+    generation: u64,
+    backend: Arc<dyn Backend>,
+    request: DbCellRequest,
 }
 
 #[derive(Debug, Clone)]
@@ -150,11 +185,22 @@ pub struct PastePlanPayload {
 pub enum WorkerResult {
     FileTree {
         generation: u64,
+        tree_revision: u64,
         result: Result<FileTreePayload, String>,
+    },
+    FileTreeSubtree {
+        request_id: u64,
+        parent_path: PathBuf,
+        result: Result<FileTreeSubtreePayload, String>,
     },
     Preview {
         generation: u64,
         result: Result<Option<PreviewContent>, String>,
+    },
+    PreviewEnrichmentFinished {
+        generation: u64,
+        path: String,
+        enrichment: Option<PreviewEnrichment>,
     },
     DbPage {
         generation: u64,
@@ -164,9 +210,17 @@ pub enum WorkerResult {
         generation: u64,
         result: Result<DbDetailPayload, String>,
     },
+    DbCell {
+        generation: u64,
+        result: Result<DbCellPayload, String>,
+    },
     QuickOpenIndex {
         generation: u64,
         result: Result<Vec<crate::features::quick_open::Candidate>, String>,
+    },
+    QuickOpenFilter {
+        generation: u64,
+        matches: Vec<crate::features::quick_open::MatchEntry>,
     },
     TreeEditPlan {
         generation: u64,
@@ -179,6 +233,10 @@ pub enum WorkerResult {
     GitStatus {
         generation: u64,
         result: Result<GitStatusPayload, String>,
+    },
+    GitStatusStats {
+        generation: u64,
+        result: Result<GitStatusStats, String>,
     },
     GitMutation {
         generation: u64,
@@ -326,13 +384,10 @@ pub struct ReplaceItem {
 pub struct ReplaceLine {
     /// 0-indexed line number in the file.
     pub line_no: usize,
-    /// `line_text` snapshot from the UI's `MatchHit`. The worker
-    /// compares the current file's line against this snapshot before
-    /// rewriting; a mismatch (file was edited under us) bumps
-    /// `summary.skipped_stale`. May have been truncated by
-    /// `global_search::truncate_line` to `MAX_LINE_CHARS` chars; use
-    /// `starts_with` semantics when the snapshot is at the cap.
-    pub expected_text: String,
+    /// Revision of the complete line observed by content search. The worker
+    /// compares the current complete line before rewriting; display text is
+    /// intentionally not part of this consistency check because it is capped.
+    pub expected_revision: u64,
 }
 
 /// Aggregate result of a `FilesTask::ReplaceInFiles` run. Every
@@ -401,20 +456,34 @@ pub enum FsMutationKind {
     CopiedMulti { count: usize },
 }
 
+struct FileTreeRebuildTask {
+    identity: FileTreeRebuildIdentity,
+    backend: Arc<dyn Backend>,
+    expanded: Vec<PathBuf>,
+    git_statuses: HashMap<String, char>,
+    selected_path: Option<PathBuf>,
+    fallback_selected: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileTreeRebuildIdentity {
+    pub generation: u64,
+    pub tree_revision: u64,
+}
+
+struct FileTreeSubtreeTask {
+    request_id: u64,
+    backend: Arc<dyn Backend>,
+    parent_path: PathBuf,
+    parent_depth: usize,
+    expanded: Vec<PathBuf>,
+}
+
 enum FilesTask {
-    RebuildTree {
-        generation: u64,
-        backend: Arc<dyn Backend>,
-        expanded: Vec<PathBuf>,
-        git_statuses: HashMap<String, char>,
-        selected_path: Option<PathBuf>,
-        fallback_selected: usize,
-    },
     LoadPreview {
         generation: u64,
         backend: Arc<dyn Backend>,
         rel_path: PathBuf,
-        dark: bool,
         wants_decoded_image: bool,
     },
     LoadDbPage {
@@ -441,7 +510,6 @@ enum FilesTask {
     PrefetchPreview {
         backend: Arc<dyn Backend>,
         rel_path: PathBuf,
-        dark: bool,
         wants_decoded_image: bool,
     },
     PlanTreeEdit {
@@ -459,9 +527,10 @@ enum FilesTask {
         dest_rel: PathBuf,
         sources: Vec<PathBuf>,
     },
-    /// Drag-and-drop copy: each source lands under `dest_dir`. Sources can
-    /// be external host-local paths or workdir-local paths; `reef-io`
-    /// performs the actual local copy or remote upload.
+    /// Drag-and-drop / place-mode copy: each source lands under `dest_dir`.
+    /// Local backends may optimize sources already under their workdir into
+    /// native copies; remote backends always treat these paths as host-local
+    /// uploads. Workdir-internal copy uses `CopyPaths` instead.
     CopyFiles {
         generation: u64,
         backend: Arc<dyn Backend>,
@@ -561,6 +630,31 @@ enum FilesTask {
     },
 }
 
+struct QuickOpenFilterTask {
+    generation: u64,
+    index: Arc<[crate::features::quick_open::Candidate]>,
+    query: String,
+    mru: VecDeque<PathBuf>,
+}
+
+struct PreviewEnrichmentTask {
+    generation: u64,
+    path: String,
+    input: PreviewEnrichmentInput,
+    dark: bool,
+}
+
+enum PreviewEnrichmentInput {
+    Text {
+        bytes_on_disk: u64,
+        lines: Vec<String>,
+        source: Option<Arc<str>>,
+    },
+    Markdown {
+        source: String,
+    },
+}
+
 /// One source's contribution to a `MovePaths` / `CopyPaths` batch.
 #[derive(Debug, Clone)]
 pub struct PasteItem {
@@ -581,16 +675,6 @@ enum GitTask {
         generation: u64,
         backend: Arc<dyn Backend>,
     },
-    LoadDiff {
-        generation: u64,
-        backend: Arc<dyn Backend>,
-        path: String,
-        staged: bool,
-        context_lines: u32,
-        /// Picks the syntect theme (dark vs light) — same role as
-        /// `LoadCommitFileDiff.dark` / `LoadPreview.dark`.
-        dark: bool,
-    },
     Mutate {
         generation: u64,
         backend: Arc<dyn Backend>,
@@ -605,6 +689,26 @@ enum GitTask {
         generation: u64,
         backend: Arc<dyn Backend>,
         force: bool,
+    },
+}
+
+enum GitDiffTask {
+    Load {
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        path: String,
+        staged: bool,
+        context_lines: u32,
+        /// Picks the syntect theme (dark vs light) — same role as
+        /// `LoadCommitFileDiff.dark` / `LoadPreview.dark`.
+        dark: bool,
+    },
+}
+
+enum GitStatusStatsTask {
+    Refresh {
+        generation: u64,
+        backend: Arc<dyn Backend>,
     },
 }
 
@@ -638,19 +742,22 @@ enum LspTask {
     },
 }
 
-enum GraphTask {
+enum GraphRefreshTask {
     RefreshGraph {
         generation: u64,
         backend: Arc<dyn Backend>,
         limit: usize,
         scope: GraphScope,
     },
-    LoadCommitDetail {
+}
+
+enum GraphContentTask {
+    CommitDetail {
         generation: u64,
         backend: Arc<dyn Backend>,
         oid: String,
     },
-    LoadCommitFileDiff {
+    CommitFileDiff {
         generation: u64,
         backend: Arc<dyn Backend>,
         oid: String,
@@ -660,13 +767,13 @@ enum GraphTask {
         /// read correctly against the active UI theme — same as `load_preview`.
         dark: bool,
     },
-    LoadCommitRangeDetail {
+    CommitRangeDetail {
         generation: u64,
         backend: Arc<dyn Backend>,
         oldest_oid: String,
         newest_oid: String,
     },
-    LoadRangeFileDiff {
+    RangeFileDiff {
         generation: u64,
         backend: Arc<dyn Backend>,
         oldest_oid: String,
@@ -678,35 +785,78 @@ enum GraphTask {
 }
 
 pub struct TaskCoordinator {
+    file_tree_rebuild_tx: mpsc::Sender<FileTreeRebuildTask>,
+    file_tree_subtree_tx: mpsc::Sender<FileTreeSubtreeTask>,
     files_tx: mpsc::Sender<FilesTask>,
+    quick_open_filter_tx: mpsc::Sender<QuickOpenFilterTask>,
+    quick_open_filter_generation: Arc<AtomicU64>,
     /// Dedicated channel for `FilesTask::LoadPreview`. Keeping previews
     /// on their own worker thread means a slow directory rebuild or an
     /// in-flight copy never queues in front of the image the user just
     /// clicked. Both threads can hit the `LocalBackend` preview cache
     /// safely via the internal `Mutex`.
     preview_tx: mpsc::Sender<FilesTask>,
+    db_cell_tx: mpsc::Sender<DbCellTask>,
+    preview_enrichment_tx: mpsc::Sender<PreviewEnrichmentTask>,
     git_tx: mpsc::Sender<GitTask>,
-    graph_tx: mpsc::Sender<GraphTask>,
+    git_diff_tx: mpsc::Sender<GitDiffTask>,
+    git_status_stats_tx: mpsc::Sender<GitStatusStatsTask>,
+    graph_refresh_tx: mpsc::Sender<GraphRefreshTask>,
+    graph_content_tx: mpsc::Sender<GraphContentTask>,
     global_search_tx: mpsc::Sender<GlobalSearchTask>,
-    result_tx: mpsc::Sender<WorkerResult>,
+    result_tx: WorkerResultSender,
     /// LSP worker. Holds the per-language `LspClient`s +
     /// spawn-failure backoff.
     lsp_tx: mpsc::Sender<LspTask>,
     result_rx: mpsc::Receiver<WorkerResult>,
+    worker_wake_rx: mpsc::Receiver<()>,
+}
+
+#[derive(Clone)]
+struct WorkerResultSender {
+    result_tx: mpsc::Sender<WorkerResult>,
+    worker_wake_tx: mpsc::Sender<()>,
+}
+
+impl WorkerResultSender {
+    fn send(&self, result: WorkerResult) -> Result<(), ()> {
+        self.result_tx.send(result).map_err(|_| ())?;
+        let _ = self.worker_wake_tx.try_send(());
+        Ok(())
+    }
 }
 
 impl TaskCoordinator {
     pub fn new() -> Self {
-        let (result_tx, result_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::unbounded();
+        let (worker_wake_tx, worker_wake_rx) = mpsc::bounded(1);
+        let result_tx = WorkerResultSender {
+            result_tx,
+            worker_wake_tx,
+        };
+        let quick_open_filter_generation = Arc::new(AtomicU64::new(0));
         Self {
+            file_tree_rebuild_tx: spawn_file_tree_rebuild_worker(result_tx.clone()),
+            file_tree_subtree_tx: spawn_file_tree_subtree_workers(result_tx.clone()),
             files_tx: spawn_files_worker(result_tx.clone()),
+            quick_open_filter_tx: spawn_quick_open_filter_worker(
+                result_tx.clone(),
+                Arc::clone(&quick_open_filter_generation),
+            ),
+            quick_open_filter_generation,
             preview_tx: spawn_preview_worker(result_tx.clone()),
+            db_cell_tx: spawn_db_cell_worker(result_tx.clone()),
+            preview_enrichment_tx: spawn_preview_enrichment_worker(result_tx.clone()),
             git_tx: spawn_git_worker(result_tx.clone()),
-            graph_tx: spawn_graph_worker(result_tx.clone()),
+            git_diff_tx: spawn_git_diff_worker(result_tx.clone()),
+            git_status_stats_tx: spawn_git_status_stats_worker(result_tx.clone()),
+            graph_refresh_tx: spawn_graph_refresh_worker(result_tx.clone()),
+            graph_content_tx: spawn_graph_content_worker(result_tx.clone()),
             global_search_tx: spawn_global_search_worker(result_tx.clone()),
             lsp_tx: spawn_lsp_worker(result_tx.clone()),
             result_tx,
             result_rx,
+            worker_wake_rx,
         }
     }
 
@@ -753,17 +903,21 @@ impl TaskCoordinator {
         self.result_rx.try_recv()
     }
 
+    pub fn worker_wake_receiver(&self) -> mpsc::Receiver<()> {
+        self.worker_wake_rx.clone()
+    }
+
     pub fn rebuild_tree(
         &self,
-        generation: u64,
+        identity: FileTreeRebuildIdentity,
         backend: Arc<dyn Backend>,
         expanded: Vec<PathBuf>,
         git_statuses: HashMap<String, char>,
         selected_path: Option<PathBuf>,
         fallback_selected: usize,
     ) {
-        let _ = self.files_tx.send(FilesTask::RebuildTree {
-            generation,
+        let _ = self.file_tree_rebuild_tx.send(FileTreeRebuildTask {
+            identity,
             backend,
             expanded,
             git_statuses,
@@ -772,12 +926,28 @@ impl TaskCoordinator {
         });
     }
 
+    pub fn load_tree_subtree(
+        &self,
+        request_id: u64,
+        backend: Arc<dyn Backend>,
+        parent_path: PathBuf,
+        parent_depth: usize,
+        expanded: Vec<PathBuf>,
+    ) {
+        let _ = self.file_tree_subtree_tx.send(FileTreeSubtreeTask {
+            request_id,
+            backend,
+            parent_path,
+            parent_depth,
+            expanded,
+        });
+    }
+
     pub fn load_preview(
         &self,
         generation: u64,
         backend: Arc<dyn Backend>,
         rel_path: PathBuf,
-        dark: bool,
         wants_decoded_image: bool,
     ) {
         // Route to the dedicated preview worker so an in-flight tree
@@ -787,7 +957,6 @@ impl TaskCoordinator {
             generation,
             backend,
             rel_path,
-            dark,
             wants_decoded_image,
         });
     }
@@ -815,10 +984,35 @@ impl TaskCoordinator {
         });
     }
 
+    pub fn load_db_cell(&self, generation: u64, backend: Arc<dyn Backend>, request: DbCellRequest) {
+        let _ = self.db_cell_tx.send(DbCellTask {
+            generation,
+            backend,
+            request,
+        });
+    }
+
     pub fn build_quick_open_index(&self, generation: u64, backend: Arc<dyn Backend>) {
         let _ = self.files_tx.send(FilesTask::BuildQuickOpenIndex {
             generation,
             backend,
+        });
+    }
+
+    pub fn filter_quick_open(
+        &self,
+        generation: u64,
+        index: Arc<[crate::features::quick_open::Candidate]>,
+        query: String,
+        mru: VecDeque<PathBuf>,
+    ) {
+        self.quick_open_filter_generation
+            .store(generation, Ordering::Release);
+        let _ = self.quick_open_filter_tx.send(QuickOpenFilterTask {
+            generation,
+            index,
+            query,
+            mru,
         });
     }
 
@@ -829,15 +1023,20 @@ impl TaskCoordinator {
         &self,
         backend: Arc<dyn Backend>,
         rel_path: PathBuf,
-        dark: bool,
         wants_decoded_image: bool,
     ) {
         let _ = self.preview_tx.send(FilesTask::PrefetchPreview {
             backend,
             rel_path,
-            dark,
             wants_decoded_image,
         });
+    }
+
+    pub fn enrich_preview(&self, generation: u64, content: &PreviewContent, dark: bool) -> bool {
+        let Some(task) = preview_enrichment_task(generation, content, dark) else {
+            return false;
+        };
+        self.preview_enrichment_tx.send(task).is_ok()
     }
 
     pub fn copy_files(
@@ -1003,7 +1202,7 @@ impl TaskCoordinator {
     /// Dispatch a global replace batch to the files worker. The caller
     /// owns generation bookkeeping — see `App::commit_replace_in_files`
     /// for the canonical pattern: `replace_load.begin()` produces the
-    /// generation, `complete_ok` consumes it, and `App::tick` drops
+    /// generation, `complete_ok` consumes it, and `ReefApp::step` drops
     /// stale results whose `generation` no longer matches.
     pub fn replace_in_files(
         &self,
@@ -1029,6 +1228,13 @@ impl TaskCoordinator {
         });
     }
 
+    pub fn refresh_status_stats(&self, generation: u64, backend: Arc<dyn Backend>) {
+        let _ = self.git_status_stats_tx.send(GitStatusStatsTask::Refresh {
+            generation,
+            backend,
+        });
+    }
+
     pub fn load_diff(
         &self,
         generation: u64,
@@ -1038,7 +1244,7 @@ impl TaskCoordinator {
         context_lines: u32,
         dark: bool,
     ) {
-        let _ = self.git_tx.send(GitTask::LoadDiff {
+        let _ = self.git_diff_tx.send(GitDiffTask::Load {
             generation,
             backend,
             path,
@@ -1079,7 +1285,7 @@ impl TaskCoordinator {
         limit: usize,
         scope: GraphScope,
     ) {
-        let _ = self.graph_tx.send(GraphTask::RefreshGraph {
+        let _ = self.graph_refresh_tx.send(GraphRefreshTask::RefreshGraph {
             generation,
             backend,
             limit,
@@ -1088,7 +1294,7 @@ impl TaskCoordinator {
     }
 
     pub fn load_commit_detail(&self, generation: u64, backend: Arc<dyn Backend>, oid: String) {
-        let _ = self.graph_tx.send(GraphTask::LoadCommitDetail {
+        let _ = self.graph_content_tx.send(GraphContentTask::CommitDetail {
             generation,
             backend,
             oid,
@@ -1104,14 +1310,16 @@ impl TaskCoordinator {
         context_lines: u32,
         dark: bool,
     ) {
-        let _ = self.graph_tx.send(GraphTask::LoadCommitFileDiff {
-            generation,
-            backend,
-            oid,
-            path,
-            context_lines,
-            dark,
-        });
+        let _ = self
+            .graph_content_tx
+            .send(GraphContentTask::CommitFileDiff {
+                generation,
+                backend,
+                oid,
+                path,
+                context_lines,
+                dark,
+            });
     }
 
     pub fn load_commit_range_detail(
@@ -1121,12 +1329,14 @@ impl TaskCoordinator {
         oldest_oid: String,
         newest_oid: String,
     ) {
-        let _ = self.graph_tx.send(GraphTask::LoadCommitRangeDetail {
-            generation,
-            backend,
-            oldest_oid,
-            newest_oid,
-        });
+        let _ = self
+            .graph_content_tx
+            .send(GraphContentTask::CommitRangeDetail {
+                generation,
+                backend,
+                oldest_oid,
+                newest_oid,
+            });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1140,7 +1350,7 @@ impl TaskCoordinator {
         context_lines: u32,
         dark: bool,
     ) {
-        let _ = self.graph_tx.send(GraphTask::LoadRangeFileDiff {
+        let _ = self.graph_content_tx.send(GraphContentTask::RangeFileDiff {
             generation,
             backend,
             oldest_oid,
@@ -1174,30 +1384,78 @@ impl TaskCoordinator {
     }
 }
 
-fn spawn_files_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<FilesTask> {
-    let (tx, rx) = mpsc::channel();
+fn spawn_file_tree_rebuild_worker(
+    result_tx: WorkerResultSender,
+) -> mpsc::Sender<FileTreeRebuildTask> {
+    let (tx, rx) = mpsc::unbounded::<FileTreeRebuildTask>();
+    let _ = thread::Builder::new()
+        .name("reef-file-tree-rebuild".into())
+        .spawn(move || {
+            while let Ok(task) = recv_latest_file_tree_rebuild_task(&rx) {
+                let result = build_file_tree_payload(
+                    task.backend.as_ref(),
+                    task.expanded,
+                    task.git_statuses,
+                    task.selected_path,
+                    task.fallback_selected,
+                );
+                let _ = result_tx.send(WorkerResult::FileTree {
+                    generation: task.identity.generation,
+                    tree_revision: task.identity.tree_revision,
+                    result,
+                });
+            }
+        });
+    tx
+}
+
+fn recv_latest_file_tree_rebuild_task(
+    rx: &mpsc::Receiver<FileTreeRebuildTask>,
+) -> Result<FileTreeRebuildTask, mpsc::RecvError> {
+    let mut latest = rx.recv()?;
+    while let Ok(task) = rx.try_recv() {
+        latest = task;
+    }
+    Ok(latest)
+}
+
+fn spawn_file_tree_subtree_workers(
+    result_tx: WorkerResultSender,
+) -> mpsc::Sender<FileTreeSubtreeTask> {
+    const WORKER_COUNT: usize = 2;
+    let (tx, rx) = mpsc::unbounded::<FileTreeSubtreeTask>();
+    for index in 0..WORKER_COUNT {
+        let rx = rx.clone();
+        let result_tx = result_tx.clone();
+        let _ = thread::Builder::new()
+            .name(format!("reef-file-tree-subtree-{index}"))
+            .spawn(move || {
+                while let Ok(task) = rx.recv() {
+                    let parent_path = task.parent_path.clone();
+                    let result = build_file_tree_subtree_payload(
+                        task.backend.as_ref(),
+                        task.parent_path,
+                        task.parent_depth,
+                        task.expanded,
+                    );
+                    let _ = result_tx.send(WorkerResult::FileTreeSubtree {
+                        request_id: task.request_id,
+                        parent_path,
+                        result,
+                    });
+                }
+            });
+    }
+    tx
+}
+
+fn spawn_files_worker(result_tx: WorkerResultSender) -> mpsc::Sender<FilesTask> {
+    let (tx, rx) = mpsc::unbounded::<FilesTask>();
     let _ = thread::Builder::new()
         .name("reef-files-worker".into())
         .spawn(move || {
             while let Ok(task) = rx.recv() {
                 match task {
-                    FilesTask::RebuildTree {
-                        generation,
-                        backend,
-                        expanded,
-                        git_statuses,
-                        selected_path,
-                        fallback_selected,
-                    } => {
-                        let result = build_file_tree_payload(
-                            backend.as_ref(),
-                            expanded,
-                            git_statuses,
-                            selected_path,
-                            fallback_selected,
-                        );
-                        let _ = result_tx.send(WorkerResult::FileTree { generation, result });
-                    }
                     FilesTask::BuildQuickOpenIndex {
                         generation,
                         backend,
@@ -1207,16 +1465,6 @@ fn spawn_files_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Fil
                             .map(|resp| reef_core::quick_open::build_candidates(resp.paths))
                             .map_err(|e| e.to_string());
                         let _ = result_tx.send(WorkerResult::QuickOpenIndex { generation, result });
-                    }
-                    FilesTask::LoadPreview {
-                        generation,
-                        backend,
-                        rel_path,
-                        dark,
-                        wants_decoded_image,
-                    } => {
-                        let result = Ok(backend.load_preview(&rel_path, dark, wants_decoded_image));
-                        let _ = result_tx.send(WorkerResult::Preview { generation, result });
                     }
                     FilesTask::CopyFiles {
                         generation,
@@ -1391,11 +1639,38 @@ fn spawn_files_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Fil
                             &result_tx,
                         );
                     }
-                    // These routes belong to the preview worker; these
-                    // arms only satisfy exhaustiveness.
-                    FilesTask::LoadDbPage { .. }
+                    // These routes belong to dedicated workers; these arms
+                    // only satisfy exhaustiveness.
+                    FilesTask::LoadPreview { .. }
+                    | FilesTask::LoadDbPage { .. }
                     | FilesTask::LoadDbDetail { .. }
                     | FilesTask::PrefetchPreview { .. } => {}
+                }
+            }
+        });
+    tx
+}
+
+fn spawn_quick_open_filter_worker(
+    result_tx: WorkerResultSender,
+    latest_generation: Arc<AtomicU64>,
+) -> mpsc::Sender<QuickOpenFilterTask> {
+    let (tx, rx) = mpsc::unbounded::<QuickOpenFilterTask>();
+    let _ = thread::Builder::new()
+        .name("reef-quick-open-filter".into())
+        .spawn(move || {
+            while let Ok(task) = recv_latest(&rx) {
+                let matches = reef_core::quick_open::filter_candidates_interruptible(
+                    &task.index,
+                    &task.query,
+                    &task.mru,
+                    || latest_generation.load(Ordering::Acquire) != task.generation,
+                );
+                if let Some(matches) = matches {
+                    let _ = result_tx.send(WorkerResult::QuickOpenFilter {
+                        generation: task.generation,
+                        matches,
+                    });
                 }
             }
         });
@@ -1703,11 +1978,11 @@ fn run_paste_batch(
     (kind, result)
 }
 
-/// Dedicated worker thread for `FilesTask::LoadPreview`. Same task
-/// shape as the main files worker, but sitting on its own channel so
-/// slow preview decodes can't queue behind a big tree rebuild or a
-/// long-running copy. Non-preview tasks arriving here are silently
-/// ignored — they're never routed to `preview_tx` in practice.
+/// Dedicated worker thread for preview-adjacent file work. Keeping
+/// previews on their own channel means slow tree rebuilds or copies
+/// cannot queue in front of the file the user just selected. The worker
+/// also owns SQLite preview paging/detail tasks, so fresh `LoadPreview`
+/// requests are allowed to jump ahead of queued paging work.
 /// Run a preview decode under `catch_unwind`. A panic anywhere inside
 /// the backend codepath (image crate on a malformed PNG, syntect on a
 /// pathological file, sqlite reader on a corrupt DB, ...) becomes an
@@ -1730,22 +2005,184 @@ where
         .map_err(|_| format!("preview decoder panicked on {}", rel_path.display()))
 }
 
-fn spawn_preview_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<FilesTask> {
-    let (tx, rx) = mpsc::channel();
+fn recv_preview_worker_task(
+    rx: &mpsc::Receiver<FilesTask>,
+    backlog: &mut VecDeque<FilesTask>,
+) -> Result<FilesTask, mpsc::RecvError> {
+    let task = match backlog.pop_front() {
+        Some(task) => task,
+        None => rx.recv()?,
+    };
+    if !matches!(
+        task,
+        FilesTask::LoadPreview { .. } | FilesTask::PrefetchPreview { .. }
+    ) {
+        if let Some(load_preview) = take_pending_load_preview(rx, backlog) {
+            backlog.push_front(task);
+            return Ok(load_preview);
+        }
+    }
+    Ok(coalesce_preview_worker_task(task, rx, backlog))
+}
+
+fn take_pending_load_preview(
+    rx: &mpsc::Receiver<FilesTask>,
+    backlog: &mut VecDeque<FilesTask>,
+) -> Option<FilesTask> {
+    let mut selected = None;
+    while let Ok(task) = rx.try_recv() {
+        match task {
+            FilesTask::LoadPreview { .. } => selected = Some(task),
+            other => backlog.push_back(other),
+        }
+    }
+    selected
+}
+
+fn coalesce_preview_worker_task(
+    first: FilesTask,
+    rx: &mpsc::Receiver<FilesTask>,
+    backlog: &mut VecDeque<FilesTask>,
+) -> FilesTask {
+    if matches!(
+        first,
+        FilesTask::LoadDbPage { .. } | FilesTask::LoadDbDetail { .. }
+    ) {
+        let mut selected = first;
+        while let Ok(task) = rx.try_recv() {
+            match task {
+                FilesTask::LoadDbPage { .. } | FilesTask::LoadDbDetail { .. } => {
+                    selected = task;
+                }
+                other => backlog.push_back(other),
+            }
+        }
+        return selected;
+    }
+
+    let mut selected = match first {
+        FilesTask::LoadPreview { .. } | FilesTask::PrefetchPreview { .. } => first,
+        other => return other,
+    };
+
+    while let Ok(task) = rx.try_recv() {
+        match task {
+            FilesTask::LoadPreview { .. } => {
+                selected = task;
+            }
+            FilesTask::PrefetchPreview { .. } => {
+                if matches!(selected, FilesTask::PrefetchPreview { .. }) {
+                    selected = task;
+                }
+            }
+            other => backlog.push_back(other),
+        }
+    }
+
+    selected
+}
+
+fn preview_enrichment_task(
+    generation: u64,
+    content: &PreviewContent,
+    dark: bool,
+) -> Option<PreviewEnrichmentTask> {
+    let input = match &content.body {
+        PreviewBody::Text(text) => {
+            if !reef_core::preview::text_preview_can_be_enriched(
+                content.bytes_on_disk,
+                text.lines.len(),
+            ) {
+                return None;
+            }
+            PreviewEnrichmentInput::Text {
+                bytes_on_disk: content.bytes_on_disk,
+                lines: text.lines.clone(),
+                source: text.source.clone(),
+            }
+        }
+        PreviewBody::Markdown(markdown) => {
+            if !reef_core::preview::text_preview_can_be_enriched(
+                content.bytes_on_disk,
+                markdown.line_count(),
+            ) {
+                return None;
+            }
+            PreviewEnrichmentInput::Markdown {
+                source: markdown.source.clone(),
+            }
+        }
+        _ => return None,
+    };
+    Some(PreviewEnrichmentTask {
+        generation,
+        path: content.path.clone(),
+        input,
+        dark,
+    })
+}
+
+fn spawn_preview_enrichment_worker(
+    result_tx: WorkerResultSender,
+) -> mpsc::Sender<PreviewEnrichmentTask> {
+    let (tx, rx) = mpsc::unbounded::<PreviewEnrichmentTask>();
+    let _ = thread::Builder::new()
+        .name("reef-preview-enrichment".into())
+        .spawn(move || {
+            reef_core::highlight::warm_up_common_syntaxes();
+            while let Ok(mut task) = rx.recv() {
+                while let Ok(newer) = rx.try_recv() {
+                    task = newer;
+                }
+                let enrichment =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match task.input {
+                        PreviewEnrichmentInput::Text {
+                            bytes_on_disk,
+                            ref lines,
+                            ref source,
+                        } => reef_core::preview::build_text_preview_enrichment(
+                            &task.path,
+                            bytes_on_disk,
+                            lines,
+                            source.as_deref(),
+                            task.dark,
+                        )
+                        .map(PreviewEnrichment::Text),
+                        PreviewEnrichmentInput::Markdown { ref source } => {
+                            reef_core::markdown::build_markdown_preview_with_syntax(
+                                &task.path, source, task.dark,
+                            )
+                            .map(PreviewEnrichment::Markdown)
+                        }
+                    }))
+                    .ok()
+                    .flatten();
+                let _ = result_tx.send(WorkerResult::PreviewEnrichmentFinished {
+                    generation: task.generation,
+                    path: task.path,
+                    enrichment,
+                });
+            }
+        });
+    tx
+}
+
+fn spawn_preview_worker(result_tx: WorkerResultSender) -> mpsc::Sender<FilesTask> {
+    let (tx, rx) = mpsc::unbounded();
     let _ = thread::Builder::new()
         .name("reef-preview-worker".into())
         .spawn(move || {
-            while let Ok(task) = rx.recv() {
+            let mut backlog = VecDeque::new();
+            while let Ok(task) = recv_preview_worker_task(&rx, &mut backlog) {
                 match task {
                     FilesTask::LoadPreview {
                         generation,
                         backend,
                         rel_path,
-                        dark,
                         wants_decoded_image,
                     } => {
                         let result = run_preview_with_panic_guard(&rel_path, || {
-                            backend.load_preview(&rel_path, dark, wants_decoded_image)
+                            backend.load_preview(&rel_path, wants_decoded_image)
                         });
                         let _ = result_tx.send(WorkerResult::Preview { generation, result });
                     }
@@ -1767,6 +2204,7 @@ fn spawn_preview_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<F
                                 key: request.key,
                                 page: request.page,
                                 rows: page_data.rows,
+                                row_locators: page_data.row_locators,
                                 reset_h_scroll: request.reset_h_scroll,
                             })
                             .map_err(|e| e.to_string());
@@ -1787,7 +2225,6 @@ fn spawn_preview_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<F
                     FilesTask::PrefetchPreview {
                         backend,
                         rel_path,
-                        dark,
                         wants_decoded_image,
                     } => {
                         // Fire-and-forget: the backend's LRU cache
@@ -1795,7 +2232,7 @@ fn spawn_preview_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<F
                         // `LoadPreview` arm — a bad neighbor on
                         // prefetch must not take the worker down.
                         let _ = run_preview_with_panic_guard(&rel_path, || {
-                            backend.load_preview(&rel_path, dark, wants_decoded_image)
+                            backend.load_preview(&rel_path, wants_decoded_image)
                         });
                     }
                     _ => {}
@@ -1805,8 +2242,55 @@ fn spawn_preview_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<F
     tx
 }
 
-fn spawn_git_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<GitTask> {
-    let (tx, rx) = mpsc::channel();
+fn spawn_db_cell_worker(result_tx: WorkerResultSender) -> mpsc::Sender<DbCellTask> {
+    let (tx, rx) = mpsc::unbounded::<DbCellTask>();
+    let _ = thread::Builder::new()
+        .name("reef-db-cell-worker".into())
+        .spawn(move || {
+            while let Ok(task) = recv_latest_db_cell_task(&rx) {
+                if task.request.cancellation.is_cancelled() {
+                    continue;
+                }
+                let result = task
+                    .backend
+                    .db_load_cell(
+                        &task.request.path,
+                        &task.request.key,
+                        &task.request.row_locator,
+                        task.request.column,
+                        &task.request.cancellation,
+                    )
+                    .map(|value| DbCellPayload {
+                        path: task.request.path,
+                        key: task.request.key,
+                        row_offset: task.request.row_offset,
+                        row_locator: task.request.row_locator,
+                        column: task.request.column,
+                        value,
+                    })
+                    .map_err(|error| error.to_string());
+                let _ = result_tx.send(WorkerResult::DbCell {
+                    generation: task.generation,
+                    result,
+                });
+            }
+        });
+    tx
+}
+
+fn recv_latest_db_cell_task(
+    rx: &mpsc::Receiver<DbCellTask>,
+) -> Result<DbCellTask, mpsc::RecvError> {
+    let mut task = rx.recv()?;
+    while let Ok(newer) = rx.try_recv() {
+        task.request.cancellation.cancel();
+        task = newer;
+    }
+    Ok(task)
+}
+
+fn spawn_git_worker(result_tx: WorkerResultSender) -> mpsc::Sender<GitTask> {
+    let (tx, rx) = mpsc::unbounded();
     let _ = thread::Builder::new()
         .name("reef-git-worker".into())
         .spawn(move || {
@@ -1826,26 +2310,6 @@ fn spawn_git_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<GitTa
                             })
                             .map_err(|e| e.to_string());
                         let _ = result_tx.send(WorkerResult::GitStatus { generation, result });
-                    }
-                    GitTask::LoadDiff {
-                        generation,
-                        backend,
-                        path,
-                        staged,
-                        context_lines,
-                        dark,
-                    } => {
-                        // Merge: diff data via backend (remote-aware),
-                        // then apply v0.14.0's syntect highlighting on
-                        // the client side.
-                        let result = if staged {
-                            backend.staged_diff(&path, context_lines)
-                        } else {
-                            backend.unstaged_diff(&path, context_lines)
-                        }
-                        .map_err(|e| e.to_string())
-                        .map(|opt| opt.map(|diff| build_highlighted_diff(&path, diff, dark)));
-                        let _ = result_tx.send(WorkerResult::Diff { generation, result });
                     }
                     GitTask::Mutate {
                         generation,
@@ -1881,6 +2345,60 @@ fn spawn_git_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<GitTa
     tx
 }
 
+fn spawn_git_diff_worker(result_tx: WorkerResultSender) -> mpsc::Sender<GitDiffTask> {
+    let (tx, rx) = mpsc::unbounded();
+    let _ = thread::Builder::new()
+        .name("reef-git-diff-worker".into())
+        .spawn(move || {
+            while let Ok(task) = recv_latest(&rx) {
+                match task {
+                    GitDiffTask::Load {
+                        generation,
+                        backend,
+                        path,
+                        staged,
+                        context_lines,
+                        dark,
+                    } => {
+                        let result = if staged {
+                            backend.staged_diff(&path, context_lines)
+                        } else {
+                            backend.unstaged_diff(&path, context_lines)
+                        }
+                        .map_err(|e| e.to_string())
+                        .map(|opt| opt.map(|diff| build_highlighted_diff(&path, diff, dark)));
+                        let _ = result_tx.send(WorkerResult::Diff { generation, result });
+                    }
+                }
+            }
+        });
+    tx
+}
+
+fn spawn_git_status_stats_worker(
+    result_tx: WorkerResultSender,
+) -> mpsc::Sender<GitStatusStatsTask> {
+    let (tx, rx) = mpsc::unbounded();
+    let _ = thread::Builder::new()
+        .name("reef-git-stats-worker".into())
+        .spawn(move || {
+            while let Ok(task) = recv_latest(&rx) {
+                match task {
+                    GitStatusStatsTask::Refresh {
+                        generation,
+                        backend,
+                    } => {
+                        let result = backend
+                            .git_status_stats()
+                            .map_err(|error| error.to_string());
+                        let _ = result_tx.send(WorkerResult::GitStatusStats { generation, result });
+                    }
+                }
+            }
+        });
+    tx
+}
+
 fn run_git_mutation(
     backend: &dyn Backend,
     mutation: GitMutation,
@@ -1888,22 +2406,14 @@ fn run_git_mutation(
     let mut touched = Vec::new();
     let mut errors = Vec::new();
     match &mutation {
-        GitMutation::Stage(paths) => {
-            for path in paths {
-                match backend.stage(path) {
-                    Ok(()) => touched.push(path.clone()),
-                    Err(error) => errors.push(format!("{path}: {error}")),
-                }
-            }
-        }
-        GitMutation::Unstage(paths) => {
-            for path in paths {
-                match backend.unstage(path) {
-                    Ok(()) => touched.push(path.clone()),
-                    Err(error) => errors.push(format!("{path}: {error}")),
-                }
-            }
-        }
+        GitMutation::Stage(paths) => match backend.stage_paths(paths) {
+            Ok(()) => touched.extend(paths.iter().cloned()),
+            Err(error) => errors.push(error.to_string()),
+        },
+        GitMutation::Unstage(paths) => match backend.unstage_paths(paths) {
+            Ok(()) => touched.extend(paths.iter().cloned()),
+            Err(error) => errors.push(error.to_string()),
+        },
         GitMutation::Revert(paths) => {
             for item in paths {
                 match backend.revert_path(&item.path, item.is_staged) {
@@ -1924,14 +2434,14 @@ fn run_git_mutation(
     })
 }
 
-fn spawn_graph_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<GraphTask> {
-    let (tx, rx) = mpsc::channel();
+fn spawn_graph_refresh_worker(result_tx: WorkerResultSender) -> mpsc::Sender<GraphRefreshTask> {
+    let (tx, rx) = mpsc::unbounded();
     let _ = thread::Builder::new()
-        .name("reef-graph-worker".into())
+        .name("reef-graph-refresh-worker".into())
         .spawn(move || {
-            while let Ok(task) = rx.recv() {
+            while let Ok(task) = recv_latest(&rx) {
                 match task {
-                    GraphTask::RefreshGraph {
+                    GraphRefreshTask::RefreshGraph {
                         generation,
                         backend,
                         limit,
@@ -1978,7 +2488,28 @@ fn spawn_graph_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Gra
                         })();
                         let _ = result_tx.send(WorkerResult::Graph { generation, result });
                     }
-                    GraphTask::LoadCommitDetail {
+                }
+            }
+        });
+    tx
+}
+
+fn recv_latest<T>(rx: &mpsc::Receiver<T>) -> Result<T, mpsc::RecvError> {
+    let mut latest = rx.recv()?;
+    while let Ok(newer) = rx.try_recv() {
+        latest = newer;
+    }
+    Ok(latest)
+}
+
+fn spawn_graph_content_worker(result_tx: WorkerResultSender) -> mpsc::Sender<GraphContentTask> {
+    let (tx, rx) = mpsc::unbounded();
+    let _ = thread::Builder::new()
+        .name("reef-graph-content-worker".into())
+        .spawn(move || {
+            while let Ok(task) = rx.recv() {
+                match task {
+                    GraphContentTask::CommitDetail {
                         generation,
                         backend,
                         oid,
@@ -1986,7 +2517,7 @@ fn spawn_graph_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Gra
                         let result = backend.commit_detail(&oid).map_err(|e| e.to_string());
                         let _ = result_tx.send(WorkerResult::CommitDetail { generation, result });
                     }
-                    GraphTask::LoadCommitFileDiff {
+                    GraphContentTask::CommitFileDiff {
                         generation,
                         backend,
                         oid,
@@ -2000,7 +2531,7 @@ fn spawn_graph_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Gra
                             .map(|opt| opt.map(|diff| build_commit_file_diff(path, diff, dark)));
                         let _ = result_tx.send(WorkerResult::CommitFileDiff { generation, result });
                     }
-                    GraphTask::LoadCommitRangeDetail {
+                    GraphContentTask::CommitRangeDetail {
                         generation,
                         backend,
                         oldest_oid,
@@ -2011,7 +2542,7 @@ fn spawn_graph_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Gra
                             .map_err(|e| e.to_string());
                         let _ = result_tx.send(WorkerResult::RangeDetail { generation, result });
                     }
-                    GraphTask::LoadRangeFileDiff {
+                    GraphContentTask::RangeFileDiff {
                         generation,
                         backend,
                         oldest_oid,
@@ -2555,6 +3086,152 @@ fn build_file_tree_payload(
     })
 }
 
+fn build_file_tree_subtree_payload(
+    backend: &dyn Backend,
+    parent_path: PathBuf,
+    parent_depth: usize,
+    expanded: Vec<PathBuf>,
+) -> Result<FileTreeSubtreePayload, String> {
+    let expanded: HashSet<PathBuf> = expanded.into_iter().collect();
+    let mut entries = Vec::new();
+    collect_file_tree_subtree(
+        backend,
+        &parent_path,
+        parent_depth + 1,
+        &expanded,
+        &mut entries,
+    )?;
+    Ok(FileTreeSubtreePayload {
+        parent_path,
+        entries,
+    })
+}
+
+fn collect_file_tree_subtree(
+    backend: &dyn Backend,
+    parent_path: &Path,
+    depth: usize,
+    expanded: &HashSet<PathBuf>,
+    entries: &mut Vec<TreeEntry>,
+) -> Result<(), String> {
+    let mut children = backend
+        .list_dir(parent_path)
+        .map_err(|error| error.to_string())?;
+    children.retain(|entry| entry.name != ".git");
+    children.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+    });
+
+    for child in children {
+        let path = parent_path.join(&child.name);
+        let is_expanded = child.is_dir && expanded.contains(&path);
+        entries.push(TreeEntry {
+            path: path.clone(),
+            name: child.name,
+            depth,
+            is_dir: child.is_dir,
+            has_children: child.has_children,
+            is_expanded,
+            git_status: None,
+        });
+        if is_expanded {
+            collect_file_tree_subtree(backend, &path, depth + 1, expanded, entries)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod file_tree_subtree_tests {
+    use std::fs;
+
+    use reef_io::LocalBackend;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn subtree_load_reads_parent_and_preserves_nested_expansion() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src/nested")).unwrap();
+        fs::create_dir_all(tmp.path().join("outside")).unwrap();
+        fs::write(tmp.path().join("src/a.rs"), "a").unwrap();
+        fs::write(tmp.path().join("src/nested/b.rs"), "b").unwrap();
+        fs::write(tmp.path().join("outside/c.rs"), "c").unwrap();
+        let backend = LocalBackend::open_at(tmp.path().to_path_buf());
+        let payload = build_file_tree_subtree_payload(
+            &backend,
+            PathBuf::from("src"),
+            0,
+            vec![PathBuf::from("src"), PathBuf::from("src/nested")],
+        )
+        .unwrap();
+
+        assert_eq!(payload.parent_path, Path::new("src"));
+        assert_eq!(
+            payload
+                .entries
+                .iter()
+                .map(|entry| (entry.path.as_path(), entry.depth, entry.is_expanded))
+                .collect::<Vec<_>>(),
+            vec![
+                (Path::new("src/nested"), 1, true),
+                (Path::new("src/nested/b.rs"), 2, false),
+                (Path::new("src/a.rs"), 1, false),
+            ]
+        );
+        assert_eq!(payload.entries[2].git_status, None);
+    }
+}
+
+#[cfg(test)]
+mod file_tree_worker_coalescing_tests {
+    use super::*;
+
+    fn backend() -> Arc<dyn Backend> {
+        Arc::new(reef_io::LocalBackend::open_at(std::env::temp_dir()))
+    }
+
+    fn rebuild(generation: u64) -> FileTreeRebuildTask {
+        FileTreeRebuildTask {
+            identity: FileTreeRebuildIdentity {
+                generation,
+                tree_revision: generation,
+            },
+            backend: backend(),
+            expanded: Vec::new(),
+            git_statuses: HashMap::new(),
+            selected_path: None,
+            fallback_selected: 0,
+        }
+    }
+
+    #[test]
+    fn queued_full_tree_rebuilds_coalesce_to_latest_generation() {
+        let (tx, rx) = mpsc::unbounded();
+        tx.send(rebuild(1)).unwrap();
+        tx.send(rebuild(3)).unwrap();
+
+        let task = recv_latest_file_tree_rebuild_task(&rx).unwrap();
+
+        assert_eq!(task.identity.generation, 3);
+        assert_eq!(task.identity.tree_revision, 3);
+        assert!(rx.is_empty());
+    }
+
+    #[test]
+    fn single_full_tree_rebuild_is_preserved() {
+        let (tx, rx) = mpsc::unbounded();
+        tx.send(rebuild(4)).unwrap();
+
+        let task = recv_latest_file_tree_rebuild_task(&rx).unwrap();
+
+        assert_eq!(task.identity.generation, 4);
+    }
+}
+
 fn build_nav_workspace_index(
     backend: &dyn Backend,
 ) -> Result<reef_core::nav::WorkspaceIndex, String> {
@@ -2640,15 +3317,13 @@ fn hash_ref_map(map: &HashMap<String, Vec<RefLabel>>) -> u64 {
 
 // ─── Global-search worker ───────────────────────────────────────────────────
 
-fn spawn_global_search_worker(
-    result_tx: mpsc::Sender<WorkerResult>,
-) -> mpsc::Sender<GlobalSearchTask> {
-    let (tx, rx) = mpsc::channel();
+fn spawn_global_search_worker(result_tx: WorkerResultSender) -> mpsc::Sender<GlobalSearchTask> {
+    let (tx, rx) = mpsc::unbounded();
     let _ = thread::Builder::new()
         .name("reef-global-search-worker".into())
         .spawn(move || {
             // Drain new tasks as they arrive. A task starting while the previous
-            // one is still running won't happen in practice (App::tick only
+            // one is still running won't happen in practice (`ReefApp::step` only
             // kicks off a new task after flipping the old `cancel` flag), but
             // if it did, the previous search would finish and then this one
             // would run — the old `generation` keeps its chunks from leaking.
@@ -2684,8 +3359,8 @@ fn spawn_global_search_worker(
 /// Dedicated LSP worker thread. Owns the per-language `LspClient`s
 /// and a spawn-failure backoff so a missing/broken server isn't
 /// re-spawned (with its 15s init handshake) on every single click.
-fn spawn_lsp_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<LspTask> {
-    let (tx, rx) = mpsc::channel();
+fn spawn_lsp_worker(result_tx: WorkerResultSender) -> mpsc::Sender<LspTask> {
+    let (tx, rx) = mpsc::unbounded();
     let _ = thread::Builder::new()
         .name("reef-lsp-worker".into())
         .spawn(move || {
@@ -2801,19 +3476,19 @@ fn spawn_lsp_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<LspTa
 /// of waiting for the whole walk. Returns `truncated = true` iff the
 /// backend reported hitting the hit cap.
 ///
-/// Cancellation: the sink returns `ControlFlow::Break(())` once `cancel`
-/// flips. The Local backend honours this at the next file boundary; the
-/// Remote backend stops forwarding to the UI but lets the agent finish
-/// the walk naturally (we don't have a "cancel this request" wire op
-/// yet — adding one would be the obvious follow-up if mis-typing a
-/// pattern on a huge remote monorepo proves costly).
+/// Cancellation is carried into the backend as well as checked by the sink.
+/// Local file reads are interruptible, while remote walks receive a protocol
+/// cancellation request, so obsolete work does not delay a newer query.
 fn run_global_search_via_backend(
     generation: u64,
     cancel: Arc<AtomicBool>,
     backend: &dyn Backend,
     query: &str,
-    result_tx: &mpsc::Sender<WorkerResult>,
+    result_tx: &WorkerResultSender,
 ) -> bool {
+    const PUBLISH_BATCH_SIZE: usize = 64;
+    const PUBLISH_INTERVAL: Duration = Duration::from_millis(16);
+
     if query.is_empty() {
         return false;
     }
@@ -2823,8 +3498,24 @@ fn run_global_search_via_backend(
         case_sensitive: None,
         max_results: GLOBAL_SEARCH_MAX_RESULTS as u32,
         max_line_chars: GLOBAL_SEARCH_MAX_LINE_CHARS as u32,
+        cancellation: reef_io::CancellationToken::from_flag(Arc::clone(&cancel)),
     };
 
+    let mut pending = Vec::with_capacity(PUBLISH_BATCH_SIZE);
+    let mut last_publish = Instant::now();
+    let publish = |pending: &mut Vec<MatchHit>| -> std::ops::ControlFlow<()> {
+        if pending.is_empty() {
+            return std::ops::ControlFlow::Continue(());
+        }
+        let hits = std::mem::replace(pending, Vec::with_capacity(PUBLISH_BATCH_SIZE));
+        if result_tx
+            .send(WorkerResult::GlobalSearchChunk { generation, hits })
+            .is_err()
+        {
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    };
     let mut on_chunk = |hits: Vec<reef_io::ContentMatchHit>| -> std::ops::ControlFlow<()> {
         if cancel.load(Ordering::Relaxed) {
             return std::ops::ControlFlow::Break(());
@@ -2832,99 +3523,43 @@ fn run_global_search_via_backend(
         if hits.is_empty() {
             return std::ops::ControlFlow::Continue(());
         }
-        let ui_hits: Vec<MatchHit> = hits
-            .into_iter()
-            .map(|h| MatchHit {
-                path: h.path,
-                display: h.display,
-                line: h.line,
-                line_text: h.line_text,
-                byte_range: h.byte_range,
-            })
-            .collect();
-        // If the result channel is gone the App has torn down; stop
-        // trying to push chunks but let the backend tidy up on its
-        // own schedule.
-        if result_tx
-            .send(WorkerResult::GlobalSearchChunk {
-                generation,
-                hits: ui_hits,
-            })
-            .is_err()
-        {
-            return std::ops::ControlFlow::Break(());
+        pending.extend(hits.into_iter().map(|h| MatchHit {
+            path: h.path,
+            display: h.display,
+            line: h.line,
+            line_text: h.line_text,
+            line_revision: h.line_revision,
+            byte_range: h.byte_range,
+        }));
+        if pending.len() >= PUBLISH_BATCH_SIZE || last_publish.elapsed() >= PUBLISH_INTERVAL {
+            let flow = publish(&mut pending);
+            last_publish = Instant::now();
+            return flow;
         }
         std::ops::ControlFlow::Continue(())
     };
 
-    match backend.search_content(&request, &mut on_chunk) {
-        Ok(completed) => completed.truncated,
-        Err(_) => false,
+    let completed = backend.search_content(&request, &mut on_chunk);
+    if !cancel.load(Ordering::Relaxed) {
+        let _ = publish(&mut pending);
     }
-}
-
-/// Walk file bytes preserving each line's terminator. Each yielded
-/// segment ends at (and includes) a `\n`, except possibly the last
-/// segment if the file doesn't end with a newline. `\r\n` is kept
-/// intact because we only split on `\n` — the `\r` rides with the
-/// preceding bytes. This is the byte-level analogue of
-/// `bstr::ByteSlice::lines_with_terminator` without the dep.
-fn lines_with_terminator(bytes: &[u8]) -> Vec<&[u8]> {
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    for (i, b) in bytes.iter().enumerate() {
-        if *b == b'\n' {
-            out.push(&bytes[start..=i]);
-            start = i + 1;
-        }
-    }
-    if start < bytes.len() {
-        out.push(&bytes[start..]);
-    }
-    out
-}
-
-/// Drop a single trailing `\n` (and any `\r` immediately before it) so
-/// the byte slice represents the visible line content the search
-/// matcher saw. The matcher operates on the line body without the
-/// terminator — keeping `\r` would make `starts_with` comparisons
-/// against `expected_line_text` (CRLF-stripped by `grep_searcher`)
-/// fail on every CRLF file.
-fn strip_line_terminator(line: &[u8]) -> &[u8] {
-    let n = line.len();
-    if n >= 2 && line[n - 2] == b'\r' && line[n - 1] == b'\n' {
-        &line[..n - 2]
-    } else if n >= 1 && line[n - 1] == b'\n' {
-        &line[..n - 1]
-    } else {
-        line
-    }
+    completed.map(|result| result.truncated).unwrap_or(false)
 }
 
 /// Run one `FilesTask::ReplaceInFiles` batch. Streams a
 /// `WorkerResult::ReplaceProgress` per file and a final
 /// `WorkerResult::ReplaceDone`.
 ///
-/// Per-file flow:
-///   1. `backend.read_file` (cap = `MAX_REPLACE_FILE_SIZE`).
-///   2. Build a `grep_regex::RegexMatcher` from the same `query` that
-///      drove the search — guarantees byte-identical matching.
-///   3. Walk lines preserving terminators; for each `included_line` whose
-///      current text still matches the UI snapshot
-///      (`expected_line_text`), replace ALL occurrences of the pattern
-///      on that line with `replace_text` in-place.
-///   4. Concatenate back to bytes and `backend.write_file`.
-///
-/// All bytes stay as `Vec<u8>` end-to-end so non-UTF-8 files survive
-/// untouched. Failed files surface in `summary.errors` without aborting
-/// the rest of the batch.
+/// Each backend owns the complete guarded transform and atomic write. For a
+/// remote workspace this keeps the source file on the agent and transfers
+/// only the pattern, replacement, line revisions, and bounded outcome.
 fn run_replace_in_files(
     generation: u64,
     backend: &dyn Backend,
     query: &str,
     replace_text: &str,
     items: &[ReplaceItem],
-    result_tx: &mpsc::Sender<WorkerResult>,
+    result_tx: &WorkerResultSender,
 ) {
     let mut summary = ReplaceSummary::default();
     let total = items.len();
@@ -2936,40 +3571,36 @@ fn run_replace_in_files(
         });
         return;
     }
-    // Same builder the search worker used (smart-case, fixed-strings)
-    // so the worker rewrites exactly the matches the UI streamed in.
-    let matcher = match reef_io::local::build_smart_case_matcher(
-        query, /* fixed_strings */ true, /* case_sensitive */ None,
-    ) {
-        Ok(m) => m,
-        Err(e) => {
-            let _ = result_tx.send(WorkerResult::ReplaceDone {
-                generation,
-                result: Err(format!("build matcher: {e}")),
-            });
-            return;
-        }
-    };
-
-    let replace_bytes = replace_text.as_bytes();
-
     for (file_idx, item) in items.iter().enumerate() {
         let path = &item.path;
-        match replace_one_file(backend, &matcher, path, item, replace_bytes) {
-            FileReplaceOutcome::Changed {
+        let request = reef_io::ReplaceFileRequest {
+            pattern: query.to_string(),
+            replacement: replace_text.as_bytes().to_vec(),
+            lines: item
+                .lines
+                .iter()
+                .map(|line| reef_io::ReplaceLineGuard {
+                    line_no: line.line_no as u64,
+                    expected_revision: line.expected_revision,
+                })
+                .collect(),
+            max_file_size: MAX_REPLACE_FILE_SIZE,
+        };
+        match backend.replace_file(path, &request) {
+            Ok(reef_io::ReplaceFileOutcome::Changed {
                 lines_replaced,
                 stale,
-            } => {
+            }) => {
                 summary.files_changed += 1;
-                summary.lines_replaced += lines_replaced;
-                summary.skipped_stale += stale;
+                summary.lines_replaced += lines_replaced as usize;
+                summary.skipped_stale += stale as usize;
             }
-            FileReplaceOutcome::NoMatch { stale } => {
-                summary.skipped_stale += stale;
+            Ok(reef_io::ReplaceFileOutcome::NoMatch { stale }) => {
+                summary.skipped_stale += stale as usize;
             }
-            FileReplaceOutcome::TooLarge => summary.skipped_too_large += 1,
-            FileReplaceOutcome::SymlinkEscape => summary.skipped_symlink_escape += 1,
-            FileReplaceOutcome::Err(msg) => summary.errors.push((path.clone(), msg)),
+            Ok(reef_io::ReplaceFileOutcome::TooLarge) => summary.skipped_too_large += 1,
+            Err(reef_io::BackendError::PathEscape(_)) => summary.skipped_symlink_escape += 1,
+            Err(error) => summary.errors.push((path.clone(), error.to_string())),
         }
         let _ = result_tx.send(WorkerResult::ReplaceProgress {
             generation,
@@ -2982,157 +3613,6 @@ fn run_replace_in_files(
         generation,
         result: Ok(summary),
     });
-}
-
-enum FileReplaceOutcome {
-    /// File was rewritten with `lines_replaced` rewrites; `stale`
-    /// counts per-line stale-skips that the same pass observed (mixed
-    /// outcomes within one file are common when only some lines drift).
-    Changed {
-        lines_replaced: usize,
-        stale: usize,
-    },
-    /// File was read OK but no included line was rewritten. `stale`
-    /// carries the count for the per-batch counter.
-    NoMatch {
-        stale: usize,
-    },
-    TooLarge,
-    SymlinkEscape,
-    Err(String),
-}
-
-/// Per-file inner of `run_replace_in_files`. Pulled out so the outer
-/// loop only handles bookkeeping and the file-level decisions stay
-/// readable.
-fn replace_one_file(
-    backend: &dyn Backend,
-    matcher: &grep_regex::RegexMatcher,
-    path: &Path,
-    item: &ReplaceItem,
-    replace_bytes: &[u8],
-) -> FileReplaceOutcome {
-    use grep_matcher::Matcher;
-
-    // Cheap probe first — if the file exceeds the cap we skip without
-    // ever pulling its bytes across the wire (matters most for the
-    // remote backend, where `read_file` would otherwise transfer up to
-    // the cap and then we'd discard the truncated copy). Bare-`>` so a
-    // file that's *exactly* `MAX_REPLACE_FILE_SIZE` is still in scope —
-    // the cap is "no larger than", not "smaller than".
-    match backend.file_size(path) {
-        Ok(sz) if sz > MAX_REPLACE_FILE_SIZE => return FileReplaceOutcome::TooLarge,
-        Ok(_) => {}
-        Err(reef_io::BackendError::PathEscape(_)) => {
-            return FileReplaceOutcome::SymlinkEscape;
-        }
-        Err(e) => return FileReplaceOutcome::Err(format!("stat: {e}")),
-    }
-    let original = match backend.read_file(path, MAX_REPLACE_FILE_SIZE) {
-        Ok(bytes) => bytes,
-        Err(reef_io::BackendError::PathEscape(_)) => {
-            return FileReplaceOutcome::SymlinkEscape;
-        }
-        Err(e) => return FileReplaceOutcome::Err(format!("read: {e}")),
-    };
-
-    // Pre-walk line numbers so the replacement loop is straight-line.
-    let lines = lines_with_terminator(&original);
-    let mut out: Vec<u8> = Vec::with_capacity(original.len());
-    let mut included_idx = 0usize;
-    let included = &item.lines;
-    let mut lines_replaced = 0usize;
-    let mut stale = 0usize;
-
-    for (line_no, raw_line) in lines.iter().enumerate() {
-        let target = match included.get(included_idx) {
-            Some(t) if t.line_no == line_no => {
-                included_idx += 1;
-                Some(t)
-            }
-            _ => None,
-        };
-        let Some(target) = target else {
-            out.extend_from_slice(raw_line);
-            continue;
-        };
-
-        let body = strip_line_terminator(raw_line);
-        // TOCTOU guard. The UI saw `target.expected_text`; if the
-        // file's current line doesn't still start with that, an
-        // external editor changed the file under us — skip the
-        // replacement, count as stale.
-        let snapshot = target.expected_text.as_str();
-        let matches_snapshot = match std::str::from_utf8(body) {
-            Ok(text) => {
-                if snapshot.chars().count() >= GLOBAL_SEARCH_MAX_LINE_CHARS {
-                    text.starts_with(snapshot)
-                } else {
-                    text == snapshot
-                }
-            }
-            Err(_) => false,
-        };
-        if !matches_snapshot {
-            stale += 1;
-            out.extend_from_slice(raw_line);
-            continue;
-        }
-
-        // Replace every occurrence on this line. `find_iter` is
-        // borrow-checker-friendly via a callback and stops cleanly on
-        // matcher errors — same regex engine the search built so we
-        // see exactly what it streamed.
-        let mut new_body: Vec<u8> = Vec::with_capacity(body.len());
-        let mut cursor = 0usize;
-        let mut had_match = false;
-        let walk = matcher.find_iter(body, |m| {
-            had_match = true;
-            new_body.extend_from_slice(&body[cursor..m.start()]);
-            new_body.extend_from_slice(replace_bytes);
-            cursor = m.end();
-            true
-        });
-        if walk.is_err() {
-            // Pathological matcher state — leave the line intact.
-            out.extend_from_slice(raw_line);
-            continue;
-        }
-        if !had_match {
-            // The matcher disagrees with the UI snapshot (smart-case
-            // edge case, etc.). Treat as stale rather than silently
-            // doing nothing.
-            stale += 1;
-            out.extend_from_slice(raw_line);
-            continue;
-        }
-        new_body.extend_from_slice(&body[cursor..]);
-        // Re-attach the original terminator so `\r\n` files stay
-        // `\r\n` and `\n`-only files stay `\n`-only.
-        out.extend_from_slice(&new_body);
-        out.extend_from_slice(&raw_line[body.len()..]);
-        lines_replaced += 1;
-    }
-
-    if lines_replaced == 0 {
-        return FileReplaceOutcome::NoMatch { stale };
-    }
-    // Pathological case: user replaced `foo` with `foo`. The line
-    // was visited but produced byte-identical output, so the rewrite
-    // is a no-op. Skip the atomic write (saves a tempfile + rename
-    // + git status churn + fs-watcher event); report as NoMatch so
-    // downstream summary counts stay honest.
-    if out == original {
-        return FileReplaceOutcome::NoMatch { stale };
-    }
-
-    if let Err(e) = backend.write_file(path, &out) {
-        return FileReplaceOutcome::Err(format!("write: {e}"));
-    }
-    FileReplaceOutcome::Changed {
-        lines_replaced,
-        stale,
-    }
 }
 
 #[cfg(test)]
@@ -3539,11 +4019,11 @@ mod fs_mutation_tests {
 
 #[cfg(test)]
 mod replace_tests {
-    //! Worker-level tests for `run_replace_in_files` / `replace_one_file`.
+    //! Worker-level tests for the replace-in-files backend contract.
     //! Drive `LocalBackend` against a tempdir so the same code path the
     //! UI hits in production is exercised end-to-end (read → match →
-    //! rewrite → atomic write). Uses a plain `mpsc` to capture progress
-    //! / done frames the way the App's `tick` would.
+    //! rewrite → atomic write). Uses the same worker-result sender shape
+    //! that `ReefApp::step` drains in production.
     use super::*;
     use reef_io::LocalBackend;
     use std::fs;
@@ -3556,7 +4036,12 @@ mod replace_tests {
         replace_text: &str,
         items: Vec<ReplaceItem>,
     ) -> ReplaceSummary {
-        let (tx, rx) = mpsc::channel();
+        let (result_tx, rx) = mpsc::unbounded();
+        let (worker_wake_tx, _worker_wake_rx) = mpsc::bounded(1);
+        let tx = WorkerResultSender {
+            result_tx,
+            worker_wake_tx,
+        };
         run_replace_in_files(0, backend.as_ref(), query, replace_text, &items, &tx);
         // Drain the channel — `Done` is the last frame.
         let mut summary = None;
@@ -3578,7 +4063,7 @@ mod replace_tests {
                 .iter()
                 .map(|(line_no, expected_text)| ReplaceLine {
                     line_no: *line_no,
-                    expected_text: (*expected_text).to_string(),
+                    expected_revision: reef_io::content_line_revision(expected_text.as_bytes()),
                 })
                 .collect(),
         }
@@ -3629,6 +4114,28 @@ mod replace_tests {
         assert_eq!(
             fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
             "edited\nfoo here\n"
+        );
+    }
+
+    #[test]
+    fn skips_line_when_edit_is_beyond_search_display_cap() {
+        let tmp = TempDir::new().unwrap();
+        let original = format!("foo{}", "a".repeat(GLOBAL_SEARCH_MAX_LINE_CHARS));
+        let edited = format!("{}b\n", &original[..original.len() - 1]);
+        fs::write(tmp.path().join("a.txt"), &edited).unwrap();
+        let backend: Arc<dyn Backend> = Arc::new(LocalBackend::open_at(tmp.path().to_path_buf()));
+
+        let summary = run(
+            backend,
+            "foo",
+            "BAR",
+            vec![item("a.txt", &[(0, &original)])],
+        );
+
+        assert_eq!(summary.skipped_stale, 1);
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+            edited
         );
     }
 
@@ -3766,22 +4273,8 @@ mod replace_tests {
     }
 
     #[test]
-    fn skips_oversize_files_via_file_size_probe_without_reading_bytes() {
-        // Regression: the previous worker code first read up to
-        // `MAX_REPLACE_FILE_SIZE` bytes and then checked `>=`, which (a)
-        // round-tripped a useless 50 MB copy on the remote backend and
-        // (b) misclassified a file *exactly* at the cap as too-large.
-        // The fix routes through `Backend::file_size` first and uses
-        // strict `>` so a cap-sized file is still in scope.
+    fn replaces_a_file_below_the_size_cap() {
         let tmp = TempDir::new().unwrap();
-        // One byte over the cap — a real 50 MB+ allocation would be
-        // wasteful for a unit test, so we synthesise a marker and
-        // stub the backend response by writing actual bytes; we use a
-        // tiny override of the cap inside the worker via a wrapper
-        // in a follow-up if performance becomes an issue.
-        // For now, just verify a normal file under the cap goes
-        // through and a file over the cap reports `skipped_too_large`
-        // without panicking.
         fs::write(tmp.path().join("ok.txt"), "tiny needle line\n").unwrap();
         let backend: Arc<dyn Backend> = Arc::new(LocalBackend::open_at(tmp.path().to_path_buf()));
         let summary = run(
@@ -3790,7 +4283,6 @@ mod replace_tests {
             "x",
             vec![item("ok.txt", &[(0, "tiny needle line")])],
         );
-        // File well under the cap → replaced normally.
         assert_eq!(summary.lines_replaced, 1);
         assert_eq!(summary.skipped_too_large, 0);
     }
@@ -3849,8 +4341,13 @@ mod preview_panic_guard_tests {
     fn run_preview_with_panic_guard_passes_through_some() {
         let preview = PreviewContent {
             path: "x.txt".into(),
+            resolved_path: None,
+            local_path: None,
+            bytes_on_disk: 2,
+            mime: Some("text/plain".into()),
             body: reef_core::preview::PreviewBody::Text(reef_core::preview::TextPreview {
                 lines: vec!["hi".into()],
+                source: None,
                 highlighted: None,
                 parsed: None,
             }),
@@ -3862,8 +4359,371 @@ mod preview_panic_guard_tests {
 }
 
 #[cfg(test)]
+mod preview_worker_coalescing_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn backend() -> Arc<dyn Backend> {
+        Arc::new(reef_io::LocalBackend::open_at(std::env::temp_dir()))
+    }
+
+    fn load_preview(generation: u64, path: &str) -> FilesTask {
+        FilesTask::LoadPreview {
+            generation,
+            backend: backend(),
+            rel_path: PathBuf::from(path),
+            wants_decoded_image: false,
+        }
+    }
+
+    fn prefetch_preview(path: &str) -> FilesTask {
+        FilesTask::PrefetchPreview {
+            backend: backend(),
+            rel_path: PathBuf::from(path),
+            wants_decoded_image: false,
+        }
+    }
+
+    fn build_quick_open_index(generation: u64) -> FilesTask {
+        FilesTask::BuildQuickOpenIndex {
+            generation,
+            backend: backend(),
+        }
+    }
+
+    fn load_db_page(generation: u64) -> FilesTask {
+        FilesTask::LoadDbPage {
+            generation,
+            backend: backend(),
+            request: DbPageRequest {
+                path: PathBuf::from("data.sqlite"),
+                key: reef_sqlite_preview::DbObjectKey {
+                    schema: "main".to_string(),
+                    name: "items".to_string(),
+                    kind: reef_sqlite_preview::DbObjectKind::Table,
+                },
+                page: 0,
+                rows_per_page: 100,
+                reset_h_scroll: false,
+            },
+        }
+    }
+
+    fn load_db_detail(generation: u64) -> FilesTask {
+        FilesTask::LoadDbDetail {
+            generation,
+            backend: backend(),
+            path: PathBuf::from("data.sqlite"),
+            key: reef_sqlite_preview::DbObjectKey {
+                schema: "main".to_string(),
+                name: "items_by_name".to_string(),
+                kind: reef_sqlite_preview::DbObjectKind::Index,
+            },
+        }
+    }
+
+    fn load_db_cell(generation: u64, cancellation: reef_io::CancellationToken) -> DbCellTask {
+        DbCellTask {
+            generation,
+            backend: backend(),
+            request: DbCellRequest {
+                path: PathBuf::from("data.sqlite"),
+                key: reef_sqlite_preview::DbObjectKey {
+                    schema: "main".to_string(),
+                    name: "items".to_string(),
+                    kind: reef_sqlite_preview::DbObjectKind::Table,
+                },
+                row_offset: 0,
+                row_locator: reef_sqlite_preview::DbRowLocator::RowId(1),
+                column: 0,
+                cancellation,
+            },
+        }
+    }
+
+    fn assert_load_preview(task: FilesTask, generation: u64, path: &str) {
+        match task {
+            FilesTask::LoadPreview {
+                generation: got_generation,
+                rel_path,
+                ..
+            } => {
+                assert_eq!(got_generation, generation);
+                assert_eq!(rel_path, PathBuf::from(path));
+            }
+            _ => panic!("expected LoadPreview"),
+        }
+    }
+
+    #[test]
+    fn coalescing_keeps_latest_load_preview_and_backlogs_other_work() {
+        let (tx, rx) = mpsc::unbounded();
+        let mut backlog = VecDeque::new();
+        tx.send(prefetch_preview("prefetched.md")).unwrap();
+        tx.send(load_preview(2, "latest.html")).unwrap();
+        tx.send(build_quick_open_index(9)).unwrap();
+
+        let selected = coalesce_preview_worker_task(load_preview(1, "old.html"), &rx, &mut backlog);
+
+        assert_load_preview(selected, 2, "latest.html");
+        assert_eq!(backlog.len(), 1);
+        match backlog.pop_front().unwrap() {
+            FilesTask::BuildQuickOpenIndex { generation, .. } => assert_eq!(generation, 9),
+            _ => panic!("expected backlogged BuildQuickOpenIndex"),
+        }
+    }
+
+    #[test]
+    fn prefetch_does_not_replace_selected_load_preview() {
+        let (tx, rx) = mpsc::unbounded();
+        let mut backlog = VecDeque::new();
+        tx.send(prefetch_preview("neighbor.md")).unwrap();
+
+        let selected =
+            coalesce_preview_worker_task(load_preview(3, "selected.md"), &rx, &mut backlog);
+
+        assert_load_preview(selected, 3, "selected.md");
+        assert!(backlog.is_empty());
+    }
+
+    #[test]
+    fn pending_load_preview_jumps_ahead_of_backlogged_non_preview_work() {
+        let (tx, rx) = mpsc::unbounded();
+        let mut backlog = VecDeque::from([build_quick_open_index(11)]);
+        tx.send(load_preview(4, "clicked.html")).unwrap();
+
+        let selected = recv_preview_worker_task(&rx, &mut backlog).unwrap();
+
+        assert_load_preview(selected, 4, "clicked.html");
+        assert_eq!(backlog.len(), 1);
+        match backlog.pop_front().unwrap() {
+            FilesTask::BuildQuickOpenIndex { generation, .. } => assert_eq!(generation, 11),
+            _ => panic!("expected BuildQuickOpenIndex to stay queued"),
+        }
+    }
+
+    #[test]
+    fn pending_load_preview_jumps_ahead_of_received_db_page() {
+        let (tx, rx) = mpsc::unbounded();
+        let mut backlog = VecDeque::new();
+        tx.send(load_db_page(12)).unwrap();
+        tx.send(load_preview(5, "clicked.html")).unwrap();
+
+        let selected = recv_preview_worker_task(&rx, &mut backlog).unwrap();
+
+        assert_load_preview(selected, 5, "clicked.html");
+        assert_eq!(backlog.len(), 1);
+        match backlog.pop_front().unwrap() {
+            FilesTask::LoadDbPage { generation, .. } => assert_eq!(generation, 12),
+            _ => panic!("expected LoadDbPage to stay queued"),
+        }
+    }
+
+    #[test]
+    fn database_content_coalescing_keeps_only_the_latest_selection() {
+        let (tx, rx) = mpsc::unbounded();
+        let mut backlog = VecDeque::new();
+        tx.send(load_db_detail(2)).unwrap();
+        tx.send(load_db_page(3)).unwrap();
+        tx.send(build_quick_open_index(9)).unwrap();
+
+        let selected = coalesce_preview_worker_task(load_db_page(1), &rx, &mut backlog);
+
+        match selected {
+            FilesTask::LoadDbPage { generation, .. } => assert_eq!(generation, 3),
+            _ => panic!("expected latest database content request"),
+        }
+        assert_eq!(backlog.len(), 1);
+        assert!(matches!(
+            backlog.pop_front(),
+            Some(FilesTask::BuildQuickOpenIndex { generation: 9, .. })
+        ));
+    }
+
+    #[test]
+    fn database_cell_queue_cancels_obsolete_requests() {
+        let (tx, rx) = mpsc::unbounded();
+        let obsolete_cancellation = reef_io::CancellationToken::default();
+        tx.send(load_db_cell(1, obsolete_cancellation.clone()))
+            .unwrap();
+        tx.send(load_db_cell(2, reef_io::CancellationToken::default()))
+            .unwrap();
+
+        let selected = recv_latest_db_cell_task(&rx).unwrap();
+
+        assert_eq!(selected.generation, 2);
+        assert!(obsolete_cancellation.is_cancelled());
+        assert!(!selected.request.cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn preview_worker_publishes_plain_content_before_enrichment_is_requested() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let tasks = TaskCoordinator::new();
+        let wake = tasks.worker_wake_receiver();
+        tasks.load_preview(
+            1,
+            Arc::new(reef_io::LocalBackend::open_at(tmp.path().to_path_buf())),
+            PathBuf::from("main.rs"),
+            false,
+        );
+
+        let first = recv_worker_result(&tasks, &wake);
+        let WorkerResult::Preview {
+            generation,
+            result: Ok(Some(content)),
+        } = first
+        else {
+            panic!("base preview must be published first");
+        };
+        assert_eq!(generation, 1);
+        let PreviewBody::Text(text) = &content.body else {
+            panic!("expected text preview");
+        };
+        assert!(text.highlighted.is_none());
+        assert!(text.parsed.is_none());
+
+        assert!(tasks.enrich_preview(generation, &content, false));
+        let second = recv_worker_result(&tasks, &wake);
+        let WorkerResult::PreviewEnrichmentFinished {
+            generation,
+            path,
+            enrichment,
+        } = second
+        else {
+            panic!("preview enrichment must follow base content");
+        };
+        assert_eq!(generation, 1);
+        assert_eq!(path, "main.rs");
+        let Some(PreviewEnrichment::Text(enrichment)) = enrichment else {
+            panic!("expected text enrichment");
+        };
+        assert!(enrichment.highlighted.is_some());
+        assert!(enrichment.parsed.is_some());
+    }
+
+    #[test]
+    fn markdown_preview_worker_publishes_unstyled_base_before_syntax_enrichment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = "```rs\nfn main() {}\n```\n";
+        std::fs::write(tmp.path().join("README.md"), source).unwrap();
+        let tasks = TaskCoordinator::new();
+        let wake = tasks.worker_wake_receiver();
+        tasks.load_preview(
+            7,
+            Arc::new(reef_io::LocalBackend::open_at(tmp.path().to_path_buf())),
+            PathBuf::from("README.md"),
+            false,
+        );
+
+        let first = recv_worker_result(&tasks, &wake);
+        let WorkerResult::Preview {
+            generation,
+            result: Ok(Some(content)),
+        } = first
+        else {
+            panic!("base markdown preview must be published first");
+        };
+        let PreviewBody::Markdown(markdown) = &content.body else {
+            panic!("expected markdown preview");
+        };
+        assert!(
+            markdown
+                .rows()
+                .expect("small markdown preview should include a render model")
+                .iter()
+                .flatten()
+                .all(|span| span.syntax.is_none())
+        );
+
+        assert!(tasks.enrich_preview(generation, &content, false));
+        let second = recv_worker_result(&tasks, &wake);
+        let WorkerResult::PreviewEnrichmentFinished {
+            generation,
+            path,
+            enrichment,
+        } = second
+        else {
+            panic!("markdown syntax enrichment must follow base content");
+        };
+        assert_eq!(generation, 7);
+        assert_eq!(path, "README.md");
+        let Some(PreviewEnrichment::Markdown(markdown)) = enrichment else {
+            panic!("expected markdown enrichment");
+        };
+        assert_eq!(markdown.source, source);
+        assert!(
+            markdown
+                .rows()
+                .expect("enriched markdown preview should include a render model")
+                .iter()
+                .flatten()
+                .any(|span| span.syntax.is_some())
+        );
+    }
+
+    #[test]
+    fn large_markdown_preview_skips_syntax_enrichment() {
+        let source = format!("# Title\n\n{}", "large markdown paragraph ".repeat(24_000));
+        let content = PreviewContent {
+            path: "README.md".into(),
+            resolved_path: None,
+            local_path: None,
+            bytes_on_disk: source.len() as u64,
+            mime: Some("text/markdown".into()),
+            body: reef_core::preview::build_textual_preview_body("README.md", &source),
+        };
+
+        assert!(matches!(content.body, PreviewBody::Markdown(_)));
+        assert!(preview_enrichment_task(1, &content, false).is_none());
+    }
+
+    #[test]
+    fn large_structured_preview_skips_enrichment_worker() {
+        let source = r#"{"event":"open"}"#;
+        let content = PreviewContent {
+            path: "events.jsonl".into(),
+            resolved_path: None,
+            local_path: None,
+            bytes_on_disk: 513 * 1024,
+            mime: Some("application/x-ndjson".into()),
+            body: reef_core::preview::build_textual_preview_body("events.jsonl", source),
+        };
+
+        let PreviewBody::Text(text) = &content.body else {
+            panic!("expected text preview");
+        };
+        assert!(text.source.is_some());
+        assert!(preview_enrichment_task(1, &content, false).is_none());
+    }
+
+    fn recv_worker_result(tasks: &TaskCoordinator, wake: &mpsc::Receiver<()>) -> WorkerResult {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(result) = tasks.try_recv() {
+                return result;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "timed out waiting for worker result");
+            let _ = wake.recv_timeout(remaining);
+        }
+    }
+}
+
+#[cfg(test)]
 mod graph_worker_helpers_tests {
     use super::*;
+
+    #[test]
+    fn recv_latest_discards_obsolete_queued_work() {
+        let (tx, rx) = mpsc::unbounded();
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        tx.send(3).unwrap();
+
+        assert_eq!(recv_latest(&rx).unwrap(), 3);
+    }
 
     #[test]
     fn ref_present_in_map_matches_local_branch() {

@@ -53,7 +53,13 @@ fn wait_for_git_status(app: &mut App) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         app.tick();
-        if !app.engine.state.git_status_load.loading {
+        let stats_settled = app.engine.state.active_tab != reef_app::AppTab::Git
+            || (!app.engine.state.git_status_stats_load.loading
+                && !app.engine.state.git_status_stats_load.stale);
+        if !app.engine.state.git_status_load.loading
+            && !app.engine.state.git_status_load.stale
+            && stats_settled
+        {
             return;
         }
         thread::sleep(Duration::from_millis(10));
@@ -649,6 +655,7 @@ fn snapshot_search_tab_replace_open_with_excluded_row() {
             display: "alpha.txt".to_string(),
             line: 0,
             line_text: "needle in alpha".to_string(),
+            line_revision: reef_io::content_line_revision(b"needle in alpha"),
             byte_range: 0..6,
         },
         reef_app::MatchHit {
@@ -656,6 +663,7 @@ fn snapshot_search_tab_replace_open_with_excluded_row() {
             display: "beta.txt".to_string(),
             line: 0,
             line_text: "another needle here".to_string(),
+            line_revision: reef_io::content_line_revision(b"another needle here"),
             byte_range: 8..14,
         },
     ];

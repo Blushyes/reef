@@ -83,10 +83,10 @@ fn load_preview_parity_for_text_empty_and_nullbyte() {
 
     for name in ["text.txt", "empty.txt", "garbage.bin"] {
         let l = local
-            .load_preview(Path::new(name), true, true)
+            .load_preview(Path::new(name), true)
             .unwrap_or_else(|| panic!("local preview None for {name}"));
         let r = remote
-            .load_preview(Path::new(name), true, true)
+            .load_preview(Path::new(name), true)
             .unwrap_or_else(|| panic!("remote preview None for {name}"));
         assert_eq!(l.path, r.path, "file_path for {name}");
         assert_eq!(
@@ -110,12 +110,34 @@ fn load_preview_text_lines_match() {
     let local = LocalBackend::open_at(tmp.path().to_path_buf());
     let remote = spawn_remote(tmp.path());
 
-    let l = local.load_preview(Path::new("a.txt"), true, true).unwrap();
-    let r = remote.load_preview(Path::new("a.txt"), true, true).unwrap();
+    let l = local.load_preview(Path::new("a.txt"), true).unwrap();
+    let r = remote.load_preview(Path::new("a.txt"), true).unwrap();
     let (PreviewBody::Text(lt), PreviewBody::Text(rt)) = (&l.body, &r.body) else {
         panic!("expected both Text, got {:?} / {:?}", l.body, r.body);
     };
     assert_eq!(lt.lines, rt.lines, "text lines diverged");
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_preview_reports_the_canonical_workspace_dependency() {
+    use std::os::unix::fs::symlink;
+
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, _repo) = tempdir_repo();
+    std::fs::write(tmp.path().join("target.txt"), "hello\n").unwrap();
+    symlink("target.txt", tmp.path().join("alias.txt")).unwrap();
+
+    let remote = spawn_remote(tmp.path());
+    let preview = remote
+        .load_preview(Path::new("alias.txt"), true)
+        .expect("remote symlink preview");
+
+    assert_eq!(preview.path, "alias.txt");
+    assert_eq!(
+        preview.resolved_path.as_deref(),
+        Some(Path::new("target.txt"))
+    );
 }
 
 #[test]
@@ -128,12 +150,8 @@ fn load_preview_markdown_model_matches_on_local_and_remote() {
     let local = LocalBackend::open_at(tmp.path().to_path_buf());
     let remote = spawn_remote(tmp.path());
 
-    let l = local
-        .load_preview(Path::new("README.md"), true, true)
-        .unwrap();
-    let r = remote
-        .load_preview(Path::new("README.md"), true, true)
-        .unwrap();
+    let l = local.load_preview(Path::new("README.md"), true).unwrap();
+    let r = remote.load_preview(Path::new("README.md"), true).unwrap();
     let (PreviewBody::Markdown(lm), PreviewBody::Markdown(rm)) = (&l.body, &r.body) else {
         panic!(
             "expected both Markdown previews, got {:?} / {:?}",
@@ -141,6 +159,64 @@ fn load_preview_markdown_model_matches_on_local_and_remote() {
         );
     };
     assert_eq!(lm, rm);
+}
+
+#[test]
+fn load_preview_large_markdown_stays_markdown_locally_and_remotely() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, _repo) = tempdir_repo();
+    let body = format!("# Title\n\n{}", "large markdown paragraph ".repeat(24_000));
+    std::fs::write(tmp.path().join("README.md"), body.as_bytes()).unwrap();
+
+    let local = LocalBackend::open_at(tmp.path().to_path_buf());
+    let remote = spawn_remote(tmp.path());
+
+    let local_preview = local.load_preview(Path::new("README.md"), true).unwrap();
+    let remote_preview = remote.load_preview(Path::new("README.md"), true).unwrap();
+
+    assert_eq!(shape_of(&local_preview.body), BodyShape::Markdown);
+    assert_eq!(shape_of(&remote_preview.body), BodyShape::Markdown);
+}
+
+#[test]
+fn remote_structured_preview_preserves_complete_source_above_ordinary_text_limit() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, _repo) = tempdir_repo();
+    let source = format!(r#"{{"payload":"{}"}}"#, "x".repeat(2 * 1024 * 1024));
+    std::fs::write(tmp.path().join("large.json"), source.as_bytes()).unwrap();
+
+    let remote = spawn_remote(tmp.path());
+    let preview = remote
+        .load_preview(Path::new("large.json"), true)
+        .expect("remote structured preview");
+    let PreviewBody::Text(text) = preview.body else {
+        panic!("expected text preview");
+    };
+
+    assert_eq!(text.source.as_deref(), Some(source.as_str()));
+}
+
+#[test]
+fn oversized_structured_preview_is_too_large_locally_and_remotely() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, _repo) = tempdir_repo();
+    let source = format!(
+        r#"{{"payload":"{}"}}"#,
+        "x".repeat(reef_core::preview::MAX_TEXT_PREVIEW_BYTES as usize)
+    );
+    std::fs::write(tmp.path().join("oversized.json"), source.as_bytes()).unwrap();
+
+    let local = LocalBackend::open_at(tmp.path().to_path_buf());
+    let remote = spawn_remote(tmp.path());
+    let local_preview = local
+        .load_preview(Path::new("oversized.json"), true)
+        .expect("local structured preview");
+    let remote_preview = remote
+        .load_preview(Path::new("oversized.json"), true)
+        .expect("remote structured preview");
+
+    assert_eq!(shape_of(&local_preview.body), BodyShape::BinaryTooLarge);
+    assert_eq!(shape_of(&remote_preview.body), BodyShape::BinaryTooLarge);
 }
 
 /// Build a tiny SQLite fixture at `path` with `SETUP_SQL` so both
@@ -179,10 +255,10 @@ fn load_preview_parity_for_sqlite_database() {
     let remote = spawn_remote(tmp.path());
 
     let l = local
-        .load_preview(Path::new("fixture.db"), true, true)
+        .load_preview(Path::new("fixture.db"), true)
         .expect("local preview None for fixture.db");
     let r = remote
-        .load_preview(Path::new("fixture.db"), true, true)
+        .load_preview(Path::new("fixture.db"), true)
         .expect("remote preview None for fixture.db");
 
     assert_eq!(shape_of(&l.body), BodyShape::Database, "local shape");
@@ -223,6 +299,28 @@ fn load_preview_parity_for_sqlite_database() {
         li.initial_page.rows.len(),
         ri.initial_page.rows.len(),
         "initial_page row count",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_sqlite_preview_reports_the_canonical_workspace_dependency() {
+    use std::os::unix::fs::symlink;
+
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, _repo) = tempdir_repo();
+    seed_sqlite_db(&tmp.path().join("target.db"));
+    symlink("target.db", tmp.path().join("alias.db")).unwrap();
+
+    let remote = spawn_remote(tmp.path());
+    let preview = remote
+        .load_preview(Path::new("alias.db"), true)
+        .expect("remote sqlite symlink preview");
+
+    assert_eq!(shape_of(&preview.body), BodyShape::Database);
+    assert_eq!(
+        preview.resolved_path.as_deref(),
+        Some(Path::new("target.db"))
     );
 }
 
@@ -281,6 +379,60 @@ fn db_load_page_offset_works_across_backends() {
 }
 
 #[test]
+fn db_load_cell_returns_complete_text_across_backends() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, _repo) = tempdir_repo();
+    let db_path = tmp.path().join("fixture.db");
+    seed_sqlite_db(&db_path);
+    let unit = "完整单元格";
+    let full_text = unit.repeat(reef_sqlite_preview::DB_CELL_CHUNK_BYTES / unit.len() + 100);
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute("UPDATE posts SET body = ?1 WHERE id = 1", [&full_text])
+        .expect("seed long text");
+    drop(connection);
+    let key = reef_sqlite_preview::DbObjectKey {
+        schema: "main".to_string(),
+        name: "posts".to_string(),
+        kind: reef_sqlite_preview::DbObjectKind::Table,
+    };
+
+    let local = LocalBackend::open_at(tmp.path().to_path_buf());
+    let remote = spawn_remote(tmp.path());
+    let page = local
+        .db_load_page(Path::new("fixture.db"), &key, 0, 1)
+        .expect("local db_load_page");
+    let locator = &page.row_locators[0];
+    let local_value = local
+        .db_load_cell(
+            Path::new("fixture.db"),
+            &key,
+            locator,
+            1,
+            &reef_io::CancellationToken::default(),
+        )
+        .expect("local db_load_cell");
+    let remote_value = remote
+        .db_load_cell(
+            Path::new("fixture.db"),
+            &key,
+            locator,
+            1,
+            &reef_io::CancellationToken::default(),
+        )
+        .expect("remote db_load_cell");
+
+    assert_eq!(local_value, remote_value);
+    assert_eq!(
+        local_value,
+        reef_sqlite_preview::SqliteValue::Text {
+            value: full_text,
+            truncated: false,
+        }
+    );
+}
+
+#[test]
 fn load_preview_missing_file_returns_none_on_both() {
     let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, _repo) = tempdir_repo();
@@ -288,14 +440,10 @@ fn load_preview_missing_file_returns_none_on_both() {
     let local = LocalBackend::open_at(tmp.path().to_path_buf());
     let remote = spawn_remote(tmp.path());
 
-    assert!(
-        local
-            .load_preview(Path::new("no-such.txt"), true, true)
-            .is_none()
-    );
+    assert!(local.load_preview(Path::new("no-such.txt"), true).is_none());
     assert!(
         remote
-            .load_preview(Path::new("no-such.txt"), true, true)
+            .load_preview(Path::new("no-such.txt"), true)
             .is_none()
     );
 }

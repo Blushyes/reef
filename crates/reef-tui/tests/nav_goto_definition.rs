@@ -13,6 +13,7 @@ use reef_app::{AppPanel as Panel, AppTab as Tab};
 use reef_core::nav::{NavLang, parse_file_if_supported};
 use reef_core::preview::{PreviewBody, PreviewDocument as PreviewContent, TextPreview};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use test_support::CwdGuard;
 
@@ -39,14 +40,63 @@ fn install_rust_preview(app: &mut App, path: &str, src: &str) {
     app.engine.state.preview_content = Some(
         PreviewContent {
             path: path.to_string(),
+            resolved_path: None,
+            local_path: None,
+            bytes_on_disk: src.len() as u64,
+            mime: Some("text/plain".into()),
             body: PreviewBody::Text(TextPreview {
                 lines: src.lines().map(|s| s.to_string()).collect(),
+                source: None,
                 highlighted: None,
                 parsed,
             }),
         }
         .into(),
     );
+}
+
+fn install_plain_rust_preview_and_request_enrichment(app: &mut App, path: &str, src: &str) {
+    let generation = app.engine.state.preview_load.begin();
+    let outcome = app.engine.state.apply_preview_content(
+        generation,
+        Some(PreviewContent {
+            path: path.to_string(),
+            resolved_path: None,
+            local_path: None,
+            bytes_on_disk: src.len() as u64,
+            mime: Some("text/plain".into()),
+            body: PreviewBody::Text(TextPreview {
+                lines: src.lines().map(str::to_owned).collect(),
+                source: None,
+                highlighted: None,
+                parsed: None,
+            }),
+        }),
+        app.layout.last_preview_view_h as usize,
+    );
+    assert!(outcome.accepted);
+    assert!(
+        app.engine
+            .state
+            .request_current_preview_enrichment(generation)
+    );
+}
+
+fn drive_app_until(
+    app: &mut App,
+    mut wait_for_work: impl FnMut(Duration),
+    condition: impl Fn(&App) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !condition(app) {
+        app.tick();
+        if condition(app) {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "timed out waiting for app state");
+        wait_for_work(remaining.min(Duration::from_millis(100)));
+    }
 }
 
 fn set_keyboard_cursor(app: &mut App, line: usize, byte_col: usize) {
@@ -71,6 +121,60 @@ fn cursor_at_nth(src: &str, needle: &str, n: usize) -> (usize, usize) {
     let row = prefix.bytes().filter(|b| *b == b'\n').count();
     let line_start = prefix.rfind('\n').map(|p| p + 1).unwrap_or(0);
     (row, idx - line_start)
+}
+
+#[test]
+fn goto_definition_requested_during_preview_enrichment_replays_after_parse_arrives() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut app, _tmp, _g) = fresh_app();
+    let wake = app.engine.worker_wake_receiver();
+    let src = "fn helper() -> i32 { 42 }\nfn main() { let _ = helper(); }\n";
+    install_plain_rust_preview_and_request_enrichment(&mut app, "scratch.rs", src);
+    let cursor = cursor_at_nth(src, "helper", 1);
+    set_keyboard_cursor(&mut app, cursor.0, cursor.1);
+
+    app.goto_definition_at_cursor(NavAnchor::Keyboard);
+    assert!(app.engine.state.preview_highlight.is_none());
+
+    drive_app_until(
+        &mut app,
+        |timeout| {
+            let _ = wake.recv_timeout(timeout);
+        },
+        |app| app.engine.state.preview_highlight.is_some(),
+    );
+    let highlight = app.engine.state.preview_highlight.as_ref().unwrap();
+    assert_eq!(highlight.path, std::path::PathBuf::from("scratch.rs"));
+    assert_eq!(highlight.row, 0);
+}
+
+#[test]
+fn find_references_requested_during_preview_enrichment_replays_after_parse_arrives() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut app, _tmp, _g) = fresh_app();
+    let wake = app.engine.worker_wake_receiver();
+    let src = "fn helper() -> i32 { 42 }\nfn main() { let _ = helper(); }\n";
+    install_plain_rust_preview_and_request_enrichment(&mut app, "scratch.rs", src);
+    let cursor = cursor_at_nth(src, "helper", 1);
+    set_keyboard_cursor(&mut app, cursor.0, cursor.1);
+
+    app.find_references_at_cursor(NavAnchor::Keyboard);
+    assert!(app.engine.state.toasts.is_empty());
+
+    drive_app_until(
+        &mut app,
+        |timeout| {
+            let _ = wake.recv_timeout(timeout);
+        },
+        |app| !app.engine.state.toasts.is_empty(),
+    );
+    assert!(
+        app.engine
+            .state
+            .toasts
+            .iter()
+            .any(|toast| toast.message == "No references to `helper`")
+    );
 }
 
 #[test]
@@ -218,8 +322,13 @@ fn goto_definition_on_unknown_extension_is_noop() {
     app.engine.state.preview_content = Some(
         PreviewContent {
             path: "scratch.txt".to_string(),
+            resolved_path: None,
+            local_path: None,
+            bytes_on_disk: 14,
+            mime: Some("text/plain".into()),
             body: PreviewBody::Text(TextPreview {
                 lines: vec!["fn helper() {}".to_string()],
+                source: None,
                 highlighted: None,
                 parsed: None,
             }),

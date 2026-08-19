@@ -35,8 +35,13 @@ fn fresh_app() -> (App, TempDir) {
 fn text_preview(line_count: usize) -> PreviewContent {
     PreviewContent {
         path: "test.txt".into(),
+        resolved_path: None,
+        local_path: None,
+        bytes_on_disk: line_count as u64,
+        mime: Some("text/plain".into()),
         body: PreviewBody::Text(TextPreview {
             lines: (0..line_count).map(|i| format!("line {}", i)).collect(),
+            source: None,
             highlighted: None,
             parsed: None,
         }),
@@ -209,12 +214,15 @@ fn preview_non_text_body_aborts() {
     app.engine.state.preview_content = Some(
         PreviewContent {
             path: "blob.bin".into(),
-            body: PreviewBody::Binary(reef_core::preview::BinaryInfo {
-                bytes_on_disk: 42,
-                mime: None,
-                reason: reef_core::preview::BinaryReason::NullBytes,
-                meta_line: "x".into(),
-            }),
+            resolved_path: None,
+            local_path: None,
+            bytes_on_disk: 42,
+            mime: None,
+            body: PreviewBody::Binary(reef_core::preview::BinaryInfo::new(
+                42,
+                None,
+                reef_core::preview::BinaryReason::NullBytes,
+            )),
         }
         .into(),
     );

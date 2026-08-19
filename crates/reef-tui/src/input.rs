@@ -9,7 +9,6 @@
 use crate::TuiApp as App;
 use crate::find_widget;
 use crate::global_search;
-use crate::i18n::{Msg, t};
 use crate::keymap::{Command, InputScope, Keymap, scope_for_app};
 use crate::quick_open;
 use crate::search;
@@ -23,19 +22,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
-use reef_app::{AppCommand, AppPanel as Panel, AppTab as Tab, DbNav, NavAnchor, Toast, ViewMode};
+use reef_app::{AppCommand, AppPanel as Panel, AppTab as Tab, DbNav, NavAnchor, ViewMode};
 use reef_core::diff::{DiffLayout, DiffSide};
 use std::time::{Duration, Instant};
 
 pub const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
-
-fn dispatch_clipboard_copy(app: &mut App, text: String) {
-    app.engine.dispatch(AppCommand::CopyToClipboard {
-        text,
-        success: Some(Toast::info(t(Msg::ClipboardCopied))),
-        failure: Toast::error(t(Msg::ClipboardCopyFailed)),
-    });
-}
 
 fn input_modifiers(mods: KeyModifiers) -> reef_app::InputModifiers {
     reef_app::InputModifiers {
@@ -217,6 +208,11 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
     // accidentally leaving a menu lingering).
     if scope == InputScope::TreeContextMenu {
         handle_key_tree_context_menu(key, app);
+        return;
+    }
+
+    if scope == InputScope::SelectionContextMenu {
+        handle_key_selection_context_menu(key, app);
         return;
     }
 
@@ -1007,16 +1003,16 @@ fn handle_key_search(key: KeyEvent, app: &mut App) {
             // (search::begin) and works here via resolve_target.
             match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
-                    app.engine.dispatch(AppCommand::PreviewScroll(-1));
+                    app.scroll_file_preview(-1);
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    app.engine.dispatch(AppCommand::PreviewScroll(1));
+                    app.scroll_file_preview(1);
                 }
                 KeyCode::PageUp => {
-                    app.engine.dispatch(AppCommand::PreviewScroll(-20));
+                    app.scroll_file_preview(-20);
                 }
                 KeyCode::PageDown => {
-                    app.engine.dispatch(AppCommand::PreviewScroll(20));
+                    app.scroll_file_preview(20);
                 }
                 KeyCode::Left => {
                     let step = if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -1732,7 +1728,7 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 // within current_rows" — same field, different
                 // semantics. The renderer reads this for either body
                 // shape, so a single decrement works for both.
-                app.engine.dispatch(AppCommand::PreviewScroll(-1));
+                app.scroll_file_preview(-1);
             }
         },
         KeyCode::Down | KeyCode::Char('j') if !ctrl => match app.engine.active_panel() {
@@ -1743,7 +1739,7 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 // Same dual-semantics as the Up arm. Render clamps the
                 // upper bound against the actual row count, so we
                 // don't need to know current_rows.len() here.
-                app.engine.dispatch(AppCommand::PreviewScroll(1));
+                app.scroll_file_preview(1);
             }
         },
         // Readline-style nav: Ctrl+P/K = up, Ctrl+N/J = down. Mirrors
@@ -1756,7 +1752,7 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 app.engine.dispatch(AppCommand::NavigateFileTree(-1));
             }
             Panel::Diff | Panel::Commit => {
-                app.engine.dispatch(AppCommand::PreviewScroll(-1));
+                app.scroll_file_preview(-1);
             }
         },
         KeyCode::Char('n' | 'j') if ctrl => match app.engine.active_panel() {
@@ -1764,7 +1760,7 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 app.engine.dispatch(AppCommand::NavigateFileTree(1));
             }
             Panel::Diff | Panel::Commit => {
-                app.engine.dispatch(AppCommand::PreviewScroll(1));
+                app.scroll_file_preview(1);
             }
         },
         KeyCode::PageUp => match app.engine.active_panel() {
@@ -1779,7 +1775,7 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 if app.engine.preview_is_database() {
                     app.db_navigate(DbNav::PrevPage);
                 } else {
-                    app.engine.dispatch(AppCommand::PreviewScroll(-20));
+                    app.scroll_file_preview(-20);
                 }
             }
         },
@@ -1791,7 +1787,7 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 if app.engine.preview_is_database() {
                     app.db_navigate(DbNav::NextPage);
                 } else {
-                    app.engine.dispatch(AppCommand::PreviewScroll(20));
+                    app.scroll_file_preview(20);
                 }
             }
         },
@@ -1822,6 +1818,13 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
                 && app.engine.preview_is_database() =>
         {
             app.engine.dispatch(AppCommand::OpenDbGoto);
+        }
+        KeyCode::Char('t')
+            if !ctrl
+                && matches!(app.engine.active_panel(), Panel::Diff | Panel::Commit)
+                && app.engine.structured_preview_document().is_some() =>
+        {
+            app.toggle_structured_preview_mode();
         }
         KeyCode::Left if app.engine.active_panel() == Panel::Diff => {
             let step = if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -1987,6 +1990,19 @@ fn handle_key_tree_context_menu(key: KeyEvent, app: &mut App) {
         // Any other key closes the menu (VSCode behaviour). Prevents
         // the menu from lingering if the user mis-clicks into it.
         _ => app.close_tree_context_menu(),
+    }
+}
+
+fn handle_key_selection_context_menu(key: KeyEvent, app: &mut App) {
+    match Keymap::resolve(InputScope::SelectionContextMenu, &key) {
+        Some(Command::Close) | Some(Command::Quit) => app.close_selection_context_menu(),
+        Some(Command::MoveUp) => app.navigate_selection_context_menu(-1),
+        Some(Command::MoveDown) => app.navigate_selection_context_menu(1),
+        Some(Command::Confirm) => {
+            let item = app.selection_context_menu.current();
+            app.dispatch_selection_context_menu_item(item);
+        }
+        _ => app.close_selection_context_menu(),
     }
 }
 
@@ -2367,6 +2383,27 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
         return;
     }
 
+    if app.selection_context_menu.is_active() {
+        match mouse.kind {
+            MouseEventKind::Moved => {
+                app.hover_row = Some(mouse.row);
+                app.hover_col = Some(mouse.column);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                match app.hit_registry.hit_test(mouse.column, mouse.row) {
+                    Some(action @ ui::mouse::ClickAction::SelectionContextMenuItem(_))
+                    | Some(action @ ui::mouse::ClickAction::SelectionContextMenuClose) => {
+                        app.handle_action(action);
+                    }
+                    _ => app.close_selection_context_menu(),
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) => app.close_selection_context_menu(),
+            _ => {}
+        }
+        return;
+    }
+
     // Intra-tree drag in progress: route Drag→hover-update,
     // Up→commit, Right-click→cancel. Scroll wheel falls through so
     // the user can scroll the tree to reach a deep destination
@@ -2403,6 +2440,37 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
     // scroll keep working while the user types.
     if app.engine.tree_edit_active() && matches!(mouse.kind, MouseEventKind::Down(_)) {
         app.cancel_tree_edit();
+    }
+
+    if let MouseEventKind::Down(MouseButton::Right) = mouse.kind
+        && !app.engine.tree_context_menu_active()
+        && !app.engine.nav_candidates_active()
+        && let Some(rect) = app.last_preview_rect
+        && point_in_rect(rect, mouse.column, mouse.row)
+        && app.preview_has_selectable_text()
+    {
+        app.open_selection_context_menu(
+            crate::selection_context_menu::SelectionContextTarget::Preview,
+            (mouse.column, mouse.row),
+        );
+        return;
+    }
+
+    if let MouseEventKind::Down(MouseButton::Right) = mouse.kind
+        && !app.engine.tree_context_menu_active()
+        && !app.engine.nav_candidates_active()
+        && let Some(rect) = app.last_diff_rect
+        && point_in_rect(rect, mouse.column, mouse.row)
+        && let Some(hit) = app.last_diff_hit.as_ref()
+        && !hit.rows.is_empty()
+    {
+        let side = hit.side_for_column(mouse.column);
+        app.set_active_panel(Panel::Diff);
+        app.open_selection_context_menu(
+            crate::selection_context_menu::SelectionContextTarget::Diff(side),
+            (mouse.column, mouse.row),
+        );
+        return;
     }
 
     // Right-click on the Files tab's tree panel → open context menu.
@@ -2518,6 +2586,20 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
             }
             _ => {}
         }
+    }
+
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+        && let Some(rect) = app.last_preview_rect
+        && point_in_rect(rect, mouse.column, mouse.row)
+        && let Some(action) = app.hit_registry.hit_test(mouse.column, mouse.row)
+        && matches!(
+            action,
+            ui::mouse::ClickAction::SetStructuredPreviewMode(_)
+                | ui::mouse::ClickAction::ToggleStructuredPreviewNode(_)
+        )
+    {
+        app.handle_action(action);
+        return;
     }
 
     // Clicking a rendered Markdown link opens it. Sits before preview
@@ -2834,6 +2916,11 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
 /// clipboard copy. A `Drag` after a double/triple click extends the active
 /// endpoint normally (VS Code-style word-range extension).
 fn handle_preview_selection(mouse: &MouseEvent, app: &mut App) -> bool {
+    if app.engine.structured_preview_mode() == reef_app::StructuredPreviewMode::Tree
+        && app.engine.structured_preview_document().is_some()
+    {
+        return false;
+    }
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             let Some(rect) = app.last_preview_rect else {
@@ -2935,7 +3022,7 @@ fn handle_preview_selection(mouse: &MouseEvent, app: &mut App) -> bool {
                     if preview.is_text() {
                         let text = collect_preview_selected_text(preview, &sel_snapshot);
                         if !text.is_empty() {
-                            dispatch_clipboard_copy(app, text);
+                            app.copy_text_to_clipboard(text);
                         }
                     }
                 }
@@ -3061,7 +3148,7 @@ fn handle_diff_selection(mouse: &MouseEvent, app: &mut App) -> bool {
                 if let Some(hit) = app.last_diff_hit.as_ref() {
                     let text = collect_diff_selected_text(hit, &snap);
                     if !text.is_empty() {
-                        dispatch_clipboard_copy(app, text);
+                        app.copy_text_to_clipboard(text);
                     }
                 }
             }
@@ -3163,7 +3250,7 @@ fn handle_commit_detail_selection(mouse: &MouseEvent, app: &mut App) -> bool {
             {
                 let text = collect_commit_detail_selected_text(hit, &snap);
                 if !text.is_empty() {
-                    dispatch_clipboard_copy(app, text);
+                    app.copy_text_to_clipboard(text);
                 }
             }
             true
@@ -3250,17 +3337,20 @@ fn mouse_to_preview_coord(app: &App, col: u16, row: u16) -> Option<(usize, usize
     let preview = app.engine.preview_content_ref()?;
     match &preview.body {
         reef_core::preview::PreviewBody::Markdown(markdown) => {
-            if markdown.text_rows.is_empty() {
+            if app.markdown_layout.len() == 0 {
                 return None;
             }
             let (content_x, content_y) = app.last_markdown_content_origin?;
             let visible_row = row.saturating_sub(content_y) as usize;
-            let line_idx =
-                (app.engine.preview_scroll() + visible_row).min(markdown.text_rows.len() - 1);
+            let visual_row = app.markdown_layout.row(
+                (app.markdown_visual_scroll + visible_row).min(app.markdown_layout.len() - 1),
+            )?;
+            let text = markdown.text_for_row(visual_row.logical_row)?;
+            let visible_text = &text[visual_row.byte_start..visual_row.byte_end];
             let visible_col =
                 (col.saturating_sub(content_x) as usize) + app.engine.preview_h_scroll();
-            let byte_offset = col_to_byte_offset(&markdown.text_rows[line_idx], visible_col);
-            Some((line_idx, byte_offset))
+            let byte_offset = visual_row.byte_start + col_to_byte_offset(visible_text, visible_col);
+            Some((visual_row.logical_row, byte_offset))
         }
         reef_core::preview::PreviewBody::Text(_) => {
             let origin = app.last_preview_content_origin?;
@@ -3379,29 +3469,38 @@ fn tick_preview_drag_autoscroll(app: &mut App) {
         return;
     }
 
-    // Clamp the scroll target to the line count, accounting for the
-    // viewport height (you can't scroll the last line off the top).
+    // Markdown owns a terminal-local visual-row scroll because one logical
+    // source row can wrap across several terminal rows. Other preview bodies
+    // continue to use the renderer-neutral logical scroll directly.
     let Some(preview) = app.engine.preview_content_ref() else {
         return;
     };
+    let is_markdown = matches!(preview.body, reef_core::preview::PreviewBody::Markdown(_));
     let line_count = match &preview.body {
-        reef_core::preview::PreviewBody::Markdown(markdown) => markdown.text_rows.len(),
+        reef_core::preview::PreviewBody::Markdown(_) => app.markdown_layout.len(),
         reef_core::preview::PreviewBody::Text(text) => text.lines.len(),
         _ => return,
     };
     let max_scroll = line_count.saturating_sub(view_h as usize);
-    let new_scroll = if step < 0 {
-        app.engine
-            .preview_scroll()
-            .saturating_sub(step.unsigned_abs() as usize)
+    let current_scroll = if is_markdown {
+        app.markdown_visual_scroll
     } else {
-        (app.engine.preview_scroll() + step as usize).min(max_scroll)
+        app.engine.preview_scroll()
     };
-    if new_scroll == app.engine.preview_scroll() {
+    let new_scroll = if step < 0 {
+        current_scroll.saturating_sub(step.unsigned_abs() as usize)
+    } else {
+        (current_scroll + step as usize).min(max_scroll)
+    };
+    if new_scroll == current_scroll {
         return;
     }
-    app.engine
-        .dispatch(AppCommand::SetPreviewVerticalScroll(new_scroll));
+    if is_markdown {
+        app.scroll_file_preview(step);
+    } else {
+        app.engine
+            .dispatch(AppCommand::SetPreviewVerticalScroll(new_scroll));
+    }
     app.preview_autoscroll_at = Some(now);
 
     // Re-translate the frozen mouse against the new scroll — this is what
@@ -3679,7 +3778,7 @@ fn dispatch_vertical_scroll<B: Backend>(
     if app.engine.view_mode() == reef_app::ViewMode::FocusedPreview {
         match app.engine.active_tab() {
             Tab::Files | Tab::Search => {
-                app.engine.dispatch(AppCommand::PreviewScroll(step_i));
+                app.scroll_file_preview(step_i);
             }
             Tab::Git => {
                 app.engine.dispatch(AppCommand::DiffScroll(step_i));
@@ -3713,7 +3812,7 @@ fn dispatch_vertical_scroll<B: Backend>(
             if is_left {
                 app.engine.dispatch(AppCommand::ScrollFileTree(step_i));
             } else {
-                app.engine.dispatch(AppCommand::PreviewScroll(step_i));
+                app.scroll_file_preview(step_i);
             }
         }
         Tab::Graph => {
@@ -3736,7 +3835,7 @@ fn dispatch_vertical_scroll<B: Backend>(
                 // rather than mutating a scroll offset.
                 global_search::move_selection_by(app, step_i);
             } else {
-                app.engine.dispatch(AppCommand::PreviewScroll(step_i));
+                app.scroll_file_preview(step_i);
             }
         }
     }
@@ -3966,6 +4065,7 @@ pub fn handle_paste(s: String, app: &mut App) {
     // textarea, Tab::Search input) and silently mutate a buffer the
     // user can't see behind the modal.
     if app.engine.tree_context_menu_active()
+        || app.selection_context_menu.is_active()
         || app.engine.confirm_request().is_some()
         || app.engine.paste_conflict_active()
         || app.engine.place_mode_active()

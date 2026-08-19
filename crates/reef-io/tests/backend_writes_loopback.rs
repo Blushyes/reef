@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use reef_io::{Backend, LocalBackend, RemoteBackend};
+use reef_io::{
+    Backend, LocalBackend, RemoteBackend, ReplaceFileOutcome, ReplaceFileRequest, ReplaceLineGuard,
+};
 use tempfile::TempDir;
 use test_support::agent_bin;
 
@@ -300,6 +302,43 @@ fn write_file_round_trips_large_payload_without_json_array_blowup() {
         "1 MiB write_file took {:?} — likely the per-byte JSON array regression",
         elapsed,
     );
+}
+
+#[test]
+fn remote_replace_keeps_large_source_file_off_the_wire() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let remote_tmp = TempDir::new().unwrap();
+    let mut source = b"needle\n".to_vec();
+    source.resize(13 * 1024 * 1024, b'x');
+    std::fs::write(remote_tmp.path().join("large.txt"), &source).unwrap();
+    let remote = spawn_remote(remote_tmp.path());
+
+    let outcome = remote
+        .replace_file(
+            Path::new("large.txt"),
+            &ReplaceFileRequest {
+                pattern: "needle".into(),
+                replacement: b"replaced".to_vec(),
+                lines: vec![ReplaceLineGuard {
+                    line_no: 0,
+                    expected_revision: reef_io::content_line_revision(b"needle"),
+                }],
+                max_file_size: 50 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        ReplaceFileOutcome::Changed {
+            lines_replaced: 1,
+            stale: 0,
+        }
+    );
+    let after = std::fs::read(remote_tmp.path().join("large.txt")).unwrap();
+    assert!(after.starts_with(b"replaced\n"));
+    assert_eq!(after.len(), source.len() + 2);
+    remote.list_dir(Path::new("")).expect("agent remains alive");
 }
 
 #[test]

@@ -3,24 +3,24 @@ use std::time::Instant;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::TryRecvError;
 
+use crossbeam_channel::TryRecvError;
 use reef_core::diff::DiffLayout;
 use reef_core::git::{FileEntry, GraphScope};
 use reef_core::preview::PreviewDocument;
-use reef_io::{Backend, BackendError, EditorLaunchSpec};
+use reef_io::{Backend, BackendError, EditorLaunchSpec, FsChange};
 
-use crate::app::TabChangeOutcome;
+use crate::app::{AppState, AppStateConfig, TabChangeOutcome};
 use crate::tasks::WorkerResult;
 use crate::{
-    AppCommand, AppEffect, AppPanel, AppRuntimeEvent, AppSnapshot, AppState, AppTab, AsyncState,
-    CommitDetailState, CommitFileDiffLoadOutcome, ConfirmRequest, ContextMenuItem, DbPreviewState,
-    FileClipboard, FindWidgetState, GitGraphState, GitStatusState, GlobalSearchRowSnapshot,
-    GraphBranchPickerRowSnapshot, GraphScopeChangeOutcome, HighlightedDiff, HostsPickerRowSnapshot,
-    HoverTarget, LocationSnapshot, LspRefineOutcome, MatchHit, NormalizeActivePanelOutcome,
-    PickerInputOutcome, PlaceModeState, PreviewHighlight, QuickOpenRowSnapshot, SearchState,
-    SelectedFile, SelectionSet, SettingsState, TextEditOutcome, TickOptions, TreeDragState,
-    TreeEditState, TreeEntry, ViewMode,
+    AppCommand, AppEffect, AppPanel, AppPrefs, AppRuntimeEvent, AppSnapshot, AppTab, AsyncSnapshot,
+    AsyncState, CommitDetailState, CommitFileDiffLoadOutcome, ConfirmRequest, ContextMenuItem,
+    DbPreviewState, FileClipboard, FindWidgetState, GitGraphState, GitStatusState,
+    GlobalSearchRowSnapshot, GraphBranchPickerRowSnapshot, GraphScopeChangeOutcome,
+    HighlightedDiff, HostsPickerRowSnapshot, HoverTarget, LocationSnapshot, LspRefineOutcome,
+    MatchHit, NormalizeActivePanelOutcome, PickerInputOutcome, PlaceModeState, PreviewHighlight,
+    QuickOpenRowSnapshot, SearchState, SelectedFile, SelectionSet, SettingsState, TextEditOutcome,
+    TickOptions, TreeDragState, TreeEditState, TreeEntry, ViewMode,
 };
 
 pub struct ReefApp {
@@ -30,6 +30,16 @@ pub struct ReefApp {
     state: AppState,
     effects: Vec<AppEffect>,
     runtime_events: Vec<AppRuntimeEvent>,
+}
+
+#[derive(Debug, Default)]
+pub struct AppStepOutcome {
+    pub changed: bool,
+    /// True when this step only applied file-tree worker results. Renderers can
+    /// refresh the tree projection without rebuilding unrelated panel state.
+    pub file_tree_only: bool,
+    pub runtime_events: Vec<AppRuntimeEvent>,
+    pub next_deadline: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -43,8 +53,14 @@ pub struct AppCommandOutcome {
 
 impl ReefApp {
     pub fn new(config: AppConfig) -> Self {
+        let state = AppState::new(AppStateConfig {
+            backend: config.backend,
+            prefs: config.prefs,
+            now: Instant::now(),
+            subscribe_fs_events: config.subscribe_fs_events,
+        });
         Self {
-            state: config.state,
+            state,
             effects: Vec::new(),
             runtime_events: Vec::new(),
         }
@@ -131,14 +147,16 @@ impl ReefApp {
     ) {
         match row.source {
             crate::FocusedPreviewFileSource::GitStaged => {
-                self.state.select_file(row.path, true, dark);
-                self.runtime_events
-                    .push(AppRuntimeEvent::ClearDiffSelection);
+                if self.state.select_file(row.path, true, dark) {
+                    self.runtime_events
+                        .push(AppRuntimeEvent::ClearDiffSelection);
+                }
             }
             crate::FocusedPreviewFileSource::GitUnstaged => {
-                self.state.select_file(row.path, false, dark);
-                self.runtime_events
-                    .push(AppRuntimeEvent::ClearDiffSelection);
+                if self.state.select_file(row.path, false, dark) {
+                    self.runtime_events
+                        .push(AppRuntimeEvent::ClearDiffSelection);
+                }
             }
             crate::FocusedPreviewFileSource::GraphCommit => {
                 let outcome = self
@@ -175,10 +193,8 @@ impl ReefApp {
             self.runtime_events
                 .push(AppRuntimeEvent::ClearPreviewSelection);
         }
-        if outcome.resolve_pending_highlight {
-            self.runtime_events
-                .push(AppRuntimeEvent::ResolvePendingHighlight);
-        }
+        self.runtime_events
+            .push(AppRuntimeEvent::RetryDeferredPreviewActions);
     }
 
     fn push_location_jump_outcome(&mut self, outcome: crate::app::JumpToLocationOutcome) {
@@ -210,10 +226,46 @@ impl ReefApp {
         result: Result<Option<PreviewDocument>, String>,
         view_height: usize,
     ) {
-        let outcome = self
+        if self
             .state
-            .apply_preview_result(generation, result, view_height);
-        self.push_preview_merge_outcome(outcome);
+            .global_search_hit_accepting_generation(generation)
+        {
+            match result {
+                Ok(Some(content)) => {
+                    let outcome =
+                        self.state
+                            .apply_preview_content(generation, Some(content), view_height);
+                    if outcome.accepted {
+                        self.state.request_current_preview_enrichment(generation);
+                        let tab_change = self
+                            .state
+                            .complete_global_search_hit_accept(generation, view_height);
+                        self.push_preview_merge_outcome(outcome);
+                        if let Some(tab_change) = tab_change {
+                            self.push_tab_change_outcome(tab_change);
+                        }
+                    }
+                }
+                Ok(None) => {
+                    if self.state.reject_global_search_hit_accept(generation, None) {
+                        self.runtime_events
+                            .push(AppRuntimeEvent::SyncSearchPreviewIfStale);
+                    }
+                }
+                Err(error) => {
+                    self.state
+                        .reject_global_search_hit_accept(generation, Some(error));
+                }
+            }
+        } else {
+            let outcome = self
+                .state
+                .apply_preview_result(generation, result, view_height);
+            if outcome.accepted {
+                self.state.request_current_preview_enrichment(generation);
+            }
+            self.push_preview_merge_outcome(outcome);
+        }
     }
 
     fn apply_lsp_refine_done_command(
@@ -373,6 +425,15 @@ impl ReefApp {
             AppCommand::ClampPreviewHorizontalScroll(max_scroll) => {
                 self.state.clamp_preview_horizontal_scroll(max_scroll);
             }
+            AppCommand::SetStructuredPreviewMode(mode) => {
+                self.state.set_structured_preview_mode(mode);
+            }
+            AppCommand::ToggleStructuredPreviewMode => {
+                self.state.toggle_structured_preview_mode();
+            }
+            AppCommand::ToggleStructuredPreviewNode(node_id) => {
+                self.state.toggle_structured_preview_node(&node_id);
+            }
             AppCommand::SetDiffVerticalScroll(value) => {
                 self.state.set_diff_vertical_scroll(value);
             }
@@ -410,6 +471,19 @@ impl ReefApp {
             }
             AppCommand::CommitReplaceInFiles => self.state.commit_replace_in_files(),
             AppCommand::RefreshStatus => self.state.refresh_status(),
+            AppCommand::ApplyFsChange {
+                workspace_changed,
+                workspace_paths,
+                git_metadata_changed,
+                repo_presence_changed,
+            } => {
+                self.state.apply_fs_change(reef_io::FsChange {
+                    workspace_changed,
+                    workspace_paths,
+                    git_metadata_changed,
+                    repo_presence_changed,
+                });
+            }
             AppCommand::RefreshFileTree => self.state.refresh_file_tree(),
             AppCommand::RefreshFileTreeWithTarget(target) => {
                 self.state.refresh_file_tree_with_target(target);
@@ -430,16 +504,17 @@ impl ReefApp {
             AppCommand::ToggleFileTreeExpand(idx) => {
                 self.state.toggle_file_tree_expand_and_refresh(idx);
             }
+            AppCommand::ToggleFileTreeExpandPath(path) => {
+                self.state.toggle_file_tree_expand_path_and_refresh(&path);
+            }
             AppCommand::ActivateFileTreeEntryAtIndex(idx) => {
                 self.state.activate_file_tree_entry_at_index(idx);
             }
             AppCommand::SelectFileTreeEntry(idx) => {
-                self.state.file_tree.state.selected = idx;
-                if let Some(entry) = self.state.file_tree.selected_entry()
-                    && !entry.is_dir
-                {
-                    self.state.preview_schedule = Some((entry.path.clone(), Instant::now()));
-                }
+                self.state.select_file_tree_entry_and_schedule_preview(idx);
+            }
+            AppCommand::SelectVisibleFileTreePath(path) => {
+                self.state.select_visible_file_tree_path(&path);
             }
             AppCommand::ActivateSelectedFileTreeEntry => {
                 self.state.activate_selected_file_tree_entry();
@@ -520,6 +595,9 @@ impl ReefApp {
             AppCommand::DbToggleSchema(name) => self.state.db_toggle_schema(&name),
             AppCommand::DbSelectObject(key) => self.state.db_select_object(key),
             AppCommand::DbNavigateToPage(page) => self.state.db_navigate_to_page(page),
+            AppCommand::DbLoadCell { row, column } => {
+                self.state.dispatch_db_cell_load(row, column);
+            }
             AppCommand::EditDbGoto(op) => {
                 let _ = self.state.edit_db_goto_input(op);
             }
@@ -540,6 +618,7 @@ impl ReefApp {
                 .scroll_horizontal_at_column(column, total_width, delta),
             AppCommand::OpenQuickOpen => self.state.open_quick_open(),
             AppCommand::CloseQuickOpen => self.state.close_quick_open(),
+            AppCommand::SetQuickOpenQuery(query) => self.state.set_quick_open_query(query),
             AppCommand::ApplyQuickOpenPickerInput {
                 input,
                 visible_rows,
@@ -595,9 +674,8 @@ impl ReefApp {
                 let outcome = self.state.pin_global_search_to_tab();
                 self.push_tab_change_outcome(outcome);
             }
-            AppCommand::AcceptGlobalSearchHit(hit) => {
-                let outcome = self.state.accept_global_search_hit(hit);
-                self.push_tab_change_outcome(outcome);
+            AppCommand::AcceptGlobalSearchHit { hit, origin } => {
+                self.state.begin_global_search_hit_accept(hit, origin);
             }
             AppCommand::BeginVimSearch { target, backwards } => {
                 self.state.begin_vim_search(target, backwards);
@@ -635,7 +713,7 @@ impl ReefApp {
                 self.runtime_events
                     .push(AppRuntimeEvent::RecomputeFindWidget);
             }
-            AppCommand::CloseFindWidget { dark } => self.state.close_find_widget(dark),
+            AppCommand::CloseFindWidget => self.state.close_find_widget(),
             AppCommand::EditFindWidgetInput(op) => {
                 if self.state.edit_find_widget_input(op) == TextEditOutcome::Edited {
                     self.runtime_events
@@ -708,16 +786,13 @@ impl ReefApp {
                 dispatch_outcome.global_search_preview_sync_due =
                     self.state.consume_global_search_preview_sync_due(now);
             }
-            AppCommand::SyncGlobalSearchPreviewToSelected => {
-                self.state.clear_global_search_preview_sync();
-                if let Some(hit) = self.state.selected_global_search_hit() {
-                    self.state.set_preview_highlight_persistent(
-                        hit.path.clone(),
-                        hit.line,
-                        hit.byte_range.clone(),
-                    );
-                    self.state.load_preview_for_path(hit.path);
-                }
+            AppCommand::SyncGlobalSearchPreviewToSelected { preview_view_h } => {
+                self.state
+                    .sync_global_search_preview_to_selected(preview_view_h);
+            }
+            AppCommand::SyncGlobalSearchPreviewIfStale { preview_view_h } => {
+                self.state
+                    .sync_global_search_preview_if_stale(preview_view_h);
             }
             AppCommand::FocusGlobalSearchFindInput => self.state.focus_global_search_find_input(),
             AppCommand::FocusGlobalSearchReplaceInput => {
@@ -748,6 +823,12 @@ impl ReefApp {
             AppCommand::SetGlobalSearchResultsHorizontalScroll(value) => {
                 self.state
                     .set_global_search_results_horizontal_scroll(value);
+            }
+            AppCommand::SetGlobalSearchQuery { query, now } => {
+                self.state.set_global_search_query(query, now);
+            }
+            AppCommand::SetGlobalSearchReplacement(replacement) => {
+                self.state.set_global_search_replacement(replacement);
             }
             AppCommand::EditGlobalSearchFindInput { op, now } => {
                 let _ = self.state.edit_global_search_find_input(op, now);
@@ -868,9 +949,10 @@ impl ReefApp {
                 is_staged,
                 dark,
             } => {
-                self.state.select_file(path, is_staged, dark);
-                self.runtime_events
-                    .push(AppRuntimeEvent::ClearDiffSelection);
+                if self.state.select_file(path, is_staged, dark) {
+                    self.runtime_events
+                        .push(AppRuntimeEvent::ClearDiffSelection);
+                }
             }
             AppCommand::SelectGitFileForDiscard {
                 path,
@@ -1232,7 +1314,7 @@ impl ReefApp {
                 self.runtime_events.extend(events);
             }
             AppCommand::CollapseAllTreeEntries => {
-                self.state.file_tree.collapse_all();
+                self.state.collapse_all_file_tree_entries();
             }
             AppCommand::ExtendFileSelectionToIndex(idx) => {
                 self.state.extend_file_selection_to_index(idx);
@@ -1256,11 +1338,22 @@ impl ReefApp {
         dispatch_outcome
     }
 
-    pub fn tick(&mut self, now: Instant, options: TickOptions) {
+    pub fn step(&mut self, now: Instant, options: TickOptions) -> AppStepOutcome {
+        let mut file_tree_changed = false;
+        let mut other_changed =
+            self.state.has_step_work_due(now) || !self.runtime_events.is_empty();
         loop {
             match self.state.tasks.try_recv() {
                 Ok(result) => match result {
+                    result @ (WorkerResult::FileTree { .. }
+                    | WorkerResult::FileTreeSubtree { .. }) => {
+                        file_tree_changed = true;
+                        let events = self.state.apply_worker_result_core(result, now);
+                        other_changed |= !events.is_empty();
+                        self.runtime_events.extend(events);
+                    }
                     WorkerResult::Preview { generation, result } => {
+                        other_changed = true;
                         self.runtime_events
                             .push(AppRuntimeEvent::PreviewResultForAdapter { generation, result });
                     }
@@ -1272,6 +1365,7 @@ impl ReefApp {
                         rel_location,
                         server_returned_location,
                     } => {
+                        other_changed = true;
                         if let Some(outcome) = self.apply_lsp_refine_done_command(
                             generation,
                             epoch,
@@ -1285,6 +1379,7 @@ impl ReefApp {
                         }
                     }
                     result => {
+                        other_changed = true;
                         let events = self.state.apply_worker_result_core(result, now);
                         self.runtime_events.extend(events);
                     }
@@ -1294,13 +1389,25 @@ impl ReefApp {
             }
         }
         self.state.maybe_kick_global_search(now);
-        self.state.drain_fs_watcher_events();
+        if self.state.drain_fs_watcher_events() {
+            other_changed = true;
+        }
         if self.state.nav_workspace_load.should_request() {
+            other_changed = true;
             self.state.dispatch_nav_workspace_build();
         }
         self.state.drain_preview_schedule(now, options);
         self.state.drain_prefetch_schedule(now, options);
         self.state.kick_active_tab_work(now, options);
+        let runtime_events = std::mem::take(&mut self.runtime_events);
+        other_changed |= !runtime_events.is_empty();
+        let changed = file_tree_changed || other_changed;
+        AppStepOutcome {
+            changed,
+            file_tree_only: file_tree_changed && !other_changed,
+            runtime_events,
+            next_deadline: self.state.next_deadline(),
+        }
     }
 
     pub fn snapshot(&self) -> AppSnapshot {
@@ -1364,6 +1471,18 @@ impl ReefApp {
         Arc::clone(&self.state.backend)
     }
 
+    pub fn worker_wake_receiver(&self) -> crossbeam_channel::Receiver<()> {
+        self.state.tasks.worker_wake_receiver()
+    }
+
+    pub fn fs_watcher_receiver(&self) -> Option<crossbeam_channel::Receiver<FsChange>> {
+        self.state.fs_watcher_rx.clone()
+    }
+
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.state.next_deadline()
+    }
+
     pub fn confirm_request(&self) -> Option<&ConfirmRequest> {
         self.state.pending_confirm.as_ref()
     }
@@ -1376,6 +1495,7 @@ impl ReefApp {
         let matched = self.state.quick_open.matches.get(match_idx)?;
         let candidate = self.state.quick_open.index.get(matched.idx)?;
         Some(QuickOpenRowSnapshot {
+            path: candidate.rel_path.clone(),
             display: candidate.display.clone(),
             indices: matched.indices.clone(),
         })
@@ -1404,15 +1524,6 @@ impl ReefApp {
         self.state.selected_global_search_hit()
     }
 
-    pub fn selected_global_search_hit_if_preview_stale(&self) -> Option<MatchHit> {
-        let hit = self.selected_global_search_hit()?;
-        let stale = match &self.state.preview_highlight {
-            Some(hl) => hl.path != hit.path || hl.row != hit.line,
-            None => true,
-        };
-        stale.then_some(hit)
-    }
-
     pub fn diff_layout(&self) -> DiffLayout {
         self.state.diff_layout
     }
@@ -1439,6 +1550,18 @@ impl ReefApp {
 
     pub fn db_preview(&self) -> Option<&DbPreviewState> {
         self.state.db_preview()
+    }
+
+    pub fn db_page_load_snapshot(&self) -> AsyncSnapshot {
+        AsyncSnapshot::from_state(&self.state.db_page_load)
+    }
+
+    pub fn db_detail_load_snapshot(&self) -> AsyncSnapshot {
+        AsyncSnapshot::from_state(&self.state.db_detail_load)
+    }
+
+    pub fn db_cell_load_snapshot(&self) -> AsyncSnapshot {
+        AsyncSnapshot::from_state(&self.state.db_cell_load)
     }
 
     pub fn graph_sidebar_width(&self, total_width: u16) -> u16 {
@@ -1642,6 +1765,14 @@ impl ReefApp {
         &self.state.file_tree.entries
     }
 
+    pub fn file_tree_rows_revision(&self) -> u64 {
+        self.state.file_tree.rows_revision()
+    }
+
+    pub fn file_tree_rows_splice(&self) -> Option<crate::FileTreeRowsSplice> {
+        self.state.file_tree.rows_splice()
+    }
+
     pub fn tree_scroll(&self) -> usize {
         self.state.tree_scroll
     }
@@ -1775,11 +1906,29 @@ impl ReefApp {
         self.state.preview_content.as_deref()
     }
 
+    pub fn preview_enrichment_pending(&self) -> bool {
+        self.state.preview_enrichment_pending()
+    }
+
+    pub fn structured_preview_mode(&self) -> crate::StructuredPreviewMode {
+        self.state.structured_preview_mode
+    }
+
+    pub fn structured_preview_document(
+        &self,
+    ) -> Option<Arc<reef_core::structured_data::StructuredDataDocument>> {
+        self.state.structured_preview_document()
+    }
+
     pub fn preview_scheduled_path(&self) -> Option<PathBuf> {
         self.state
             .preview_schedule
             .as_ref()
             .map(|(path, _)| path.clone())
+    }
+
+    pub fn preview_target_matches(&self, path: &Path) -> bool {
+        self.state.preview_target_matches(path)
     }
 
     pub fn preview_is_database(&self) -> bool {
@@ -1795,6 +1944,10 @@ impl ReefApp {
 
     pub fn unstaged_files(&self) -> &[FileEntry] {
         &self.state.unstaged_files
+    }
+
+    pub fn git_status_rows_revision(&self) -> u64 {
+        self.state.git_status_rows_revision
     }
 
     pub fn selected_file(&self) -> Option<&SelectedFile> {
@@ -1830,6 +1983,14 @@ impl ReefApp {
 
     pub fn git_status(&self) -> &GitStatusState {
         &self.state.git_status
+    }
+
+    pub fn git_status_tree_rows(&self, is_staged: bool) -> &[reef_core::git::tree::TreeRow] {
+        if is_staged {
+            &self.state.git_status.staged_tree_rows
+        } else {
+            &self.state.git_status.unstaged_tree_rows
+        }
     }
 
     pub fn git_graph(&self) -> &GitGraphState {
@@ -1902,6 +2063,11 @@ impl ReefApp {
 
     pub fn preview_generation(&self) -> u64 {
         self.state.preview_load.generation
+    }
+
+    pub fn global_search_hit_accepting_generation(&self, generation: u64) -> bool {
+        self.state
+            .global_search_hit_accepting_generation(generation)
     }
 
     pub fn preview_highlight_cloned(&self) -> Option<PreviewHighlight> {
@@ -2092,24 +2258,72 @@ impl ReefApp {
 }
 
 pub struct AppConfig {
-    pub state: AppState,
+    pub backend: Arc<dyn Backend>,
+    pub prefs: AppPrefs,
+    pub subscribe_fs_events: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reef_core::preview::{PreviewBody, TextPreview};
     use reef_io::LocalBackend;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     fn test_app() -> ReefApp {
         let backend = Arc::new(LocalBackend::open_at(PathBuf::from(".")));
-        let state = AppState::new(crate::AppStateConfig {
+        ReefApp::new(AppConfig {
             backend,
-            prefs: crate::AppPrefs::default(),
-            now: Instant::now(),
+            prefs: AppPrefs::default(),
             subscribe_fs_events: false,
+        })
+    }
+
+    fn global_search_hit(path: &str) -> MatchHit {
+        MatchHit {
+            path: PathBuf::from(path),
+            display: path.to_string(),
+            line: 3,
+            line_text: "needle".to_string(),
+            line_revision: reef_io::content_line_revision(b"needle"),
+            byte_range: 0..6,
+        }
+    }
+
+    fn global_search_origin() -> LocationSnapshot {
+        LocationSnapshot {
+            surface: crate::LocationSurface::GitDiff {
+                file_path: "src/origin.rs".to_string(),
+                is_staged: false,
+            },
+            path: PathBuf::from("src/origin.rs"),
+            cursor: crate::CursorPosition {
+                line: 4,
+                byte_col: 2,
+            },
+            scroll: crate::ScrollPosition {
+                vertical: 3,
+                horizontal: 1,
+            },
+        }
+    }
+
+    fn start_global_search_hit_validation(app: &mut ReefApp, hit: MatchHit) -> u64 {
+        app.dispatch(AppCommand::AcceptGlobalSearchHit {
+            hit,
+            origin: Some(global_search_origin()),
         });
-        ReefApp::new(AppConfig { state })
+        let (path, _) = app
+            .state
+            .preview_schedule
+            .take()
+            .expect("accepting a hit schedules validation");
+        let generation = app.state.preview_load.begin();
+        app.state
+            .bind_global_search_hit_accept_to_preview_generation(&path, generation);
+        app.state.preview_in_flight_path = Some(path);
+        generation
     }
 
     #[test]
@@ -2135,5 +2349,286 @@ mod tests {
         app.dispatch(AppCommand::SetActiveTab(AppTab::Files));
 
         assert!(app.drain_runtime_events().is_empty());
+    }
+
+    #[test]
+    fn selecting_visible_file_does_not_rebuild_file_tree() {
+        let mut app = test_app();
+        app.state.file_tree.state.entries = vec![crate::TreeEntry {
+            path: PathBuf::from("src/main.rs"),
+            name: "main.rs".to_string(),
+            depth: 1,
+            is_dir: false,
+            has_children: false,
+            is_expanded: false,
+            git_status: None,
+        }];
+        let tree_generation = app.state.file_tree_load.generation;
+
+        app.dispatch(AppCommand::SelectVisibleFileTreePath(PathBuf::from(
+            "src/main.rs",
+        )));
+
+        assert_eq!(app.state.file_tree.state.selected, 0);
+        assert_eq!(app.state.file_tree_load.generation, tree_generation);
+        assert!(!app.state.file_tree_load.loading);
+        assert_eq!(
+            app.state.preview_schedule.as_ref().map(|(path, _)| path),
+            Some(&PathBuf::from("src/main.rs"))
+        );
+    }
+
+    #[test]
+    fn reselecting_current_git_file_does_not_enqueue_diff() {
+        let mut app = test_app();
+        let command = AppCommand::SelectGitFile {
+            path: "src/main.rs".to_string(),
+            is_staged: false,
+            dark: false,
+        };
+
+        app.dispatch(command.clone());
+        let first_generation = app.state.diff_load.generation;
+        assert!(
+            app.drain_runtime_events()
+                .iter()
+                .any(|event| matches!(event, AppRuntimeEvent::ClearDiffSelection))
+        );
+
+        app.dispatch(command);
+
+        assert_eq!(app.state.diff_load.generation, first_generation);
+        assert!(app.drain_runtime_events().is_empty());
+    }
+
+    #[test]
+    fn dispatch_fs_change_preserves_precise_workspace_paths() {
+        let mut app = test_app();
+        app.state.preview_content = Some(Arc::new(PreviewDocument {
+            path: "script.json".to_string(),
+            resolved_path: None,
+            local_path: None,
+            bytes_on_disk: 2,
+            mime: Some("application/json".to_string()),
+            body: PreviewBody::Text(TextPreview {
+                lines: vec!["{}".to_string()],
+                source: None,
+                highlighted: None,
+                parsed: None,
+            }),
+        }));
+        app.state.preview_load.stale = false;
+
+        app.dispatch(AppCommand::ApplyFsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from(".DS_Store")],
+            git_metadata_changed: false,
+            repo_presence_changed: false,
+        });
+
+        assert!(!app.state.preview_load.stale);
+    }
+
+    #[test]
+    fn resolved_preview_target_change_invalidates_symlink_preview() {
+        let mut app = test_app();
+        app.state.preview_content = Some(Arc::new(PreviewDocument {
+            path: "current.txt".to_string(),
+            resolved_path: Some(PathBuf::from("target.txt")),
+            local_path: None,
+            bytes_on_disk: 4,
+            mime: Some("text/plain".to_string()),
+            body: PreviewBody::Text(TextPreview {
+                lines: vec!["reef".to_string()],
+                source: None,
+                highlighted: None,
+                parsed: None,
+            }),
+        }));
+        app.state.preview_load.stale = false;
+
+        app.dispatch(AppCommand::ApplyFsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from("target.txt")],
+            git_metadata_changed: false,
+            repo_presence_changed: false,
+        });
+
+        assert!(app.state.preview_load.stale);
+    }
+
+    #[test]
+    fn sqlite_sidecar_change_invalidates_open_preview() {
+        let mut app = test_app();
+        app.state.preview_content = Some(Arc::new(PreviewDocument {
+            path: "fixture.db".to_string(),
+            resolved_path: None,
+            local_path: None,
+            bytes_on_disk: 0,
+            mime: Some("application/vnd.sqlite3".to_string()),
+            body: PreviewBody::Database(reef_sqlite_preview::DatabaseInfoV2 {
+                schemas: Vec::new(),
+                default_schema: "main".to_string(),
+                default_object: None,
+                initial_page: reef_sqlite_preview::DbPage {
+                    rows: Vec::new(),
+                    row_locators: Vec::new(),
+                },
+                bytes_on_disk: 0,
+            }),
+        }));
+        app.state.preview_load.stale = false;
+        app.state.preview_in_flight_path = Some(PathBuf::from("other.txt"));
+
+        app.dispatch(AppCommand::ApplyFsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from("fixture.db-wal")],
+            git_metadata_changed: false,
+            repo_presence_changed: false,
+        });
+
+        assert!(app.state.preview_load.stale);
+    }
+
+    #[test]
+    fn accepted_preview_result_schedules_enrichment_after_base_merge() {
+        let mut app = test_app();
+        let wake = app.worker_wake_receiver();
+        let generation = app.state.preview_load.begin();
+        app.dispatch(AppCommand::ApplyPreviewResult {
+            generation,
+            result: Ok(Some(PreviewDocument {
+                path: "src/main.rs".to_string(),
+                resolved_path: None,
+                local_path: None,
+                bytes_on_disk: 13,
+                mime: Some("text/plain".to_string()),
+                body: PreviewBody::Text(TextPreview {
+                    lines: vec!["fn main() {}".to_string()],
+                    source: None,
+                    highlighted: None,
+                    parsed: None,
+                }),
+            })),
+            preview_view_h: 20,
+        });
+
+        let Some(PreviewBody::Text(base)) = app
+            .state
+            .preview_content
+            .as_deref()
+            .map(|preview| &preview.body)
+        else {
+            panic!("expected merged base preview");
+        };
+        assert!(base.highlighted.is_none());
+        let base_events = app.drain_runtime_events();
+        assert!(
+            base_events
+                .iter()
+                .any(|event| matches!(event, AppRuntimeEvent::RetryDeferredPreviewActions))
+        );
+
+        wake.recv_timeout(Duration::from_secs(15))
+            .expect("enrichment worker should wake the app runtime");
+        let outcome = app.step(
+            Instant::now(),
+            TickOptions {
+                dark: false,
+                wants_decoded_image: false,
+                uses_three_col: false,
+            },
+        );
+        assert!(
+            outcome
+                .runtime_events
+                .iter()
+                .any(|event| matches!(event, AppRuntimeEvent::RetryDeferredPreviewActions))
+        );
+
+        let Some(PreviewBody::Text(enriched)) = app
+            .state
+            .preview_content
+            .as_deref()
+            .map(|preview| &preview.body)
+        else {
+            panic!("expected enriched preview");
+        };
+        assert!(enriched.highlighted.is_some());
+        assert!(enriched.parsed.is_some());
+    }
+
+    #[test]
+    fn missing_global_search_hit_keeps_search_open_without_history_entry() {
+        let mut app = test_app();
+        app.state.active_tab = AppTab::Git;
+        app.state.global_search.core.active = true;
+        let hit = global_search_hit("deleted.rs");
+        app.state.global_search.results = vec![hit.clone()];
+        let generation = start_global_search_hit_validation(&mut app, hit);
+
+        app.dispatch(AppCommand::ApplyPreviewResult {
+            generation,
+            result: Ok(None),
+            preview_view_h: 20,
+        });
+
+        assert_eq!(app.state.active_tab, AppTab::Git);
+        assert!(app.state.global_search.core.active);
+        assert!(app.state.global_search.results.is_empty());
+        assert!(app.state.location_history.is_empty());
+        assert!(
+            app.drain_runtime_events()
+                .iter()
+                .all(|event| !matches!(event, AppRuntimeEvent::TabChanged(_)))
+        );
+    }
+
+    #[test]
+    fn existing_global_search_hit_commits_navigation_after_preview_validation() {
+        let mut app = test_app();
+        app.state.active_tab = AppTab::Git;
+        app.state.global_search.core.active = true;
+        let hit = global_search_hit("src/main.rs");
+        app.state.global_search.results = vec![hit.clone()];
+        let generation = start_global_search_hit_validation(&mut app, hit.clone());
+
+        app.dispatch(AppCommand::ApplyPreviewResult {
+            generation,
+            result: Ok(Some(PreviewDocument {
+                path: hit.path.to_string_lossy().to_string(),
+                resolved_path: None,
+                local_path: None,
+                bytes_on_disk: 7,
+                mime: Some("text/plain".to_string()),
+                body: PreviewBody::Text(TextPreview {
+                    lines: vec!["needle".to_string()],
+                    source: None,
+                    highlighted: None,
+                    parsed: None,
+                }),
+            })),
+            preview_view_h: 20,
+        });
+
+        assert_eq!(app.state.active_tab, AppTab::Files);
+        assert!(!app.state.global_search.core.active);
+        assert_eq!(
+            app.state.location_history.back_items(),
+            &[global_search_origin()]
+        );
+        assert_eq!(
+            app.state
+                .preview_highlight
+                .as_ref()
+                .map(|highlight| (&highlight.path, highlight.row)),
+            Some((&hit.path, hit.line))
+        );
+        assert!(app.state.preview_enrichment_pending());
+        assert!(
+            app.drain_runtime_events().iter().any(
+                |event| matches!(event, AppRuntimeEvent::TabChanged(outcome) if outcome.changed)
+            )
+        );
     }
 }

@@ -56,12 +56,10 @@ pub fn begin_with_selection(app: &mut App) {
     app.drain_engine_runtime_events();
 }
 
-/// Close the widget, restoring pre-find scroll. Idempotent — safe to call
-/// when widget is already inactive.
+/// Close the widget while keeping the currently revealed match in view.
+/// Idempotent — safe to call when widget is already inactive.
 pub fn close(app: &mut App) {
-    app.engine.dispatch(AppCommand::CloseFindWidget {
-        dark: app.theme.is_dark,
-    });
+    app.engine.dispatch(AppCommand::CloseFindWidget);
     app.find_widget_ui = Default::default();
 }
 

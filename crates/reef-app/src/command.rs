@@ -68,6 +68,9 @@ pub enum AppCommand {
     },
     SetPreviewHorizontalScroll(usize),
     ClampPreviewHorizontalScroll(usize),
+    SetStructuredPreviewMode(crate::StructuredPreviewMode),
+    ToggleStructuredPreviewMode,
+    ToggleStructuredPreviewNode(String),
     SetDiffVerticalScroll(usize),
     SetDiffHorizontalScroll(usize),
     SetDiffScrollState {
@@ -85,10 +88,17 @@ pub enum AppCommand {
     },
     CommitReplaceInFiles,
     RefreshStatus,
+    ApplyFsChange {
+        workspace_changed: bool,
+        workspace_paths: Vec<PathBuf>,
+        git_metadata_changed: bool,
+        repo_presence_changed: bool,
+    },
     RefreshFileTree,
     RefreshFileTreeWithTarget(Option<PathBuf>),
     RevealFileTreePath(PathBuf),
     SelectFileTreeEntry(usize),
+    SelectVisibleFileTreePath(PathBuf),
     NavigateFileTree(i32),
     NavigateGitFiles(i32),
     ScrollFileTree(i32),
@@ -97,6 +107,7 @@ pub enum AppCommand {
         selection_changed: bool,
     },
     ToggleFileTreeExpand(usize),
+    ToggleFileTreeExpandPath(PathBuf),
     ActivateFileTreeEntryAtIndex(usize),
     ActivateSelectedFileTreeEntry,
     RequestEditSelectedFileTreeEntry,
@@ -137,6 +148,10 @@ pub enum AppCommand {
     DbToggleSchema(String),
     DbSelectObject(reef_sqlite_preview::DbObjectKey),
     DbNavigateToPage(u64),
+    DbLoadCell {
+        row: usize,
+        column: usize,
+    },
     EditDbGoto(TextEditOp),
     PasteDbGoto(String),
     ConfirmDbGoto,
@@ -147,6 +162,7 @@ pub enum AppCommand {
     },
     OpenQuickOpen,
     CloseQuickOpen,
+    SetQuickOpenQuery(String),
     ApplyQuickOpenPickerInput {
         input: PickerInput,
         visible_rows: usize,
@@ -169,7 +185,10 @@ pub enum AppCommand {
     CloseGlobalSearch,
     OpenGlobalReplaceTab,
     PinGlobalSearchToTab,
-    AcceptGlobalSearchHit(MatchHit),
+    AcceptGlobalSearchHit {
+        hit: MatchHit,
+        origin: Option<LocationSnapshot>,
+    },
     BeginVimSearch {
         target: SearchTarget,
         backwards: bool,
@@ -196,9 +215,7 @@ pub enum AppCommand {
         target: FindTarget,
         query: String,
     },
-    CloseFindWidget {
-        dark: bool,
-    },
+    CloseFindWidget,
     EditFindWidgetInput(TextEditOp),
     PasteFindWidgetInput(String),
     ToggleFindWidgetOption(FindWidgetToggle),
@@ -238,7 +255,12 @@ pub enum AppCommand {
     DrainGlobalSearchPreviewSyncDebounce {
         now: Instant,
     },
-    SyncGlobalSearchPreviewToSelected,
+    SyncGlobalSearchPreviewToSelected {
+        preview_view_h: usize,
+    },
+    SyncGlobalSearchPreviewIfStale {
+        preview_view_h: usize,
+    },
     FocusGlobalSearchFindInput,
     FocusGlobalSearchReplaceInput,
     FocusGlobalSearchList,
@@ -253,6 +275,11 @@ pub enum AppCommand {
     },
     ScrollGlobalSearchResultsHorizontal(i32),
     SetGlobalSearchResultsHorizontalScroll(usize),
+    SetGlobalSearchQuery {
+        query: String,
+        now: Instant,
+    },
+    SetGlobalSearchReplacement(String),
     EditGlobalSearchFindInput {
         op: TextEditOp,
         now: Instant,

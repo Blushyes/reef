@@ -7,21 +7,46 @@ use super::{PreviewBody, PreviewDocument, TextPreview};
 
 const PROBE_BYTES: usize = 8192;
 const SQLITE_MIME: &str = "application/vnd.sqlite3";
-const MAX_TEXT_PROBE_BYTES: u64 = 10 * 1024 * 1024;
+pub const MAX_TEXT_PREVIEW_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_ENRICHMENT_BYTES: u64 = 512 * 1024;
+const MAX_ENRICHMENT_LINES: usize = 5_000;
+const MAX_TEXT_PREVIEW_LINES: usize = 10_000;
 
 pub const INITIAL_DB_PAGE_ROWS: u32 = 50;
+
+fn preview_document(
+    path: &str,
+    bytes_on_disk: u64,
+    mime: Option<&str>,
+    body: PreviewBody,
+) -> PreviewDocument {
+    PreviewDocument {
+        path: path.to_string(),
+        resolved_path: None,
+        local_path: None,
+        bytes_on_disk,
+        mime: mime.map(str::to_string),
+        body,
+    }
+}
 
 pub fn load_preview(
     root: &Path,
     rel_path: &Path,
-    dark: bool,
+    wants_decoded_image: bool,
+) -> Option<PreviewDocument> {
+    load_preview_from_path(&root.join(rel_path), rel_path, wants_decoded_image)
+}
+
+pub fn load_preview_from_path(
+    full: &Path,
+    rel_path: &Path,
     wants_decoded_image: bool,
 ) -> Option<PreviewDocument> {
     use std::io::Read;
 
-    let full = root.join(rel_path);
     let rel_str = rel_path.to_string_lossy().to_string();
-    let mut file = std::fs::File::open(&full).ok()?;
+    let mut file = std::fs::File::open(full).ok()?;
     let meta = file.metadata().ok()?;
     if !meta.is_file() {
         return None;
@@ -29,10 +54,12 @@ pub fn load_preview(
     let file_size = meta.len();
 
     if file_size == 0 {
-        return Some(PreviewDocument {
-            path: rel_str,
-            body: PreviewBody::Binary(BinaryInfo::new(0, None, BinaryReason::Empty)),
-        });
+        return Some(preview_document(
+            &rel_str,
+            file_size,
+            None,
+            PreviewBody::Binary(BinaryInfo::new(0, None, BinaryReason::Empty)),
+        ));
     }
 
     let probe_len = (file_size as usize).min(PROBE_BYTES);
@@ -46,32 +73,40 @@ pub fn load_preview(
         && reef_sqlite_preview::has_sqlite_magic(&probe)
     {
         use reef_sqlite_preview::PreviewError as SqlitePreviewError;
-        match reef_sqlite_preview::read_initial_v2(&full, INITIAL_DB_PAGE_ROWS) {
+        match reef_sqlite_preview::read_initial_v2(full, INITIAL_DB_PAGE_ROWS) {
             Ok(info) => {
-                return Some(PreviewDocument {
-                    path: rel_str,
-                    body: PreviewBody::Database(info),
-                });
+                return Some(preview_document(
+                    &rel_str,
+                    file_size,
+                    Some(SQLITE_MIME),
+                    PreviewBody::Database(info),
+                ));
             }
             Err(SqlitePreviewError::TooLarge { .. }) => {
-                return Some(PreviewDocument {
-                    path: rel_str,
-                    body: PreviewBody::Binary(BinaryInfo::new(
+                return Some(preview_document(
+                    &rel_str,
+                    file_size,
+                    Some(SQLITE_MIME),
+                    PreviewBody::Binary(BinaryInfo::with_head_bytes(
                         file_size,
                         Some(SQLITE_MIME),
                         BinaryReason::TooLarge,
+                        &probe,
                     )),
-                });
+                ));
             }
             Err(e) => {
-                return Some(PreviewDocument {
-                    path: rel_str,
-                    body: PreviewBody::Binary(BinaryInfo::new(
+                return Some(preview_document(
+                    &rel_str,
+                    file_size,
+                    Some(SQLITE_MIME),
+                    PreviewBody::Binary(BinaryInfo::with_head_bytes(
                         file_size,
                         Some(SQLITE_MIME),
                         decode_error(format!("sqlite: {e}")),
+                        &probe,
                     )),
-                });
+                ));
             }
         }
     }
@@ -80,7 +115,7 @@ pub fn load_preview(
         && mime.starts_with("image/")
     {
         return Some(load_image_preview(
-            &full,
+            full,
             &rel_str,
             file_size,
             mime,
@@ -91,28 +126,45 @@ pub fn load_preview(
     if let Some(mime) = mime
         && !mime.starts_with("text/")
     {
-        return Some(PreviewDocument {
-            path: rel_str,
-            body: PreviewBody::Binary(BinaryInfo::new(
+        return Some(preview_document(
+            &rel_str,
+            file_size,
+            Some(mime),
+            PreviewBody::Binary(BinaryInfo::with_head_bytes(
                 file_size,
                 Some(mime),
                 BinaryReason::NonImage,
+                &probe,
             )),
-        });
+        ));
     }
 
-    if file_size > MAX_TEXT_PROBE_BYTES {
-        return Some(PreviewDocument {
-            path: rel_str,
-            body: PreviewBody::Binary(BinaryInfo::new(file_size, None, BinaryReason::NullBytes)),
-        });
+    if file_size > MAX_TEXT_PREVIEW_BYTES {
+        return Some(preview_document(
+            &rel_str,
+            file_size,
+            mime,
+            PreviewBody::Binary(BinaryInfo::with_head_bytes(
+                file_size,
+                mime,
+                BinaryReason::TooLarge,
+                &probe,
+            )),
+        ));
     }
 
     if probe.contains(&0) {
-        return Some(PreviewDocument {
-            path: rel_str,
-            body: PreviewBody::Binary(BinaryInfo::new(file_size, None, BinaryReason::NullBytes)),
-        });
+        return Some(preview_document(
+            &rel_str,
+            file_size,
+            mime,
+            PreviewBody::Binary(BinaryInfo::with_head_bytes(
+                file_size,
+                mime,
+                BinaryReason::NullBytes,
+                &probe,
+            )),
+        ));
     }
 
     let mut raw = probe;
@@ -121,48 +173,95 @@ pub fn load_preview(
         file.read_to_end(&mut raw).ok()?;
     }
 
-    let content = String::from_utf8_lossy(&raw);
-    let lines: Vec<String> = content.lines().map(str::to_string).collect();
-    let lines = if lines.len() > 10_000 {
-        lines[..10_000].to_vec()
-    } else {
-        lines
-    };
+    Some(preview_document(
+        &rel_str,
+        file_size,
+        mime,
+        build_textual_preview_body(&rel_str, &String::from_utf8_lossy(&raw)),
+    ))
+}
 
-    let within_cap = raw.len() <= 512 * 1024 && lines.len() <= 5_000;
-    if within_cap
-        && let Some(markdown) = crate::markdown::build_markdown_preview(&rel_str, &content, dark)
-    {
-        return Some(PreviewDocument {
-            path: rel_str,
-            body: PreviewBody::Markdown(markdown),
-        });
+pub fn build_textual_preview_body(path: &str, content: &str) -> PreviewBody {
+    if crate::markdown::is_markdown_path(path) {
+        let line_count = content.lines().take(MAX_ENRICHMENT_LINES + 1).count();
+        let markdown = if text_preview_can_be_enriched(content.len() as u64, line_count) {
+            crate::markdown::build_markdown_preview(path, content)
+                .expect("markdown path must produce a markdown preview")
+        } else {
+            crate::markdown::MarkdownPreview::source_only(content)
+        };
+        return PreviewBody::Markdown(markdown);
     }
 
-    let highlighted = if within_cap {
-        crate::highlight::highlight_file(&rel_str, &lines, dark)
-    } else {
-        None
-    };
-
-    let parsed = if within_cap {
-        let path_buf = std::path::PathBuf::from(&rel_str);
-        crate::nav::NavLang::from_path(&path_buf).and_then(|lang| {
-            let source: Arc<[u8]> = Arc::from(raw.clone().into_boxed_slice());
-            crate::nav::parse_file_if_supported(lang, source).map(Arc::new)
-        })
-    } else {
-        None
-    };
-
-    Some(PreviewDocument {
-        path: rel_str,
-        body: PreviewBody::Text(TextPreview {
-            lines,
-            highlighted,
-            parsed,
-        }),
+    PreviewBody::Text(TextPreview {
+        lines: content
+            .lines()
+            .take(MAX_TEXT_PREVIEW_LINES)
+            .map(str::to_string)
+            .collect(),
+        source: structured_data_source_required(path).then(|| Arc::from(content)),
+        highlighted: None,
+        parsed: None,
     })
+}
+
+pub fn structured_data_source_required(path: &str) -> bool {
+    matches!(
+        Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("json" | "jsonc" | "json5" | "jsonl" | "yaml" | "yml")
+    )
+}
+
+pub fn build_text_preview_enrichment(
+    path: &str,
+    bytes_on_disk: u64,
+    lines: &[String],
+    source: Option<&str>,
+    dark: bool,
+) -> Option<super::TextPreviewEnrichment> {
+    if !text_preview_can_be_enriched(bytes_on_disk, lines.len()) {
+        return None;
+    }
+    let highlighted = crate::highlight::highlight_file(path, lines, dark);
+    let parsed = crate::nav::NavLang::from_path(std::path::Path::new(path)).and_then(|lang| {
+        let source: Arc<[u8]> = Arc::from(lines.join("\n").into_bytes().into_boxed_slice());
+        crate::nav::parse_file_if_supported(lang, source).map(Arc::new)
+    });
+    let structured = source.and_then(|source| structured_document_for_path(path, source));
+    if highlighted.is_none() && parsed.is_none() && structured.is_none() {
+        return None;
+    }
+    Some(super::TextPreviewEnrichment {
+        highlighted,
+        parsed,
+        structured,
+    })
+}
+
+fn structured_document_for_path(
+    path: &str,
+    source: &str,
+) -> Option<crate::structured_data::StructuredDataDocument> {
+    match Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("json") => crate::structured_data::StructuredDataDocument::from_json(source).ok(),
+        Some("jsonl") => {
+            crate::structured_data::StructuredDataDocument::from_json_lines(source).ok()
+        }
+        _ => None,
+    }
+}
+
+pub fn text_preview_can_be_enriched(bytes_on_disk: u64, line_count: usize) -> bool {
+    bytes_on_disk <= MAX_ENRICHMENT_BYTES && line_count <= MAX_ENRICHMENT_LINES
 }
 
 #[cfg(test)]
@@ -201,7 +300,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_bytes(tmp.path(), "red.png", &tiny_png(4, 4));
 
-        let content = load_preview(tmp.path(), Path::new("red.png"), true, true).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("red.png"), true).expect("preview");
 
         match content.body {
             PreviewBody::Image(img) => {
@@ -219,7 +318,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_bytes(tmp.path(), "shot.jpg", &tiny_png(2, 2));
 
-        let content = load_preview(tmp.path(), Path::new("shot.jpg"), true, true).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("shot.jpg"), true).expect("preview");
 
         match content.body {
             PreviewBody::Image(img) => assert_eq!(img.format, image::ImageFormat::Png),
@@ -241,7 +340,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_bytes(tmp.path(), "huge.png", &png);
 
-        let content = load_preview(tmp.path(), Path::new("huge.png"), true, true).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("huge.png"), true).expect("preview");
 
         match content.body {
             PreviewBody::Binary(info) => {
@@ -260,20 +359,88 @@ mod tests {
     }
 
     #[test]
-    fn load_preview_text_attaches_highlight_and_parse() {
+    fn load_preview_text_returns_plain_content_before_enrichment() {
         let tmp = tempfile::tempdir().unwrap();
         write_bytes(tmp.path(), "src.rs", b"fn main() {}\n");
 
-        let content = load_preview(tmp.path(), Path::new("src.rs"), true, true).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("src.rs"), true).expect("preview");
 
         match content.body {
             PreviewBody::Text(text) => {
                 assert_eq!(text.lines, vec!["fn main() {}".to_string()]);
-                assert!(text.highlighted.is_some());
-                assert!(text.parsed.is_some());
+                assert!(text.highlighted.is_none());
+                assert!(text.parsed.is_none());
+
+                let enrichment = build_text_preview_enrichment(
+                    "src.rs",
+                    content.bytes_on_disk,
+                    &text.lines,
+                    text.source.as_deref(),
+                    true,
+                )
+                .expect("small rust preview should enrich");
+                assert!(enrichment.highlighted.is_some());
+                assert!(enrichment.parsed.is_some());
             }
             other => panic!("expected Text body, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn structured_data_preserves_complete_source_after_visible_rows_are_capped() {
+        let source = format!(
+            "{{\"items\":[]}}\n{}",
+            "\n\n".repeat(MAX_TEXT_PREVIEW_LINES)
+        );
+        let PreviewBody::Text(text) = build_textual_preview_body("large.json", &source) else {
+            panic!("expected text preview");
+        };
+
+        assert_eq!(text.lines.len(), MAX_TEXT_PREVIEW_LINES);
+        assert_eq!(text.source.as_deref(), Some(source.as_str()));
+    }
+
+    #[test]
+    fn json_lines_enrichment_builds_a_structured_outline() {
+        let source = "{\"event\":\"open\"}\n{\"event\":\"close\"}\n";
+        let PreviewBody::Text(text) = build_textual_preview_body("events.jsonl", source) else {
+            panic!("expected text preview");
+        };
+
+        let enrichment = build_text_preview_enrichment(
+            "events.jsonl",
+            source.len() as u64,
+            &text.lines,
+            text.source.as_deref(),
+            true,
+        )
+        .expect("jsonl preview should enrich");
+
+        let document = enrichment.structured.expect("structured document");
+        assert!(
+            document
+                .outline()
+                .rows()
+                .iter()
+                .any(|row| row.id == "root/1/event.value")
+        );
+    }
+
+    #[test]
+    fn large_structured_preview_skips_enrichment() {
+        let source = r#"{"event":"open","count":1}"#;
+        let lines = vec![source.to_string()];
+
+        assert!(
+            build_text_preview_enrichment(
+                "events.jsonl",
+                MAX_ENRICHMENT_BYTES + 1,
+                &lines,
+                Some(source),
+                true,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -285,13 +452,16 @@ mod tests {
             b"# Title\n\n| Name | Count |\n|:---|---:|\n| reef | 1 |\n",
         );
 
-        let content =
-            load_preview(tmp.path(), Path::new("README.md"), true, true).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("README.md"), true).expect("preview");
 
         match content.body {
             PreviewBody::Markdown(markdown) => {
-                assert_eq!(markdown.text_rows[0], "Title");
-                let rows: Vec<String> = markdown
+                let model = markdown
+                    .render_model
+                    .as_ref()
+                    .expect("small markdown render model");
+                assert_eq!(model.text_rows[0], "Title");
+                let rows: Vec<String> = model
                     .rows
                     .iter()
                     .map(|r| r.iter().map(|s| s.text.as_str()).collect())
@@ -303,12 +473,40 @@ mod tests {
     }
 
     #[test]
+    fn load_preview_large_markdown_keeps_markdown_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = format!("# Title\n\n{}", "large markdown paragraph ".repeat(24_000));
+        assert!(source.len() > MAX_ENRICHMENT_BYTES as usize);
+        write_bytes(tmp.path(), "README.md", source.as_bytes());
+
+        let content = load_preview(tmp.path(), Path::new("README.md"), true).expect("preview");
+
+        let PreviewBody::Markdown(markdown) = content.body else {
+            panic!("large markdown must not be downgraded to text");
+        };
+        assert_eq!(markdown.source, source);
+        assert!(markdown.render_model.is_none());
+    }
+
+    #[test]
+    fn load_preview_many_line_markdown_keeps_markdown_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = (0..=MAX_ENRICHMENT_LINES)
+            .map(|line| format!("paragraph {line}\n\n"))
+            .collect::<String>();
+        write_bytes(tmp.path(), "notes.markdown", source.as_bytes());
+
+        let content = load_preview(tmp.path(), Path::new("notes.markdown"), true).expect("preview");
+
+        assert!(matches!(content.body, PreviewBody::Markdown(_)));
+    }
+
+    #[test]
     fn load_preview_plain_text_stays_text() {
         let tmp = tempfile::tempdir().unwrap();
         write_bytes(tmp.path(), "notes.txt", b"# not markdown here\n");
 
-        let content =
-            load_preview(tmp.path(), Path::new("notes.txt"), true, true).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("notes.txt"), true).expect("preview");
 
         match content.body {
             PreviewBody::Text(text) => assert_eq!(text.lines, vec!["# not markdown here"]),
@@ -321,8 +519,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_bytes(tmp.path(), "empty.bin", b"");
 
-        let content =
-            load_preview(tmp.path(), Path::new("empty.bin"), true, true).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("empty.bin"), true).expect("preview");
 
         match content.body {
             PreviewBody::Binary(info) => {
@@ -338,7 +535,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_bytes(tmp.path(), "red.png", &tiny_png(8, 8));
 
-        let content = load_preview(tmp.path(), Path::new("red.png"), true, false).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("red.png"), false).expect("preview");
 
         match content.body {
             PreviewBody::Image(img) => {
@@ -356,7 +553,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_bytes(tmp.path(), "doc.pdf", b"%PDF-1.4\n%bogus content\n");
 
-        let content = load_preview(tmp.path(), Path::new("doc.pdf"), true, true).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("doc.pdf"), true).expect("preview");
 
         match content.body {
             PreviewBody::Binary(info) => {
@@ -376,8 +573,7 @@ mod tests {
             b"<template>\n  <div>hello</div>\n</template>\n",
         );
 
-        let content =
-            load_preview(tmp.path(), Path::new("General.vue"), true, true).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("General.vue"), true).expect("preview");
 
         match content.body {
             PreviewBody::Text(text) => {
@@ -396,8 +592,7 @@ mod tests {
         data[512] = 0;
         write_bytes(tmp.path(), "weird.dat", &data);
 
-        let content =
-            load_preview(tmp.path(), Path::new("weird.dat"), true, true).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("weird.dat"), true).expect("preview");
 
         match content.body {
             PreviewBody::Binary(info) => assert!(matches!(info.reason, BinaryReason::NullBytes)),
@@ -409,7 +604,7 @@ mod tests {
     fn load_preview_huge_unknown_skips_full_read() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("big.dat");
-        let big_size = MAX_TEXT_PROBE_BYTES + 1;
+        let big_size = MAX_TEXT_PREVIEW_BYTES + 1;
         {
             use std::io::Write;
 
@@ -423,14 +618,14 @@ mod tests {
             }
         }
 
-        let content = load_preview(tmp.path(), Path::new("big.dat"), true, true).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("big.dat"), true).expect("preview");
 
         match content.body {
             PreviewBody::Binary(info) => {
-                assert!(matches!(info.reason, BinaryReason::NullBytes));
+                assert!(matches!(info.reason, BinaryReason::TooLarge));
                 assert_eq!(info.bytes_on_disk, big_size);
             }
-            other => panic!("expected Binary(NullBytes), got {other:?}"),
+            other => panic!("expected Binary(TooLarge), got {other:?}"),
         }
     }
 
@@ -440,8 +635,7 @@ mod tests {
         let path = tmp.path().join("fixture.db");
         seed_sqlite(&path);
 
-        let content =
-            load_preview(tmp.path(), Path::new("fixture.db"), true, true).expect("preview");
+        let content = load_preview(tmp.path(), Path::new("fixture.db"), true).expect("preview");
 
         match content.body {
             PreviewBody::Database(info) => {

@@ -11,11 +11,18 @@ use std::sync::Arc;
 pub struct FileEntry {
     pub path: String,
     pub status: FileStatus,
-    /// Lines added in this file for the relevant diff (HEAD→index for staged,
-    /// index→workdir for unstaged; whole-file line count for untracked).
-    /// Populated by [`GitRepo::get_status`]; `commit_files` leaves this at 0.
+    /// Diff statistics are intentionally not calculated as part of a status
+    /// refresh. They remain zero until a dedicated, demand-driven stats task
+    /// supplies them; calculating two whole-repository diffs here made every
+    /// stage and unstage wait on content-level work.
     pub additions: u32,
     pub deletions: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitStatusStats {
+    pub staged: HashMap<String, (u32, u32)>,
+    pub unstaged: HashMap<String, (u32, u32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,8 +48,7 @@ impl FileStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileStatus, count_workdir_lines};
-    use std::io::Write;
+    use super::FileStatus;
 
     #[test]
     fn file_status_label_all_variants() {
@@ -51,62 +57,6 @@ mod tests {
         assert_eq!(FileStatus::Deleted.label(), "D");
         assert_eq!(FileStatus::Renamed.label(), "R");
         assert_eq!(FileStatus::Untracked.label(), "U");
-    }
-
-    fn write_tmp(bytes: &[u8]) -> (tempfile::TempDir, String) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let name = "f.txt";
-        let mut f = std::fs::File::create(dir.path().join(name)).expect("create");
-        f.write_all(bytes).expect("write");
-        (dir, name.to_string())
-    }
-
-    #[test]
-    fn count_workdir_lines_empty_file() {
-        let (dir, name) = write_tmp(b"");
-        assert_eq!(count_workdir_lines(Some(dir.path()), &name), 0);
-    }
-
-    #[test]
-    fn count_workdir_lines_single_line_no_trailing_newline() {
-        let (dir, name) = write_tmp(b"hello");
-        assert_eq!(count_workdir_lines(Some(dir.path()), &name), 1);
-    }
-
-    #[test]
-    fn count_workdir_lines_single_line_with_trailing_newline() {
-        let (dir, name) = write_tmp(b"hello\n");
-        assert_eq!(count_workdir_lines(Some(dir.path()), &name), 1);
-    }
-
-    #[test]
-    fn count_workdir_lines_multi_line() {
-        let (dir, name) = write_tmp(b"a\nb\nc\n");
-        assert_eq!(count_workdir_lines(Some(dir.path()), &name), 3);
-    }
-
-    #[test]
-    fn count_workdir_lines_just_newline() {
-        // "\n" is a single blank line — matches `str::lines()` ("" has 0, "\n" has 1).
-        let (dir, name) = write_tmp(b"\n");
-        assert_eq!(count_workdir_lines(Some(dir.path()), &name), 1);
-    }
-
-    #[test]
-    fn count_workdir_lines_binary_nul_short_circuits() {
-        let (dir, name) = write_tmp(b"abc\x00def\n");
-        assert_eq!(count_workdir_lines(Some(dir.path()), &name), 0);
-    }
-
-    #[test]
-    fn count_workdir_lines_missing_file_is_zero() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        assert_eq!(count_workdir_lines(Some(dir.path()), "nope.txt"), 0);
-    }
-
-    #[test]
-    fn count_workdir_lines_no_workdir_is_zero() {
-        assert_eq!(count_workdir_lines(None, "whatever.txt"), 0);
     }
 }
 
@@ -180,6 +130,10 @@ impl GitRepo {
         self.repo.path()
     }
 
+    pub fn commondir(&self) -> &Path {
+        self.repo.commondir()
+    }
+
     pub fn branch_name(&self) -> String {
         self.repo
             .head()
@@ -217,13 +171,6 @@ impl GitRepo {
             Err(_) => return (staged, unstaged),
         };
 
-        // Per-file line add/remove counts. Two diffs cover staged and
-        // unstaged separately so each section can show its own numbers
-        // (e.g. a file modified in index then re-edited in workdir has a
-        // distinct +/- on each side).
-        let staged_stats = self.diff_line_counts_staged();
-        let unstaged_stats = self.diff_line_counts_unstaged();
-
         for entry in statuses.iter() {
             let status = entry.status();
             let fallback_path = entry.path().ok().map(str::to_string);
@@ -257,12 +204,11 @@ impl GitRepo {
                     (FileStatus::Deleted, fallback_path.clone())
                 };
                 if let Some(path) = path {
-                    let (additions, deletions) = staged_stats.get(&path).copied().unwrap_or((0, 0));
                     staged.push(FileEntry {
                         path,
                         status: file_status,
-                        additions,
-                        deletions,
+                        additions: 0,
+                        deletions: 0,
                     });
                 }
             }
@@ -294,18 +240,11 @@ impl GitRepo {
                     (FileStatus::Deleted, fallback_path.clone())
                 };
                 if let Some(path) = path {
-                    // Untracked paths don't appear in the index→workdir diff;
-                    // count their lines directly so the +N column is still useful.
-                    let (additions, deletions) = if matches!(file_status, FileStatus::Untracked) {
-                        (count_workdir_lines(self.repo.workdir(), &path), 0)
-                    } else {
-                        unstaged_stats.get(&path).copied().unwrap_or((0, 0))
-                    };
                     unstaged.push(FileEntry {
                         path,
                         status: file_status,
-                        additions,
-                        deletions,
+                        additions: 0,
+                        deletions: 0,
                     });
                 }
             }
@@ -317,23 +256,57 @@ impl GitRepo {
         (staged, unstaged)
     }
 
-    fn diff_line_counts_staged(&self) -> HashMap<String, (u32, u32)> {
-        let head_tree = self.repo.head().ok().and_then(|h| h.peel_to_tree().ok());
-        let mut diff = match self.repo.diff_tree_to_index(head_tree.as_ref(), None, None) {
-            Ok(d) => d,
-            Err(_) => return HashMap::new(),
-        };
-        merge_renames(&mut diff);
-        collect_diff_line_counts(&diff)
-    }
+    /// Compute content-level line statistics separately from status
+    /// classification. Callers should run this on a background worker and
+    /// merge it into an already-visible status snapshot.
+    pub fn get_status_stats(&self) -> GitStatusStats {
+        if let Ok(mut index) = self.repo.index() {
+            let _ = index.read(true);
+        }
 
-    fn diff_line_counts_unstaged(&self) -> HashMap<String, (u32, u32)> {
-        let mut diff = match self.repo.diff_index_to_workdir(None, None) {
-            Ok(d) => d,
-            Err(_) => return HashMap::new(),
-        };
-        merge_renames(&mut diff);
-        collect_diff_line_counts(&diff)
+        let head_tree = self
+            .repo
+            .head()
+            .ok()
+            .and_then(|head| head.peel_to_tree().ok());
+        let mut staged = self
+            .repo
+            .diff_tree_to_index(head_tree.as_ref(), None, None)
+            .map(|mut diff| {
+                merge_renames(&mut diff);
+                collect_diff_line_counts(&diff)
+            })
+            .unwrap_or_default();
+        let mut unstaged = self
+            .repo
+            .diff_index_to_workdir(None, None)
+            .map(|mut diff| {
+                merge_renames(&mut diff);
+                collect_diff_line_counts(&diff)
+            })
+            .unwrap_or_default();
+
+        let (staged_entries, unstaged_entries) = self.get_status();
+        staged.retain(|path, _| {
+            staged_entries
+                .iter()
+                .any(|entry| entry.path.as_str() == path)
+        });
+        unstaged.retain(|path, _| {
+            unstaged_entries
+                .iter()
+                .any(|entry| entry.path.as_str() == path)
+        });
+        for entry in unstaged_entries {
+            if entry.status == FileStatus::Untracked {
+                unstaged.insert(
+                    entry.path.clone(),
+                    (count_workdir_lines(self.repo.workdir(), &entry.path), 0),
+                );
+            }
+        }
+
+        GitStatusStats { staged, unstaged }
     }
 
     pub fn get_diff(&self, path: &str, staged: bool, context_lines: u32) -> Option<DiffContent> {
@@ -346,8 +319,7 @@ impl GitRepo {
 
     fn get_staged_diff(&self, path: &str, context_lines: u32) -> Option<DiffContent> {
         // Force-reload index so we see writes from a concurrent external
-        // `git add`, and so our own index.write() from stage_file is picked
-        // up without needing to reopen the repo.
+        // `git add` is picked up without needing to reopen the repo.
         if let Ok(mut idx) = self.repo.index() {
             let _ = idx.read(true);
         }
@@ -367,8 +339,7 @@ impl GitRepo {
 
     fn get_unstaged_diff(&self, path: &str, context_lines: u32) -> Option<DiffContent> {
         // Force-reload index so we see writes from a concurrent external
-        // `git add`, and so our own index.write() from stage_file is picked
-        // up without needing to reopen the repo.
+        // `git add` is picked up without needing to reopen the repo.
         if let Ok(mut idx) = self.repo.index() {
             let _ = idx.read(true);
         }
@@ -489,42 +460,6 @@ impl GitRepo {
         })
     }
 
-    pub fn stage_file(&self, path: &str) -> Result<(), git2::Error> {
-        let mut index = self.repo.index()?;
-
-        // Check if the file exists in workdir
-        let workdir = self.repo.workdir().unwrap();
-        let full_path = workdir.join(path);
-
-        if full_path.exists() {
-            index.add_path(Path::new(path))?;
-        } else {
-            // File was deleted
-            index.remove_path(Path::new(path))?;
-        }
-        index.write()?;
-        Ok(())
-    }
-
-    pub fn unstage_file(&self, path: &str) -> Result<(), git2::Error> {
-        let head = self.repo.head();
-
-        match head {
-            Ok(head_ref) => {
-                let head_commit = head_ref.peel_to_commit()?;
-                self.repo
-                    .reset_default(Some(head_commit.as_object()), [path])?;
-            }
-            Err(_) => {
-                // No HEAD (initial commit) — remove from index
-                let mut index = self.repo.index()?;
-                index.remove_path(Path::new(path))?;
-                index.write()?;
-            }
-        }
-        Ok(())
-    }
-
     /// Restore a working-tree file to its HEAD state (like `git restore <file>`).
     /// For untracked files that have no HEAD counterpart, the file is deleted.
     /// Does not touch the index.
@@ -588,26 +523,14 @@ impl GitRepo {
     }
 }
 
-/// Ask libgit2 to collapse `(delete old, add new)` pairs whose contents are
-/// similar into a single `Renamed` delta. Matches `StatusOptions.renames_*`
-/// so the line counts keyed by `new_file().path()` line up with the
-/// `FileStatus::Renamed` entry the sidebar shows. Copy detection is
-/// intentionally off — it's O(n²) over unchanged files and `git status`
-/// itself doesn't enable it. Failure (e.g. the diff holds no renameable
-/// pairs) is ignored; the unmerged diff still yields correct `+N -M` for
-/// non-rename files.
 fn merge_renames(diff: &mut git2::Diff) {
-    let mut opts = git2::DiffFindOptions::new();
-    opts.renames(true);
-    let _ = diff.find_similar(Some(&mut opts));
+    let mut options = git2::DiffFindOptions::new();
+    options.renames(true);
+    let _ = diff.find_similar(Some(&mut options));
 }
 
-/// Walk the patch text of `diff` and tally `+` / `-` lines per file path.
-/// Used by [`GitRepo::get_status`] to show `+N -M` next to each file row.
-/// Binary files produce zero counts here (libgit2 emits no line callbacks
-/// for them) — the same behavior you'd see from `git diff --numstat`.
 fn collect_diff_line_counts(diff: &git2::Diff) -> HashMap<String, (u32, u32)> {
-    let mut out: HashMap<String, (u32, u32)> = HashMap::new();
+    let mut counts = HashMap::new();
     let _ = diff.foreach(
         &mut |_, _| true,
         None,
@@ -617,31 +540,26 @@ fn collect_diff_line_counts(diff: &git2::Diff) -> HashMap<String, (u32, u32)> {
                 .new_file()
                 .path()
                 .or_else(|| delta.old_file().path())
-                .and_then(|p| p.to_str())
+                .and_then(Path::to_str)
                 .unwrap_or("");
             if path.is_empty() {
                 return true;
             }
-            let entry = out.entry(path.to_string()).or_insert((0, 0));
+            let count = counts.entry(path.to_string()).or_insert((0, 0));
             match line.origin() {
-                '+' => entry.0 += 1,
-                '-' => entry.1 += 1,
+                '+' => count.0 += 1,
+                '-' => count.1 += 1,
                 _ => {}
             }
             true
         }),
     );
-    out
+    counts
 }
 
-/// Count newline-delimited lines in an untracked workdir file. Streams via
-/// `BufReader::read_until` so a large untracked log doesn't get slurped into
-/// memory. Bails early with 0 on a NUL byte (binary file — mirrors how
-/// `git diff` suppresses numstat for binaries). Unreadable / missing files
-/// also return 0 instead of propagating. Counting semantics follow
-/// `str::lines()`: an unterminated trailing line still counts once.
 fn count_workdir_lines(workdir: Option<&Path>, path: &str) -> u32 {
     use std::io::{BufRead, BufReader};
+
     let Some(root) = workdir else {
         return 0;
     };
@@ -649,21 +567,116 @@ fn count_workdir_lines(workdir: Option<&Path>, path: &str) -> u32 {
         return 0;
     };
     let mut reader = BufReader::new(file);
-    let mut buf: Vec<u8> = Vec::with_capacity(8192);
-    let mut count: u32 = 0;
+    let mut buffer = Vec::with_capacity(8192);
+    let mut count = 0u32;
     loop {
-        buf.clear();
-        match reader.read_until(b'\n', &mut buf) {
+        buffer.clear();
+        match reader.read_until(b'\n', &mut buffer) {
             Ok(0) => return count,
-            Ok(_) => {
-                if buf.contains(&0) {
-                    return 0;
-                }
-                count = count.saturating_add(1);
-            }
+            Ok(_) if buffer.contains(&0) => return 0,
+            Ok(_) => count = count.saturating_add(1),
             Err(_) => return 0,
         }
     }
+}
+
+/// Stage every supplied repository-relative path with the system Git client.
+///
+/// `git add -A` records deletions as well as additions and modifications. The
+/// pathspec is literal and rooted at the repository top level, so status paths
+/// remain valid when Reef opens a subdirectory of a repository and a file named
+/// like `:(glob)*` cannot expand into a mutation of unrelated files.
+pub fn stage_paths_at(workdir: &Path, paths: &[String]) -> Result<(), String> {
+    run_git_path_batch(workdir, &["add", "-A"], paths)
+}
+
+/// Remove every supplied path from the index while preserving its worktree
+/// content. An unborn repository has no `HEAD`, so its only valid unstage
+/// operation is `git rm --cached -r`.
+pub fn unstage_paths_at(workdir: &Path, paths: &[String]) -> Result<(), String> {
+    let args = if git_has_head(workdir)? {
+        vec!["restore", "--staged"]
+    } else {
+        vec!["rm", "--cached", "-r"]
+    };
+    run_git_path_batch(workdir, &args, paths)
+}
+
+fn git_has_head(workdir: &Path) -> Result<bool, String> {
+    let output = std::process::Command::new("git")
+        .current_dir(workdir)
+        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+        .output()
+        .map_err(git_command_spawn_error)?;
+    Ok(output.status.success())
+}
+
+fn run_git_path_batch(workdir: &Path, args: &[&str], paths: &[String]) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut child = std::process::Command::new("git")
+        .current_dir(workdir)
+        .env("LC_ALL", "C")
+        .env("GIT_PAGER", "cat")
+        .args(args)
+        .args(["--pathspec-from-file=-", "--pathspec-file-nul"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(git_command_spawn_error)?;
+    let write_result = (|| -> Result<(), String> {
+        use std::io::Write;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "failed to open git pathspec input".to_string())?;
+        let mut stdin = stdin;
+        for path in paths {
+            stdin
+                .write_all(format!(":(top,literal){path}\0").as_bytes())
+                .map_err(|error| format!("failed to write git pathspec input: {error}"))?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("failed to wait for git: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            git_command_output(&output)
+        ));
+    }
+    Ok(())
+}
+
+fn git_command_spawn_error(error: std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        "git executable not found on PATH — install git on the host running the backend".to_string()
+    } else {
+        format!("failed to run git: {error}")
+    }
+}
+
+fn git_command_output(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+    format!("exited with {}", output.status)
 }
 
 /// Push the branch at `workdir` to its upstream. When `force` is true, uses

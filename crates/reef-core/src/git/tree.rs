@@ -8,22 +8,38 @@
 use super::FileEntry;
 use std::collections::{BTreeMap, HashSet};
 
+#[derive(Debug)]
 pub enum Node {
     Dir {
         path: String,
         children: BTreeMap<String, Node>,
     },
-    File(FileEntry),
+    File {
+        source_index: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeRow {
+    Dir {
+        name: String,
+        path: String,
+        depth: usize,
+    },
+    File {
+        source_index: usize,
+        depth: usize,
+    },
 }
 
 pub fn build(files: &[FileEntry]) -> BTreeMap<String, Node> {
     let mut root: BTreeMap<String, Node> = BTreeMap::new();
-    for file in files {
+    for (source_index, file) in files.iter().enumerate() {
         let parts: Vec<&str> = file.path.split('/').filter(|s| !s.is_empty()).collect();
         if parts.is_empty() {
             continue;
         }
-        insert(&mut root, file.clone(), &parts, 0, String::new());
+        insert(&mut root, source_index, &parts, 0, String::new());
     }
     root
 }
@@ -52,12 +68,13 @@ pub fn visible_file_paths(
 ) -> Vec<String> {
     let tree = build(files);
     let mut paths = Vec::new();
-    collect_visible_file_paths(&tree, is_staged, collapsed, &mut paths);
+    collect_visible_file_paths(&tree, files, is_staged, collapsed, &mut paths);
     paths
 }
 
 fn collect_visible_file_paths(
     tree: &BTreeMap<String, Node>,
+    files: &[FileEntry],
     is_staged: bool,
     collapsed: &HashSet<String>,
     paths: &mut Vec<String>,
@@ -66,17 +83,55 @@ fn collect_visible_file_paths(
         match node {
             Node::Dir { path, children } => {
                 if !collapsed.contains(&collapsed_key(is_staged, path)) {
-                    collect_visible_file_paths(children, is_staged, collapsed, paths);
+                    collect_visible_file_paths(children, files, is_staged, collapsed, paths);
                 }
             }
-            Node::File(entry) => paths.push(entry.path.clone()),
+            Node::File { source_index } => paths.push(files[*source_index].path.clone()),
+        }
+    }
+}
+
+pub fn visible_rows(
+    files: &[FileEntry],
+    is_staged: bool,
+    collapsed: &HashSet<String>,
+) -> Vec<TreeRow> {
+    let tree = build(files);
+    let mut rows = Vec::new();
+    collect_visible_rows(&tree, is_staged, collapsed, 1, &mut rows);
+    rows
+}
+
+fn collect_visible_rows(
+    tree: &BTreeMap<String, Node>,
+    is_staged: bool,
+    collapsed: &HashSet<String>,
+    depth: usize,
+    rows: &mut Vec<TreeRow>,
+) {
+    for (name, node) in sorted_entries(tree) {
+        match node {
+            Node::Dir { path, children } => {
+                rows.push(TreeRow::Dir {
+                    name: name.to_string(),
+                    path: path.clone(),
+                    depth,
+                });
+                if !collapsed.contains(&collapsed_key(is_staged, path)) {
+                    collect_visible_rows(children, is_staged, collapsed, depth + 1, rows);
+                }
+            }
+            Node::File { source_index } => rows.push(TreeRow::File {
+                source_index: *source_index,
+                depth,
+            }),
         }
     }
 }
 
 fn insert(
     map: &mut BTreeMap<String, Node>,
-    file: FileEntry,
+    source_index: usize,
     parts: &[&str],
     idx: usize,
     prefix: String,
@@ -90,7 +145,7 @@ fn insert(
     let is_last = idx + 1 == parts.len();
 
     if is_last {
-        map.insert(part, Node::File(file));
+        map.insert(part, Node::File { source_index });
         return;
     }
 
@@ -99,7 +154,7 @@ fn insert(
         children: BTreeMap::new(),
     });
     if let Node::Dir { children, .. } = node {
-        insert(children, file, parts, idx + 1, full_path);
+        insert(children, source_index, parts, idx + 1, full_path);
     }
 }
 
@@ -133,8 +188,8 @@ mod tests {
     fn build_flat_files() {
         let tree = build(&[entry("foo.rs"), entry("bar.rs")]);
         assert_eq!(tree.len(), 2);
-        assert!(matches!(tree.get("foo.rs"), Some(Node::File(_))));
-        assert!(matches!(tree.get("bar.rs"), Some(Node::File(_))));
+        assert!(matches!(tree.get("foo.rs"), Some(Node::File { .. })));
+        assert!(matches!(tree.get("bar.rs"), Some(Node::File { .. })));
     }
 
     #[test]
@@ -153,7 +208,7 @@ mod tests {
         else {
             panic!("expected Dir")
         };
-        assert!(matches!(c_map.get("c.rs"), Some(Node::File(_))));
+        assert!(matches!(c_map.get("c.rs"), Some(Node::File { .. })));
     }
 
     #[test]
@@ -164,8 +219,8 @@ mod tests {
             panic!()
         };
         assert_eq!(children.len(), 2);
-        assert!(matches!(children.get("x.rs"), Some(Node::File(_))));
-        assert!(matches!(children.get("y.rs"), Some(Node::File(_))));
+        assert!(matches!(children.get("x.rs"), Some(Node::File { .. })));
+        assert!(matches!(children.get("y.rs"), Some(Node::File { .. })));
     }
 
     #[test]
@@ -225,6 +280,43 @@ mod tests {
         assert_eq!(
             visible_file_paths(&files, false, &collapsed),
             vec!["README.md", "z.txt"]
+        );
+    }
+
+    #[test]
+    fn visible_rows_keep_source_indices_in_tree_order() {
+        let files = vec![
+            entry("z.txt"),
+            entry("src/z.rs"),
+            entry("README.md"),
+            entry("src/a.rs"),
+        ];
+
+        assert_eq!(
+            visible_rows(&files, false, &HashSet::new()),
+            vec![
+                TreeRow::Dir {
+                    name: "src".to_string(),
+                    path: "src".to_string(),
+                    depth: 1,
+                },
+                TreeRow::File {
+                    source_index: 3,
+                    depth: 2,
+                },
+                TreeRow::File {
+                    source_index: 1,
+                    depth: 2,
+                },
+                TreeRow::File {
+                    source_index: 2,
+                    depth: 1,
+                },
+                TreeRow::File {
+                    source_index: 0,
+                    depth: 1,
+                },
+            ]
         );
     }
 }

@@ -1,7 +1,7 @@
 use crate::ui::mouse::{ClickAction, HitTestRegistry};
 use crate::ui::theme::Theme;
 use reef_app::{
-    AppPanel as Panel, AppPrefs, AppStateConfig, AppTab as Tab, AsyncState, DbNav, DiffMode,
+    AppPanel as Panel, AppPrefs, AppTab as Tab, AsyncState, DbNav, DiffMode,
     GRAPH_RECENT_BRANCHES_MAX, HighlightFade, Toast, ViewMode,
 };
 use reef_core::diff::DiffLayout;
@@ -98,6 +98,21 @@ pub struct TuiLayoutCache {
     pub global_search_last_view_h: u16,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PendingPreviewNavAction {
+    GotoDefinition,
+    FindReferences,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPreviewNav {
+    action: PendingPreviewNavAction,
+    anchor: reef_app::NavAnchor,
+    cursor: (usize, usize),
+    path: PathBuf,
+    generation: u64,
+}
+
 pub struct TuiApp {
     pub engine: reef_app::ReefApp,
 
@@ -115,6 +130,8 @@ pub struct TuiApp {
     pub preview_image_protocol_builds: u64,
 
     pub preview_selection: Option<crate::ui::selection::PreviewSelection>,
+    pub selection_context_menu: crate::selection_context_menu::SelectionContextMenuState,
+    pending_preview_nav: Option<PendingPreviewNav>,
     pub last_preview_rect: Option<ratatui::layout::Rect>,
     pub db_preview_layout: Option<DbPreviewLayoutCache>,
     pub vertical_scroll_lock: crate::input::AxisLock,
@@ -123,6 +140,9 @@ pub struct TuiApp {
     pub horizontal_scroll_pacer: crate::input::ScrollPacer,
     pub last_preview_content_origin: Option<(u16, u16, u16)>,
     pub last_markdown_content_origin: Option<(u16, u16)>,
+    pub(crate) markdown_layout: crate::ui::preview::markdown::MarkdownLayoutCache,
+    pub(crate) markdown_visual_scroll: usize,
+    pub(crate) markdown_engine_scroll_seen: Option<usize>,
     pub preview_click_state: Option<(Instant, u16, u16, u8)>,
 
     pub diff_selection: Option<crate::ui::selection::DiffSelection>,
@@ -163,6 +183,25 @@ pub struct TuiApp {
 }
 
 use self::TuiApp as App;
+
+fn preview_text_extent(
+    preview: Option<&reef_core::preview::PreviewDocument>,
+) -> Option<(usize, usize)> {
+    let body = &preview?.body;
+    match body {
+        reef_core::preview::PreviewBody::Text(text) => text
+            .lines
+            .last()
+            .map(|line| (text.lines.len() - 1, line.len())),
+        reef_core::preview::PreviewBody::Markdown(markdown) => {
+            let last_row = markdown.line_count().checked_sub(1)?;
+            markdown
+                .text_for_row(last_row)
+                .map(|line| (last_row, line.len()))
+        }
+        _ => None,
+    }
+}
 
 impl App {
     /// Local-backend entry point. Threads `image_picker` straight through
@@ -220,31 +259,33 @@ impl App {
 
         let (saved_layout, saved_mode) = load_prefs();
         let (graph_scope, graph_recent_branches) = load_graph_scope_pref();
-        let now = Instant::now();
         let mut app = Self {
             engine: reef_app::ReefApp::new(reef_app::AppConfig {
-                state: reef_app::AppState::new(AppStateConfig {
-                    backend,
-                    prefs: AppPrefs {
-                        diff_layout: saved_layout,
-                        diff_mode: saved_mode,
-                        status_tree_mode: crate::prefs::get_bool("status.tree_mode"),
-                        graph_scope,
-                        graph_recent_branches,
-                        commit_diff_layout: crate::prefs::get("commit.diff_layout")
-                            .as_deref()
-                            .map(DiffLayout::from_pref_str)
-                            .unwrap_or(DiffLayout::Unified),
-                        commit_diff_mode: crate::prefs::get("commit.diff_mode")
-                            .as_deref()
-                            .map(DiffMode::from_pref_str)
-                            .unwrap_or(DiffMode::Compact),
-                        commit_files_tree_mode: crate::prefs::get_bool("commit.files_tree_mode"),
-                        quick_open: crate::quick_open::from_prefs(),
-                    },
-                    now,
-                    subscribe_fs_events: true,
-                }),
+                backend,
+                prefs: AppPrefs {
+                    diff_layout: saved_layout,
+                    diff_mode: saved_mode,
+                    status_tree_mode: crate::prefs::get_bool("status.tree_mode"),
+                    graph_scope,
+                    graph_recent_branches,
+                    commit_diff_layout: crate::prefs::get("commit.diff_layout")
+                        .as_deref()
+                        .map(DiffLayout::from_pref_str)
+                        .unwrap_or(DiffLayout::Unified),
+                    commit_diff_mode: crate::prefs::get("commit.diff_mode")
+                        .as_deref()
+                        .map(DiffMode::from_pref_str)
+                        .unwrap_or(DiffMode::Compact),
+                    commit_files_tree_mode: crate::prefs::get_bool("commit.files_tree_mode"),
+                    structured_preview_mode: crate::prefs::get(
+                        reef_core::prefs::STRUCTURED_PREVIEW_MODE,
+                    )
+                    .as_deref()
+                    .map(reef_app::StructuredPreviewMode::from_pref_str)
+                    .unwrap_or_default(),
+                    quick_open: crate::quick_open::from_prefs(),
+                },
+                subscribe_fs_events: true,
             }),
             layout: TuiLayoutCache::default(),
             image_picker,
@@ -255,6 +296,9 @@ impl App {
             preview_build_rx,
             preview_image_protocol_builds: 0,
             preview_selection: None,
+            selection_context_menu:
+                crate::selection_context_menu::SelectionContextMenuState::default(),
+            pending_preview_nav: None,
             last_preview_rect: None,
             db_preview_layout: None,
             vertical_scroll_lock: crate::input::AxisLock::new(),
@@ -263,6 +307,9 @@ impl App {
             horizontal_scroll_pacer: crate::input::ScrollPacer::new(),
             last_preview_content_origin: None,
             last_markdown_content_origin: None,
+            markdown_layout: crate::ui::preview::markdown::MarkdownLayoutCache::default(),
+            markdown_visual_scroll: 0,
+            markdown_engine_scroll_seen: None,
             preview_click_state: None,
             diff_selection: None,
             last_diff_rect: None,
@@ -312,7 +359,7 @@ impl App {
     /// inline inside `commit_detail_panel` (the pre-split behaviour).
     /// Chosen so the middle column still shows readable file names and the
     /// diff column has at least ~40 cols for content after its gutter.
-    pub const GRAPH_THREE_COL_MIN_WIDTH: u16 = reef_app::AppState::GRAPH_THREE_COL_MIN_WIDTH;
+    pub const GRAPH_THREE_COL_MIN_WIDTH: u16 = reef_app::GRAPH_THREE_COL_MIN_WIDTH;
 
     /// Width of the left (graph / tree / status) sidebar for the current
     /// frame. Single source of truth for the `split_percent → columns`
@@ -377,6 +424,171 @@ impl App {
         });
     }
 
+    pub fn clear_preview_selection(&mut self) {
+        self.preview_selection = None;
+        self.preview_click_state = None;
+        if self.selection_context_menu.target()
+            == Some(crate::selection_context_menu::SelectionContextTarget::Preview)
+        {
+            self.selection_context_menu.close();
+        }
+    }
+
+    pub fn preview_has_selectable_text(&self) -> bool {
+        if self.engine.structured_preview_mode() == reef_app::StructuredPreviewMode::Tree
+            && self.engine.structured_preview_document().is_some()
+        {
+            return false;
+        }
+        preview_text_extent(self.engine.preview_content_ref()).is_some()
+    }
+
+    pub fn selection_context_menu_has_text(&self) -> bool {
+        self.selection_context_menu
+            .target()
+            .is_some_and(|target| self.selection_context_target_has_text(target))
+    }
+
+    pub fn selection_context_copy_enabled(&self) -> bool {
+        use crate::selection_context_menu::SelectionContextTarget as Target;
+
+        match self.selection_context_menu.target() {
+            Some(Target::Preview) => self
+                .preview_selection
+                .is_some_and(|selection| !selection.is_empty()),
+            Some(Target::Diff(_)) => self
+                .diff_selection
+                .is_some_and(|selection| !selection.sel.is_empty()),
+            None => false,
+        }
+    }
+
+    pub fn open_selection_context_menu(
+        &mut self,
+        target: crate::selection_context_menu::SelectionContextTarget,
+        anchor: (u16, u16),
+    ) {
+        if !self.selection_context_target_has_text(target) {
+            return;
+        }
+        self.close_tree_context_menu();
+        self.nav_close_candidates();
+        self.selection_context_menu.open(target, anchor);
+    }
+
+    fn selection_context_target_has_text(
+        &self,
+        target: crate::selection_context_menu::SelectionContextTarget,
+    ) -> bool {
+        use crate::selection_context_menu::SelectionContextTarget as Target;
+
+        match target {
+            Target::Preview => self.preview_has_selectable_text(),
+            Target::Diff(_) => self
+                .last_diff_hit
+                .as_ref()
+                .is_some_and(|hit| !hit.rows.is_empty()),
+        }
+    }
+
+    pub fn close_selection_context_menu(&mut self) {
+        self.selection_context_menu.close();
+    }
+
+    pub fn navigate_selection_context_menu(&mut self, delta: i32) {
+        self.selection_context_menu.navigate(delta);
+    }
+
+    pub fn dispatch_selection_context_menu_item(
+        &mut self,
+        item: crate::selection_context_menu::SelectionContextMenuItem,
+    ) {
+        use crate::selection_context_menu::{
+            SelectionContextMenuItem as Item, SelectionContextTarget as Target,
+        };
+
+        let Some(target) = self.selection_context_menu.target() else {
+            return;
+        };
+        self.close_selection_context_menu();
+        match (item, target) {
+            (Item::Copy, Target::Preview) => {
+                let Some(selection) = self
+                    .preview_selection
+                    .filter(|selection| !selection.is_empty())
+                else {
+                    return;
+                };
+                let Some(preview) = self.engine.preview_content_ref() else {
+                    return;
+                };
+                let rows = preview.body.display_text_rows();
+                let text = crate::ui::selection::collect_selected_text_from_rows(
+                    rows.iter().map(|row| row.as_ref()),
+                    rows.len(),
+                    &selection,
+                );
+                if !text.is_empty() {
+                    self.copy_text_to_clipboard(text);
+                }
+            }
+            (Item::Copy, Target::Diff(_)) => {
+                let Some(selection) = self
+                    .diff_selection
+                    .filter(|selection| !selection.sel.is_empty())
+                else {
+                    return;
+                };
+                let Some(hit) = self.last_diff_hit.as_ref() else {
+                    return;
+                };
+                let text = crate::ui::selection::collect_diff_selected_text(hit, &selection);
+                if !text.is_empty() {
+                    self.copy_text_to_clipboard(text);
+                }
+            }
+            (Item::SelectAll, Target::Preview) => {
+                let Some((last_row, last_byte)) =
+                    preview_text_extent(self.engine.preview_content_ref())
+                else {
+                    return;
+                };
+                self.preview_selection = Some(crate::ui::selection::PreviewSelection {
+                    anchor: (0, 0),
+                    active: (last_row, last_byte),
+                    dragging: false,
+                });
+            }
+            (Item::SelectAll, Target::Diff(side)) => {
+                let Some(hit) = self.last_diff_hit.as_ref() else {
+                    return;
+                };
+                let Some(last_row) = hit.rows.len().checked_sub(1) else {
+                    return;
+                };
+                let last_byte = hit.rows[last_row].text_for(side).len();
+                self.diff_selection = Some(crate::ui::selection::DiffSelection {
+                    sel: crate::ui::selection::PreviewSelection {
+                        anchor: (0, 0),
+                        active: (last_row, last_byte),
+                        dragging: false,
+                    },
+                    side,
+                });
+            }
+        }
+    }
+
+    pub(crate) fn copy_text_to_clipboard(&mut self, text: String) {
+        self.engine.dispatch(reef_app::AppCommand::CopyToClipboard {
+            text,
+            success: Some(Toast::info(crate::i18n::t(
+                crate::i18n::Msg::ClipboardCopied,
+            ))),
+            failure: Toast::error(crate::i18n::t(crate::i18n::Msg::ClipboardCopyFailed)),
+        });
+    }
+
     /// Drop the in-panel diff selection and its click counter. Called
     /// whenever the underlying row list is about to shift out from under
     /// the cached `(row_idx, byte_offset)` anchor — file swap, layout /
@@ -385,6 +597,14 @@ impl App {
     pub fn clear_diff_selection(&mut self) {
         self.diff_selection = None;
         self.diff_click_state = None;
+        if matches!(
+            self.selection_context_menu.target(),
+            Some(crate::selection_context_menu::SelectionContextTarget::Diff(
+                _
+            ))
+        ) {
+            self.selection_context_menu.close();
+        }
     }
 
     pub fn clear_commit_detail_selection(&mut self) {
@@ -1053,16 +1273,10 @@ impl App {
         self.drain_engine_runtime_events();
     }
 
-    /// Collapse every expanded folder and async-refresh the tree so
-    /// the render path picks up the shorter row list.
+    /// Collapse every expanded folder and shorten the cached flat tree.
     pub fn collapse_all_tree_entries(&mut self) {
-        let selected_path = self
-            .engine
-            .selected_file_tree_entry()
-            .map(|entry| entry.path);
         self.engine
             .dispatch(reef_app::AppCommand::CollapseAllTreeEntries);
-        self.refresh_file_tree_with_target(selected_path);
     }
 
     /// Rebuild the file tree from disk, applying git decorations when a repo is open.
@@ -1129,12 +1343,15 @@ impl App {
     /// stale responses whose id doesn't match (the `ThreadProtocol`
     /// bumps its id each time it dispatches, so a resize for an older
     /// selection arrives as a no-op after the user already switched).
-    fn drain_preview_resize_responses(&mut self) {
+    fn drain_preview_resize_responses(&mut self) -> bool {
+        let mut changed = false;
         while let Ok(resp) = self.preview_resize_rx.try_recv() {
             if let Some(proto) = self.preview_image_protocol.as_mut() {
                 proto.update_resized_protocol(resp);
+                changed = true;
             }
         }
+        changed
     }
 
     /// Pick up freshly-built `StatefulProtocol`s and slot them into the
@@ -1143,15 +1360,18 @@ impl App {
     /// the user switched files before the build completed, the build
     /// is stale and gets dropped; the next `BuiltProtocol` arriving
     /// with the new generation wins.
-    fn drain_preview_protocol_builds(&mut self) {
+    fn drain_preview_protocol_builds(&mut self) -> bool {
+        let mut changed = false;
         while let Ok(built) = self.preview_build_rx.try_recv() {
             if built.generation != self.engine.preview_generation() {
                 continue;
             }
             if let Some(proto) = self.preview_image_protocol.as_mut() {
                 proto.replace_protocol(built.protocol);
+                changed = true;
             }
         }
+        changed
     }
 
     pub fn select_file(&mut self, path: &str, is_staged: bool) {
@@ -1229,6 +1449,23 @@ impl App {
             "commit.files_tree_mode",
             self.engine.commit_files_tree_mode(),
         );
+    }
+
+    pub fn set_structured_preview_mode(&mut self, mode: reef_app::StructuredPreviewMode) {
+        self.engine
+            .dispatch(reef_app::AppCommand::SetStructuredPreviewMode(mode));
+        crate::prefs::set(reef_core::prefs::STRUCTURED_PREVIEW_MODE, mode.pref_str());
+        self.clear_preview_selection();
+    }
+
+    pub fn toggle_structured_preview_mode(&mut self) {
+        self.engine
+            .dispatch(reef_app::AppCommand::ToggleStructuredPreviewMode);
+        crate::prefs::set(
+            reef_core::prefs::STRUCTURED_PREVIEW_MODE,
+            self.engine.structured_preview_mode().pref_str(),
+        );
+        self.clear_preview_selection();
     }
 
     pub fn stage_file(&mut self, path: &str) {
@@ -1485,13 +1722,21 @@ impl App {
         generation: u64,
         result: Result<Option<reef_core::preview::PreviewDocument>, String>,
     ) {
+        if generation != self.engine.preview_generation() {
+            return;
+        }
+        let validating_global_search_hit = self
+            .engine
+            .global_search_hit_accepting_generation(generation);
         match result {
             Ok(mut content) => {
                 let same_file = matches!(
                     (self.engine.preview_content_ref(), content.as_ref()),
                     (Some(old), Some(new)) if old.path == new.path
                 );
-                self.prepare_preview_image_protocol(generation, same_file, &mut content);
+                if !(validating_global_search_hit && content.is_none()) {
+                    self.prepare_preview_image_protocol(generation, same_file, &mut content);
+                }
                 self.engine
                     .dispatch(reef_app::AppCommand::ApplyPreviewResult {
                         generation,
@@ -1537,7 +1782,10 @@ impl App {
                 reef_app::AppRuntimeEvent::LoadPreviewSelected => self.load_preview(),
                 reef_app::AppRuntimeEvent::LoadDiffRequested => self.load_diff(),
                 reef_app::AppRuntimeEvent::SyncSearchPreviewIfStale => {
-                    self.sync_search_preview_if_stale();
+                    self.engine
+                        .dispatch(reef_app::AppCommand::SyncGlobalSearchPreviewIfStale {
+                            preview_view_h: self.layout.last_preview_view_h as usize,
+                        });
                 }
                 reef_app::AppRuntimeEvent::RecomputeVimSearch => {
                     crate::search::recompute_and_jump(self);
@@ -1590,16 +1838,17 @@ impl App {
                     }
                 }
                 reef_app::AppRuntimeEvent::ClearPreviewSelection => {
-                    self.preview_selection = None;
-                    self.preview_click_state = None;
+                    self.clear_preview_selection();
+                    self.pending_preview_nav = None;
                     self.db_preview_layout = None;
                 }
                 reef_app::AppRuntimeEvent::LspRefineJump(outcome) => {
                     self.nav_push_back(outcome.pending_jump.origin);
                     self.nav_jump_to_lsp(&outcome.location);
                 }
-                reef_app::AppRuntimeEvent::ResolvePendingHighlight => {
+                reef_app::AppRuntimeEvent::RetryDeferredPreviewActions => {
                     self.resolve_pending_highlight();
+                    self.retry_pending_preview_nav();
                 }
                 reef_app::AppRuntimeEvent::ClearCommitDetailSelection => {
                     self.clear_commit_detail_selection();
@@ -1940,8 +2189,7 @@ impl App {
             self.dismiss_confirm();
         }
         if outcome.clear_preview_selection {
-            self.preview_selection = None;
-            self.preview_click_state = None;
+            self.clear_preview_selection();
         }
         if outcome.clear_commit_detail_selection {
             self.clear_commit_detail_selection();
@@ -1953,7 +2201,10 @@ impl App {
             crate::find_widget::close(self);
         }
         if outcome.sync_search_preview {
-            self.sync_search_preview_if_stale();
+            self.engine
+                .dispatch(reef_app::AppCommand::SyncGlobalSearchPreviewIfStale {
+                    preview_view_h: self.layout.last_preview_view_h as usize,
+                });
         }
     }
 
@@ -2101,6 +2352,12 @@ impl App {
             ClickAction::TreeContextMenuClose => {
                 self.close_tree_context_menu();
             }
+            ClickAction::SelectionContextMenuItem(item) => {
+                self.dispatch_selection_context_menu_item(item);
+            }
+            ClickAction::SelectionContextMenuClose => {
+                self.close_selection_context_menu();
+            }
             ClickAction::NavCandidateSelect(idx) => {
                 // Move selection to the clicked row, then commit. A
                 // double-click semantics here would be safer (single
@@ -2115,6 +2372,14 @@ impl App {
             }
             ClickAction::OpenMarkdownLink(target) => {
                 self.open_markdown_link(&target);
+            }
+            ClickAction::SetStructuredPreviewMode(mode) => {
+                self.set_structured_preview_mode(mode);
+            }
+            ClickAction::ToggleStructuredPreviewNode(node_id) => {
+                self.engine
+                    .dispatch(reef_app::AppCommand::ToggleStructuredPreviewNode(node_id));
+                self.clear_preview_selection();
             }
             ClickAction::HostsPickerSelect(idx) => {
                 // Mouse click on a hosts-picker row: move selection to
@@ -2305,6 +2570,80 @@ impl App {
             .dispatch(reef_app::AppCommand::NavigateGitFiles(delta));
     }
 
+    pub(crate) fn scroll_file_preview(&mut self, delta: i32) {
+        let markdown_preview_id = self.engine.preview_content_ref().and_then(|preview| {
+            matches!(preview.body, reef_core::preview::PreviewBody::Markdown(_))
+                .then_some(preview as *const reef_core::preview::PreviewDocument as usize)
+        });
+        if !markdown_preview_id.is_some_and(|id| self.markdown_layout.matches(id)) {
+            self.engine
+                .dispatch(reef_app::AppCommand::PreviewScroll(delta));
+            return;
+        }
+
+        let max_scroll = self
+            .markdown_layout
+            .max_scroll(self.layout.last_preview_view_h as usize);
+        let next = if delta < 0 {
+            self.markdown_visual_scroll
+                .saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            self.markdown_visual_scroll
+                .saturating_add(delta as usize)
+                .min(max_scroll)
+        };
+        self.set_markdown_visual_scroll(next);
+    }
+
+    fn set_markdown_visual_scroll(&mut self, scroll: usize) {
+        self.markdown_visual_scroll = scroll.min(
+            self.markdown_layout
+                .max_scroll(self.layout.last_preview_view_h as usize),
+        );
+        let logical_scroll = self
+            .markdown_layout
+            .row(self.markdown_visual_scroll)
+            .map_or(0, |row| row.logical_row);
+        self.engine
+            .dispatch(reef_app::AppCommand::SetPreviewVerticalScroll(
+                logical_scroll,
+            ));
+        self.markdown_engine_scroll_seen = Some(logical_scroll);
+    }
+
+    fn scroll_file_preview_to_top(&mut self) {
+        let is_current_markdown = self.engine.preview_content_ref().is_some_and(|preview| {
+            matches!(preview.body, reef_core::preview::PreviewBody::Markdown(_))
+                && self
+                    .markdown_layout
+                    .matches(preview as *const reef_core::preview::PreviewDocument as usize)
+        });
+        if is_current_markdown {
+            self.set_markdown_visual_scroll(0);
+        } else {
+            self.engine
+                .dispatch(reef_app::AppCommand::SetPreviewVerticalScroll(0));
+        }
+    }
+
+    fn scroll_file_preview_to_bottom(&mut self) {
+        let is_current_markdown = self.engine.preview_content_ref().is_some_and(|preview| {
+            matches!(preview.body, reef_core::preview::PreviewBody::Markdown(_))
+                && self
+                    .markdown_layout
+                    .matches(preview as *const reef_core::preview::PreviewDocument as usize)
+        });
+        if is_current_markdown {
+            let bottom = self
+                .markdown_layout
+                .max_scroll(self.layout.last_preview_view_h as usize);
+            self.set_markdown_visual_scroll(bottom);
+        } else {
+            self.engine
+                .dispatch(reef_app::AppCommand::SetPreviewVerticalScroll(usize::MAX));
+        }
+    }
+
     /// Vim `gg` — jump the active content panel to its top. List panels
     /// (file tree, git status, commit graph) move their selection to the
     /// first row; content panels (Diff/Commit) reset the vertical scroll.
@@ -2340,8 +2679,7 @@ impl App {
                 }
             }
             (Tab::Files, Panel::Diff) | (Tab::Search, Panel::Diff) => {
-                self.engine
-                    .dispatch(reef_app::AppCommand::SetPreviewVerticalScroll(0));
+                self.scroll_file_preview_to_top();
             }
             (Tab::Search, Panel::Files) => {
                 // Search-tab left column owns its own list cursor via the
@@ -2383,9 +2721,7 @@ impl App {
 
     /// Vim `G` — jump the active content panel to its bottom. List panels
     /// move selection to the last row; content panels set the scroll to
-    /// `usize::MAX` and rely on the render-layer clamp
-    /// (ui::preview / diff_panel / commit_detail_panel all clamp
-    /// against `lines.len() - viewport`).
+    /// jump to their renderer-specific bottom offset.
     pub fn scroll_active_preview_to_bottom(&mut self) {
         if self.is_sqlite_preview() {
             return;
@@ -2399,8 +2735,7 @@ impl App {
                 }
             }
             (Tab::Files, Panel::Diff) | (Tab::Search, Panel::Diff) => {
-                self.engine
-                    .dispatch(reef_app::AppCommand::SetPreviewVerticalScroll(usize::MAX));
+                self.scroll_file_preview_to_bottom();
             }
             (Tab::Search, Panel::Files) => {}
             (Tab::Git, Panel::Files) => {
@@ -2450,28 +2785,34 @@ impl App {
                 .is_some_and(|p| p.is_database())
     }
 
-    /// Called every frame: drive the renderer-neutral engine, then merge
-    /// terminal-local state such as image protocols, selection fades, and
-    /// mouse drag autoscroll.
-    pub fn tick(&mut self) {
+    /// Drive the renderer-neutral engine and merge terminal-local async state.
+    /// Returns whether the terminal needs another frame. The main loop still
+    /// polls at a short interval so worker results stay responsive, but an
+    /// idle poll no longer forces a full redraw.
+    pub fn tick(&mut self) -> bool {
         let now = Instant::now();
-        self.engine.tick(now, self.tick_options());
-        let events = self.engine.drain_runtime_events();
-        self.apply_runtime_events(events);
+        let outcome = self.engine.step(now, self.tick_options());
+        let mut changed = outcome.changed;
+        self.apply_runtime_events(outcome.runtime_events);
 
         // VSCode "Reveal" fade — clear `preview_highlight` after
         // `PREVIEW_HIGHLIGHT_TTL` so the highlight doesn't linger
         // forever on the destination line. Set on the rising edge
         // (None → Some) and consumed on expiry. Cleared synchronously
         // here so the next render sees no highlight.
-        self.advance_preview_highlight_fade();
+        changed |= self.advance_preview_highlight_fade();
 
-        self.drain_preview_sync_debounce();
-        self.drain_preview_resize_responses();
-        self.drain_preview_protocol_builds();
+        changed |= self.drain_preview_sync_debounce();
+        changed |= self.drain_preview_resize_responses();
+        changed |= self.drain_preview_protocol_builds();
         self.tick_place_mode_auto_expand();
         self.tick_tree_drag_auto_expand();
         crate::input::tick_drag_autoscroll(self);
+
+        changed
+            || self.engine.place_mode_active()
+            || self.engine.tree_drag_active()
+            || self.last_drag_mouse.is_some()
     }
 
     fn tick_options(&self) -> reef_app::TickOptions {
@@ -2487,41 +2828,17 @@ impl App {
     /// navigation); coalesces bursts so holding ↓ doesn't spam the preview
     /// worker. Click / chunk-arrival / pin go through `navigate_to_selected`
     /// directly and bypass this.
-    fn drain_preview_sync_debounce(&mut self) {
+    fn drain_preview_sync_debounce(&mut self) -> bool {
         let outcome =
             self.engine
                 .dispatch(reef_app::AppCommand::DrainGlobalSearchPreviewSyncDebounce {
                     now: Instant::now(),
                 });
         if !outcome.global_search_preview_sync_due {
-            return;
+            return false;
         }
         crate::global_search::navigate_to_selected(self);
-    }
-
-    /// Reload the Search tab's right-side preview iff the currently-selected
-    /// hit no longer matches what `preview_highlight` is pointing at.
-    /// Called after every global-search chunk arrives — without this the
-    /// right panel goes stale between "user types new query" and "user
-    /// presses ↑↓ manually," which looks like a bug.
-    ///
-    /// Gated on `active_tab == Tab::Search` so the overlay (which doesn't
-    /// render a preview) doesn't waste preview-worker cycles. Cheap when a
-    /// burst of chunks all point at the same hit — the staleness check
-    /// short-circuits.
-    fn sync_search_preview_if_stale(&mut self) {
-        if self.engine.active_tab() != Tab::Search {
-            return;
-        }
-        if self
-            .engine
-            .selected_global_search_hit_if_preview_stale()
-            .is_none()
-        {
-            return;
-        }
-        self.engine
-            .dispatch(reef_app::AppCommand::SyncGlobalSearchPreviewToSelected);
+        true
     }
 
     /// VSCode-style hover auto-expand. When the cursor rests on a
@@ -2634,8 +2951,7 @@ mod tests {
         load_graph_scope_pref, persist_graph_scope,
     };
     use crate::ui::theme::Theme;
-    use reef_app::GitGraphState;
-    use reef_app::{GraphPayload, WorkerResult};
+    use reef_app::{AppCommand, GitGraphState, GraphPayload, MatchHit, WorkerResult};
     use reef_core::git::GraphScope;
     use reef_core::preview::{PreviewBody, PreviewDocument as PreviewContent};
     use reef_io::LocalBackend;
@@ -2721,11 +3037,17 @@ mod tests {
     #[test]
     fn markdown_link_targets_resolve_from_preview_directory() {
         let mut fx = make_scope_fixture();
+        fx.app.engine.state.preview_content_revision = 1;
         fx.app.engine.state.preview_content = Some(
             PreviewContent {
                 path: "docs/guide/index.md".into(),
+                resolved_path: None,
+                local_path: None,
+                bytes_on_disk: 0,
+                mime: Some("text/markdown".into()),
                 body: PreviewBody::Text(reef_core::preview::TextPreview {
                     lines: vec![],
+                    source: None,
                     highlighted: None,
                     parsed: None,
                 }),
@@ -3216,6 +3538,62 @@ mod tests {
         );
         assert!(app.engine.state.preview_load.stale);
         assert!(!app.engine.state.preview_load.loading);
+    }
+
+    #[test]
+    fn stale_preview_result_keeps_terminal_image_protocol() {
+        let mut fx = make_scope_fixture();
+        let stale_generation = fx.app.engine.state.preview_load.begin();
+        let current_generation = fx.app.engine.state.preview_load.begin();
+        fx.app.preview_image_protocol = Some(ratatui_image::thread::ThreadProtocol::new(
+            fx.app.preview_resize_tx.clone(),
+            None,
+        ));
+
+        fx.app
+            .apply_preview_result_for_adapter(stale_generation, Ok(None));
+
+        assert_eq!(fx.app.engine.preview_generation(), current_generation);
+        assert!(fx.app.preview_image_protocol.is_some());
+    }
+
+    #[test]
+    fn missing_global_search_hit_keeps_terminal_image_protocol() {
+        let mut fx = make_scope_fixture();
+        let hit = MatchHit {
+            path: PathBuf::from("missing.png"),
+            display: "missing.png".to_string(),
+            line: 0,
+            line_text: "needle".to_string(),
+            line_revision: reef_io::content_line_revision(b"needle"),
+            byte_range: 0..6,
+        };
+        fx.app.engine.state.global_search.core.active = true;
+        fx.app.engine.dispatch(AppCommand::AcceptGlobalSearchHit {
+            hit: hit.clone(),
+            origin: None,
+        });
+        let (path, _) = fx
+            .app
+            .engine
+            .state
+            .preview_schedule
+            .take()
+            .expect("accepting a hit schedules validation");
+        fx.app
+            .engine
+            .state
+            .dispatch_preview_load(path, false, false);
+        let generation = fx.app.engine.preview_generation();
+        fx.app.preview_image_protocol = Some(ratatui_image::thread::ThreadProtocol::new(
+            fx.app.preview_resize_tx.clone(),
+            None,
+        ));
+
+        fx.app
+            .apply_preview_result_for_adapter(generation, Ok(None));
+
+        assert!(fx.app.preview_image_protocol.is_some());
     }
 
     // ── Graph layout math ────────────────────────────────────────────────

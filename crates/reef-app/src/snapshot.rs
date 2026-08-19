@@ -1,9 +1,10 @@
+use crate::app::AppState;
 use crate::{
-    AppPanel, AppState, AppTab, ConfirmRequest, ConfirmTone, GitGraphState, MatchHit, SelectedFile,
-    ViewMode, features::hosts_picker::InputMode,
+    AppPanel, AppTab, ConfirmRequest, ConfirmTone, GitGraphState, MatchHit, SelectedFile, ViewMode,
+    features::hosts_picker::InputMode, preview_snapshot::PreviewDocumentSnapshot,
 };
 use reef_core::git::GraphScope;
-use std::path::PathBuf;
+use std::{ops::Range, path::PathBuf, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub struct AppSnapshot {
@@ -50,16 +51,18 @@ pub struct PendingConfirmSnapshot {
     pub tone: ConfirmTone,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AsyncSnapshot {
+    pub generation: u64,
     pub loading: bool,
     pub stale: bool,
     pub error: Option<String>,
 }
 
 impl AsyncSnapshot {
-    fn from_state(state: &crate::AsyncState) -> Self {
+    pub(crate) fn from_state(state: &crate::AsyncState) -> Self {
         Self {
+            generation: state.generation,
             loading: state.loading,
             stale: state.stale,
             error: state.error.clone(),
@@ -76,6 +79,7 @@ pub struct FilesPanelSnapshot {
     pub selected_path: Option<PathBuf>,
     pub preview_path: Option<String>,
     pub preview_kind: Option<PreviewKindSnapshot>,
+    pub preview: Option<Arc<PreviewDocumentSnapshot>>,
     pub preview_scroll: usize,
     pub preview_h_scroll: usize,
     pub tree_load: AsyncSnapshot,
@@ -91,7 +95,7 @@ pub enum PreviewKindSnapshot {
     Database,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlobalSearchPanelSnapshot {
     pub active: bool,
     pub query: String,
@@ -109,6 +113,19 @@ pub struct GlobalSearchPanelSnapshot {
     pub load: AsyncSnapshot,
     pub replace_load: AsyncSnapshot,
     pub replace_progress: Option<(usize, usize)>,
+    pub preview_match: Option<GlobalSearchPreviewMatchSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalSearchPreviewMatchSnapshot {
+    pub path: PathBuf,
+    pub query: String,
+    pub occurrence_index: usize,
+    /// Zero-based source row of the selected search hit.
+    pub row: usize,
+    /// Source line containing the selected match.
+    pub line_text: String,
+    pub byte_range: Range<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,7 +134,7 @@ pub struct GlobalSearchRowSnapshot {
     pub included: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitPanelSnapshot {
     pub staged_count: usize,
     pub unstaged_count: usize,
@@ -127,6 +144,7 @@ pub struct GitPanelSnapshot {
     pub diff_scroll: usize,
     pub diff_h_scroll: usize,
     pub status_load: AsyncSnapshot,
+    pub mutation_in_flight: bool,
     pub diff_load: AsyncSnapshot,
     pub commit_in_flight: bool,
     pub push_in_flight: bool,
@@ -149,7 +167,7 @@ pub struct GraphPanelSnapshot {
     pub file_diff_load: AsyncSnapshot,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuickOpenSnapshot {
     pub active: bool,
     pub query: String,
@@ -158,10 +176,12 @@ pub struct QuickOpenSnapshot {
     pub match_count: usize,
     pub recent: bool,
     pub scroll: usize,
+    pub load: AsyncSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuickOpenRowSnapshot {
+    pub path: PathBuf,
     pub display: String,
     pub indices: Vec<u32>,
 }
@@ -258,6 +278,7 @@ impl FilesPanelSnapshot {
                 .preview_content
                 .as_ref()
                 .map(|p| PreviewKindSnapshot::from_body(&p.body)),
+            preview: state.preview_snapshot.clone(),
             preview_scroll: state.preview_scroll,
             preview_h_scroll: state.preview_h_scroll,
             tree_load: AsyncSnapshot::from_state(&state.file_tree_load),
@@ -280,6 +301,27 @@ impl PreviewKindSnapshot {
 
 impl GlobalSearchPanelSnapshot {
     fn from_state(state: &AppState) -> Self {
+        let selected_index = state.global_search.core.selected_idx;
+        let preview_match = state
+            .global_search
+            .results
+            .get(selected_index)
+            .filter(|_| {
+                !state.global_search.core.filter.is_empty()
+                    && state.global_search.core.filter == state.global_search.last_searched_query
+                    && state.global_search.results_generation == state.global_search_load.generation
+            })
+            .map(|hit| GlobalSearchPreviewMatchSnapshot {
+                path: hit.path.clone(),
+                query: state.global_search.core.filter.clone(),
+                occurrence_index: state.global_search.results[..selected_index]
+                    .iter()
+                    .filter(|candidate| candidate.path == hit.path)
+                    .count(),
+                row: hit.line,
+                line_text: hit.line_text.clone(),
+                byte_range: hit.byte_range.clone(),
+            });
         Self {
             active: state.global_search.core.active,
             query: state.global_search.core.filter.clone(),
@@ -297,6 +339,7 @@ impl GlobalSearchPanelSnapshot {
             load: AsyncSnapshot::from_state(&state.global_search_load),
             replace_load: AsyncSnapshot::from_state(&state.replace_load),
             replace_progress: state.global_search.replace_progress,
+            preview_match,
         }
     }
 }
@@ -312,6 +355,7 @@ impl GitPanelSnapshot {
             diff_scroll: state.diff_scroll,
             diff_h_scroll: state.diff_h_scroll,
             status_load: AsyncSnapshot::from_state(&state.git_status_load),
+            mutation_in_flight: state.git_mutation_load.loading,
             diff_load: AsyncSnapshot::from_state(&state.diff_load),
             commit_in_flight: state.commit_load.loading,
             push_in_flight: state.push_load.loading,
@@ -354,6 +398,11 @@ impl QuickOpenSnapshot {
             match_count: state.quick_open.matches.len(),
             recent: state.quick_open.core.filter.is_empty() && !state.quick_open.mru.is_empty(),
             scroll: state.quick_open.scroll,
+            load: AsyncSnapshot::from_state(if state.quick_open_load.loading {
+                &state.quick_open_load
+            } else {
+                &state.quick_open_filter_load
+            }),
         }
     }
 }
@@ -390,6 +439,105 @@ impl GraphBranchPickerSnapshot {
             selected_idx: state.graph_branch_picker.core.selected_idx,
             row_count: state.graph_branch_picker.visible_rows().len(),
             scroll: state.graph_branch_picker.scroll,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::PathBuf, sync::Arc, time::Instant};
+
+    use reef_core::preview::{PreviewBody, PreviewDocument, TextPreview};
+    use reef_io::LocalBackend;
+
+    use super::AppSnapshot;
+    use crate::MatchHit;
+    use crate::app::{AppPrefs, AppState, AppStateConfig};
+
+    #[test]
+    fn preview_snapshot_source_revision_tracks_accepted_content_generation() {
+        let backend = Arc::new(LocalBackend::open_at(PathBuf::from(".")));
+        let mut state = AppState::new(AppStateConfig {
+            backend,
+            prefs: AppPrefs::default(),
+            now: Instant::now(),
+            subscribe_fs_events: false,
+        });
+
+        let accepted_generation = state.preview_load.begin();
+        state.apply_preview_content(accepted_generation, Some(text_preview("src/main.rs")), 20);
+        let loading_generation = state.preview_load.begin();
+        let first = AppSnapshot::from_state(&state)
+            .files
+            .preview
+            .expect("preview snapshot");
+        let second = AppSnapshot::from_state(&state)
+            .files
+            .preview
+            .expect("preview snapshot");
+
+        assert_ne!(accepted_generation, loading_generation);
+        assert_eq!(first.revision, accepted_generation);
+        assert_eq!(first.source_revision, accepted_generation);
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn global_search_preview_match_tracks_occurrence_within_selected_file() {
+        let backend = Arc::new(LocalBackend::open_at(PathBuf::from(".")));
+        let mut state = AppState::new(AppStateConfig {
+            backend,
+            prefs: AppPrefs::default(),
+            now: Instant::now(),
+            subscribe_fs_events: false,
+        });
+        state.global_search.core.filter = "reef".to_string();
+        state.global_search.last_searched_query = "reef".to_string();
+        state.global_search.results_generation = state.global_search_load.generation;
+        state.global_search.results = vec![
+            search_hit("src/a.rs", 3, 0..4),
+            search_hit("src/b.rs", 1, 2..6),
+            search_hit("src/a.rs", 8, 5..9),
+        ];
+        state.global_search.core.selected_idx = 2;
+
+        let focus = AppSnapshot::from_state(&state)
+            .search
+            .preview_match
+            .expect("selected global-search preview match");
+
+        assert_eq!(focus.path, PathBuf::from("src/a.rs"));
+        assert_eq!(focus.query, "reef");
+        assert_eq!(focus.occurrence_index, 1);
+        assert_eq!(focus.row, 8);
+        assert_eq!(focus.line_text, "reef");
+        assert_eq!(focus.byte_range, 5..9);
+    }
+
+    fn text_preview(path: &str) -> PreviewDocument {
+        PreviewDocument {
+            path: path.to_string(),
+            resolved_path: None,
+            local_path: None,
+            bytes_on_disk: 0,
+            mime: Some("text/rust".to_string()),
+            body: PreviewBody::Text(TextPreview {
+                lines: vec!["fn main() {}".to_string()],
+                source: None,
+                highlighted: None,
+                parsed: None,
+            }),
+        }
+    }
+
+    fn search_hit(path: &str, line: usize, byte_range: std::ops::Range<usize>) -> MatchHit {
+        MatchHit {
+            path: PathBuf::from(path),
+            display: format!("{path}:{line}"),
+            line,
+            line_text: "reef".to_string(),
+            line_revision: reef_io::content_line_revision(b"reef"),
+            byte_range,
         }
     }
 }

@@ -11,4 +11,5 @@ pub mod prefs;
 pub mod preview;
 pub mod quick_open;
 pub mod search;
+pub mod structured_data;
 pub mod text;

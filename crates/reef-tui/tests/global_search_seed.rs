@@ -30,8 +30,13 @@ fn install_text_preview(app: &mut App, lines: &[&str]) {
     app.engine.state.preview_content = Some(
         PreviewContent {
             path: "scratch.txt".to_string(),
+            resolved_path: None,
+            local_path: None,
+            bytes_on_disk: lines.iter().map(|line| line.len() as u64).sum(),
+            mime: Some("text/plain".into()),
             body: PreviewBody::Text(TextPreview {
                 lines: lines.iter().map(|s| s.to_string()).collect(),
+                source: None,
                 highlighted: None,
                 parsed: None,
             }),
@@ -41,11 +46,15 @@ fn install_text_preview(app: &mut App, lines: &[&str]) {
 }
 
 fn install_markdown_preview(app: &mut App, source: &str) {
-    let markdown = reef_core::markdown::build_markdown_preview("README.md", source, true)
-        .expect("markdown preview");
+    let markdown =
+        reef_core::markdown::build_markdown_preview("README.md", source).expect("markdown preview");
     app.engine.state.preview_content = Some(
         PreviewContent {
             path: "README.md".to_string(),
+            resolved_path: None,
+            local_path: None,
+            bytes_on_disk: source.len() as u64,
+            mime: Some("text/markdown".into()),
             body: PreviewBody::Markdown(markdown),
         }
         .into(),
@@ -152,7 +161,7 @@ fn begin_seeds_from_markdown_rendered_rows() {
     let (mut app, _tmp, _g) = fresh_app();
     install_markdown_preview(&mut app, "| Name | Count |\n|---|---:|\n| reef | 12 |\n");
     let rendered = match &app.engine.state.preview_content.as_ref().unwrap().body {
-        PreviewBody::Markdown(markdown) => markdown.text_rows[1].clone(),
+        PreviewBody::Markdown(markdown) => markdown.text_for_row(1).unwrap().to_string(),
         _ => panic!("markdown preview expected"),
     };
     assert_eq!(rendered, "┃ Name ┃ Count ┃");

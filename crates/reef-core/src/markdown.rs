@@ -8,6 +8,12 @@ use crate::text::TextStyle;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownPreview {
+    pub source: String,
+    pub render_model: Option<MarkdownRenderModel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownRenderModel {
     pub rows: Vec<Vec<MarkdownSpan>>,
     pub text_rows: Vec<String>,
 }
@@ -41,12 +47,38 @@ pub enum MarkdownRole {
 }
 
 impl MarkdownPreview {
+    pub fn source_only(source: &str) -> Self {
+        Self {
+            source: source.to_string(),
+            render_model: None,
+        }
+    }
+
+    pub fn rows(&self) -> Option<&[Vec<MarkdownSpan>]> {
+        self.render_model
+            .as_ref()
+            .map(|model| model.rows.as_slice())
+    }
+
+    pub fn text_rows(&self) -> Option<&[String]> {
+        self.render_model
+            .as_ref()
+            .map(|model| model.text_rows.as_slice())
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.text_rows()
+            .map_or_else(|| self.source.lines().count(), <[String]>::len)
+    }
+
     pub fn spans_for_row(&self, row: usize) -> Option<&[MarkdownSpan]> {
-        self.rows.get(row).map(Vec::as_slice)
+        self.rows()?.get(row).map(Vec::as_slice)
     }
 
     pub fn text_for_row(&self, row: usize) -> Option<&str> {
-        self.text_rows.get(row).map(String::as_str)
+        self.text_rows()
+            .and_then(|rows| rows.get(row).map(String::as_str))
+            .or_else(|| self.source.lines().nth(row))
     }
 }
 
@@ -129,7 +161,23 @@ struct CodeBlockBuild {
     lines: Vec<String>,
 }
 
-pub fn build_markdown_preview(path: &str, source: &str, dark: bool) -> Option<MarkdownPreview> {
+pub fn build_markdown_preview(path: &str, source: &str) -> Option<MarkdownPreview> {
+    build_markdown_preview_inner(path, source, None)
+}
+
+pub fn build_markdown_preview_with_syntax(
+    path: &str,
+    source: &str,
+    dark: bool,
+) -> Option<MarkdownPreview> {
+    build_markdown_preview_inner(path, source, Some(dark))
+}
+
+fn build_markdown_preview_inner(
+    path: &str,
+    source: &str,
+    syntax_dark: Option<bool>,
+) -> Option<MarkdownPreview> {
     if !is_markdown_path(path) {
         return None;
     }
@@ -255,7 +303,7 @@ pub fn build_markdown_preview(path: &str, source: &str, dark: bool) -> Option<Ma
                 }
                 TagEnd::CodeBlock => {
                     if let Some(code) = code_block.take() {
-                        rows.extend(render_code_block_lines(code, dark));
+                        rows.extend(render_code_block_lines(code, syntax_dark));
                     }
                     rows.push(code_block_padding_row());
                     push_blank(&mut rows);
@@ -337,7 +385,9 @@ pub fn build_markdown_preview(path: &str, source: &str, dark: bool) -> Option<Ma
                 active.push(text.as_ref());
                 active.style = old;
             }
-            Event::SoftBreak | Event::HardBreak => flush_inline(&mut rows, &mut inline),
+            Event::SoftBreak if quote_depth > 0 => flush_inline(&mut rows, &mut inline),
+            Event::SoftBreak => active_inline(&mut inline, &mut table).push(" "),
+            Event::HardBreak => flush_inline(&mut rows, &mut inline),
             Event::Rule => {
                 flush_inline(&mut rows, &mut inline);
                 rows.push(vec![MarkdownSpan {
@@ -373,7 +423,10 @@ pub fn build_markdown_preview(path: &str, source: &str, dark: bool) -> Option<Ma
     trim_trailing_blanks(&mut rows);
 
     let text_rows = rows.iter().map(|row| row_text(row)).collect();
-    Some(MarkdownPreview { rows, text_rows })
+    Some(MarkdownPreview {
+        source: source.to_string(),
+        render_model: Some(MarkdownRenderModel { rows, text_rows }),
+    })
 }
 
 pub fn is_url_link(target: &str) -> bool {
@@ -483,11 +536,15 @@ fn code_block_padding_row() -> Vec<MarkdownSpan> {
     }]
 }
 
-fn render_code_block_lines(code: CodeBlockBuild, dark: bool) -> Vec<Vec<MarkdownSpan>> {
-    let highlighted = code
-        .label
-        .as_deref()
-        .and_then(|lang| crate::highlight::highlight_code_block(lang, &code.lines, dark));
+fn render_code_block_lines(
+    code: CodeBlockBuild,
+    syntax_dark: Option<bool>,
+) -> Vec<Vec<MarkdownSpan>> {
+    let highlighted = syntax_dark.and_then(|dark| {
+        code.label
+            .as_deref()
+            .and_then(|lang| crate::highlight::highlight_code_block(lang, &code.lines, dark))
+    });
 
     code.lines
         .iter()
@@ -648,8 +705,13 @@ fn normal_spaces(width: usize) -> MarkdownSpan {
 mod tests {
     use super::*;
 
+    fn model(md: &MarkdownPreview) -> &MarkdownRenderModel {
+        md.render_model.as_ref().expect("markdown render model")
+    }
+
     fn texts(md: &MarkdownPreview) -> Vec<String> {
-        md.rows
+        model(md)
+            .rows
             .iter()
             .map(|r| r.iter().map(|s| s.text.as_str()).collect())
             .collect()
@@ -660,6 +722,14 @@ mod tests {
         assert!(is_markdown_path("README.md"));
         assert!(is_markdown_path("notes.Markdown"));
         assert!(!is_markdown_path("notes.txt"));
+    }
+
+    #[test]
+    fn preview_keeps_raw_source() {
+        let source = "# Title\n\n<span>inline html</span>\n";
+        let md = build_markdown_preview("README.md", source).unwrap();
+
+        assert_eq!(md.source, source);
     }
 
     #[test]
@@ -703,11 +773,14 @@ mod tests {
     fn builds_headings_lists_quotes_links_and_code() {
         let source =
             "# Title\n\n- **bold** [site](https://x.test)\n> quote\n\n```rs\nfn main() {}\n```\n";
-        let md = build_markdown_preview("README.md", source, true).unwrap();
+        let md = build_markdown_preview_with_syntax("README.md", source, true).unwrap();
         let rendered = texts(&md);
         assert!(rendered.iter().any(|l| l == "Title"));
         assert!(rendered.iter().any(|l| l.contains("• bold site")));
         let link = md
+            .render_model
+            .as_ref()
+            .unwrap()
             .rows
             .iter()
             .flatten()
@@ -719,6 +792,9 @@ mod tests {
         assert!(rendered.iter().any(|l| l == " rs "));
         assert!(rendered.iter().any(|l| l == "  fn main() {}"));
         let code_row = md
+            .render_model
+            .as_ref()
+            .unwrap()
             .rows
             .iter()
             .find(|row| row_text(row) == "  fn main() {}")
@@ -732,26 +808,75 @@ mod tests {
     }
 
     #[test]
+    fn base_preview_leaves_fenced_code_syntax_unstyled() {
+        let source = "```rs\nfn main() {}\n```\n";
+        let base = build_markdown_preview("README.md", source).unwrap();
+        let enriched = build_markdown_preview_with_syntax("README.md", source, true).unwrap();
+
+        assert!(
+            model(&base)
+                .rows
+                .iter()
+                .flatten()
+                .all(|span| span.syntax.is_none())
+        );
+        assert!(
+            model(&enriched)
+                .rows
+                .iter()
+                .flatten()
+                .any(|span| span.syntax.is_some())
+        );
+    }
+
+    #[test]
     fn unlabeled_code_block_has_no_header() {
-        let md = build_markdown_preview("README.md", "```\nplain\n```\n", true).unwrap();
+        let md = build_markdown_preview("README.md", "```\nplain\n```\n").unwrap();
         let rendered = texts(&md);
 
         assert_eq!(rendered, vec!["", "  plain", ""]);
-        assert!(md.rows.iter().flatten().all(|span| span.syntax.is_none()));
+        assert!(
+            model(&md)
+                .rows
+                .iter()
+                .flatten()
+                .all(|span| span.syntax.is_none())
+        );
     }
 
     #[test]
     fn consecutive_blockquote_lines_keep_quote_prefix() {
-        let md = build_markdown_preview("README.md", "> xxx\n> xxx\n", true).unwrap();
+        let md = build_markdown_preview("README.md", "> xxx\n> xxx\n").unwrap();
         assert_eq!(texts(&md), vec!["│ xxx", "│ xxx"]);
+    }
+
+    #[test]
+    fn soft_breaks_join_paragraph_lines() {
+        let md = build_markdown_preview(
+            "README.md",
+            "A paragraph wrapped for source readability\ncontinues on the next source line.\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            texts(&md),
+            vec!["A paragraph wrapped for source readability continues on the next source line."]
+        );
+    }
+
+    #[test]
+    fn hard_breaks_preserve_rendered_line_boundaries() {
+        let md = build_markdown_preview("README.md", "first line  \nsecond line\n").unwrap();
+
+        assert_eq!(texts(&md), vec!["first line", "second line"]);
     }
 
     #[test]
     fn builds_integrated_table_with_cjk_width() {
         let source = "| 名称 | Count |\n|:---|---:|\n| 鲨鱼 | 12 |\n| ray | 3 |\n";
-        let md = build_markdown_preview("README.md", source, true).unwrap();
+        let md = build_markdown_preview("README.md", source).unwrap();
         let rendered = texts(&md);
-        assert_eq!(md.text_rows, rendered);
+        assert_eq!(model(&md).text_rows, rendered);
         assert_eq!(rendered[0], "┏━━━━━━┳━━━━━━━┓");
         assert_eq!(rendered[1], "┃ 名称 ┃ Count ┃");
         assert_eq!(rendered[2], "┣━━━━━━╋━━━━━━━┫");

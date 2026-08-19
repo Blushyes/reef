@@ -1,4 +1,4 @@
-//! Right-click context-menu overlay for the Files-tab tree.
+//! Shared right-click context-menu renderer plus the Files-tree adapter.
 //!
 //! Rendered LAST in `ui::render` (after help popup, before palette
 //! overlays) so it floats above everything — the `HitTestRegistry`'s
@@ -18,55 +18,71 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear};
 
+pub(crate) struct ContextMenuRow {
+    pub label: &'static str,
+    pub enabled: bool,
+    pub action: ClickAction,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ContextMenuPlacement {
+    Below((u16, u16)),
+    Adjacent((u16, u16)),
+}
+
 pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     if !app.engine.tree_context_menu_active() {
         return;
     }
-    let th = app.theme;
-
-    // Menu width derived from longest label + padding. Add 2 for the
-    // border, 2 for the inside padding. Clamp to screen width so a
-    // narrow terminal doesn't push the menu off the right edge.
-    let items: Vec<&'static str> = app
+    let clipboard_empty = app.engine.file_clipboard_empty();
+    let rows: Vec<_> = app
         .engine
         .tree_context_menu_items()
         .iter()
-        .map(crate::i18n::tree_context_menu_label)
+        .map(|item| ContextMenuRow {
+            label: crate::i18n::tree_context_menu_label(item),
+            enabled: item.is_enabled(clipboard_empty),
+            action: ClickAction::TreeContextMenuItem(item.clone()),
+        })
         .collect();
-    let max_label_w = items
+    let anchor = app.engine.tree_context_menu_anchor();
+    let selected = app.engine.tree_context_menu_selected();
+    render_rows(
+        f,
+        app,
+        screen,
+        selected,
+        &rows,
+        ClickAction::TreeContextMenuClose,
+        ContextMenuPlacement::Below(anchor),
+    );
+}
+
+pub(crate) fn render_rows(
+    f: &mut Frame,
+    app: &mut App,
+    screen: Rect,
+    selected: usize,
+    rows: &[ContextMenuRow],
+    close_action: ClickAction,
+    placement: ContextMenuPlacement,
+) {
+    let th = app.theme;
+    let max_label_w = rows
         .iter()
-        .map(|s| unicode_width::UnicodeWidthStr::width(*s))
+        .map(|row| unicode_width::UnicodeWidthStr::width(row.label))
         .max()
         .unwrap_or(0);
-    let popup_w = (max_label_w as u16 + 4 + 2).min(screen.width);
-    let popup_h = app.engine.tree_context_menu_items_len() as u16 + 2;
-    let popup_h = popup_h.min(screen.height);
+    let popup_w = (max_label_w as u16 + 6).min(screen.width);
+    let popup_h = (rows.len() as u16 + 2).min(screen.height);
+    let area = context_menu_area(screen, popup_w, popup_h, placement);
 
-    let (anchor_x, anchor_y) = app.engine.tree_context_menu_anchor();
-    // Clamp so the menu stays fully on-screen even when the click
-    // landed near the right/bottom edge. Prefer the click position
-    // when there's room, fall back to shifting left/up otherwise.
-    let x = anchor_x.min(screen.x + screen.width.saturating_sub(popup_w));
-    let y = anchor_y.min(screen.y + screen.height.saturating_sub(popup_h));
-    let area = Rect::new(x, y, popup_w, popup_h);
-
-    // Panel-wide fallthrough: any click anywhere on screen that doesn't
-    // land on a menu row closes the menu. Registered FIRST so the
-    // per-row zones shadow it via the hit-registry's late-wins ordering.
-    // Use the full screen so even clicks on the status bar dismiss.
-    for sy in screen.y..screen.y + screen.height {
-        app.hit_registry.register_row(
-            screen.x,
-            sy,
-            screen.width,
-            ClickAction::TreeContextMenuClose,
-        );
+    for screen_y in screen.y..screen.y + screen.height {
+        app.hit_registry
+            .register_row(screen.x, screen_y, screen.width, close_action.clone());
     }
 
-    // Clear under the popup so the menu's rows don't show stale
-    // characters from the tree / preview panels.
     f.render_widget(Clear, area);
-
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
@@ -74,17 +90,11 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Render each item row with hover/selected highlight.
-    let clipboard_empty = app.engine.file_clipboard_empty();
-    let items = app.engine.tree_context_menu_items();
-    let selected = app.engine.tree_context_menu_selected();
-    for (i, item) in items.iter().enumerate() {
+    for (i, row) in rows.iter().enumerate() {
         let y = inner.y + i as u16;
         if y >= inner.y + inner.height {
             break;
         }
-        let label = crate::i18n::tree_context_menu_label(item);
-        let enabled = item.is_enabled(clipboard_empty);
         let is_hovered = app.hover_row == Some(y)
             && app
                 .hover_col
@@ -96,16 +106,16 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
         } else {
             th.chrome_bg
         };
-        let fg = if enabled {
+        let fg = if row.enabled {
             th.fg_primary
         } else {
             th.fg_secondary
         };
         let mut fg_style = Style::default().fg(fg).bg(bg);
-        if !enabled {
+        if !row.enabled {
             fg_style = fg_style.add_modifier(Modifier::DIM);
         }
-        let padded_label = format!("  {}  ", label);
+        let padded_label = format!("  {}  ", row.label);
         let used = unicode_width::UnicodeWidthStr::width(padded_label.as_str());
         let mut s = padded_label;
         if (inner.width as usize) > used {
@@ -123,14 +133,111 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
             Rect::new(inner.x, y, inner.width, 1),
         );
 
-        // Disabled items still register their hit zones — but
-        // dispatch checks `is_enabled` again on click and short-
-        // circuits, so the click is silently swallowed.
-        app.hit_registry.register_row(
-            inner.x,
-            y,
-            inner.width,
-            ClickAction::TreeContextMenuItem(item.clone()),
+        app.hit_registry
+            .register_row(inner.x, y, inner.width, row.action.clone());
+    }
+}
+
+fn context_menu_area(
+    screen: Rect,
+    popup_w: u16,
+    popup_h: u16,
+    placement: ContextMenuPlacement,
+) -> Rect {
+    let anchor = match placement {
+        ContextMenuPlacement::Below(anchor) | ContextMenuPlacement::Adjacent(anchor) => anchor,
+    };
+    let screen_right = screen.x + screen.width;
+    let screen_bottom = screen.y + screen.height;
+    let anchor_x = anchor.0.clamp(screen.x, screen_right.saturating_sub(1));
+    let anchor_y = anchor.1.clamp(screen.y, screen_bottom.saturating_sub(1));
+    let x = match placement {
+        ContextMenuPlacement::Below(_) => {
+            anchor_x.clamp(screen.x, screen_right.saturating_sub(popup_w))
+        }
+        ContextMenuPlacement::Adjacent(_) => {
+            let right = anchor_x.saturating_add(1);
+            if right.saturating_add(popup_w) <= screen_right {
+                right
+            } else if anchor_x >= screen.x.saturating_add(popup_w) {
+                anchor_x - popup_w
+            } else {
+                right.clamp(screen.x, screen_right.saturating_sub(popup_w))
+            }
+        }
+    };
+    let below = anchor_y.saturating_add(1);
+    let y = if below.saturating_add(popup_h) <= screen_bottom {
+        below
+    } else if anchor_y >= screen.y.saturating_add(popup_h) {
+        anchor_y - popup_h
+    } else {
+        below.clamp(screen.y, screen_bottom.saturating_sub(popup_h))
+    };
+    Rect::new(x, y, popup_w, popup_h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_menu_prefers_row_below_anchor() {
+        let area = context_menu_area(
+            Rect::new(0, 0, 80, 24),
+            18,
+            4,
+            ContextMenuPlacement::Below((12, 7)),
         );
+
+        assert_eq!(area, Rect::new(12, 8, 18, 4));
+    }
+
+    #[test]
+    fn context_menu_flips_above_anchor_near_bottom() {
+        let area = context_menu_area(
+            Rect::new(0, 0, 80, 24),
+            18,
+            4,
+            ContextMenuPlacement::Adjacent((12, 22)),
+        );
+
+        assert_eq!(area, Rect::new(13, 18, 18, 4));
+    }
+
+    #[test]
+    fn context_menu_clamps_to_offset_screen_bounds() {
+        let area = context_menu_area(
+            Rect::new(5, 3, 20, 10),
+            8,
+            4,
+            ContextMenuPlacement::Adjacent((30, 12)),
+        );
+
+        assert_eq!(area, Rect::new(16, 8, 8, 4));
+    }
+
+    #[test]
+    fn context_menu_flips_left_of_anchor_near_right_edge() {
+        let area = context_menu_area(
+            Rect::new(0, 0, 80, 24),
+            18,
+            4,
+            ContextMenuPlacement::Adjacent((78, 7)),
+        );
+
+        assert_eq!(area, Rect::new(60, 8, 18, 4));
+    }
+
+    #[test]
+    fn adjacent_menu_offsets_from_anchor() {
+        let area = context_menu_area(
+            Rect::new(0, 0, 80, 24),
+            18,
+            4,
+            ContextMenuPlacement::Adjacent((12, 7)),
+        );
+
+        assert_eq!(area, Rect::new(13, 8, 18, 4));
     }
 }

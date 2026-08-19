@@ -259,16 +259,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.enter_focused_preview_with_file(file);
         }
         let mut session_swap_target = None;
+        let mut redraw_requested = true;
 
         // Main loop
         loop {
-            app.tick();
-            terminal.draw(|f| ui::render(f, &mut app))?;
+            redraw_requested |= app.tick();
+            if redraw_requested {
+                terminal.draw(|f| ui::render(f, &mut app))?;
+                redraw_requested = false;
+            }
 
-            // Block until at least one event arrives (or 16ms timeout for ~60fps)
+            // Wake frequently enough to merge worker results promptly. Idle
+            // wakeups do not redraw unless tick() reports changed state.
             if !event::poll(Duration::from_millis(16))? {
                 continue;
             }
+            redraw_requested = true;
 
             // Snapshot selection before processing events
             let sel_before = app.engine.selected_file_identity();

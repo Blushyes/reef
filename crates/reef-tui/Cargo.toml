@@ -27,6 +27,7 @@ ratatui-image = { version = "10.0.6", default-features = false, features = ["cro
 reef-sqlite-preview = { path = "../reef-sqlite-preview" }
 
 [dev-dependencies]
+crossbeam-channel = "0.5"
 insta        = { version = "1", features = ["filters"] }
 criterion    = { version = "0.5", features = ["html_reports"] }
 test-support = { path = "../test-support" }

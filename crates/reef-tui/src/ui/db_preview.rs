@@ -284,6 +284,8 @@ pub(in crate::ui) fn render(
                             table_count: row_bearing_total,
                             page_index,
                             rows_per_page,
+                            last_page: state_ref.and_then(|state| state.last_page),
+                            visible_row_count: rows.len() as u64,
                         },
                     );
                 }
@@ -571,6 +573,8 @@ struct FooterContext<'a> {
     table_count: usize,
     page_index: u64,
     rows_per_page: u64,
+    last_page: Option<u64>,
+    visible_row_count: u64,
 }
 
 /// Footer with chip-style pagination buttons. Layout:
@@ -595,17 +599,20 @@ fn render_pagination_footer(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    // Row count missing (views, indexes, triggers) → degrade footer to
-    // "page 1 / 1" with no row range, since we can't paginate something
-    // we haven't counted.
-    let row_count = ctx.object.row_count.unwrap_or(0);
-    let total_pages = if ctx.rows_per_page == 0 {
-        1
-    } else {
-        row_count.div_ceil(ctx.rows_per_page).max(1)
-    };
     let current = ctx.page_index + 1;
-    let chips = build_page_chips(current, total_pages);
+    let chips = if let Some(last_page) = ctx.last_page {
+        build_page_chips(current, last_page + 1)
+    } else {
+        vec![
+            PageChip::Prev {
+                enabled: current > 1,
+            },
+            PageChip::Active(current),
+            PageChip::Next {
+                enabled: ctx.visible_row_count == ctx.rows_per_page,
+            },
+        ]
+    };
 
     let mut x = area.x;
     let max_x = area.x + area.width;
@@ -666,22 +673,37 @@ fn render_pagination_footer(
     if x >= max_x {
         return;
     }
-    let row_start = if row_count > 0 {
+    let row_start = if ctx.visible_row_count > 0 {
         ctx.page_index * ctx.rows_per_page + 1
     } else {
         0
     };
-    let row_end = (ctx.page_index * ctx.rows_per_page + ctx.rows_per_page).min(row_count);
-    let suffix = format!(
-        " ·  {} {}-{} / {}  ·  {} ({}/{})",
-        t(Msg::DbRowsLabel),
-        row_start,
-        row_end,
-        row_count,
-        ctx.object.name,
-        ctx.selected_idx + 1,
-        ctx.table_count,
-    );
+    let row_end = if ctx.visible_row_count > 0 {
+        row_start + ctx.visible_row_count - 1
+    } else {
+        0
+    };
+    let suffix = match ctx.object.row_count {
+        Some(row_count) => format!(
+            " ·  {} {}-{} / {}  ·  {} ({}/{})",
+            t(Msg::DbRowsLabel),
+            row_start,
+            row_end,
+            row_count,
+            ctx.object.name,
+            ctx.selected_idx + 1,
+            ctx.table_count,
+        ),
+        None => format!(
+            " ·  {} {}-{}  ·  {} ({}/{})",
+            t(Msg::DbRowsLabel),
+            row_start,
+            row_end,
+            ctx.object.name,
+            ctx.selected_idx + 1,
+            ctx.table_count,
+        ),
+    };
     let suffix_w = UnicodeWidthStr::width(suffix.as_str()) as u16;
     let render_w = suffix_w.min(max_x - x);
     f.render_widget(

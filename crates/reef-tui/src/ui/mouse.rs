@@ -92,6 +92,10 @@ pub enum ClickAction {
     /// left-click that misses a menu row falls through to this and
     /// just closes the menu.
     TreeContextMenuClose,
+    /// Pick from a read-only Preview or Diff text context menu.
+    SelectionContextMenuItem(crate::selection_context_menu::SelectionContextMenuItem),
+    /// Registered screen-wide beneath the text-selection context menu.
+    SelectionContextMenuClose,
     /// Left-click on the Files-tab tree panel that missed every
     /// entry row (i.e. clicked on the empty area below the last
     /// entry). Clears the selection so a subsequent toolbar New
@@ -166,6 +170,8 @@ pub enum ClickAction {
     NavCandidatesClose,
     /// Click a rendered Markdown link in the file preview.
     OpenMarkdownLink(String),
+    SetStructuredPreviewMode(reef_app::StructuredPreviewMode),
+    ToggleStructuredPreviewNode(String),
 }
 
 #[derive(Debug, Clone)]

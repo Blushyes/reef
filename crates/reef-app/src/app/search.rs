@@ -328,10 +328,7 @@ impl AppState {
         };
     }
 
-    pub fn close_find_widget(&mut self, dark: bool) {
-        if let Some(snap) = self.find_widget.snapshot.clone() {
-            self.restore_search_snapshot(&snap, dark);
-        }
+    pub fn close_find_widget(&mut self) {
         self.find_widget.clear();
     }
 

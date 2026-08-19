@@ -101,6 +101,8 @@ pub enum Msg {
     YEscHint,
     ViewModeTree,
     ViewModeList,
+    StructuredModeTree,
+    StructuredModeRaw,
     StagedChanges,
     Changes,
     StageAll,
@@ -329,6 +331,8 @@ fn t_zh(m: Msg) -> &'static str {
         YEscHint => "(y / Esc)",
         ViewModeTree => "视图: 树形",
         ViewModeList => "视图: 列表",
+        StructuredModeTree => "树形",
+        StructuredModeRaw => "原始",
         StagedChanges => "暂存的更改",
         Changes => "更改",
         StageAll => "暂存全部",
@@ -375,7 +379,7 @@ fn t_zh(m: Msg) -> &'static str {
         HelpKeyAnyKey => "任意键",
         HelpKeyMouseHScroll => "Shift+滚轮 / 触控板横划",
         HelpKeyDragDrop => "拖文件进终端",
-        HelpKeyRightClick => "右键文件树行",
+        HelpKeyRightClick => "右键文件树 / 预览文本",
         HelpQuit => "退出",
         HelpSwitchTab => "切换顶部标签页（文件 ↔ Git ↔ 图表）",
         HelpSwitchPanel => "切换焦点面板（侧边栏 ↔ 编辑区）",
@@ -410,7 +414,7 @@ fn t_zh(m: Msg) -> &'static str {
         HelpRenameEntry => "重命名选中项",
         HelpDeleteEntry => "移动到废纸篓（带确认）",
         HelpHardDeleteEntry => "永久删除（不可撤销）",
-        HelpRightClickMenu => "打开文件树右键菜单",
+        HelpRightClickMenu => "打开对应的右键菜单",
         HelpToggleSidebar => "切换侧边栏显示",
         HelpOpenSettings => {
             "打开设置页（部分终端不转发 Ctrl+, ，可在 Settings 内手动通过 Esc 退出）"
@@ -508,6 +512,8 @@ fn t_en(m: Msg) -> &'static str {
         YEscHint => "(y / Esc)",
         ViewModeTree => "View: tree",
         ViewModeList => "View: list",
+        StructuredModeTree => "Tree",
+        StructuredModeRaw => "Raw",
         StagedChanges => "Staged changes",
         Changes => "Changes",
         StageAll => "Stage all",
@@ -554,7 +560,7 @@ fn t_en(m: Msg) -> &'static str {
         HelpKeyAnyKey => "any key",
         HelpKeyMouseHScroll => "Shift+Wheel / trackpad",
         HelpKeyDragDrop => "Drag file into terminal",
-        HelpKeyRightClick => "Right-click a tree row",
+        HelpKeyRightClick => "Right-click tree / preview text",
         HelpQuit => "Quit",
         HelpSwitchTab => "Cycle top tabs (Files ↔ Git ↔ Graph)",
         HelpSwitchPanel => "Switch focused panel (sidebar ↔ editor)",
@@ -591,7 +597,7 @@ fn t_en(m: Msg) -> &'static str {
         HelpRenameEntry => "Rename the selected entry",
         HelpDeleteEntry => "Move to Trash (with confirm)",
         HelpHardDeleteEntry => "Delete permanently (cannot be undone)",
-        HelpRightClickMenu => "Open file-tree context menu",
+        HelpRightClickMenu => "Open the corresponding context menu",
         HelpToggleSidebar => "Toggle sidebar",
         HelpOpenSettings => "Open settings page (some terminals don't forward Ctrl+,)",
         HelpEscBackOut => "Exit focus / clear search",
@@ -1144,6 +1150,18 @@ pub fn tree_context_menu_label(item: &reef_app::ContextMenuItem) -> &'static str
         (Lang::En, I::CopyRelativePath) => "Copy Relative Path",
         (Lang::Zh, I::RevealInFinder) => "在 Finder 中显示",
         (Lang::En, I::RevealInFinder) => "Reveal in Finder",
+    }
+}
+
+pub fn selection_context_menu_label(
+    item: crate::selection_context_menu::SelectionContextMenuItem,
+) -> &'static str {
+    use crate::selection_context_menu::SelectionContextMenuItem as Item;
+    match (lang(), item) {
+        (Lang::Zh, Item::Copy) => "复制",
+        (Lang::En, Item::Copy) => "Copy",
+        (Lang::Zh, Item::SelectAll) => "全选",
+        (Lang::En, Item::SelectAll) => "Select All",
     }
 }
 

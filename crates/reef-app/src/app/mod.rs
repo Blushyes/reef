@@ -6,8 +6,8 @@ use reef_io::Backend;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 mod db;
@@ -42,8 +42,8 @@ use crate::features::{
     tree_edit::TreeEditState,
 };
 use crate::tasks::{
-    DbPageRequest, GitMutation, GitMutationPayload, GitRevertPath, GraphPayload, PasteItem,
-    PastePlanError, PastePlanPayload, TaskCoordinator, TreeEditMutation, TreeEditPlan,
+    DbCellRequest, DbPageRequest, GitMutation, GitMutationPayload, GitRevertPath, GraphPayload,
+    PasteItem, PastePlanError, PastePlanPayload, TaskCoordinator, TreeEditMutation, TreeEditPlan,
     TreeEditPlanError, WorkerResult,
 };
 use crate::{
@@ -69,6 +69,29 @@ pub enum AppPanel {
 pub enum DiffMode {
     Compact,
     FullFile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StructuredPreviewMode {
+    #[default]
+    Tree,
+    Raw,
+}
+
+impl StructuredPreviewMode {
+    pub fn pref_str(self) -> &'static str {
+        match self {
+            Self::Tree => "tree",
+            Self::Raw => "raw",
+        }
+    }
+
+    pub fn from_pref_str(value: &str) -> Self {
+        match value {
+            "raw" => Self::Raw,
+            _ => Self::Tree,
+        }
+    }
 }
 
 impl DiffMode {
@@ -98,6 +121,8 @@ pub enum DiscardTarget {
 pub struct GitStatusState {
     pub tree_mode: bool,
     pub collapsed_dirs: HashSet<String>,
+    pub(crate) staged_tree_rows: Vec<reef_core::git::tree::TreeRow>,
+    pub(crate) unstaged_tree_rows: Vec<reef_core::git::tree::TreeRow>,
     pub confirm_discard: Option<DiscardTarget>,
     pub confirm_push: bool,
     pub confirm_force_push: bool,
@@ -378,7 +403,7 @@ fn sbs_cursor_on_left(panel_start: u16, panel_w: u16, column: u16) -> bool {
 pub const GLOBAL_SEARCH_MAX_RESULTS: usize = 1000;
 pub const GLOBAL_SEARCH_MAX_LINE_CHARS: usize = 250;
 pub const GLOBAL_SEARCH_MAX_H_SCROLL: usize = GLOBAL_SEARCH_MAX_LINE_CHARS;
-pub const GLOBAL_SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
+pub const GLOBAL_SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
 pub const GLOBAL_SEARCH_PREVIEW_SYNC_DEBOUNCE: std::time::Duration =
     std::time::Duration::from_millis(100);
 pub const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(80);
@@ -398,7 +423,27 @@ pub struct MatchHit {
     pub display: String,
     pub line: usize,
     pub line_text: String,
+    pub line_revision: u64,
     pub byte_range: Range<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingPreviewEnrichment {
+    generation: u64,
+    path: String,
+}
+
+#[derive(Debug, Clone)]
+struct StructuredPreviewState {
+    path: String,
+    document: Arc<reef_core::structured_data::StructuredDataDocument>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingGlobalSearchAccept {
+    hit: MatchHit,
+    origin: Option<LocationSnapshot>,
+    generation: Option<u64>,
 }
 
 pub struct AppState {
@@ -429,6 +474,13 @@ pub struct AppState {
 
     pub file_tree: FileTree,
     pub preview_content: Option<Arc<PreviewContent>>,
+    pub preview_content_revision: u64,
+    pub preview_source_revision: u64,
+    pub preview_snapshot: Option<Arc<crate::PreviewDocumentSnapshot>>,
+    pub preview_enrichment_dark: bool,
+    preview_enrichment_pending: Option<PendingPreviewEnrichment>,
+    structured_preview: Option<StructuredPreviewState>,
+    pub structured_preview_mode: StructuredPreviewMode,
     pub preview_schedule: Option<(PathBuf, Instant)>,
     pub prefetch_schedule: Option<Instant>,
     pub preview_in_flight_path: Option<PathBuf>,
@@ -449,7 +501,7 @@ pub struct AppState {
     pub commit_detail: CommitDetailState,
     pub toasts: Vec<Toast>,
 
-    pub fs_watcher_rx: Option<mpsc::Receiver<()>>,
+    pub fs_watcher_rx: Option<crossbeam_channel::Receiver<reef_io::FsChange>>,
 
     pub show_help: bool,
     pub pending_edit: Option<PathBuf>,
@@ -457,6 +509,7 @@ pub struct AppState {
 
     pub quick_open: QuickOpenState,
     pub global_search: GlobalSearchState,
+    pending_global_search_accept: Option<PendingGlobalSearchAccept>,
     pub search: SearchState,
     pub find_widget: FindWidgetState,
     pub hosts_picker: HostsPickerState,
@@ -487,10 +540,17 @@ pub struct AppState {
 
     pub tasks: TaskCoordinator,
     pub file_tree_load: AsyncState,
+    file_tree_revision: u64,
+    next_file_tree_subtree_request_id: u64,
+    file_tree_subtree_requests: HashMap<PathBuf, u64>,
     pub preview_load: AsyncState,
     pub db_page_load: AsyncState,
     pub db_detail_load: AsyncState,
+    pub db_cell_load: AsyncState,
+    pub db_cell_cancellation: Option<reef_io::CancellationToken>,
     pub git_status_load: AsyncState,
+    pub git_status_stats_load: AsyncState,
+    pub(crate) git_status_rows_revision: u64,
     pub git_mutation_load: AsyncState,
     pub commit_load: AsyncState,
     pub push_load: AsyncState,
@@ -500,11 +560,11 @@ pub struct AppState {
     pub commit_file_diff_load: AsyncState,
     pub global_search_load: AsyncState,
     pub quick_open_load: AsyncState,
+    pub quick_open_filter_load: AsyncState,
     pub file_copy_load: AsyncState,
     pub fs_mutation_load: AsyncState,
     pub fs_mutation_select_on_done: Option<PathBuf>,
     pub replace_load: AsyncState,
-    pub next_git_revalidate_at: Instant,
     pub next_graph_revalidate_at: Instant,
 }
 
@@ -517,6 +577,7 @@ pub struct AppPrefs {
     pub commit_diff_layout: DiffLayout,
     pub commit_diff_mode: DiffMode,
     pub commit_files_tree_mode: bool,
+    pub structured_preview_mode: StructuredPreviewMode,
     pub quick_open: QuickOpenState,
 }
 
@@ -531,6 +592,7 @@ impl Default for AppPrefs {
             commit_diff_layout: DiffLayout::Unified,
             commit_diff_mode: DiffMode::Compact,
             commit_files_tree_mode: false,
+            structured_preview_mode: StructuredPreviewMode::Tree,
             quick_open: QuickOpenState::default(),
         }
     }
@@ -597,7 +659,6 @@ pub struct PreviewMergeOutcome {
     pub accepted: bool,
     pub same_file: bool,
     pub clear_preview_selection: bool,
-    pub resolve_pending_highlight: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -647,6 +708,13 @@ impl AppState {
             sbs_right_h_scroll: 0,
             file_tree,
             preview_content: None,
+            preview_content_revision: 0,
+            preview_source_revision: 0,
+            preview_snapshot: None,
+            preview_enrichment_dark: false,
+            preview_enrichment_pending: None,
+            structured_preview: None,
+            structured_preview_mode: prefs.structured_preview_mode,
             preview_schedule: None,
             prefetch_schedule: None,
             preview_in_flight_path: None,
@@ -682,6 +750,7 @@ impl AppState {
             settings: SettingsState::default(),
             quick_open: prefs.quick_open,
             global_search: GlobalSearchState::default(),
+            pending_global_search_accept: None,
             search: SearchState::default(),
             find_widget: FindWidgetState::default(),
             hosts_picker: HostsPickerState::default(),
@@ -709,10 +778,17 @@ impl AppState {
             pending_confirm: None,
             tasks: TaskCoordinator::new(),
             file_tree_load: AsyncState::default(),
+            file_tree_revision: 0,
+            next_file_tree_subtree_request_id: 0,
+            file_tree_subtree_requests: HashMap::new(),
             preview_load: AsyncState::default(),
             db_page_load: AsyncState::default(),
             db_detail_load: AsyncState::default(),
+            db_cell_load: AsyncState::default(),
+            db_cell_cancellation: None,
             git_status_load: AsyncState::default(),
+            git_status_stats_load: AsyncState::default(),
+            git_status_rows_revision: 0,
             git_mutation_load: AsyncState::default(),
             commit_load: AsyncState::default(),
             push_load: AsyncState::default(),
@@ -722,11 +798,11 @@ impl AppState {
             commit_file_diff_load: AsyncState::default(),
             global_search_load: AsyncState::default(),
             quick_open_load: AsyncState::default(),
+            quick_open_filter_load: AsyncState::default(),
             file_copy_load: AsyncState::default(),
             fs_mutation_load: AsyncState::default(),
             fs_mutation_select_on_done: None,
             replace_load: AsyncState::default(),
-            next_git_revalidate_at: now + Duration::from_millis(800),
             next_graph_revalidate_at: now + Duration::from_millis(1200),
         }
     }
@@ -766,17 +842,21 @@ fn folder_contains(folder_path: &str, file_path: &str) -> bool {
 fn navigable_git_files(
     staged_files: &[FileEntry],
     unstaged_files: &[FileEntry],
+    staged_tree_rows: &[reef_core::git::tree::TreeRow],
+    unstaged_tree_rows: &[reef_core::git::tree::TreeRow],
     staged_collapsed: bool,
     unstaged_collapsed: bool,
     tree_mode: bool,
-    collapsed_dirs: &HashSet<String>,
 ) -> Vec<(String, bool)> {
     let mut items = Vec::new();
     if !staged_files.is_empty() && !staged_collapsed {
         if tree_mode {
-            for path in reef_core::git::tree::visible_file_paths(staged_files, true, collapsed_dirs)
-            {
-                items.push((path, true));
+            for row in staged_tree_rows {
+                if let reef_core::git::tree::TreeRow::File { source_index, .. } = row
+                    && let Some(file) = staged_files.get(*source_index)
+                {
+                    items.push((file.path.clone(), true));
+                }
             }
         } else {
             for file in staged_files {
@@ -786,10 +866,12 @@ fn navigable_git_files(
     }
     if !unstaged_collapsed {
         if tree_mode {
-            for path in
-                reef_core::git::tree::visible_file_paths(unstaged_files, false, collapsed_dirs)
-            {
-                items.push((path, false));
+            for row in unstaged_tree_rows {
+                if let reef_core::git::tree::TreeRow::File { source_index, .. } = row
+                    && let Some(file) = unstaged_files.get(*source_index)
+                {
+                    items.push((file.path.clone(), false));
+                }
             }
         } else {
             for file in unstaged_files {
@@ -846,6 +928,18 @@ mod tests {
             status: FileStatus::Modified,
             additions: 0,
             deletions: 0,
+        }
+    }
+
+    fn tree_entry(path: &str, depth: usize, is_dir: bool) -> crate::TreeEntry {
+        crate::TreeEntry {
+            path: PathBuf::from(path),
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            depth,
+            is_dir,
+            has_children: is_dir,
+            is_expanded: false,
+            git_status: None,
         }
     }
 
@@ -939,9 +1033,10 @@ mod tests {
             git_entry("src/a.rs"),
             git_entry("assets/logo.png"),
         ];
+        let rows = reef_core::git::tree::visible_rows(&unstaged, false, &HashSet::new());
 
         assert_eq!(
-            navigable_git_files(&[], &unstaged, false, false, true, &HashSet::new()),
+            navigable_git_files(&[], &unstaged, &[], &rows, false, false, true),
             vec![
                 ("assets/logo.png".to_string(), false),
                 ("src/a.rs".to_string(), false),
@@ -961,14 +1056,457 @@ mod tests {
             git_entry("z.txt"),
         ];
         let collapsed = HashSet::from([reef_core::git::tree::collapsed_key(false, "src")]);
+        let rows = reef_core::git::tree::visible_rows(&unstaged, false, &collapsed);
 
         assert_eq!(
-            navigable_git_files(&[], &unstaged, false, false, true, &collapsed),
+            navigable_git_files(&[], &unstaged, &[], &rows, false, false, true),
             vec![
                 ("README.md".to_string(), false),
                 ("z.txt".to_string(), false)
             ]
         );
+    }
+
+    #[test]
+    fn list_mode_does_not_request_git_tree_rebuilds() {
+        let app = minimal_app_state();
+
+        assert!(!app.git_status_tree_needs_rebuild(&[git_entry("src/a.rs")], &[]));
+    }
+
+    #[test]
+    fn unchanged_git_paths_keep_cached_tree_rows() {
+        let app = AppState {
+            staged_files: vec![git_entry("src/a.rs")],
+            git_status: GitStatusState {
+                tree_mode: true,
+                ..GitStatusState::default()
+            },
+            ..minimal_app_state()
+        };
+        let mut updated = git_entry("src/a.rs");
+        updated.status = FileStatus::Added;
+        updated.additions = 42;
+
+        assert!(!app.git_status_tree_needs_rebuild(&[updated], &[]));
+    }
+
+    #[test]
+    fn status_metadata_refresh_retains_visible_counts_until_stats_arrive() {
+        let mut previous = git_entry("src/a.rs");
+        previous.additions = 7;
+        previous.deletions = 3;
+        let mut next = vec![git_entry("src/a.rs"), git_entry("src/b.rs")];
+
+        AppState::retain_cached_git_status_stats(&mut next, &[previous]);
+
+        assert_eq!((next[0].additions, next[0].deletions), (7, 3));
+        assert_eq!((next[1].additions, next[1].deletions), (0, 0));
+    }
+
+    #[test]
+    fn completed_status_stats_replace_cached_counts() {
+        let mut staged = git_entry("src/a.rs");
+        staged.additions = 7;
+        staged.deletions = 3;
+        let mut app = AppState {
+            staged_files: vec![staged],
+            unstaged_files: vec![git_entry("src/b.rs")],
+            ..minimal_app_state()
+        };
+        let initial_revision = app.git_status_rows_revision;
+
+        let stats = reef_core::git::GitStatusStats {
+            staged: HashMap::from([("src/a.rs".to_string(), (2, 1))]),
+            unstaged: HashMap::new(),
+        };
+        app.apply_git_status_stats(stats.clone());
+
+        assert_eq!(
+            (app.staged_files[0].additions, app.staged_files[0].deletions),
+            (2, 1)
+        );
+        assert_eq!(
+            (
+                app.unstaged_files[0].additions,
+                app.unstaged_files[0].deletions
+            ),
+            (0, 0)
+        );
+        assert!(app.git_status_rows_revision > initial_revision);
+
+        let updated_revision = app.git_status_rows_revision;
+        app.apply_git_status_stats(stats);
+        assert_eq!(app.git_status_rows_revision, updated_revision);
+    }
+
+    #[test]
+    fn completed_status_metadata_defers_stats_when_git_tab_is_inactive() {
+        let mut app = minimal_app_state();
+        app.active_tab = AppTab::Files;
+        let generation = app.git_status_load.begin();
+
+        app.apply_worker_result_core(
+            WorkerResult::GitStatus {
+                generation,
+                result: Ok(crate::tasks::GitStatusPayload {
+                    staged: Vec::new(),
+                    unstaged: vec![git_entry("src/a.rs")],
+                    ahead_behind: None,
+                    branch_name: "main".to_string(),
+                }),
+            },
+            Instant::now(),
+        );
+
+        assert!(!app.git_status_stats_load.loading);
+        assert!(app.git_status_stats_load.stale);
+    }
+
+    #[test]
+    fn failed_status_stats_wait_for_a_new_invalidation_before_retrying() {
+        let mut app = minimal_app_state();
+        app.active_tab = AppTab::Git;
+        let generation = app.git_status_stats_load.begin();
+
+        app.apply_worker_result_core(
+            WorkerResult::GitStatusStats {
+                generation,
+                result: Err("stats failed".to_string()),
+            },
+            Instant::now(),
+        );
+
+        assert!(!app.has_step_work_due(Instant::now()));
+
+        app.git_status_stats_load.invalidate();
+        app.git_status_stats_load.mark_stale();
+
+        assert!(app.has_step_work_due(Instant::now()));
+    }
+
+    #[test]
+    fn stale_git_mutation_success_does_not_change_current_selection() {
+        let mut app = AppState {
+            selected_file: Some(SelectedFile {
+                path: "src/a.rs".to_string(),
+                is_staged: false,
+            }),
+            ..minimal_app_state()
+        };
+        let generation = app.git_mutation_load.begin();
+        app.git_mutation_load.invalidate();
+
+        let events = app.apply_worker_result_core(
+            WorkerResult::GitMutation {
+                generation,
+                result: Ok(GitMutationPayload {
+                    mutation: GitMutation::Stage(vec!["src/a.rs".to_string()]),
+                    touched: vec!["src/a.rs".to_string()],
+                    errors: Vec::new(),
+                }),
+            },
+            Instant::now(),
+        );
+
+        assert!(
+            events.is_empty()
+                && !app.git_status_load.loading
+                && app
+                    .selected_file
+                    .as_ref()
+                    .is_some_and(|selected| !selected.is_staged)
+        );
+    }
+
+    #[test]
+    fn stale_git_mutation_error_does_not_emit_side_effects() {
+        let mut app = minimal_app_state();
+        let generation = app.git_mutation_load.begin();
+        app.git_mutation_load.invalidate();
+
+        let events = app.apply_worker_result_core(
+            WorkerResult::GitMutation {
+                generation,
+                result: Err("stale failure".to_string()),
+            },
+            Instant::now(),
+        );
+
+        assert!(events.is_empty() && app.toasts.is_empty() && !app.git_status_load.loading);
+    }
+
+    #[test]
+    fn changed_git_paths_request_tree_rebuild() {
+        let app = AppState {
+            staged_files: vec![git_entry("src/a.rs")],
+            git_status: GitStatusState {
+                tree_mode: true,
+                ..GitStatusState::default()
+            },
+            ..minimal_app_state()
+        };
+
+        assert!(app.git_status_tree_needs_rebuild(&[git_entry("src/b.rs")], &[]));
+    }
+
+    #[test]
+    fn entering_git_tree_mode_builds_cached_rows() {
+        let mut app = AppState {
+            staged_files: vec![git_entry("src/a.rs")],
+            ..minimal_app_state()
+        };
+
+        app.toggle_status_tree_mode();
+
+        assert!(!app.git_status.staged_tree_rows.is_empty());
+    }
+
+    #[test]
+    fn leaving_git_tree_mode_releases_cached_rows() {
+        let mut app = AppState {
+            staged_files: vec![git_entry("src/a.rs")],
+            git_status: GitStatusState {
+                tree_mode: true,
+                ..GitStatusState::default()
+            },
+            ..minimal_app_state()
+        };
+        app.rebuild_git_status_tree_rows();
+
+        app.toggle_status_tree_mode();
+
+        assert!(app.git_status.staged_tree_rows.is_empty());
+    }
+
+    #[test]
+    fn repo_presence_change_cancels_git_confirmations() {
+        let mut app = minimal_app_state();
+        app.git_status.confirm_discard = Some(DiscardTarget::File {
+            is_staged: false,
+            path: "src/a.rs".to_string(),
+        });
+        app.git_status.confirm_push = true;
+        app.git_status.confirm_force_push = true;
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        app.fs_watcher_rx = Some(rx);
+        tx.send(reef_io::FsChange {
+            workspace_changed: false,
+            workspace_paths: Vec::new(),
+            git_metadata_changed: false,
+            repo_presence_changed: true,
+        })
+        .unwrap();
+
+        app.drain_fs_watcher_events();
+
+        assert_eq!(
+            (
+                app.git_status.confirm_discard.as_ref(),
+                app.git_status.confirm_push,
+                app.git_status.confirm_force_push,
+            ),
+            (None, false, false),
+        );
+    }
+
+    #[test]
+    fn git_metadata_change_refreshes_git_without_reloading_workspace_content() {
+        let mut app = minimal_app_state();
+
+        app.apply_fs_change(reef_io::FsChange {
+            workspace_changed: false,
+            workspace_paths: Vec::new(),
+            git_metadata_changed: true,
+            repo_presence_changed: false,
+        });
+
+        assert!(app.git_status_load.stale);
+        assert!(app.graph_load.stale);
+        assert!(!app.file_tree_load.stale);
+        assert!(!app.preview_load.stale);
+        assert!(!app.nav_workspace_load.stale);
+    }
+
+    #[test]
+    fn unrelated_workspace_change_refreshes_tree_without_reloading_preview() {
+        let mut app = minimal_app_state();
+        app.preview_content = Some(Arc::new(global_search_text_preview("script.json")));
+
+        app.apply_fs_change(reef_io::FsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from(".DS_Store")],
+            git_metadata_changed: false,
+            repo_presence_changed: false,
+        });
+
+        assert!(app.file_tree_load.stale);
+        assert!(!app.preview_load.stale);
+    }
+
+    #[test]
+    fn selected_preview_workspace_change_reloads_preview() {
+        let mut app = minimal_app_state();
+        app.preview_content = Some(Arc::new(global_search_text_preview("script.json")));
+
+        app.apply_fs_change(reef_io::FsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from("script.json")],
+            git_metadata_changed: false,
+            repo_presence_changed: false,
+        });
+
+        assert!(app.preview_load.stale);
+    }
+
+    #[test]
+    fn workspace_change_during_quick_open_build_schedules_a_follow_up_generation() {
+        let mut app = minimal_app_state();
+        app.quick_open.core.active = true;
+        let stale_generation = app.quick_open_load.begin();
+
+        app.apply_fs_change(reef_io::FsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from("new.rs")],
+            git_metadata_changed: false,
+            repo_presence_changed: false,
+        });
+        app.apply_worker_result_core(
+            WorkerResult::QuickOpenIndex {
+                generation: stale_generation,
+                result: Ok(reef_core::quick_open::build_candidates([
+                    "old.rs".to_string()
+                ])),
+            },
+            Instant::now(),
+        );
+
+        assert!(app.quick_open_load.loading);
+        assert_ne!(app.quick_open_load.generation, stale_generation);
+    }
+
+    #[test]
+    fn scheduled_preview_target_controls_workspace_invalidation() {
+        let mut app = minimal_app_state();
+        app.preview_content = Some(Arc::new(global_search_text_preview("old.json")));
+        app.preview_schedule = Some((PathBuf::from("next.json"), Instant::now()));
+
+        app.apply_fs_change(reef_io::FsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from("old.json")],
+            git_metadata_changed: false,
+            repo_presence_changed: false,
+        });
+
+        assert!(!app.preview_load.stale);
+
+        app.apply_fs_change(reef_io::FsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from("next.json")],
+            git_metadata_changed: false,
+            repo_presence_changed: false,
+        });
+
+        assert!(app.preview_load.stale);
+    }
+
+    #[test]
+    fn selecting_displayed_preview_again_does_not_schedule_a_reload() {
+        let mut app = minimal_app_state();
+        app.preview_content = Some(Arc::new(global_search_text_preview("script.json")));
+
+        app.load_preview_for_path(PathBuf::from("script.json"));
+
+        assert!(app.preview_schedule.is_none());
+        assert!(app.preview_in_flight_path.is_none());
+    }
+
+    #[test]
+    fn stale_displayed_preview_still_schedules_a_reload() {
+        let mut app = minimal_app_state();
+        app.preview_content = Some(Arc::new(global_search_text_preview("script.json")));
+        app.preview_load.mark_stale();
+
+        app.load_preview_for_path(PathBuf::from("script.json"));
+
+        assert_eq!(
+            app.preview_schedule
+                .as_ref()
+                .map(|(path, _)| path.as_path()),
+            Some(Path::new("script.json"))
+        );
+    }
+
+    #[test]
+    fn selecting_pending_preview_again_preserves_the_original_request() {
+        let mut app = minimal_app_state();
+        let deadline = Instant::now();
+        app.preview_schedule = Some((PathBuf::from("script.json"), deadline));
+
+        app.load_preview_for_path(PathBuf::from("script.json"));
+
+        assert_eq!(
+            app.preview_schedule,
+            Some((PathBuf::from("script.json"), deadline))
+        );
+    }
+
+    #[test]
+    fn reselecting_displayed_preview_cancels_a_pending_other_path() {
+        let mut app = minimal_app_state();
+        app.preview_content = Some(Arc::new(global_search_text_preview("script.json")));
+        app.preview_schedule = Some((PathBuf::from("other.json"), Instant::now()));
+
+        app.load_preview_for_path(PathBuf::from("script.json"));
+
+        assert!(app.preview_schedule.is_none());
+        assert!(app.preview_is_for(Path::new("script.json")));
+    }
+
+    #[test]
+    fn in_flight_preview_target_controls_workspace_invalidation() {
+        let mut app = minimal_app_state();
+        app.preview_content = Some(Arc::new(global_search_text_preview("old.json")));
+        app.preview_in_flight_path = Some(PathBuf::from("next.json"));
+
+        app.apply_fs_change(reef_io::FsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from("next.json")],
+            git_metadata_changed: false,
+            repo_presence_changed: false,
+        });
+
+        assert!(app.preview_load.stale);
+    }
+
+    #[test]
+    fn selected_preview_parent_directory_change_reloads_preview() {
+        let mut app = minimal_app_state();
+        app.preview_content = Some(Arc::new(global_search_text_preview("docs/guide/index.md")));
+
+        app.apply_fs_change(reef_io::FsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from("docs/guide")],
+            git_metadata_changed: false,
+            repo_presence_changed: false,
+        });
+
+        assert!(app.preview_load.stale);
+    }
+
+    #[test]
+    fn git_metadata_change_requests_status_refresh_on_git_tab() {
+        let mut app = minimal_app_state();
+        app.active_tab = AppTab::Git;
+
+        app.apply_fs_change(reef_io::FsChange {
+            workspace_changed: false,
+            workspace_paths: Vec::new(),
+            git_metadata_changed: true,
+            repo_presence_changed: false,
+        });
+
+        assert!(app.has_step_work_due(Instant::now()));
     }
 
     #[test]
@@ -996,6 +1534,7 @@ mod tests {
             },
             ..minimal_app_state()
         };
+        app.rebuild_git_status_tree_rows();
 
         app.navigate_files(2);
 
@@ -1009,6 +1548,203 @@ mod tests {
         assert_eq!(app.diff_h_scroll, 0);
         assert_eq!(app.sbs_left_h_scroll, 0);
         assert_eq!(app.sbs_right_h_scroll, 0);
+    }
+
+    #[test]
+    fn collapse_during_tree_load_rejects_pre_collapse_payload() {
+        use crate::FileTreeState;
+        use crate::tasks::FileTreePayload;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let backend = Arc::new(reef_io::LocalBackend::open_at(tmp.path().to_path_buf()));
+        let mut app = AppState::new(AppStateConfig {
+            backend,
+            prefs: AppPrefs::default(),
+            now: Instant::now(),
+            subscribe_fs_events: false,
+        });
+        let mut parent = tree_entry("src", 0, true);
+        parent.is_expanded = true;
+        app.file_tree.state =
+            FileTreeState::with_entries(vec![parent.clone(), tree_entry("src/a.rs", 1, false)]);
+        app.file_tree.toggle_expand(0);
+        let stale_generation = app.file_tree_load.begin();
+        let stale_tree_revision = app.file_tree_revision;
+
+        app.toggle_file_tree_expand_and_refresh(0);
+        app.apply_worker_result_core(
+            WorkerResult::FileTree {
+                generation: stale_generation,
+                tree_revision: stale_tree_revision,
+                result: Ok(FileTreePayload {
+                    entries: vec![parent, tree_entry("src/a.rs", 1, false)],
+                    selected_idx: 0,
+                }),
+            },
+            Instant::now(),
+        );
+
+        assert_eq!(stale_generation, app.file_tree_load.generation);
+        assert!(!app.file_tree_load.loading);
+        assert!(app.file_tree_load.stale);
+        assert_eq!(
+            app.file_tree
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_path())
+                .collect::<Vec<_>>(),
+            vec![Path::new("src")]
+        );
+        assert!(!app.file_tree.entries[0].is_expanded);
+    }
+
+    #[test]
+    fn collapse_all_during_tree_load_invalidates_the_pending_tree_shape() {
+        use crate::FileTreeState;
+
+        let mut app = minimal_app_state();
+        app.file_tree.state = FileTreeState::with_entries(vec![
+            tree_entry("src", 0, true),
+            tree_entry("src/a.rs", 1, false),
+        ]);
+        app.file_tree.toggle_expand(0);
+        let tree_revision = app.file_tree_revision;
+        let generation = app.file_tree_load.begin();
+
+        app.collapse_all_file_tree_entries();
+
+        assert!(app.file_tree_load.loading);
+        assert_eq!(app.file_tree_load.generation, generation);
+        assert_ne!(app.file_tree_revision, tree_revision);
+        assert_eq!(
+            app.file_tree
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_path())
+                .collect::<Vec<_>>(),
+            vec![Path::new("src")],
+        );
+    }
+
+    #[test]
+    fn subtree_result_uses_current_git_status_decorations() {
+        use crate::FileTreeState;
+        use crate::tasks::FileTreeSubtreePayload;
+
+        let mut app = minimal_app_state();
+        app.file_tree.state = FileTreeState::with_entries(vec![tree_entry("src", 0, true)]);
+        app.file_tree.toggle_expand(0);
+        app.unstaged_files = vec![FileEntry {
+            path: "src/a.rs".to_string(),
+            status: FileStatus::Added,
+            additions: 1,
+            deletions: 0,
+        }];
+        app.file_tree.refresh_git_statuses(&[], &app.unstaged_files);
+        let request_id = 1;
+        app.file_tree_subtree_requests
+            .insert(PathBuf::from("src"), request_id);
+        let mut stale_child = tree_entry("src/a.rs", 1, false);
+        stale_child.git_status = Some('M');
+
+        app.apply_worker_result_core(
+            WorkerResult::FileTreeSubtree {
+                request_id,
+                parent_path: PathBuf::from("src"),
+                result: Ok(FileTreeSubtreePayload {
+                    parent_path: PathBuf::from("src"),
+                    entries: vec![stale_child],
+                }),
+            },
+            Instant::now(),
+        );
+
+        assert_eq!(app.file_tree.entries[1].git_status, Some('A'));
+    }
+
+    #[test]
+    fn sibling_subtree_results_apply_independently_out_of_order() {
+        use crate::FileTreeState;
+        use crate::tasks::FileTreeSubtreePayload;
+
+        let mut app = minimal_app_state();
+        app.file_tree.state = FileTreeState::with_entries(vec![
+            tree_entry("alpha", 0, true),
+            tree_entry("beta", 0, true),
+        ]);
+        app.file_tree.toggle_expand(0);
+        app.file_tree.toggle_expand(1);
+        app.file_tree_subtree_requests
+            .insert(PathBuf::from("alpha"), 1);
+        app.file_tree_subtree_requests
+            .insert(PathBuf::from("beta"), 2);
+
+        app.apply_worker_result_core(
+            WorkerResult::FileTreeSubtree {
+                request_id: 2,
+                parent_path: PathBuf::from("beta"),
+                result: Ok(FileTreeSubtreePayload {
+                    parent_path: PathBuf::from("beta"),
+                    entries: vec![tree_entry("beta/b.rs", 1, false)],
+                }),
+            },
+            Instant::now(),
+        );
+        app.apply_worker_result_core(
+            WorkerResult::FileTreeSubtree {
+                request_id: 1,
+                parent_path: PathBuf::from("alpha"),
+                result: Ok(FileTreeSubtreePayload {
+                    parent_path: PathBuf::from("alpha"),
+                    entries: vec![tree_entry("alpha/a.rs", 1, false)],
+                }),
+            },
+            Instant::now(),
+        );
+
+        assert_eq!(
+            app.file_tree
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_path())
+                .collect::<Vec<_>>(),
+            vec![
+                Path::new("alpha"),
+                Path::new("alpha/a.rs"),
+                Path::new("beta"),
+                Path::new("beta/b.rs"),
+            ]
+        );
+        assert!(app.file_tree_subtree_requests.is_empty());
+    }
+
+    #[test]
+    fn collapsed_parent_rejects_its_in_flight_subtree_result() {
+        use crate::FileTreeState;
+        use crate::tasks::FileTreeSubtreePayload;
+
+        let mut app = minimal_app_state();
+        app.file_tree.state = FileTreeState::with_entries(vec![tree_entry("src", 0, true)]);
+        app.file_tree.toggle_expand(0);
+        app.file_tree_subtree_requests
+            .insert(PathBuf::from("src"), 7);
+        app.toggle_file_tree_expand_and_refresh(0);
+
+        app.apply_worker_result_core(
+            WorkerResult::FileTreeSubtree {
+                request_id: 7,
+                parent_path: PathBuf::from("src"),
+                result: Ok(FileTreeSubtreePayload {
+                    parent_path: PathBuf::from("src"),
+                    entries: vec![tree_entry("src/a.rs", 1, false)],
+                }),
+            },
+            Instant::now(),
+        );
+
+        assert_eq!(app.file_tree.entries.len(), 1);
+        assert!(!app.file_tree.entries[0].is_expanded);
     }
 
     #[test]
@@ -1030,6 +1766,7 @@ mod tests {
                 commit_diff_layout: DiffLayout::SideBySide,
                 commit_diff_mode: DiffMode::FullFile,
                 commit_files_tree_mode: true,
+                structured_preview_mode: StructuredPreviewMode::Raw,
                 quick_open: crate::QuickOpenState::default(),
             },
             now: Instant::now(),
@@ -1047,6 +1784,7 @@ mod tests {
         assert_eq!(app.commit_detail.diff_layout, DiffLayout::SideBySide);
         assert_eq!(app.commit_detail.diff_mode, DiffMode::FullFile);
         assert!(app.commit_detail.files_tree_mode);
+        assert_eq!(app.structured_preview_mode, StructuredPreviewMode::Raw);
         assert!(app.fs_watcher_rx.is_none());
     }
 
@@ -1085,6 +1823,257 @@ mod tests {
         assert_eq!(app.global_search.core.selected_idx, 2);
         assert_eq!(app.global_search.replace_text, "kept");
         assert_eq!(app.global_search.replace_cursor, 4);
+    }
+
+    #[test]
+    fn set_global_search_query_atomically_updates_renderer_input_state() {
+        let mut app = minimal_app_state();
+        app.global_search.results = vec![dummy_hit("a"), dummy_hit("b")];
+        app.global_search.core.selected_idx = 1;
+        app.global_search.excluded.insert((PathBuf::from("a"), 0));
+        let now = Instant::now();
+
+        app.set_global_search_query("needle".to_string(), now);
+
+        assert_eq!(app.global_search.core.filter, "needle");
+        assert_eq!(app.global_search.core.cursor, "needle".len());
+        assert_eq!(app.global_search.core.selected_idx, 1);
+        assert!(app.global_search.excluded.is_empty());
+        assert_eq!(app.global_search.last_keystroke_at, Some(now));
+    }
+
+    #[test]
+    fn set_global_search_query_does_not_reschedule_unchanged_query() {
+        let mut app = minimal_app_state();
+        app.global_search.core.filter = "needle".to_string();
+        app.global_search.core.cursor = 0;
+        let excluded = (PathBuf::from("a"), 0);
+        app.global_search.excluded.insert(excluded.clone());
+
+        app.set_global_search_query("needle".to_string(), Instant::now());
+
+        assert_eq!(app.global_search.core.cursor, "needle".len());
+        assert_eq!(app.global_search.excluded.len(), 1);
+        assert!(app.global_search.excluded.contains(&excluded));
+        assert!(app.global_search.last_keystroke_at.is_none());
+    }
+
+    #[test]
+    fn editing_global_search_keeps_the_presented_generation_selection() {
+        let mut app = minimal_app_state();
+        app.global_search.results = vec![dummy_hit("a"), dummy_hit("b")];
+        app.global_search.core.selected_idx = 1;
+
+        app.edit_global_search_find_input(crate::TextEditOp::InsertChar('x'), Instant::now());
+
+        assert_eq!(app.global_search.core.selected_idx, 1);
+    }
+
+    #[test]
+    fn starting_a_new_global_search_keeps_the_presented_generation_visible() {
+        let mut app = minimal_app_state();
+        app.global_search.results = vec![dummy_hit("old.rs")];
+        app.global_search.last_searched_query = "old".to_string();
+        app.global_search.core.filter = "new".to_string();
+        app.global_search.results_generation = app.global_search_load.generation;
+        let now = Instant::now();
+        app.global_search.last_keystroke_at = Some(now - GLOBAL_SEARCH_DEBOUNCE);
+
+        app.maybe_kick_global_search(now);
+
+        assert_eq!(app.global_search.results.len(), 1);
+        assert_eq!(app.global_search.results[0].path, PathBuf::from("old.rs"));
+        assert!(app.global_search_load.loading);
+        assert_ne!(
+            app.global_search.results_generation,
+            app.global_search_load.generation
+        );
+    }
+
+    #[test]
+    fn replace_in_files_rejects_results_from_an_older_query() {
+        let mut app = minimal_app_state();
+        app.global_search.replace_open = true;
+        app.global_search.results = vec![dummy_hit("old.rs")];
+        app.global_search.core.filter = "new".to_string();
+        app.global_search.last_searched_query = "old".to_string();
+        app.global_search.results_generation = app.global_search_load.generation;
+
+        app.commit_replace_in_files();
+
+        assert!(!app.replace_load.loading);
+    }
+
+    #[test]
+    fn replace_in_files_waits_for_the_complete_search_generation() {
+        let mut app = minimal_app_state();
+        app.global_search.replace_open = true;
+        app.global_search.results = vec![dummy_hit("partial.rs")];
+        app.global_search.core.filter = "needle".to_string();
+        app.global_search.last_searched_query = "needle".to_string();
+        let generation = app.global_search_load.begin();
+        app.global_search.results_generation = generation;
+
+        app.commit_replace_in_files();
+
+        assert!(!app.replace_load.loading);
+    }
+
+    #[test]
+    fn set_global_search_replacement_updates_text_and_cursor_together() {
+        let mut app = minimal_app_state();
+
+        app.set_global_search_replacement("replacement".to_string());
+
+        assert_eq!(app.global_search.replace_text, "replacement");
+        assert_eq!(app.global_search.replace_cursor, "replacement".len());
+        assert!(app.global_search.last_keystroke_at.is_none());
+    }
+
+    #[test]
+    fn sync_global_search_preview_updates_a_different_match_on_the_same_line() {
+        use reef_core::preview::{PreviewBody, TextPreview};
+
+        let mut app = minimal_app_state();
+        let mut hit = dummy_hit("Cargo.toml");
+        hit.line_text = "needle and needle".to_string();
+        hit.byte_range = 11..17;
+        app.active_tab = AppTab::Search;
+        app.global_search.results = vec![hit];
+        app.preview_content = Some(Arc::new(PreviewContent {
+            path: "Cargo.toml".to_string(),
+            resolved_path: None,
+            local_path: None,
+            bytes_on_disk: 0,
+            mime: Some("text/plain".to_string()),
+            body: PreviewBody::Text(TextPreview {
+                lines: vec!["needle and needle".to_string()],
+                source: None,
+                highlighted: None,
+                parsed: None,
+            }),
+        }));
+        app.set_preview_highlight_persistent(PathBuf::from("Cargo.toml"), 0, 0..6);
+
+        assert!(app.sync_global_search_preview_if_stale(20));
+        assert_eq!(
+            app.preview_highlight
+                .as_ref()
+                .map(|highlight| highlight.byte_range.clone()),
+            Some(11..17)
+        );
+        assert!(app.preview_schedule.is_none());
+        assert!(!app.sync_global_search_preview_if_stale(20));
+    }
+
+    #[test]
+    fn sync_global_search_preview_recenters_reused_content() {
+        let mut app = minimal_app_state();
+        let mut hit = dummy_hit("Cargo.toml");
+        hit.line = 50;
+        hit.byte_range = 4..10;
+        app.active_tab = AppTab::Search;
+        app.global_search.results = vec![hit];
+        app.preview_content = Some(Arc::new(global_search_text_preview("Cargo.toml")));
+
+        assert!(app.sync_global_search_preview_to_selected(10));
+
+        assert_eq!(app.preview_scroll, 45);
+        assert!(app.preview_schedule.is_none());
+    }
+
+    #[test]
+    fn sync_global_search_preview_cancels_scheduled_other_path() {
+        let mut app = minimal_app_state();
+        let mut hit = dummy_hit("Cargo.toml");
+        hit.line = 50;
+        hit.byte_range = 4..10;
+        app.active_tab = AppTab::Search;
+        app.global_search.results = vec![hit.clone()];
+        app.preview_content = Some(Arc::new(global_search_text_preview("Cargo.toml")));
+        app.set_preview_highlight_persistent(hit.path, hit.line, hit.byte_range);
+        app.preview_schedule = Some((PathBuf::from("README.md"), Instant::now()));
+
+        assert!(app.sync_global_search_preview_if_stale(10));
+
+        assert!(app.preview_schedule.is_none());
+        assert_eq!(app.preview_scroll, 45);
+    }
+
+    #[test]
+    fn sync_global_search_preview_invalidates_in_flight_other_path() {
+        let mut app = minimal_app_state();
+        let mut hit = dummy_hit("Cargo.toml");
+        hit.line = 50;
+        hit.byte_range = 4..10;
+        app.active_tab = AppTab::Search;
+        app.global_search.results = vec![hit.clone()];
+        app.preview_content = Some(Arc::new(global_search_text_preview("Cargo.toml")));
+        app.set_preview_highlight_persistent(hit.path, hit.line, hit.byte_range);
+        let stale_generation = app.preview_load.begin();
+        app.preview_in_flight_path = Some(PathBuf::from("README.md"));
+
+        assert!(app.sync_global_search_preview_if_stale(10));
+        assert_ne!(app.preview_load.generation, stale_generation);
+        assert!(app.preview_in_flight_path.is_none());
+
+        let outcome = app.apply_preview_content(
+            stale_generation,
+            Some(global_search_text_preview("README.md")),
+            10,
+        );
+        assert!(!outcome.accepted);
+        assert!(app.preview_is_for(Path::new("Cargo.toml")));
+    }
+
+    #[test]
+    fn sync_global_search_preview_is_inactive_outside_search_tab() {
+        let mut app = minimal_app_state();
+        app.global_search.results = vec![dummy_hit("Cargo.toml")];
+
+        assert!(!app.sync_global_search_preview_if_stale(20));
+        assert!(app.preview_highlight.is_none());
+    }
+
+    #[test]
+    fn closing_find_widget_keeps_current_match_scroll() {
+        let mut app = minimal_app_state();
+        let viewport = crate::SearchViewport {
+            preview_view_h: 10,
+            ..Default::default()
+        };
+        app.begin_find_widget(crate::FindTarget::FilePreview, "needle".to_string());
+        app.recompute_find_widget(
+            (0..40).map(|row| if row == 10 || row == 30 { "needle" } else { "" }),
+            false,
+            viewport,
+        );
+        app.step_find_widget(false, viewport);
+        assert_eq!(app.preview_scroll, 25);
+
+        app.close_find_widget();
+
+        assert_eq!(app.preview_scroll, 25);
+        assert!(!app.find_widget.active);
+        assert!(app.find_widget.matches.is_empty());
+    }
+
+    #[test]
+    fn failed_global_search_accept_does_not_retry_preview() {
+        let mut app = minimal_app_state();
+        let hit = dummy_hit("Cargo.toml");
+        app.active_tab = AppTab::Search;
+        app.global_search.results = vec![hit.clone()];
+        let generation = app.preview_load.begin();
+        app.preview_in_flight_path = Some(hit.path.clone());
+        app.begin_global_search_hit_accept(hit, None);
+
+        assert!(
+            app.reject_global_search_hit_accept(generation, Some("preview failed".to_string()))
+        );
+
+        assert!(!app.preview_load.stale);
+        assert!(!app.has_step_work_due(Instant::now()));
     }
 
     #[test]
@@ -1203,6 +2192,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn idle_git_tab_does_not_schedule_periodic_status_refresh() {
+        let mut app = minimal_app_state();
+        app.active_tab = AppTab::Git;
+
+        assert!(app.next_deadline().is_none());
+    }
+
     fn minimal_app_state() -> AppState {
         use reef_io::LocalBackend;
         use std::path::PathBuf;
@@ -1224,7 +2221,26 @@ mod tests {
             display: name.to_string(),
             line: 0,
             line_text: String::new(),
+            line_revision: reef_io::content_line_revision(b""),
             byte_range: 0..0,
+        }
+    }
+
+    fn global_search_text_preview(path: &str) -> PreviewContent {
+        use reef_core::preview::{PreviewBody, TextPreview};
+
+        PreviewContent {
+            path: path.to_string(),
+            resolved_path: None,
+            local_path: None,
+            bytes_on_disk: 0,
+            mime: Some("text/plain".to_string()),
+            body: PreviewBody::Text(TextPreview {
+                lines: vec!["needle".to_string()],
+                source: None,
+                highlighted: None,
+                parsed: None,
+            }),
         }
     }
 }

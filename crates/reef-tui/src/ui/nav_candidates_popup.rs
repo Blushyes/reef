@@ -1,8 +1,7 @@
 //! Multi-candidate goto-definition popup.
 //!
 //! Shown when `gd` / Ctrl+click resolves a single identifier to more
-//! than one in-file definition (trait method with multiple impl
-//! blocks, shadowed binding, same-name overloads). UX mirrors
+//! than one definition or reference. UX mirrors
 //! `tree_context_menu` — small overlay anchored near the click /
 //! keyboard focus, fixed-order list of rows, Up/Down/Enter/Esc plus
 //! mouse. Same panel-wide fallthrough close zone keeps stray clicks
@@ -15,12 +14,13 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear};
-use unicode_width::UnicodeWidthStr;
+use std::path::Path;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-/// Maximum candidate snippet length we attempt to render before
-/// truncating with `…`. Mirrors the cap in `nav::intrafile::snippet_for`
-/// so rows don't reflow unexpectedly across rebuilds.
-const MAX_ROW_TEXT_W: u16 = 80;
+/// Keep enough source context to identify a declaration or reference while
+/// bounding the overlay on narrow terminals.
+const MAX_ROW_TEXT_W: u16 = 100;
+const MAX_PATH_TEXT_W: u16 = 48;
 
 pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     let Some(popup) = app.engine.nav_candidates() else {
@@ -92,7 +92,7 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
         let Some(cand) = popup.candidates.get(cand_idx) else {
             break;
         };
-        let row_text = format_row(cand);
+        let row = candidate_row(cand, &popup.current_path);
         let y = inner.y + row_in_view as u16;
         if y >= inner.y + inner.height {
             break;
@@ -108,25 +108,33 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
         } else {
             th.chrome_bg
         };
-        let style = Style::default()
-            .fg(th.fg_primary)
+        let location_style = Style::default()
+            .fg(th.accent)
             .bg(bg)
-            .add_modifier(if is_selected {
-                Modifier::BOLD
-            } else {
-                Modifier::empty()
-            });
+            .add_modifier(Modifier::BOLD);
+        let snippet_style =
+            Style::default()
+                .fg(th.fg_primary)
+                .bg(bg)
+                .add_modifier(if is_selected {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                });
 
         // Body width excludes the scrollbar gutter so the bar doesn't
         // overwrite row text.
         let body_w = inner.width.saturating_sub(gutter);
-        let mut s = row_text;
-        let used = UnicodeWidthStr::width(s.as_str());
-        if (body_w as usize) > used {
-            s.push_str(&" ".repeat(body_w as usize - used));
-        }
+        let used = row.display_width();
+        let padding = body_w as usize - used.min(body_w as usize);
         f.render_widget(
-            Line::from(Span::styled(s, style)),
+            Line::from(vec![
+                Span::styled(" ", location_style),
+                Span::styled(row.location, location_style),
+                Span::styled("  ", snippet_style),
+                Span::styled(row.snippet, snippet_style),
+                Span::styled(" ".repeat(padding), snippet_style),
+            ]),
             Rect::new(inner.x, y, body_w, 1),
         );
 
@@ -164,19 +172,47 @@ pub fn render(f: &mut Frame, app: &mut App, screen: Rect) {
     }
 }
 
-/// Format one candidate as ` L<line> <snippet>`, truncated with `…` to
-/// `MAX_ROW_TEXT_W`. Line numbers are 1-based for display so they match
-/// the preview gutter. Built only for the visible window.
-fn format_row(c: &reef_core::nav::Location) -> String {
-    let s = format!(" L{:<5} {}", c.line + 1, c.snippet);
-    if (UnicodeWidthStr::width(s.as_str()) as u16) <= MAX_ROW_TEXT_W {
-        return s;
+struct CandidateRow {
+    location: String,
+    snippet: String,
+}
+
+impl CandidateRow {
+    fn display_width(&self) -> usize {
+        1 + UnicodeWidthStr::width(self.location.as_str())
+            + 2
+            + UnicodeWidthStr::width(self.snippet.as_str())
+    }
+}
+
+/// Formats the same hierarchy used by VS Code's references view in a compact
+/// TUI row: workspace-relative file, one-based line, then source text.
+/// The source text itself exposes `def`, `class`, `fn`, imports, and call sites
+/// without introducing language-specific guesses into the navigation model.
+fn candidate_row(c: &reef_core::nav::Location, current_path: &Path) -> CandidateRow {
+    let path = c.path.as_deref().unwrap_or(current_path);
+    let path = truncate_start(&path.to_string_lossy(), MAX_PATH_TEXT_W);
+    let location = format!("{}:{}", path, c.line + 1);
+    let fixed_width = 1 + UnicodeWidthStr::width(location.as_str()) + 2;
+    let snippet_width = (MAX_ROW_TEXT_W as usize).saturating_sub(fixed_width);
+    CandidateRow {
+        location,
+        snippet: truncate_end(&c.snippet, snippet_width as u16),
+    }
+}
+
+fn truncate_end(text: &str, max_width: u16) -> String {
+    if UnicodeWidthStr::width(text) <= max_width as usize {
+        return text.to_owned();
+    }
+    if max_width == 0 {
+        return String::new();
     }
     let mut truncated = String::new();
     let mut acc = 0u16;
-    for ch in s.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
-        if acc + w + 1 > MAX_ROW_TEXT_W {
+    for ch in text.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+        if acc + w + 1 > max_width {
             break;
         }
         truncated.push(ch);
@@ -186,21 +222,99 @@ fn format_row(c: &reef_core::nav::Location) -> String {
     truncated
 }
 
-pub(crate) fn candidates_max_width(candidates: &[reef_core::nav::Location]) -> u16 {
-    candidates.iter().map(row_display_width).max().unwrap_or(0) as u16
+fn truncate_start(text: &str, max_width: u16) -> String {
+    if UnicodeWidthStr::width(text) <= max_width as usize {
+        return text.to_owned();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+
+    let suffix_width = max_width - 1;
+    let mut acc = 0u16;
+    let mut start = text.len();
+    for (index, ch) in text.char_indices().rev() {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+        if acc + width > suffix_width {
+            break;
+        }
+        acc += width;
+        start = index;
+    }
+    format!("…{}", &text[start..])
 }
 
-/// Display width of `format_row(c)` computed *without* building the
+pub(crate) fn candidates_max_width(
+    candidates: &[reef_core::nav::Location],
+    current_path: &Path,
+) -> u16 {
+    candidates
+        .iter()
+        .map(|candidate| row_display_width(candidate, current_path))
+        .max()
+        .unwrap_or(0) as u16
+}
+
+/// Display width of `candidate_row(c)` computed *without* building the
 /// string — used to size the popup across every candidate while only
-/// the visible rows pay for actual formatting. The `{:<5}` line field
-/// pads to at least 5 columns; the total is capped at `MAX_ROW_TEXT_W`
-/// to match `format_row`'s truncation.
-fn row_display_width(c: &reef_core::nav::Location) -> usize {
-    // Decimal digit count of the 1-based line number; `{:<5}` pads it to
-    // at least 5 columns. `c.line + 1 >= 1`, so `ilog10` never hits its
-    // zero precondition.
-    let line_w = ((c.line + 1).ilog10() as usize + 1).max(5);
-    // " L" + line field + " " + snippet.
-    let w = 2 + line_w + 1 + UnicodeWidthStr::width(c.snippet.as_str());
+/// the visible rows pay for actual formatting. The total is capped at
+/// `MAX_ROW_TEXT_W` to match `candidate_row`'s truncation.
+fn row_display_width(c: &reef_core::nav::Location, current_path: &Path) -> usize {
+    let path = c.path.as_deref().unwrap_or(current_path);
+    let path_w =
+        UnicodeWidthStr::width(path.to_string_lossy().as_ref()).min(MAX_PATH_TEXT_W as usize);
+    let line_w = (c.line + 1).ilog10() as usize + 1;
+    // Leading space + path + ':' separator + line + two spaces + snippet.
+    let w = 1 + path_w + 1 + line_w + 2 + UnicodeWidthStr::width(c.snippet.as_str());
     w.min(MAX_ROW_TEXT_W as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn location(path: Option<&str>) -> reef_core::nav::Location {
+        reef_core::nav::Location {
+            path: path.map(PathBuf::from),
+            line: 111,
+            byte_range: 4..25,
+            snippet: "def extract_source_assets(script):".to_owned(),
+        }
+    }
+
+    #[test]
+    fn candidate_row_shows_cross_file_path_line_and_source() {
+        let row = candidate_row(
+            &location(Some("pipeline/asset_localization/extract.py")),
+            Path::new("pipeline/current.py"),
+        );
+
+        assert_eq!(
+            (row.location.as_str(), row.snippet.as_str()),
+            (
+                "pipeline/asset_localization/extract.py:112",
+                "def extract_source_assets(script):"
+            )
+        );
+    }
+
+    #[test]
+    fn candidate_row_uses_current_path_for_intra_file_location() {
+        let row = candidate_row(&location(None), Path::new("src/navigation.rs"));
+
+        assert_eq!(row.location, "src/navigation.rs:112");
+    }
+
+    #[test]
+    fn candidate_row_preserves_filename_when_path_is_too_wide() {
+        let row = candidate_row(
+            &location(Some(
+                "a/very/long/workspace/path/with/many/components/asset_localization/extract.py",
+            )),
+            Path::new("unused.py"),
+        );
+
+        assert!(row.location.starts_with('…') && row.location.ends_with("extract.py:112"));
+    }
 }

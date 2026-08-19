@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-allowed_mut='^(dispatch|tick|drain_effects|drain_runtime_events)$'
+allowed_mut='^(dispatch|step|drain_effects|drain_runtime_events)$'
 mut_methods="$(
   awk '
     /pub fn [A-Za-z0-9_]+/ {
@@ -36,7 +36,7 @@ mut_methods="$(
 )"
 unexpected_mut="$(printf '%s\n' "$mut_methods" | rg -v "$allowed_mut" || true)"
 if [[ -n "$unexpected_mut" ]]; then
-  printf 'reef-app public mutable API must stay behind dispatch/tick/effects. Unexpected:\n%s\n' "$unexpected_mut" >&2
+  printf 'reef-app public mutable API must stay behind dispatch/step/effects. Unexpected:\n%s\n' "$unexpected_mut" >&2
   exit 1
 fi
 
@@ -52,6 +52,11 @@ fi
 
 if rg -n '^pub mod (app|command|effect|engine|features|location|runtime|snapshot|tab|tasks|text_input);' crates/reef-app/src/lib.rs >&2; then
   printf 'reef-app internal modules must stay private; export renderer-neutral API from crate root.\n' >&2
+  exit 1
+fi
+
+if rg -n '\bAppState(Config)?\b' crates/reef-app/src/lib.rs >&2; then
+  printf 'AppState is internal; hosts must construct and mutate ReefApp through AppConfig/AppCommand.\n' >&2
   exit 1
 fi
 

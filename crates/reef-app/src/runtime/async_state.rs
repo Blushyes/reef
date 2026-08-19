@@ -34,7 +34,6 @@ impl AsyncState {
             return false;
         }
         self.loading = false;
-        self.stale = false;
         self.error = None;
         true
     }
@@ -44,7 +43,6 @@ impl AsyncState {
             return false;
         }
         self.loading = false;
-        self.stale = true;
         self.error = Some(error);
         true
     }
@@ -73,14 +71,48 @@ mod tests {
     }
 
     #[test]
-    fn error_marks_stale_for_retry() {
+    fn error_waits_for_new_invalidation() {
         let mut state = AsyncState::default();
         let generation = state.begin();
 
         assert!(state.complete_err(generation, "boom".to_string()));
         assert!(!state.loading);
-        assert!(state.stale);
+        assert!(!state.stale);
+        assert!(!state.should_request());
+        assert_eq!(state.error.as_deref(), Some("boom"));
+
+        state.mark_stale();
+        assert!(state.should_request());
+    }
+
+    #[test]
+    fn invalidation_during_load_survives_success() {
+        let mut state = AsyncState::default();
+        let generation = state.begin();
+        state.mark_stale();
+
+        assert!(state.complete_ok(generation));
+        assert!(state.should_request());
+        assert_eq!(state.error, None);
+    }
+
+    #[test]
+    fn invalidation_during_load_survives_failure() {
+        let mut state = AsyncState::default();
+        let generation = state.begin();
+        state.mark_stale();
+
+        assert!(state.complete_err(generation, "boom".to_string()));
         assert!(state.should_request());
         assert_eq!(state.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn success_without_new_invalidation_is_fresh() {
+        let mut state = AsyncState::default();
+        let generation = state.begin();
+
+        assert!(state.complete_ok(generation));
+        assert!(!state.should_request());
     }
 }

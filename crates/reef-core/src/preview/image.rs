@@ -80,7 +80,7 @@ pub(crate) fn load_image_preview(
             Ok(bytes) => bytes,
             Err(e) => return card(decode_error(e.to_string())),
         };
-        return metadata_only_from_bytes(&header, rel_str, file_size, card);
+        return metadata_only_from_bytes(&header, rel_str, file_size, mime, card);
     }
 
     let bytes = match std::fs::read(full) {
@@ -142,6 +142,10 @@ pub(crate) fn load_image_preview(
 
     PreviewDocument {
         path: rel_str.to_string(),
+        resolved_path: None,
+        local_path: None,
+        bytes_on_disk: file_size,
+        mime: Some(mime.to_string()),
         body: PreviewBody::Image(ImagePreview::new(
             decoded, width, height, format, file_size, animated,
         )),
@@ -156,6 +160,10 @@ fn binary_card(
 ) -> PreviewDocument {
     PreviewDocument {
         path: rel_str.to_string(),
+        resolved_path: None,
+        local_path: None,
+        bytes_on_disk: file_size,
+        mime: Some(mime.to_string()),
         body: PreviewBody::Binary(BinaryInfo::new(file_size, Some(mime), reason)),
     }
 }
@@ -164,6 +172,7 @@ fn metadata_only_from_bytes<F>(
     bytes: &[u8],
     rel_str: &str,
     file_size: u64,
+    mime: &'static str,
     card: F,
 ) -> PreviewDocument
 where
@@ -194,6 +203,10 @@ where
 
     PreviewDocument {
         path: rel_str.to_string(),
+        resolved_path: None,
+        local_path: None,
+        bytes_on_disk: file_size,
+        mime: Some(mime.to_string()),
         body: PreviewBody::Image(ImagePreview::metadata_only(
             width, height, format, file_size, false,
         )),

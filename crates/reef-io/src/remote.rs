@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader, BufWriter, Write};
+use std::ops::{ControlFlow, Range};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,29 +16,107 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use crossbeam_channel::{Receiver, Sender};
 use reef_proto::{
-    ContentSearchCompletedDto, ContentSearchRequestDto, DirEntryDto, Envelope, MatchHitDto,
-    Notification, ReadFileResponse, Request, Response, TrashResponseDto, WalkOptsDto,
+    ContentSearchCompletedDto, ContentSearchRequestDto, DirEntryDto, Envelope,
+    GitPathMutationKindDto, MAX_FRAME_SIZE, MatchHitDto, Notification, ReadFileResponse,
+    ReplaceFileOutcomeDto, ReplaceLineGuardDto, Request, Response, TrashResponseDto, WalkOptsDto,
     WalkResponseDto, decode_frame, encode_frame,
 };
 
 use super::{
     Backend, BackendError, ContentMatchHit, ContentSearchCompleted, ContentSearchRequest,
-    EditorLaunchSpec, SearchChunkSink, StatusSnapshot, TrashOutcome, WalkOpts, WalkResponse,
+    EditorLaunchSpec, FsChange, ReplaceFileOutcome, ReplaceFileRequest, SearchChunkSink,
+    StatusSnapshot, TrashOutcome, WalkOpts, WalkResponse,
 };
 use crate::TreeEntry;
 use reef_core::diff::DiffContent;
 use reef_core::git::{CommitDetail, CommitInfo, FileEntry, GraphScope, RefLabel};
 use reef_core::preview::PreviewDocument as PreviewContent;
-use std::ops::ControlFlow;
 
 /// Default timeout for a single RPC round-trip. Applied to every `request`
 /// call so a hung agent can't stall the UI indefinitely.
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Max bytes we ever ask the agent to return for `ReadFile`. Matches the
-/// limits applied in `file_tree::load_preview` (512 KB highlight cap + some
-/// headroom for un-highlighted previews).
+/// Large index mutations can span frame-bounded RPCs and legitimately take
+/// longer than an ordinary metadata request on a remote worktree.
+const GIT_MUTATION_RPC_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Clone, Copy)]
+enum GitPathRequestKind {
+    Stage,
+    Unstage,
+}
+
+impl GitPathRequestKind {
+    fn dto(self) -> GitPathMutationKindDto {
+        match self {
+            Self::Stage => GitPathMutationKindDto::Stage,
+            Self::Unstage => GitPathMutationKindDto::Unstage,
+        }
+    }
+}
+
+fn git_path_batch_ranges(
+    paths: &[String],
+    kind: GitPathRequestKind,
+    operation_id: u64,
+    max_frame_size: usize,
+) -> Result<Vec<Range<usize>>, BackendError> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let empty_frame_size = serde_json::to_vec(&Envelope {
+        id: u64::MAX,
+        body: Request::GitPathMutationChunk {
+            operation_id,
+            kind: kind.dto(),
+            paths: Vec::new(),
+            final_chunk: false,
+        },
+    })
+    .map_err(|error| BackendError::Protocol(format!("encode git path request: {error}")))?
+    .len();
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut frame_size = empty_frame_size;
+
+    for (index, path) in paths.iter().enumerate() {
+        let encoded_path_size = serde_json::to_vec(path)
+            .map_err(|error| BackendError::Protocol(format!("encode git path: {error}")))?
+            .len();
+        let separator_size = usize::from(index > start);
+        let next_frame_size = frame_size
+            .checked_add(separator_size)
+            .and_then(|size| size.checked_add(encoded_path_size))
+            .ok_or_else(|| BackendError::Protocol("git path request size overflow".into()))?;
+        if next_frame_size <= max_frame_size {
+            frame_size = next_frame_size;
+            continue;
+        }
+        if index == start {
+            return Err(BackendError::Protocol(format!(
+                "git path at index {index} requires {next_frame_size} bytes, exceeding the \
+                 {max_frame_size}-byte protocol frame limit"
+            )));
+        }
+        ranges.push(start..index);
+        start = index;
+        frame_size = empty_frame_size
+            .checked_add(encoded_path_size)
+            .ok_or_else(|| BackendError::Protocol("git path request size overflow".into()))?;
+        if frame_size > max_frame_size {
+            return Err(BackendError::Protocol(format!(
+                "git path at index {index} requires {frame_size} bytes, exceeding the \
+                 {max_frame_size}-byte protocol frame limit"
+            )));
+        }
+    }
+    ranges.push(start..paths.len());
+    Ok(ranges)
+}
+
+/// Max bytes requested for an ordinary bounded text projection.
 const READ_FILE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 type PendingMap = HashMap<u64, mpsc::Sender<Response>>;
@@ -47,6 +126,53 @@ type PendingMap = HashMap<u64, mpsc::Sender<Response>>;
 /// mutated by `search_content` around the RPC (register before send,
 /// drop after the final response is received or on error).
 type ChunkSinkMap = HashMap<u64, mpsc::Sender<Vec<MatchHitDto>>>;
+type DbCellChunkSinkMap = HashMap<u64, mpsc::Sender<Vec<u8>>>;
+
+/// Repository presence observed from the remote agent.
+///
+/// The low bit stores the current value; the remaining bits form a generation
+/// that advances for every fs notification. Keeping both in one atomic lets
+/// the initial handshake update the value only when no newer notification was
+/// observed while that RPC was in flight.
+#[derive(Default)]
+struct RepoPresence {
+    state: AtomicU64,
+}
+
+impl RepoPresence {
+    const PRESENT_BIT: u64 = 1;
+
+    fn snapshot(&self) -> u64 {
+        self.state.load(Ordering::Acquire)
+    }
+
+    fn is_present(&self) -> bool {
+        self.snapshot() & Self::PRESENT_BIT != 0
+    }
+
+    fn initialize_if_unchanged(&self, snapshot: u64, present: bool) -> bool {
+        let next = (snapshot & !Self::PRESENT_BIT) | present as u64;
+        self.state
+            .compare_exchange(snapshot, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn update_from_notification(&self, present: bool) -> bool {
+        let mut current = self.snapshot();
+        loop {
+            let next = (current.wrapping_add(2) & !Self::PRESENT_BIT) | present as u64;
+            match self.state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return current & Self::PRESENT_BIT != present as u64,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
 
 /// RAII registration in a `request_id → sender` map. Drop removes the
 /// id; the read loop also removes on receipt, so Drop becomes a no-op
@@ -86,13 +212,15 @@ pub struct RemoteBackend {
     workdir: Mutex<PathBuf>,
     workdir_name: Mutex<String>,
     branch_name_cache: Mutex<String>,
+    repo_presence: Arc<RepoPresence>,
     tx: Mutex<BufWriter<ChildStdin>>,
     next_id: AtomicU64,
     pending: Arc<Mutex<PendingMap>>,
     /// See `ChunkSinkMap`. Shared with the read thread.
     search_chunks: Arc<Mutex<ChunkSinkMap>>,
-    fs_rx: Mutex<Option<mpsc::Receiver<()>>>,
-    _fs_tx: mpsc::Sender<()>,
+    db_cell_chunks: Arc<Mutex<DbCellChunkSinkMap>>,
+    fs_rx: Mutex<Option<Receiver<FsChange>>>,
+    _fs_tx: Sender<FsChange>,
     _reader: thread::JoinHandle<()>,
     _stderr_reader: thread::JoinHandle<()>,
     child: Mutex<Child>,
@@ -190,14 +318,27 @@ impl RemoteBackend {
 
         let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
         let search_chunks: Arc<Mutex<ChunkSinkMap>> = Arc::new(Mutex::new(HashMap::new()));
-        let (fs_tx, fs_rx) = mpsc::channel::<()>();
+        let db_cell_chunks: Arc<Mutex<DbCellChunkSinkMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let (fs_tx, fs_rx) = crossbeam_channel::unbounded::<FsChange>();
+        let repo_presence = Arc::new(RepoPresence::default());
 
         let reader_pending = Arc::clone(&pending);
         let reader_chunks = Arc::clone(&search_chunks);
+        let reader_db_cell_chunks = Arc::clone(&db_cell_chunks);
         let reader_fs_tx = fs_tx.clone();
+        let reader_repo_presence = Arc::clone(&repo_presence);
         let reader = thread::Builder::new()
             .name("reef-remote-reader".into())
-            .spawn(move || read_loop(stdout, reader_pending, reader_chunks, reader_fs_tx))
+            .spawn(move || {
+                read_loop(
+                    stdout,
+                    reader_pending,
+                    reader_chunks,
+                    reader_db_cell_chunks,
+                    reader_fs_tx,
+                    reader_repo_presence,
+                )
+            })
             .map_err(io::Error::other)?;
 
         let stderr_reader = thread::Builder::new()
@@ -209,10 +350,12 @@ impl RemoteBackend {
             workdir: Mutex::new(PathBuf::new()),
             workdir_name: Mutex::new(String::new()),
             branch_name_cache: Mutex::new(String::new()),
+            repo_presence: Arc::clone(&repo_presence),
             tx: Mutex::new(BufWriter::new(stdin)),
             next_id: AtomicU64::new(1),
             pending,
             search_chunks,
+            db_cell_chunks,
             fs_rx: Mutex::new(Some(fs_rx)),
             _fs_tx: fs_tx,
             _reader: reader,
@@ -224,6 +367,7 @@ impl RemoteBackend {
         // Handshake: ask the agent for its workdir and name once so the UI
         // can render `workdir_name` / `branch_name` synchronously without
         // round-tripping on every call.
+        let repo_presence_snapshot = backend.repo_presence.snapshot();
         let info = backend
             .handshake()
             .map_err(|e| io::Error::other(format!("remote backend handshake failed: {e}")))?;
@@ -236,10 +380,15 @@ impl RemoteBackend {
         if let Ok(mut b) = backend.branch_name_cache.lock() {
             *b = info.branch_name;
         }
+        backend
+            .repo_presence
+            .initialize_if_unchanged(repo_presence_snapshot, info.has_repo);
 
-        // Ask the agent to start streaming fs events. If the call fails we
-        // still return the backend — fs-change polling simply won't fire.
-        let _ = backend.request::<serde_json::Value>(Request::Subscribe);
+        backend
+            .request::<serde_json::Value>(Request::Subscribe)
+            .map_err(|error| {
+                io::Error::other(format!("remote backend subscription failed: {error}"))
+            })?;
 
         Ok(backend)
     }
@@ -270,6 +419,30 @@ impl RemoteBackend {
         Ok(())
     }
 
+    fn cancel_search(&self, request_id: u64) -> Result<(), BackendError> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        self.send_envelope(Envelope {
+            id,
+            body: Request::CancelSearch { request_id },
+        })
+    }
+
+    fn cancel_db_cell(&self, request_id: u64) -> Result<(), BackendError> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        self.send_envelope(Envelope {
+            id,
+            body: Request::CancelDbCell { request_id },
+        })
+    }
+
+    fn abort_git_path_mutation(&self, operation_id: u64) -> Result<(), BackendError> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        self.send_envelope(Envelope {
+            id,
+            body: Request::AbortGitPathMutation { operation_id },
+        })
+    }
+
     fn request<T: serde::de::DeserializeOwned>(&self, req: Request) -> Result<T, BackendError> {
         self.request_with_timeout(req, DEFAULT_RPC_TIMEOUT)
     }
@@ -293,6 +466,38 @@ impl RemoteBackend {
                 .map_err(|e| BackendError::Protocol(format!("response decode: {e}"))),
             Response::Err { code, message, .. } => Err(BackendError::from_wire(code, message)),
         }
+    }
+
+    fn request_git_paths(
+        &self,
+        paths: &[String],
+        kind: GitPathRequestKind,
+    ) -> Result<(), BackendError> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let operation_id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let ranges = git_path_batch_ranges(paths, kind, operation_id, MAX_FRAME_SIZE as usize)?;
+        let chunk_count = ranges.len();
+        for (index, range) in ranges.into_iter().enumerate() {
+            let result: Result<serde_json::Value, BackendError> = self.request_with_timeout(
+                Request::GitPathMutationChunk {
+                    operation_id,
+                    kind: kind.dto(),
+                    paths: paths[range].to_vec(),
+                    final_chunk: index + 1 == chunk_count,
+                },
+                GIT_MUTATION_RPC_TIMEOUT,
+            );
+            if let Err(error) = result {
+                // The failed frame may already have reached the agent. Abort is
+                // deliberately fire-and-forget so cleanup cannot hide or delay
+                // the original mutation error.
+                let _ = self.abort_git_path_mutation(operation_id);
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     /// Test-only accessor for the in-flight RPC map size. Used by the
@@ -365,7 +570,9 @@ fn read_loop(
     stdout: ChildStdout,
     pending: Arc<Mutex<PendingMap>>,
     search_chunks: Arc<Mutex<ChunkSinkMap>>,
-    fs_tx: mpsc::Sender<()>,
+    db_cell_chunks: Arc<Mutex<DbCellChunkSinkMap>>,
+    fs_tx: Sender<FsChange>,
+    repo_presence: Arc<RepoPresence>,
 ) {
     let mut reader = BufReader::new(stdout);
     loop {
@@ -390,8 +597,19 @@ fn read_loop(
                 }
             }
             reef_proto::Frame::Notification(note) => match note {
-                Notification::FsChanged => {
-                    let _ = fs_tx.send(());
+                Notification::FsChanged {
+                    has_repo: current_has_repo,
+                    workspace_changed,
+                    workspace_paths,
+                    git_metadata_changed,
+                } => {
+                    let _ = fs_tx.send(fs_change_from_notification(
+                        &repo_presence,
+                        current_has_repo,
+                        workspace_changed,
+                        workspace_paths,
+                        git_metadata_changed,
+                    ));
                 }
                 Notification::AgentLog { level, message } => {
                     eprintln!("[reef-agent:{level}] {message}");
@@ -411,8 +629,32 @@ fn read_loop(
                         let _ = tx.send(hits);
                     }
                 }
+                Notification::DbCellChunk { request_id, bytes } => {
+                    let sender = match db_cell_chunks.lock() {
+                        Ok(map) => map.get(&request_id).cloned(),
+                        Err(_) => None,
+                    };
+                    if let Some(tx) = sender {
+                        let _ = tx.send(bytes);
+                    }
+                }
             },
         }
+    }
+}
+
+fn fs_change_from_notification(
+    repo_presence: &RepoPresence,
+    has_repo: bool,
+    workspace_changed: bool,
+    workspace_paths: Vec<String>,
+    git_metadata_changed: bool,
+) -> FsChange {
+    FsChange {
+        workspace_changed,
+        workspace_paths: workspace_paths.into_iter().map(PathBuf::from).collect(),
+        git_metadata_changed,
+        repo_presence_changed: repo_presence.update_from_notification(has_repo),
     }
 }
 
@@ -458,7 +700,7 @@ impl Backend for RemoteBackend {
     }
 
     fn has_repo(&self) -> bool {
-        !self.branch_name().is_empty()
+        self.repo_presence.is_present()
     }
 
     fn build_file_tree(
@@ -471,19 +713,14 @@ impl Backend for RemoteBackend {
         Ok(out)
     }
 
-    fn load_preview(
-        &self,
-        rel_path: &Path,
-        dark: bool,
-        _wants_decoded_image: bool,
-    ) -> Option<PreviewContent> {
+    fn load_preview(&self, rel_path: &Path, _wants_decoded_image: bool) -> Option<PreviewContent> {
         // Fetch bytes over RPC and rebuild a `PreviewContent`. `PreviewBody`'s
         // `Image` variant carries a decoded `DynamicImage` that isn't serde-
         // shippable, so for now we surface every binary (image or otherwise)
         // as the generic Binary metadata card regardless of the decode
         // hint. Image rendering over SSH would need raw bytes +
         // client-side decode; tracked in issue #31.
-        use reef_core::preview::{BinaryInfo, BinaryReason, PreviewBody, TextPreview};
+        use reef_core::preview::{BinaryInfo, BinaryReason, PreviewBody};
         let rel_str = rel_path.to_string_lossy().to_string();
 
         // SQLite branch — client-side extension check, agent does the
@@ -495,32 +732,64 @@ impl Backend for RemoteBackend {
         // "not actually sqlite" reply, fall through to the standard
         // ReadFile path so the file still gets a binary card.
         if reef_sqlite_preview::has_sqlite_extension(rel_path)
-            && let Ok(Some(dto)) =
-                self.request::<Option<reef_proto::DatabaseInfoV2Dto>>(Request::LoadDbInitialV2 {
+            && let Ok(response) =
+                self.request::<reef_proto::LoadDbInitialV2ResponseDto>(Request::LoadDbInitialV2 {
                     rel_path: rel_str.clone(),
                     page_size: reef_core::preview::INITIAL_DB_PAGE_ROWS,
                 })
+            && let Some(dto) = response.info
         {
             return Some(PreviewContent {
                 path: rel_str,
+                resolved_path: response.resolved_path.map(PathBuf::from),
+                local_path: None,
+                bytes_on_disk: dto.bytes_on_disk,
+                mime: Some("application/vnd.sqlite3".into()),
                 body: PreviewBody::Database(database_info_v2_from_dto(dto)),
             });
         }
+        let source_required = reef_core::preview::structured_data_source_required(&rel_str);
+        let read_limit = if source_required {
+            reef_core::preview::MAX_TEXT_PREVIEW_BYTES
+        } else {
+            READ_FILE_MAX_BYTES
+        };
         let resp: ReadFileResponse = self
             .request(Request::ReadFile {
                 path: rel_str.clone(),
-                max_bytes: READ_FILE_MAX_BYTES,
+                max_bytes: read_limit,
             })
             .ok()?;
         if !resp.is_file {
             return None;
         }
+        let resolved_path = resp.resolved_path.map(PathBuf::from);
         let raw = resp.bytes;
         let bytes_on_disk = resp.size;
+
+        if source_required && bytes_on_disk > read_limit {
+            return Some(PreviewContent {
+                path: rel_str,
+                resolved_path,
+                local_path: None,
+                bytes_on_disk,
+                mime: None,
+                body: PreviewBody::Binary(BinaryInfo::with_head_bytes(
+                    bytes_on_disk,
+                    None,
+                    BinaryReason::TooLarge,
+                    &raw,
+                )),
+            });
+        }
 
         if raw.is_empty() {
             return Some(PreviewContent {
                 path: rel_str,
+                resolved_path,
+                local_path: None,
+                bytes_on_disk,
+                mime: None,
                 body: PreviewBody::Binary(BinaryInfo::new(0, None, BinaryReason::Empty)),
             });
         }
@@ -529,61 +798,30 @@ impl Backend for RemoteBackend {
         if raw[..check_len].contains(&0) {
             return Some(PreviewContent {
                 path: rel_str,
-                body: PreviewBody::Binary(BinaryInfo::new(
+                resolved_path,
+                local_path: None,
+                bytes_on_disk,
+                mime: None,
+                body: PreviewBody::Binary(BinaryInfo::with_head_bytes(
                     bytes_on_disk,
                     None,
                     BinaryReason::NullBytes,
+                    &raw,
                 )),
             });
         }
 
         let content = String::from_utf8_lossy(&raw);
-        let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-        let lines = if lines.len() > 10_000 {
-            lines[..10_000].to_vec()
-        } else {
-            lines
-        };
-
-        let within_cap = raw.len() <= 512 * 1024 && lines.len() <= 5_000;
-        if within_cap
-            && let Some(markdown) =
-                reef_core::markdown::build_markdown_preview(&rel_str, &content, dark)
-        {
-            return Some(PreviewContent {
-                path: rel_str,
-                body: PreviewBody::Markdown(markdown),
-            });
-        }
-
-        let highlighted = if within_cap {
-            reef_core::highlight::highlight_file(&rel_str, &lines, dark)
-        } else {
-            None
-        };
-
-        // SSH mode: tree-sitter still runs locally because file bytes have
-        // already crossed the SSH boundary into `raw`. The result is
-        // intra-file `gd` parity with local mode. Cross-file workspace index
-        // and LSP remain local-only and gate on `Backend::is_remote()`.
-        let parsed = if within_cap {
-            let path_buf = std::path::PathBuf::from(&rel_str);
-            reef_core::nav::NavLang::from_path(&path_buf).and_then(|lang| {
-                let source: std::sync::Arc<[u8]> =
-                    std::sync::Arc::from(raw.clone().into_boxed_slice());
-                reef_core::nav::parse_file_if_supported(lang, source).map(std::sync::Arc::new)
-            })
-        } else {
-            None
-        };
+        let body = reef_core::preview::build_textual_preview_body(&rel_str, &content);
+        let mime = matches!(body, PreviewBody::Markdown(_)).then(|| "text/markdown".into());
 
         Some(PreviewContent {
             path: rel_str,
-            body: PreviewBody::Text(TextPreview {
-                lines,
-                highlighted,
-                parsed,
-            }),
+            resolved_path,
+            local_path: None,
+            bytes_on_disk,
+            mime,
+            body,
         })
     }
 
@@ -596,6 +834,7 @@ impl Backend for RemoteBackend {
             .map(|entry| crate::DirEntry {
                 name: entry.name,
                 is_dir: entry.is_dir,
+                has_children: entry.has_children,
             })
             .collect())
     }
@@ -631,6 +870,104 @@ impl Backend for RemoteBackend {
         Ok(db_page_from_dto(dto))
     }
 
+    fn db_load_cell(
+        &self,
+        rel_path: &Path,
+        key: &reef_sqlite_preview::DbObjectKey,
+        locator: &reef_sqlite_preview::DbRowLocator,
+        column: usize,
+        cancellation: &super::CancellationToken,
+    ) -> Result<reef_sqlite_preview::SqliteValue, BackendError> {
+        if cancellation.is_cancelled() {
+            return Err(BackendError::Cancelled);
+        }
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<u8>>();
+        let (resp_tx, resp_rx) = mpsc::channel::<Response>();
+        let _pending = MapGuard::register(&self.pending, id, resp_tx, "pending")?;
+        let _chunks = MapGuard::register(&self.db_cell_chunks, id, chunk_tx, "db cell chunk")?;
+        self.send_envelope(Envelope {
+            id,
+            body: Request::LoadDbCell {
+                rel_path: rel_path.to_string_lossy().into_owned(),
+                schema: key.schema.clone(),
+                kind: db_object_kind_to_dto(key.kind),
+                name: key.name.clone(),
+                locator: db_row_locator_to_dto(locator),
+                column,
+            },
+        })?;
+
+        let mut text_bytes = Vec::new();
+        let mut last_progress = std::time::Instant::now();
+        loop {
+            if cancellation.is_cancelled() {
+                self.cancel_db_cell(id)?;
+                return Err(BackendError::Cancelled);
+            }
+            while let Ok(bytes) = chunk_rx.try_recv() {
+                text_bytes.extend_from_slice(&bytes);
+                last_progress = std::time::Instant::now();
+            }
+            match resp_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(Response::Ok { result, .. }) => {
+                    text_bytes.extend(chunk_rx.try_iter().flatten());
+                    let completed: reef_proto::DbCellCompletedDto = serde_json::from_value(result)
+                        .map_err(|error| {
+                            BackendError::Protocol(format!("response decode: {error}"))
+                        })?;
+                    return match completed {
+                        reef_proto::DbCellCompletedDto::Complete { value } => {
+                            if text_bytes.is_empty() {
+                                Ok(sqlite_value_from_dto(value))
+                            } else {
+                                Err(BackendError::Protocol(
+                                    "SQLite scalar cell emitted text chunks".to_string(),
+                                ))
+                            }
+                        }
+                        reef_proto::DbCellCompletedDto::Text {
+                            byte_len,
+                            content_hash,
+                        } => {
+                            let revision = reef_sqlite_preview::db_cell_revision(&text_bytes);
+                            if revision.byte_len != byte_len
+                                || revision.content_hash != content_hash
+                            {
+                                return Err(BackendError::Protocol(
+                                    "SQLite cell stream revision mismatch".to_string(),
+                                ));
+                            }
+                            Ok(reef_sqlite_preview::SqliteValue::Text {
+                                value: String::from_utf8_lossy(&text_bytes).into_owned(),
+                                truncated: false,
+                            })
+                        }
+                    };
+                }
+                Ok(Response::Err { code, message, .. }) => {
+                    return Err(BackendError::from_wire(code, message));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if last_progress.elapsed() >= DEFAULT_RPC_TIMEOUT {
+                        // The response guard only releases client-side routing.
+                        // Stop the agent's serial SQLite worker as well so a
+                        // timed-out value cannot block the next cell request.
+                        let _ = self.cancel_db_cell(id);
+                        return Err(BackendError::Rpc(
+                            "SQLite cell request timed out".to_string(),
+                        ));
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(BackendError::Rpc(
+                        "SQLite cell response channel disconnected".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
     fn db_load_object_detail(
         &self,
         rel_path: &Path,
@@ -656,6 +993,14 @@ impl Backend for RemoteBackend {
             unstaged: snap.unstaged.into_iter().map(file_entry_from_dto).collect(),
             branch_name: snap.branch_name,
             ahead_behind: snap.ahead_behind,
+        })
+    }
+
+    fn git_status_stats(&self) -> Result<reef_core::git::GitStatusStats, BackendError> {
+        let stats: reef_proto::GitStatusStatsDto = self.request(Request::GitStatusStats)?;
+        Ok(reef_core::git::GitStatusStats {
+            staged: stats.staged,
+            unstaged: stats.unstaged,
         })
     }
 
@@ -690,18 +1035,12 @@ impl Backend for RemoteBackend {
         Ok(resp.map(diff_content_from_dto))
     }
 
-    fn stage(&self, path: &str) -> Result<(), BackendError> {
-        let _: serde_json::Value = self.request(Request::Stage {
-            path: path.to_string(),
-        })?;
-        Ok(())
+    fn stage_paths(&self, paths: &[String]) -> Result<(), BackendError> {
+        self.request_git_paths(paths, GitPathRequestKind::Stage)
     }
 
-    fn unstage(&self, path: &str) -> Result<(), BackendError> {
-        let _: serde_json::Value = self.request(Request::Unstage {
-            path: path.to_string(),
-        })?;
-        Ok(())
+    fn unstage_paths(&self, paths: &[String]) -> Result<(), BackendError> {
+        self.request_git_paths(paths, GitPathRequestKind::Unstage)
     }
 
     fn restore(&self, path: &str) -> Result<(), BackendError> {
@@ -804,7 +1143,7 @@ impl Backend for RemoteBackend {
         Ok(resp.map(diff_content_from_dto))
     }
 
-    fn subscribe_fs_events(&self) -> mpsc::Receiver<()> {
+    fn subscribe_fs_events(&self) -> Receiver<FsChange> {
         // First subscriber gets the channel created in `spawn`. Subsequent
         // calls would lose events — but the App only calls this once.
         // For safety we hand out a fresh disconnected receiver rather than
@@ -814,7 +1153,7 @@ impl Backend for RemoteBackend {
                 return rx;
             }
         }
-        let (_tx, rx) = mpsc::channel::<()>();
+        let (_tx, rx) = crossbeam_channel::unbounded::<FsChange>();
         rx
     }
 
@@ -995,6 +1334,38 @@ impl Backend for RemoteBackend {
         Ok(())
     }
 
+    fn replace_file(
+        &self,
+        rel_path: &Path,
+        request: &ReplaceFileRequest,
+    ) -> Result<ReplaceFileOutcome, BackendError> {
+        let response: ReplaceFileOutcomeDto = self.request(Request::ReplaceFile {
+            rel_path: rel_path.to_string_lossy().into_owned(),
+            pattern: request.pattern.clone(),
+            replacement: request.replacement.clone(),
+            lines: request
+                .lines
+                .iter()
+                .map(|line| ReplaceLineGuardDto {
+                    line_no: line.line_no,
+                    expected_revision: line.expected_revision,
+                })
+                .collect(),
+            max_file_size: request.max_file_size,
+        })?;
+        Ok(match response {
+            ReplaceFileOutcomeDto::Changed {
+                lines_replaced,
+                stale,
+            } => ReplaceFileOutcome::Changed {
+                lines_replaced,
+                stale,
+            },
+            ReplaceFileOutcomeDto::NoMatch { stale } => ReplaceFileOutcome::NoMatch { stale },
+            ReplaceFileOutcomeDto::TooLarge => ReplaceFileOutcome::TooLarge,
+        })
+    }
+
     fn file_size(&self, rel_path: &Path) -> Result<u64, BackendError> {
         #[derive(serde::Deserialize)]
         struct Resp {
@@ -1044,6 +1415,9 @@ impl Backend for RemoteBackend {
         request: &ContentSearchRequest,
         on_chunk: &mut SearchChunkSink<'_>,
     ) -> Result<ContentSearchCompleted, BackendError> {
+        if request.cancellation.is_cancelled() {
+            return Ok(ContentSearchCompleted::default());
+        }
         let dto = ContentSearchRequestDto {
             pattern: request.pattern.clone(),
             fixed_strings: request.fixed_strings,
@@ -1076,10 +1450,15 @@ impl Backend for RemoteBackend {
         // agent — since a long search can legitimately take minutes on
         // a huge workdir and we still want it to work.
         let mut aborted = false;
+        let mut cancellation_sent = false;
         // 100 ms poll cap: large enough to amortize syscall overhead over
         // long searches without being perceptible as UI latency.
         let poll = Duration::from_millis(100);
         loop {
+            if !cancellation_sent && (aborted || request.cancellation.is_cancelled()) {
+                self.cancel_search(id)?;
+                cancellation_sent = true;
+            }
             // Drain every chunk that's already waiting — this is the
             // hot path when the agent is producing matches faster than
             // the UI consumes them.
@@ -1148,6 +1527,7 @@ fn match_hit_dto_to_domain(h: MatchHitDto) -> ContentMatchHit {
         display: h.display,
         line: h.line as usize,
         line_text: h.line_text,
+        line_revision: h.line_revision,
         byte_range: (h.byte_range_start as usize)..(h.byte_range_end as usize),
     }
 }
@@ -1188,6 +1568,7 @@ fn walk_remote(
             name: entry.name,
             depth,
             is_dir: entry.is_dir,
+            has_children: entry.has_children,
             is_expanded,
             git_status,
         });
@@ -1437,6 +1818,95 @@ fn db_page_from_dto(v: reef_proto::DbPageDto) -> reef_sqlite_preview::DbPage {
             .into_iter()
             .map(|cells| cells.into_iter().map(sqlite_value_from_dto).collect())
             .collect(),
+        row_locators: v
+            .row_locators
+            .into_iter()
+            .map(db_row_locator_from_dto)
+            .collect(),
+    }
+}
+
+fn db_row_locator_to_dto(
+    locator: &reef_sqlite_preview::DbRowLocator,
+) -> reef_proto::DbRowLocatorDto {
+    match locator {
+        reef_sqlite_preview::DbRowLocator::RowId(value) => {
+            reef_proto::DbRowLocatorDto::RowId { value: *value }
+        }
+        reef_sqlite_preview::DbRowLocator::PrimaryKey(values) => {
+            reef_proto::DbRowLocatorDto::PrimaryKey {
+                values: values.iter().map(db_locator_value_to_dto).collect(),
+            }
+        }
+        reef_sqlite_preview::DbRowLocator::OffsetFingerprint {
+            offset,
+            fingerprint,
+        } => reef_proto::DbRowLocatorDto::OffsetFingerprint {
+            offset: *offset,
+            fingerprint: *fingerprint,
+        },
+    }
+}
+
+fn db_locator_value_to_dto(
+    value: &reef_sqlite_preview::DbLocatorValue,
+) -> reef_proto::DbLocatorValueDto {
+    match value {
+        reef_sqlite_preview::DbLocatorValue::Null => reef_proto::DbLocatorValueDto::Null,
+        reef_sqlite_preview::DbLocatorValue::Integer(value) => {
+            reef_proto::DbLocatorValueDto::Integer { value: *value }
+        }
+        reef_sqlite_preview::DbLocatorValue::Real(value) => {
+            reef_proto::DbLocatorValueDto::Real { value: *value }
+        }
+        reef_sqlite_preview::DbLocatorValue::Text(value) => reef_proto::DbLocatorValueDto::Text {
+            value: value.clone(),
+        },
+        reef_sqlite_preview::DbLocatorValue::Blob(bytes) => reef_proto::DbLocatorValueDto::Blob {
+            bytes: bytes.clone(),
+        },
+    }
+}
+
+fn db_row_locator_from_dto(
+    locator: reef_proto::DbRowLocatorDto,
+) -> reef_sqlite_preview::DbRowLocator {
+    match locator {
+        reef_proto::DbRowLocatorDto::RowId { value } => {
+            reef_sqlite_preview::DbRowLocator::RowId(value)
+        }
+        reef_proto::DbRowLocatorDto::PrimaryKey { values } => {
+            reef_sqlite_preview::DbRowLocator::PrimaryKey(
+                values.into_iter().map(db_locator_value_from_dto).collect(),
+            )
+        }
+        reef_proto::DbRowLocatorDto::OffsetFingerprint {
+            offset,
+            fingerprint,
+        } => reef_sqlite_preview::DbRowLocator::OffsetFingerprint {
+            offset,
+            fingerprint,
+        },
+    }
+}
+
+fn db_locator_value_from_dto(
+    value: reef_proto::DbLocatorValueDto,
+) -> reef_sqlite_preview::DbLocatorValue {
+    match value {
+        reef_proto::DbLocatorValueDto::Null => reef_sqlite_preview::DbLocatorValue::Null,
+        reef_proto::DbLocatorValueDto::Integer { value } => {
+            reef_sqlite_preview::DbLocatorValue::Integer(value)
+        }
+        reef_proto::DbLocatorValueDto::Real { value } => {
+            reef_sqlite_preview::DbLocatorValue::Real(value)
+        }
+        reef_proto::DbLocatorValueDto::Text { value } => {
+            reef_sqlite_preview::DbLocatorValue::Text(value)
+        }
+        reef_proto::DbLocatorValueDto::Blob { bytes } => {
+            reef_sqlite_preview::DbLocatorValue::Blob(bytes)
+        }
     }
 }
 
@@ -1453,5 +1923,108 @@ fn sqlite_value_from_dto(v: reef_proto::SqliteValueDto) -> reef_sqlite_preview::
         reef_proto::SqliteValueDto::Blob { len } => {
             reef_sqlite_preview::SqliteValue::Blob { len: len as usize }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use reef_proto::{Envelope, GitPathMutationKindDto, Request, encode_frame};
+
+    use super::{
+        GitPathRequestKind, RepoPresence, fs_change_from_notification, git_path_batch_ranges,
+    };
+
+    #[test]
+    fn git_path_batches_stay_within_the_protocol_frame_limit() {
+        let paths = (0..75_000)
+            .map(|index| format!("src/{index:05}/{}", "x".repeat(220)))
+            .collect::<Vec<_>>();
+        let ranges = git_path_batch_ranges(
+            &paths,
+            GitPathRequestKind::Stage,
+            u64::MAX,
+            reef_proto::MAX_FRAME_SIZE as usize,
+        )
+        .expect("split paths");
+        assert!(ranges.len() > 1);
+
+        for (index, range) in ranges.iter().enumerate() {
+            let envelope = Envelope {
+                id: u64::MAX,
+                body: Request::GitPathMutationChunk {
+                    operation_id: u64::MAX,
+                    kind: GitPathMutationKindDto::Stage,
+                    paths: paths[range.clone()].to_vec(),
+                    final_chunk: index + 1 == ranges.len(),
+                },
+            };
+            let mut frame = Vec::new();
+            encode_frame(&mut frame, &envelope).expect("chunk must fit one frame");
+        }
+    }
+
+    #[test]
+    fn handshake_initializes_repo_presence_without_a_newer_notification() {
+        let repo_presence = RepoPresence::default();
+        let snapshot = repo_presence.snapshot();
+
+        assert!(repo_presence.initialize_if_unchanged(snapshot, true));
+        assert!(repo_presence.is_present());
+    }
+
+    #[test]
+    fn notification_prevents_a_stale_handshake_from_overwriting_repo_presence() {
+        let repo_presence = RepoPresence::default();
+        let snapshot = repo_presence.snapshot();
+
+        assert!(!repo_presence.update_from_notification(false));
+        assert!(!repo_presence.initialize_if_unchanged(snapshot, true));
+        assert!(!repo_presence.is_present());
+    }
+
+    #[test]
+    fn notifications_report_only_repo_presence_changes() {
+        let repo_presence = RepoPresence::default();
+
+        assert!(!repo_presence.update_from_notification(false));
+        assert!(repo_presence.update_from_notification(true));
+        assert!(!repo_presence.update_from_notification(true));
+        assert!(repo_presence.is_present());
+    }
+
+    #[test]
+    fn filesystem_notification_preserves_change_kind_and_paths() {
+        let repo_presence = RepoPresence::default();
+        let snapshot = repo_presence.snapshot();
+        assert!(repo_presence.initialize_if_unchanged(snapshot, true));
+
+        let change = fs_change_from_notification(
+            &repo_presence,
+            true,
+            true,
+            vec!["src/main.rs".to_string()],
+            false,
+        );
+
+        assert!(change.workspace_changed);
+        assert_eq!(change.workspace_paths, vec![PathBuf::from("src/main.rs")]);
+        assert!(!change.git_metadata_changed);
+        assert!(!change.repo_presence_changed);
+    }
+
+    #[test]
+    fn git_notification_does_not_become_a_workspace_change() {
+        let repo_presence = RepoPresence::default();
+        let snapshot = repo_presence.snapshot();
+        assert!(repo_presence.initialize_if_unchanged(snapshot, true));
+
+        let change = fs_change_from_notification(&repo_presence, true, false, Vec::new(), true);
+
+        assert!(!change.workspace_changed);
+        assert!(change.workspace_paths.is_empty());
+        assert!(change.git_metadata_changed);
+        assert!(!change.repo_presence_changed);
     }
 }

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-pub use reef_core::file_tree::{FileTreeState, TreeEntry};
+pub use reef_core::file_tree::{FileTreeRowsSplice, FileTreeState, TreeEntry};
 
 pub struct FileTree {
     pub root: PathBuf,
@@ -19,8 +19,21 @@ impl FileTree {
         self.state.toggle_expand(index);
     }
 
+    pub fn toggle_expand_by_path(&mut self, path: &Path) -> bool {
+        self.state.toggle_expand_by_path(path)
+    }
+
     pub fn collapse_all(&mut self) {
         self.state.collapse_all();
+    }
+
+    pub fn collapse_visible_descendants(&mut self, index: usize) {
+        self.state.collapse_visible_descendants(index);
+    }
+
+    pub fn replace_visible_descendants(&mut self, parent_path: &Path, children: Vec<TreeEntry>) {
+        self.state
+            .replace_visible_descendants(parent_path, children);
     }
 
     pub fn navigate(&mut self, delta: i32) {
@@ -43,12 +56,24 @@ impl FileTree {
         self.state.selected_path()
     }
 
+    pub fn rows_revision(&self) -> u64 {
+        self.state.rows_revision()
+    }
+
+    pub fn rows_splice(&self) -> Option<FileTreeRowsSplice> {
+        self.state.rows_splice()
+    }
+
     pub fn expanded_paths(&self) -> Vec<PathBuf> {
         self.state.expanded_paths()
     }
 
     pub fn git_statuses(&self) -> std::collections::HashMap<String, char> {
         self.state.git_statuses_map()
+    }
+
+    pub fn decorate_entries_with_git_statuses(&self, entries: &mut [TreeEntry]) {
+        self.state.decorate_entries_with_git_statuses(entries);
     }
 
     pub fn replace_entries(&mut self, entries: Vec<TreeEntry>, selected_idx: usize) {

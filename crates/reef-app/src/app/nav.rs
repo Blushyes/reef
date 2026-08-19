@@ -132,10 +132,11 @@ impl AppState {
         let items = navigable_git_files(
             &self.staged_files,
             &self.unstaged_files,
+            &self.git_status.staged_tree_rows,
+            &self.git_status.unstaged_tree_rows,
             self.staged_collapsed,
             self.unstaged_collapsed,
             self.git_status.tree_mode,
-            &self.git_status.collapsed_dirs,
         );
 
         if items.is_empty() {

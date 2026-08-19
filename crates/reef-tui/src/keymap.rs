@@ -15,6 +15,7 @@ pub enum InputScope {
     GraphBranchPicker,
     TreeEdit,
     TreeContextMenu,
+    SelectionContextMenu,
     NavCandidates,
     ConfirmModal,
     PasteConflict,
@@ -193,6 +194,8 @@ pub fn scope_for_app(app: &crate::TuiApp) -> InputScope {
         InputScope::HostsPicker
     } else if snapshot.overlays.graph_branch_picker {
         InputScope::GraphBranchPicker
+    } else if app.selection_context_menu.is_active() {
+        InputScope::SelectionContextMenu
     } else if app.engine.find_widget().active {
         InputScope::FindWidget
     } else if snapshot.overlays.global_search {
@@ -377,6 +380,12 @@ fn bindings() -> &'static [KeyBinding] {
                 KeyBinding::single(TreeContextMenu, Down, Mods::NONE, MoveDown),
                 KeyBinding::single(TreeContextMenu, Char('j'), Mods::NONE, MoveDown),
                 KeyBinding::single(TreeContextMenu, Enter, Mods::NONE, Confirm),
+                KeyBinding::single(SelectionContextMenu, Esc, Mods::NONE, Close),
+                KeyBinding::single(SelectionContextMenu, Up, Mods::NONE, MoveUp),
+                KeyBinding::single(SelectionContextMenu, Char('k'), Mods::NONE, MoveUp),
+                KeyBinding::single(SelectionContextMenu, Down, Mods::NONE, MoveDown),
+                KeyBinding::single(SelectionContextMenu, Char('j'), Mods::NONE, MoveDown),
+                KeyBinding::single(SelectionContextMenu, Enter, Mods::NONE, Confirm),
                 KeyBinding::single(NavCandidates, Esc, Mods::NONE, Close),
                 KeyBinding::single(NavCandidates, Char('q'), Mods::NONE, Close),
                 KeyBinding::single(NavCandidates, Char('c'), Mods::CONTROL, Quit),

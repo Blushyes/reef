@@ -53,12 +53,64 @@ impl AppState {
         if !self.backend.has_repo() {
             return;
         }
+        self.git_status_stats_load.invalidate();
         let generation = self.git_status_load.begin();
         self.tasks
             .refresh_status(generation, Arc::clone(&self.backend));
     }
 
-    pub fn select_file(&mut self, path: String, is_staged: bool, dark: bool) {
+    pub(super) fn refresh_status_stats(&mut self) {
+        if !self.backend.has_repo() {
+            return;
+        }
+        let generation = self.git_status_stats_load.begin();
+        self.tasks
+            .refresh_status_stats(generation, Arc::clone(&self.backend));
+    }
+
+    pub(super) fn retain_cached_git_status_stats(next: &mut [FileEntry], previous: &[FileEntry]) {
+        let counts: HashMap<&str, (u32, u32)> = previous
+            .iter()
+            .map(|entry| (entry.path.as_str(), (entry.additions, entry.deletions)))
+            .collect();
+        for entry in next {
+            if let Some((additions, deletions)) = counts.get(entry.path.as_str()) {
+                entry.additions = *additions;
+                entry.deletions = *deletions;
+            }
+        }
+    }
+
+    pub(super) fn apply_git_status_stats(&mut self, stats: reef_core::git::GitStatusStats) {
+        let mut rows_changed = false;
+        for entry in &mut self.staged_files {
+            let next = stats.staged.get(&entry.path).copied().unwrap_or_default();
+            rows_changed |= (entry.additions, entry.deletions) != next;
+            (entry.additions, entry.deletions) = next;
+        }
+        for entry in &mut self.unstaged_files {
+            let next = stats.unstaged.get(&entry.path).copied().unwrap_or_default();
+            rows_changed |= (entry.additions, entry.deletions) != next;
+            (entry.additions, entry.deletions) = next;
+        }
+        if rows_changed {
+            self.mark_git_status_rows_changed();
+        }
+        self.rebuild_git_status_tree_rows();
+    }
+
+    pub(super) fn mark_git_status_rows_changed(&mut self) {
+        self.git_status_rows_revision = self.git_status_rows_revision.wrapping_add(1).max(1);
+    }
+
+    pub fn select_file(&mut self, path: String, is_staged: bool, dark: bool) -> bool {
+        if self
+            .selected_file
+            .as_ref()
+            .is_some_and(|selected| selected.path == path && selected.is_staged == is_staged)
+        {
+            return false;
+        }
         self.selected_file = Some(SelectedFile { path, is_staged });
         self.git_status.confirm_discard = None;
         self.diff_scroll = 0;
@@ -66,6 +118,7 @@ impl AppState {
         self.sbs_left_h_scroll = 0;
         self.sbs_right_h_scroll = 0;
         self.load_diff(dark);
+        true
     }
 
     pub fn select_git_file_for_discard(&mut self, path: String, is_staged: bool, dark: bool) {
@@ -97,6 +150,35 @@ impl AppState {
         if !self.git_status.collapsed_dirs.remove(&key) {
             self.git_status.collapsed_dirs.insert(key);
         }
+        self.rebuild_git_status_tree_rows();
+    }
+
+    pub(super) fn rebuild_git_status_tree_rows(&mut self) {
+        if !self.git_status.tree_mode {
+            self.git_status.staged_tree_rows.clear();
+            self.git_status.unstaged_tree_rows.clear();
+            return;
+        }
+        self.git_status.staged_tree_rows = reef_core::git::tree::visible_rows(
+            &self.staged_files,
+            true,
+            &self.git_status.collapsed_dirs,
+        );
+        self.git_status.unstaged_tree_rows = reef_core::git::tree::visible_rows(
+            &self.unstaged_files,
+            false,
+            &self.git_status.collapsed_dirs,
+        );
+    }
+
+    pub(super) fn git_status_tree_needs_rebuild(
+        &self,
+        staged: &[FileEntry],
+        unstaged: &[FileEntry],
+    ) -> bool {
+        self.git_status.tree_mode
+            && (!same_git_tree_shape(&self.staged_files, staged)
+                || !same_git_tree_shape(&self.unstaged_files, unstaged))
     }
 
     pub fn prompt_discard_file(&mut self, is_staged: bool, path: String) {
@@ -207,6 +289,7 @@ impl AppState {
 
     pub fn toggle_status_tree_mode(&mut self) {
         self.git_status.tree_mode = !self.git_status.tree_mode;
+        self.rebuild_git_status_tree_rows();
     }
 
     pub fn toggle_commit_diff_layout(&mut self) {
@@ -318,7 +401,7 @@ impl AppState {
     }
 
     fn dispatch_git_mutation(&mut self, mutation: GitMutation) {
-        if !self.backend.has_repo() {
+        if self.git_mutation_load.loading || !self.backend.has_repo() {
             return;
         }
         let is_empty = match &mutation {
@@ -830,4 +913,12 @@ impl AppState {
             }
         }
     }
+}
+
+fn same_git_tree_shape(current: &[FileEntry], next: &[FileEntry]) -> bool {
+    current.len() == next.len()
+        && current
+            .iter()
+            .zip(next)
+            .all(|(current, next)| current.path == next.path)
 }

@@ -1,9 +1,10 @@
 //! Integration tests for the host-owned fs watcher. Drives `fs_watcher::spawn`
 //! against a real tempdir and asserts the debounced channel contract.
 
-use reef_io::fs_watcher;
+use crossbeam_channel::{Receiver, RecvTimeoutError, TryRecvError};
+use reef_io::{Backend, FsChange, LocalBackend, fs_watcher};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, mpsc};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -22,7 +23,7 @@ fn canonical(p: &Path) -> PathBuf {
 /// macOS FSEvents can take longer than a fixed warmup to register a recursive
 /// watch, especially under CI-like load; repeatedly touching a harmless marker
 /// turns that registration race into a real readiness handshake.
-fn wait_until_ready(workdir: &Path, rx: &mpsc::Receiver<()>) {
+fn wait_until_ready(workdir: &Path, rx: &Receiver<FsChange>) {
     let marker = workdir.join(".reef-watch-ready");
     let start = Instant::now();
     let mut attempt = 0usize;
@@ -30,8 +31,8 @@ fn wait_until_ready(workdir: &Path, rx: &mpsc::Receiver<()>) {
         attempt += 1;
         std::fs::write(&marker, attempt.to_string()).unwrap();
         match rx.recv_timeout(Duration::from_millis(700)) {
-            Ok(()) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) if start.elapsed() < Duration::from_secs(15) => {
+            Ok(_) => break,
+            Err(RecvTimeoutError::Timeout) if start.elapsed() < Duration::from_secs(15) => {
                 continue;
             }
             Err(e) => panic!("watcher did not become ready: {e:?}"),
@@ -39,6 +40,18 @@ fn wait_until_ready(workdir: &Path, rx: &mpsc::Receiver<()>) {
     }
     thread::sleep(Duration::from_millis(500));
     while rx.try_recv().is_ok() {}
+}
+
+fn recv_repo_presence_change(rx: &Receiver<FsChange>) -> Option<FsChange> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(change) if change.repo_presence_changed => return Some(change),
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
 }
 
 #[test]
@@ -53,12 +66,11 @@ fn workdir_write_triggers_event() {
     wait_until_ready(tmp.path(), &rx);
     write_file(&raw, "new.txt", "fresh content");
 
-    let got = rx.recv_timeout(Duration::from_secs(3));
-    assert!(
-        matches!(got, Ok(())),
-        "expected a debounced event within 3s, got {:?}",
-        got
-    );
+    let change = rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("expected a debounced workspace event");
+    assert!(change.workspace_changed);
+    assert!(change.workspace_paths.contains(&PathBuf::from("new.txt")));
 }
 
 #[test]
@@ -78,13 +90,13 @@ fn gitignored_write_does_not_trigger() {
     thread::sleep(Duration::from_millis(700));
     assert_eq!(
         rx.try_recv(),
-        Err(std::sync::mpsc::TryRecvError::Empty),
+        Err(TryRecvError::Empty),
         "gitignored write must not emit an event",
     );
 }
 
 #[test]
-fn dotgit_internal_write_does_not_trigger() {
+fn git_metadata_write_triggers_git_only_event() {
     let _lock = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
     commit_file(&raw, "keep.txt", "v1", "init");
@@ -93,15 +105,78 @@ fn dotgit_internal_write_does_not_trigger() {
     let rx = fs_watcher::spawn(workdir);
 
     wait_until_ready(tmp.path(), &rx);
-    // Simulate a git-internal write. .git/ must be skipped outright so that
-    // repeated index churn during git operations never wakes the host.
+    // Simulate an external index/ref update. The AppState can refresh Git
+    // without rebuilding the file tree or reloading the preview.
     std::fs::write(tmp.path().join(".git/custom-marker"), "x").unwrap();
 
-    thread::sleep(Duration::from_millis(700));
+    let change = rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("expected a Git metadata event");
     assert_eq!(
-        rx.try_recv(),
-        Err(std::sync::mpsc::TryRecvError::Empty),
-        ".git/ write must not emit an event",
+        change,
+        FsChange {
+            workspace_changed: false,
+            workspace_paths: Vec::new(),
+            git_metadata_changed: true,
+            repo_presence_changed: false,
+        }
+    );
+}
+
+#[test]
+fn git_metadata_above_nested_workdir_triggers_event() {
+    let _lock = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "src/keep.txt", "v1", "init");
+
+    let nested_workdir = tmp.path().join("src");
+    let backend = LocalBackend::open_at(canonical(&nested_workdir));
+    let rx = backend.subscribe_fs_events();
+    wait_until_ready(&nested_workdir, &rx);
+
+    std::fs::write(tmp.path().join(".git/custom-marker"), "x").unwrap();
+
+    let change = rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("expected a Git metadata event from the repository root");
+    assert_eq!(
+        change,
+        FsChange {
+            workspace_changed: false,
+            workspace_paths: Vec::new(),
+            git_metadata_changed: true,
+            repo_presence_changed: false,
+        }
+    );
+}
+
+#[test]
+fn linked_worktree_common_gitdir_write_triggers_git_only_event() {
+    let _lock = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_tmp, raw) = tempdir_repo();
+    commit_file(&raw, "keep.txt", "v1", "init");
+    let linked_parent = TempDir::new().expect("linked worktree parent");
+    let linked_workdir = linked_parent.path().join("linked");
+    let worktree = raw
+        .worktree("linked", &linked_workdir, None)
+        .expect("create linked worktree");
+    drop(worktree);
+
+    let rx = fs_watcher::spawn(canonical(&linked_workdir));
+    wait_until_ready(&linked_workdir, &rx);
+    std::fs::write(raw.path().join("common-marker"), "x").unwrap();
+
+    let change = rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("expected a Git metadata event from the common gitdir");
+    assert_eq!(
+        change,
+        FsChange {
+            workspace_changed: false,
+            workspace_paths: Vec::new(),
+            git_metadata_changed: true,
+            repo_presence_changed: false,
+        }
     );
 }
 
@@ -117,7 +192,7 @@ fn non_git_dir_still_triggers() {
 
     let got = rx.recv_timeout(Duration::from_secs(3));
     assert!(
-        matches!(got, Ok(())),
+        got.is_ok(),
         "non-git workdir should still receive events, got {:?}",
         got
     );
@@ -140,7 +215,7 @@ fn debounce_coalesces_bursts() {
     // First, wait for the debounce to fire at least once.
     let first = rx.recv_timeout(Duration::from_secs(3));
     assert!(
-        matches!(first, Ok(())),
+        first.is_ok(),
         "expected at least one event after burst, got {:?}",
         first
     );
@@ -157,4 +232,79 @@ fn debounce_coalesces_bursts() {
         extra
     );
     drop(tmp);
+}
+
+#[test]
+fn repository_presence_from_nested_workdir_tracks_ancestor_dotgit() {
+    let _lock = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "src/keep.txt", "v1", "init");
+
+    let nested_workdir = tmp.path().join("src");
+    let backend = LocalBackend::open_at(canonical(&nested_workdir));
+    assert!(backend.has_repo());
+    let rx = backend.subscribe_fs_events();
+    wait_until_ready(&nested_workdir, &rx);
+
+    let git_dir = tmp.path().join(".git");
+    let parked_git_dir = tmp.path().join(".git.parked");
+    std::fs::rename(&git_dir, &parked_git_dir).unwrap();
+
+    let removed = recv_repo_presence_change(&rx);
+    assert!(
+        matches!(
+            removed,
+            Some(FsChange {
+                repo_presence_changed: true,
+                ..
+            })
+        ),
+        "removing .git should report a repository capability change, got {removed:?}",
+    );
+    assert!(!backend.has_repo());
+
+    std::fs::rename(&parked_git_dir, &git_dir).unwrap();
+
+    let restored = recv_repo_presence_change(&rx);
+    assert!(
+        matches!(
+            restored,
+            Some(FsChange {
+                repo_presence_changed: true,
+                ..
+            })
+        ),
+        "restoring .git should report a repository capability change, got {restored:?}",
+    );
+    assert!(backend.has_repo());
+}
+
+#[test]
+fn repository_created_in_ancestor_after_watcher_start_updates_presence() {
+    let _lock = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().expect("tempdir");
+    let nested_workdir = tmp.path().join("src");
+    std::fs::create_dir(&nested_workdir).unwrap();
+
+    let backend = LocalBackend::open_at(canonical(&nested_workdir));
+    assert!(!backend.has_repo());
+    let rx = backend.subscribe_fs_events();
+    wait_until_ready(&nested_workdir, &rx);
+
+    let (prepared_repo, raw) = tempdir_repo();
+    drop(raw);
+    std::fs::rename(prepared_repo.path().join(".git"), tmp.path().join(".git")).unwrap();
+
+    let created = recv_repo_presence_change(&rx);
+    assert!(
+        matches!(
+            created,
+            Some(FsChange {
+                repo_presence_changed: true,
+                ..
+            })
+        ),
+        "creating .git in an ancestor should report a repository capability change, got {created:?}",
+    );
+    assert!(backend.has_repo());
 }

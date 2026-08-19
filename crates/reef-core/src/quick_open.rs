@@ -51,10 +51,23 @@ pub fn filter_candidates(
     query: &str,
     mru: &VecDeque<PathBuf>,
 ) -> Vec<QuickOpenMatch> {
+    filter_candidates_interruptible(candidates, query, mru, || false)
+        .expect("non-interruptible quick open filtering cannot be cancelled")
+}
+
+pub fn filter_candidates_interruptible(
+    candidates: &[QuickOpenCandidate],
+    query: &str,
+    mru: &VecDeque<PathBuf>,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Option<Vec<QuickOpenMatch>> {
     if query.is_empty() {
         let mut matches = Vec::with_capacity(candidates.len());
         let mut seen: HashSet<usize> = HashSet::new();
         for path in mru {
+            if is_cancelled() {
+                return None;
+            }
             if let Some(idx) = candidates.iter().position(|c| &c.rel_path == path) {
                 matches.push(QuickOpenMatch {
                     idx,
@@ -65,6 +78,9 @@ pub fn filter_candidates(
             }
         }
         for idx in 0..candidates.len() {
+            if idx % 256 == 0 && is_cancelled() {
+                return None;
+            }
             if !seen.contains(&idx) {
                 matches.push(QuickOpenMatch {
                     idx,
@@ -73,13 +89,16 @@ pub fn filter_candidates(
                 });
             }
         }
-        return matches;
+        return Some(matches);
     }
 
     let mut matcher = Matcher::new(Config::DEFAULT);
     let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
     let mut matches = Vec::new();
     for (idx, cand) in candidates.iter().enumerate() {
+        if idx % 256 == 0 && is_cancelled() {
+            return None;
+        }
         let mut indices = Vec::new();
         if let Some(score) = pattern.indices(cand.utf32.slice(..), &mut matcher, &mut indices) {
             matches.push(QuickOpenMatch {
@@ -97,7 +116,7 @@ pub fn filter_candidates(
                 .then_with(|| candidates[a.idx].display.cmp(&candidates[b.idx].display))
         })
     });
-    matches
+    Some(matches)
 }
 
 pub fn bump_mru(mru: &mut VecDeque<PathBuf>, selected: PathBuf, cap: usize) {
@@ -143,6 +162,17 @@ mod tests {
         let c = candidates(&["deep/path/foo.rs", "foo.rs"]);
         let out = filter_candidates(&c, "foo", &VecDeque::new());
         assert_eq!(c[out[0].idx].display, "foo.rs");
+    }
+
+    #[test]
+    fn interruptible_filter_stops_obsolete_work() {
+        let c = build_candidates((0..300).map(|idx| format!("file-{idx}.rs")));
+        let mut polls = 0;
+        let out = filter_candidates_interruptible(&c, "r", &VecDeque::new(), || {
+            polls += 1;
+            polls > 1
+        });
+        assert!(out.is_none());
     }
 
     #[test]

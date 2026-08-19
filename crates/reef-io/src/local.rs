@@ -7,12 +7,15 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::{
-    Backend, BackendError, ContentMatchHit, ContentSearchCompleted, ContentSearchRequest,
-    EditorLaunchSpec, SearchChunkSink, StatusSnapshot, TrashOutcome, WalkOpts, WalkResponse,
+    Backend, BackendError, CancellationToken, ContentMatchHit, ContentSearchCompleted,
+    ContentSearchRequest, EditorLaunchSpec, FsChange, ReplaceFileOutcome, ReplaceFileRequest,
+    SearchChunkSink, StatusSnapshot, TrashOutcome, WalkOpts, WalkResponse,
 };
 use crate::{TreeEntry, resolve_editor_command};
 use reef_core::diff::DiffContent;
@@ -28,19 +31,82 @@ use std::ops::ControlFlow;
 /// smaller (text files are tiny, most images are small).
 const PREVIEW_CACHE_CAP: usize = 8;
 
-/// Key shape that makes cache hits correct across:
-/// - file edits (`mtime_ns` changes → miss → fresh decode)
-/// - file truncation / growth (`size` changes → miss)
-/// - theme toggles (`dark` changes → syntect highlight differs)
-/// - graphics-protocol toggles (`wants_decoded_image` changes → need
-///   the decoded `DynamicImage` vs the lighter metadata-only shape)
+/// One local file whose metadata contributes to preview cache validity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviewDependencyFingerprint {
+    path: PathBuf,
+    mtime_ns: Option<i128>,
+    size: Option<u64>,
+}
+
+impl PreviewDependencyFingerprint {
+    fn capture(path: PathBuf) -> Self {
+        let metadata = std::fs::metadata(&path).ok();
+        Self {
+            path,
+            mtime_ns: metadata.as_ref().and_then(|metadata| {
+                metadata.modified().ok().and_then(|time| {
+                    time.duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|duration| duration.as_nanos() as i128)
+                })
+            }),
+            size: metadata.as_ref().map(std::fs::Metadata::len),
+        }
+    }
+
+    fn is_current(&self) -> bool {
+        *self == Self::capture(self.path.clone())
+    }
+}
+
+/// Cache identity plus every local file the preview consumed. This keeps
+/// compound previews such as SQLite current when a sidecar changes while the
+/// source file itself remains untouched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreviewCacheKey {
     rel_path: PathBuf,
-    mtime_ns: Option<i128>,
-    size: u64,
-    dark: bool,
+    source_path: PathBuf,
+    dependencies: Vec<PreviewDependencyFingerprint>,
     wants_decoded_image: bool,
+}
+
+impl PreviewCacheKey {
+    fn from_document(
+        document: &PreviewContent,
+        source_path: PathBuf,
+        wants_decoded_image: bool,
+    ) -> Self {
+        Self {
+            rel_path: PathBuf::from(&document.path),
+            source_path,
+            dependencies: document
+                .local_dependency_paths()
+                .into_iter()
+                .map(PreviewDependencyFingerprint::capture)
+                .collect(),
+            wants_decoded_image,
+        }
+    }
+
+    fn matches_request(
+        &self,
+        rel_path: &Path,
+        source_path: &Path,
+        wants_decoded_image: bool,
+    ) -> bool {
+        self.rel_path == rel_path
+            && self.source_path == source_path
+            && self.wants_decoded_image == wants_decoded_image
+    }
+
+    fn is_current(&self) -> bool {
+        !self.dependencies.is_empty()
+            && self
+                .dependencies
+                .iter()
+                .all(PreviewDependencyFingerprint::is_current)
+    }
 }
 
 #[derive(Default)]
@@ -52,8 +118,15 @@ struct PreviewCache {
 }
 
 impl PreviewCache {
-    fn get(&mut self, key: &PreviewCacheKey) -> Option<PreviewContent> {
-        let pos = self.entries.iter().position(|(k, _)| k == key)?;
+    fn get(
+        &mut self,
+        rel_path: &Path,
+        source_path: &Path,
+        wants_decoded_image: bool,
+    ) -> Option<PreviewContent> {
+        let pos = self.entries.iter().position(|(key, _)| {
+            key.matches_request(rel_path, source_path, wants_decoded_image) && key.is_current()
+        })?;
         let (k, v) = self.entries.remove(pos).expect("position checked");
         let cloned = v.clone();
         self.entries.push_back((k, v));
@@ -61,6 +134,9 @@ impl PreviewCache {
     }
 
     fn put(&mut self, key: PreviewCacheKey, value: PreviewContent) {
+        self.entries.retain(|(cached, _)| {
+            cached.rel_path != key.rel_path || cached.wants_decoded_image != key.wants_decoded_image
+        });
         while self.entries.len() >= PREVIEW_CACHE_CAP {
             self.entries.pop_front();
         }
@@ -71,6 +147,8 @@ impl PreviewCache {
 /// Local filesystem + libgit2 backend.
 pub struct LocalBackend {
     workdir: PathBuf,
+    has_repo: Arc<AtomicBool>,
+    repo_monitor_active: Arc<AtomicBool>,
     /// Cached `fs::canonicalize(workdir)`. Populated lazily on the first
     /// symlink-safe read because `workdir` is immutable after
     /// construction — without the cache every `read_file` / preview
@@ -92,8 +170,11 @@ impl LocalBackend {
     /// the cwd is not a git repo (the Files tab still works).
     pub fn open_cwd() -> std::io::Result<Self> {
         let workdir = std::env::current_dir()?;
+        let has_repo = GitRepo::open_at(&workdir).is_ok();
         Ok(Self {
             workdir,
+            has_repo: Arc::new(AtomicBool::new(has_repo)),
+            repo_monitor_active: Arc::new(AtomicBool::new(false)),
             canon_workdir: OnceLock::new(),
             preview_cache: Mutex::new(PreviewCache::default()),
         })
@@ -101,8 +182,11 @@ impl LocalBackend {
 
     /// Open at an explicit workdir. Used by `reef-agent --workdir`.
     pub fn open_at(workdir: PathBuf) -> Self {
+        let has_repo = GitRepo::open_at(&workdir).is_ok();
         Self {
             workdir,
+            has_repo: Arc::new(AtomicBool::new(has_repo)),
+            repo_monitor_active: Arc::new(AtomicBool::new(false)),
             canon_workdir: OnceLock::new(),
             preview_cache: Mutex::new(PreviewCache::default()),
         }
@@ -198,12 +282,94 @@ pub fn canonical_child_within(canon_root: &Path, rel: &Path) -> Result<PathBuf, 
     Ok(canon_target)
 }
 
+/// Resolve a workdir-relative directory entry without following its final
+/// component. The parent must already exist and must resolve inside
+/// `canon_root`; this is the correct boundary for entry operations such as
+/// create, rename, remove, and file-copy destinations.
+fn canonical_entry_within(canon_root: &Path, rel: &Path) -> Result<PathBuf, BackendError> {
+    let joined = resolve_rel_within(canon_root, rel)?;
+    let name = joined.file_name().ok_or_else(|| {
+        BackendError::PathEscape(format!(
+            "path must identify an entry within the workdir: {}",
+            rel.display()
+        ))
+    })?;
+    let parent = joined.parent().ok_or_else(|| {
+        BackendError::PathEscape(format!(
+            "path has no parent within the workdir: {}",
+            rel.display()
+        ))
+    })?;
+    let canon_parent = canonicalize_or_backend_err(parent, "canonicalize target parent")?;
+    if !canon_parent.starts_with(canon_root) {
+        return Err(BackendError::PathEscape(format!(
+            "symlink escapes workdir: {}",
+            rel.display()
+        )));
+    }
+    Ok(canon_parent.join(name))
+}
+
+/// Resolve a file-copy destination. Existing destinations are followed and
+/// canonicalised because `std::fs::copy` follows a final symlink; a new
+/// destination instead uses the entry boundary so its existing parent is
+/// checked without requiring the file itself to exist.
+fn canonical_file_write_target_within(
+    canon_root: &Path,
+    rel: &Path,
+) -> Result<PathBuf, BackendError> {
+    let joined = resolve_rel_within(canon_root, rel)?;
+    match std::fs::symlink_metadata(&joined) {
+        Ok(_) => canonical_child_within(canon_root, rel),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            canonical_entry_within(canon_root, rel)
+        }
+        Err(error) => Err(BackendError::Io(format!("stat write target: {error}"))),
+    }
+}
+
+/// Resolve a write target whose trailing components may not exist yet.
+/// Canonicalising the nearest existing ancestor prevents an in-workdir
+/// symlink from redirecting `create_dir_all` or recursive copies outside the
+/// workdir while still allowing new nested directories to be created.
+fn canonical_descendant_within(canon_root: &Path, rel: &Path) -> Result<PathBuf, BackendError> {
+    let joined = resolve_rel_within(canon_root, rel)?;
+    let mut existing = joined.as_path();
+    loop {
+        match std::fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                existing = existing.parent().ok_or_else(|| {
+                    BackendError::PathEscape(format!(
+                        "path has no existing ancestor within the workdir: {}",
+                        rel.display()
+                    ))
+                })?;
+            }
+            Err(error) => {
+                return Err(BackendError::Io(format!("stat target ancestor: {error}")));
+            }
+        }
+    }
+    let canon_existing = canonicalize_or_backend_err(existing, "canonicalize target ancestor")?;
+    if !canon_existing.starts_with(canon_root) {
+        return Err(BackendError::PathEscape(format!(
+            "symlink escapes workdir: {}",
+            rel.display()
+        )));
+    }
+    let suffix = joined.strip_prefix(existing).map_err(|_| {
+        BackendError::Io(format!(
+            "resolve target descendant failed: {}",
+            rel.display()
+        ))
+    })?;
+    Ok(canon_existing.join(suffix))
+}
+
 /// Build a `grep_regex::RegexMatcher` configured the way reef's
-/// content search expects. Shared between `search_content_local`
-/// (the streaming search worker) and `tasks::replace_one_file` (the
-/// global-replace worker) so they're guaranteed to find the exact
-/// same matches — anything else risks a UI showing one set of hits
-/// and a replace touching a different set.
+/// content search expects. Shared by streaming search and guarded file
+/// replacement so the two operations find the exact same matches.
 ///
 /// `case_sensitive` follows ripgrep's convention: `Some(true)` forces
 /// case-sensitive, `Some(false)` forces insensitive, `None` means
@@ -279,6 +445,121 @@ pub fn write_file_atomic(
     Ok(())
 }
 
+fn replace_file_local(
+    canon_root: &Path,
+    rel_path: &Path,
+    request: &ReplaceFileRequest,
+) -> Result<ReplaceFileOutcome, BackendError> {
+    use grep_matcher::Matcher;
+    use std::io::Read;
+
+    let target = canonical_child_within(canon_root, rel_path)?;
+    let metadata = std::fs::metadata(&target).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => BackendError::NotFound,
+        _ => BackendError::Io(format!("stat target: {error}")),
+    })?;
+    if !metadata.is_file() {
+        return Err(BackendError::NotFound);
+    }
+    if metadata.len() > request.max_file_size {
+        return Ok(ReplaceFileOutcome::TooLarge);
+    }
+
+    let file = std::fs::File::open(&target)
+        .map_err(|error| BackendError::Io(format!("open target: {error}")))?;
+    let mut original = Vec::with_capacity(metadata.len() as usize);
+    file.take(request.max_file_size.saturating_add(1))
+        .read_to_end(&mut original)
+        .map_err(|error| BackendError::Io(format!("read target: {error}")))?;
+    if original.len() as u64 > request.max_file_size {
+        return Ok(ReplaceFileOutcome::TooLarge);
+    }
+
+    let matcher = build_smart_case_matcher(&request.pattern, true, None)
+        .map_err(|error| BackendError::Other(format!("build matcher: {error}")))?;
+    let lines = lines_with_terminator(&original);
+    let mut out = Vec::with_capacity(original.len());
+    let mut included_idx = 0usize;
+    let mut lines_replaced = 0u64;
+    let mut stale = 0u64;
+
+    for (line_no, raw_line) in lines.iter().enumerate() {
+        let target = match request.lines.get(included_idx) {
+            Some(target) if target.line_no == line_no as u64 => {
+                included_idx += 1;
+                Some(target)
+            }
+            _ => None,
+        };
+        let Some(target) = target else {
+            out.extend_from_slice(raw_line);
+            continue;
+        };
+
+        let body = strip_line_terminator(raw_line);
+        if crate::content_line_revision(body) != target.expected_revision {
+            stale += 1;
+            out.extend_from_slice(raw_line);
+            continue;
+        }
+
+        let mut new_body = Vec::with_capacity(body.len());
+        let mut cursor = 0usize;
+        let mut had_match = false;
+        let walk = matcher.find_iter(body, |matched| {
+            had_match = true;
+            new_body.extend_from_slice(&body[cursor..matched.start()]);
+            new_body.extend_from_slice(&request.replacement);
+            cursor = matched.end();
+            true
+        });
+        if walk.is_err() || !had_match {
+            stale += 1;
+            out.extend_from_slice(raw_line);
+            continue;
+        }
+        new_body.extend_from_slice(&body[cursor..]);
+        out.extend_from_slice(&new_body);
+        out.extend_from_slice(&raw_line[body.len()..]);
+        lines_replaced += 1;
+    }
+
+    if lines_replaced == 0 || out == original {
+        return Ok(ReplaceFileOutcome::NoMatch { stale });
+    }
+    write_file_atomic(canon_root, rel_path, &out)?;
+    Ok(ReplaceFileOutcome::Changed {
+        lines_replaced,
+        stale,
+    })
+}
+
+fn lines_with_terminator(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'\n' {
+            out.push(&bytes[start..=index]);
+            start = index + 1;
+        }
+    }
+    if start < bytes.len() {
+        out.push(&bytes[start..]);
+    }
+    out
+}
+
+fn strip_line_terminator(line: &[u8]) -> &[u8] {
+    let len = line.len();
+    if len >= 2 && line[len - 2..] == *b"\r\n" {
+        &line[..len - 2]
+    } else if line.last() == Some(&b'\n') {
+        &line[..len - 1]
+    } else {
+        line
+    }
+}
+
 impl Backend for LocalBackend {
     fn workdir_path(&self) -> PathBuf {
         self.workdir.clone()
@@ -305,6 +586,9 @@ impl Backend for LocalBackend {
     }
 
     fn has_repo(&self) -> bool {
+        if self.repo_monitor_active.load(Ordering::Acquire) {
+            return self.has_repo.load(Ordering::Acquire);
+        }
         self.repo().is_ok()
     }
 
@@ -316,50 +600,27 @@ impl Backend for LocalBackend {
         Ok(build_entries(&self.workdir, expanded, git_statuses))
     }
 
-    fn load_preview(
-        &self,
-        rel_path: &Path,
-        dark: bool,
-        wants_decoded_image: bool,
-    ) -> Option<PreviewContent> {
-        // Build the cache key from a single `metadata()` call — cheaper
-        // than `file_tree::load_preview`'s full `File::open + read
-        // header + decode` path, so the lookup is effectively free on
-        // hits. On cache miss (fresh file or changed mtime/size) we
-        // fall through to the decoder.
-        let full = self.workdir.join(rel_path);
-        let meta = std::fs::metadata(&full).ok();
-        let key = PreviewCacheKey {
-            rel_path: rel_path.to_path_buf(),
-            mtime_ns: meta.as_ref().and_then(|m| {
-                m.modified().ok().and_then(|t| {
-                    t.duration_since(std::time::UNIX_EPOCH)
-                        .ok()
-                        .map(|d| d.as_nanos() as i128)
-                })
-            }),
-            size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
-            dark,
-            wants_decoded_image,
-        };
+    fn load_preview(&self, rel_path: &Path, wants_decoded_image: bool) -> Option<PreviewContent> {
+        let canon_root = self.canonical_workdir().ok()?;
+        let canon_target = canonical_child_within(canon_root, rel_path).ok()?;
 
         if let Ok(mut cache) = self.preview_cache.lock() {
-            if let Some(cached) = cache.get(&key) {
+            if let Some(cached) = cache.get(rel_path, &canon_target, wants_decoded_image) {
                 return Some(cached);
             }
         }
 
-        // Symlink-escape gate only fires on cache miss — hits return
-        // content we already validated on a prior read, so no fresh
-        // filesystem traversal is about to happen. `file_tree::load_preview`
-        // below does a raw `File::open` that follows symlinks without
-        // any boundary check, so without this gate a workdir-relative
-        // symlink could exfiltrate arbitrary files.
-        let canon_root = self.canonical_workdir().ok()?;
-        canonical_child_within(canon_root, rel_path).ok()?;
-
-        let fresh =
-            reef_core::preview::load_preview(&self.workdir, rel_path, dark, wants_decoded_image)?;
+        let mut fresh = reef_core::preview::load_preview_from_path(
+            &canon_target,
+            rel_path,
+            wants_decoded_image,
+        )?;
+        fresh.local_path = Some(canon_target.clone());
+        fresh.resolved_path = canon_target
+            .strip_prefix(canon_root)
+            .ok()
+            .map(Path::to_path_buf);
+        let key = PreviewCacheKey::from_document(&fresh, canon_target, wants_decoded_image);
 
         if let Ok(mut cache) = self.preview_cache.lock() {
             cache.put(key, fresh.clone());
@@ -376,8 +637,16 @@ impl Backend for LocalBackend {
         for entry in std::fs::read_dir(&abs).map_err(|e| BackendError::Io(e.to_string()))? {
             let entry = entry.map_err(|e| BackendError::Io(e.to_string()))?;
             let name = entry.file_name().to_string_lossy().to_string();
-            let is_dir = entry.path().is_dir();
-            entries.push(crate::DirEntry { name, is_dir });
+            let is_dir = dir_entry_is_dir(&entry);
+            entries.push(crate::DirEntry {
+                name,
+                is_dir,
+                // Child directories are resolved lazily when expanded. Probing
+                // each one here turns a single directory listing into N+1
+                // `read_dir` calls and makes expansion latency proportional to
+                // the number of sibling directories.
+                has_children: is_dir,
+            });
         }
         entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
             (true, false) => std::cmp::Ordering::Less,
@@ -442,6 +711,30 @@ impl Backend for LocalBackend {
         .map_err(|e| BackendError::Other(format!("sqlite: {e}")))
     }
 
+    fn db_load_cell(
+        &self,
+        rel_path: &Path,
+        key: &reef_sqlite_preview::DbObjectKey,
+        locator: &reef_sqlite_preview::DbRowLocator,
+        column: usize,
+        cancellation: &super::CancellationToken,
+    ) -> Result<reef_sqlite_preview::SqliteValue, BackendError> {
+        let full = canonical_child_within(self.canonical_workdir()?, rel_path)?;
+        reef_sqlite_preview::load_cell_qualified(
+            &full,
+            &key.schema,
+            key.kind,
+            &key.name,
+            locator,
+            column,
+            cancellation.shared_flag(),
+        )
+        .map_err(|error| match error {
+            reef_sqlite_preview::PreviewError::Cancelled => BackendError::Cancelled,
+            other => BackendError::Other(format!("sqlite: {other}")),
+        })
+    }
+
     fn db_load_object_detail(
         &self,
         rel_path: &Path,
@@ -461,6 +754,10 @@ impl Backend for LocalBackend {
             branch_name: repo.branch_name(),
             ahead_behind: repo.ahead_behind(),
         })
+    }
+
+    fn git_status_stats(&self) -> Result<reef_core::git::GitStatusStats, BackendError> {
+        Ok(self.repo()?.get_status_stats())
     }
 
     fn staged_diff(
@@ -486,16 +783,12 @@ impl Backend for LocalBackend {
         Ok(self.repo()?.get_diff(path, false, 3))
     }
 
-    fn stage(&self, path: &str) -> Result<(), BackendError> {
-        self.repo()?
-            .stage_file(path)
-            .map_err(|e| BackendError::Git(e.message().to_string()))
+    fn stage_paths(&self, paths: &[String]) -> Result<(), BackendError> {
+        reef_core::git::stage_paths_at(&self.workdir, paths).map_err(BackendError::Git)
     }
 
-    fn unstage(&self, path: &str) -> Result<(), BackendError> {
-        self.repo()?
-            .unstage_file(path)
-            .map_err(|e| BackendError::Git(e.message().to_string()))
+    fn unstage_paths(&self, paths: &[String]) -> Result<(), BackendError> {
+        reef_core::git::unstage_paths_at(&self.workdir, paths).map_err(BackendError::Git)
     }
 
     fn restore(&self, path: &str) -> Result<(), BackendError> {
@@ -511,7 +804,7 @@ impl Backend for LocalBackend {
         // surface through the backend contract.
         let repo = self.repo()?;
         if is_staged {
-            let _ = repo.unstage_file(path);
+            let _ = reef_core::git::unstage_paths_at(&self.workdir, &[path.to_string()]);
         }
         repo.restore_file(path)
             .map_err(|e| BackendError::Git(e.message().to_string()))
@@ -577,8 +870,12 @@ impl Backend for LocalBackend {
             .get_range_file_diff(oldest_oid, newest_oid, path, context_lines))
     }
 
-    fn subscribe_fs_events(&self) -> mpsc::Receiver<()> {
-        crate::fs_watcher::spawn(self.workdir.clone())
+    fn subscribe_fs_events(&self) -> crossbeam_channel::Receiver<FsChange> {
+        crate::fs_watcher::spawn_with_repo_state(
+            self.workdir.clone(),
+            Arc::clone(&self.has_repo),
+            Arc::clone(&self.repo_monitor_active),
+        )
     }
 
     fn launch_editor(&self, _rel_path: &Path) -> Result<(), BackendError> {
@@ -615,7 +912,7 @@ impl Backend for LocalBackend {
     }
 
     fn create_file(&self, rel_path: &Path) -> Result<(), BackendError> {
-        let abs = self.resolve_rel(rel_path)?;
+        let abs = canonical_entry_within(self.canonical_workdir()?, rel_path)?;
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -630,27 +927,30 @@ impl Backend for LocalBackend {
     }
 
     fn create_dir_all(&self, rel_path: &Path) -> Result<(), BackendError> {
-        let abs = self.resolve_rel(rel_path)?;
+        let abs = canonical_descendant_within(self.canonical_workdir()?, rel_path)?;
         std::fs::create_dir_all(&abs).map_err(|e| BackendError::Io(e.to_string()))
     }
 
     fn rename(&self, from_rel: &Path, to_rel: &Path) -> Result<(), BackendError> {
-        let from = self.resolve_rel(from_rel)?;
-        let to = self.resolve_rel(to_rel)?;
+        let canon_root = self.canonical_workdir()?;
+        let from = canonical_entry_within(canon_root, from_rel)?;
+        let to = canonical_entry_within(canon_root, to_rel)?;
         std::fs::rename(&from, &to).map_err(|e| BackendError::Io(e.to_string()))
     }
 
     fn copy_file(&self, from_rel: &Path, to_rel: &Path) -> Result<(), BackendError> {
-        let from = self.resolve_rel(from_rel)?;
-        let to = self.resolve_rel(to_rel)?;
+        let canon_root = self.canonical_workdir()?;
+        let from = canonical_child_within(canon_root, from_rel)?;
+        let to = canonical_file_write_target_within(canon_root, to_rel)?;
         std::fs::copy(&from, &to)
             .map(|_| ())
             .map_err(|e| BackendError::Io(e.to_string()))
     }
 
     fn copy_dir_recursive(&self, from_rel: &Path, to_rel: &Path) -> Result<(), BackendError> {
-        let from = self.resolve_rel(from_rel)?;
-        let to = self.resolve_rel(to_rel)?;
+        let canon_root = self.canonical_workdir()?;
+        let from = canonical_child_within(canon_root, from_rel)?;
+        let to = canonical_descendant_within(canon_root, to_rel)?;
         copy_dir_recursive_inner(&from, &to).map_err(|e| BackendError::Io(e.to_string()))
     }
 
@@ -663,7 +963,12 @@ impl Backend for LocalBackend {
         // degenerates to a plain copy. Keeping the shape identical to the
         // remote implementation lets higher layers ignore the local-vs-remote
         // split.
-        let to = self.resolve_rel(remote_dst_rel)?;
+        let canon_root = self.canonical_workdir()?;
+        let to = if local_src.is_dir() {
+            canonical_descendant_within(canon_root, remote_dst_rel)?
+        } else {
+            canonical_file_write_target_within(canon_root, remote_dst_rel)?
+        };
         if local_src.is_dir() {
             copy_dir_recursive_inner(local_src, &to).map_err(|e| BackendError::Io(e.to_string()))
         } else {
@@ -674,12 +979,12 @@ impl Backend for LocalBackend {
     }
 
     fn remove_file(&self, rel_path: &Path) -> Result<(), BackendError> {
-        let abs = self.resolve_rel(rel_path)?;
+        let abs = canonical_entry_within(self.canonical_workdir()?, rel_path)?;
         std::fs::remove_file(&abs).map_err(|e| BackendError::Io(e.to_string()))
     }
 
     fn remove_dir_all(&self, rel_path: &Path) -> Result<(), BackendError> {
-        let abs = self.resolve_rel(rel_path)?;
+        let abs = canonical_entry_within(self.canonical_workdir()?, rel_path)?;
         std::fs::remove_dir_all(&abs).map_err(|e| BackendError::Io(e.to_string()))
     }
 
@@ -687,12 +992,21 @@ impl Backend for LocalBackend {
         write_file_atomic(self.canonical_workdir()?, rel_path, content)
     }
 
+    fn replace_file(
+        &self,
+        rel_path: &Path,
+        request: &ReplaceFileRequest,
+    ) -> Result<ReplaceFileOutcome, BackendError> {
+        replace_file_local(self.canonical_workdir()?, rel_path, request)
+    }
+
     fn trash(&self, rel_paths: &[PathBuf]) -> Result<TrashOutcome, BackendError> {
         // Resolve every path first so a `PathEscape` fails atomically
         // before any side-effects.
+        let canon_root = self.canonical_workdir()?;
         let abs: Vec<PathBuf> = rel_paths
             .iter()
-            .map(|r| self.resolve_rel(r))
+            .map(|r| canonical_entry_within(canon_root, r))
             .collect::<Result<_, _>>()?;
         trash::delete_all(&abs)
             .map(|_| TrashOutcome { used_trash: true })
@@ -700,9 +1014,12 @@ impl Backend for LocalBackend {
     }
 
     fn hard_delete(&self, rel_paths: &[PathBuf]) -> Result<(), BackendError> {
+        let canon_root = self.canonical_workdir()?;
         for r in rel_paths {
-            let abs = self.resolve_rel(r)?;
-            let res = if abs.is_dir() {
+            let abs = canonical_entry_within(canon_root, r)?;
+            let metadata =
+                std::fs::symlink_metadata(&abs).map_err(|e| BackendError::Io(e.to_string()))?;
+            let res = if metadata.file_type().is_dir() {
                 std::fs::remove_dir_all(&abs)
             } else {
                 std::fs::remove_file(&abs)
@@ -755,7 +1072,7 @@ fn walk_dir(
             continue;
         }
         let path = entry.path();
-        let is_dir = path.is_dir();
+        let is_dir = dir_entry_is_dir(&entry);
         children.push((name, path, is_dir));
     }
 
@@ -779,6 +1096,7 @@ fn walk_dir(
             name,
             depth,
             is_dir,
+            has_children: is_dir,
             is_expanded,
             git_status,
         });
@@ -786,6 +1104,17 @@ fn walk_dir(
         if is_dir && is_expanded {
             walk_dir(root, &full_path, expanded, git_statuses, out, depth + 1);
         }
+    }
+}
+
+fn dir_entry_is_dir(entry: &std::fs::DirEntry) -> bool {
+    let Ok(file_type) = entry.file_type() else {
+        return false;
+    };
+    if file_type.is_symlink() {
+        entry.metadata().is_ok_and(|metadata| metadata.is_dir())
+    } else {
+        file_type.is_dir()
     }
 }
 
@@ -887,6 +1216,9 @@ pub(crate) fn search_content_local(
     if request.pattern.is_empty() {
         return ContentSearchCompleted::default();
     }
+    if request.cancellation.is_cancelled() {
+        return ContentSearchCompleted::default();
+    }
     let hard_cap: u32 = reef_proto::MAX_SEARCH_HITS;
     let cap: usize = request.max_results.min(hard_cap) as usize;
     if cap == 0 {
@@ -931,6 +1263,7 @@ pub(crate) fn search_content_local(
         truncated: &'a mut bool,
         max_line_chars: usize,
         matcher: &'a grep_regex::RegexMatcher,
+        cancellation: &'a super::CancellationToken,
     }
     impl grep_searcher::Sink for Collector<'_> {
         type Error = std::io::Error;
@@ -939,6 +1272,9 @@ pub(crate) fn search_content_local(
             _s: &grep_searcher::Searcher,
             mat: &SinkMatch<'_>,
         ) -> Result<bool, Self::Error> {
+            if self.cancellation.is_cancelled() {
+                return Ok(false);
+            }
             if *self.total_emitted + self.buffer.len() >= self.cap {
                 *self.truncated = true;
                 return Ok(false);
@@ -962,6 +1298,7 @@ pub(crate) fn search_content_local(
                 display: self.display.clone(),
                 line: mat.line_number().unwrap_or(1).saturating_sub(1) as usize,
                 line_text: line_text.into_owned(),
+                line_revision: crate::content_line_revision(raw),
                 byte_range,
             });
             Ok(true)
@@ -969,6 +1306,10 @@ pub(crate) fn search_content_local(
     }
 
     'walk: for result in walker {
+        if request.cancellation.is_cancelled() {
+            aborted = true;
+            break;
+        }
         let Ok(entry) = result else { continue };
         let is_file = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false);
         if !is_file {
@@ -992,8 +1333,18 @@ pub(crate) fn search_content_local(
             truncated: &mut truncated,
             max_line_chars,
             matcher: &matcher,
+            cancellation: &request.cancellation,
         };
-        let _ = searcher.search_path(&matcher, abs, &mut sink);
+        let file = match std::fs::File::open(abs) {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+        let reader = CancellationReader::new(file, request.cancellation.clone());
+        let _ = searcher.search_reader(&matcher, reader, &mut sink);
+        if request.cancellation.is_cancelled() {
+            aborted = true;
+            break;
+        }
 
         // Flush any accumulated chunks. We flush once per file as long as
         // the buffer is non-empty — small buffers still get forwarded
@@ -1040,6 +1391,39 @@ pub(crate) fn search_content_local(
     ContentSearchCompleted { truncated }
 }
 
+struct CancellationReader<R> {
+    inner: R,
+    cancellation: CancellationToken,
+}
+
+impl<R> CancellationReader<R> {
+    fn new(inner: R, cancellation: CancellationToken) -> Self {
+        Self {
+            inner,
+            cancellation,
+        }
+    }
+}
+
+impl<R: Read> Read for CancellationReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.cancellation.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "search cancelled",
+            ));
+        }
+        let read = self.inner.read(buffer)?;
+        if self.cancellation.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "search cancelled",
+            ));
+        }
+        Ok(read)
+    }
+}
+
 fn strip_trailing_newline(bytes: &[u8]) -> &[u8] {
     let mut end = bytes.len();
     if end > 0 && bytes[end - 1] == b'\n' {
@@ -1074,4 +1458,158 @@ fn clip_range(range: std::ops::Range<usize>, max_end: usize) -> Option<std::ops:
     }
     let end = range.end.min(max_end);
     Some(range.start..end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    struct CancelDuringRead {
+        cancellation: CancellationToken,
+    }
+
+    impl Read for CancelDuringRead {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            buffer[0] = b'x';
+            self.cancellation.cancel();
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn cancellation_reader_interrupts_a_file_read_in_progress() {
+        let cancellation = CancellationToken::default();
+        let source = CancelDuringRead {
+            cancellation: cancellation.clone(),
+        };
+        let mut reader = CancellationReader::new(source, cancellation);
+        let error = reader.read(&mut [0; 8]).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    fn database_row_count(preview: &PreviewContent, table: &str) -> u64 {
+        let reef_core::preview::PreviewBody::Database(database) = &preview.body else {
+            panic!("expected database preview");
+        };
+        database
+            .schemas
+            .iter()
+            .flat_map(|schema| &schema.objects)
+            .find(|object| object.name == table)
+            .and_then(|object| object.row_count)
+            .expect("table row count")
+    }
+
+    #[test]
+    fn build_entries_defers_directory_child_discovery_until_expansion() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("empty")).unwrap();
+        std::fs::create_dir_all(temp.path().join("non-empty")).unwrap();
+        std::fs::write(temp.path().join("non-empty").join("child.txt"), "x").unwrap();
+
+        let entries = build_entries(temp.path(), &HashSet::new(), &HashMap::new());
+        let empty = entries.iter().find(|entry| entry.name == "empty").unwrap();
+        let non_empty = entries
+            .iter()
+            .find(|entry| entry.name == "non-empty")
+            .unwrap();
+
+        assert!(empty.is_dir);
+        assert!(empty.has_children);
+        assert!(non_empty.is_dir);
+        assert!(non_empty.has_children);
+    }
+
+    #[test]
+    fn preview_cache_reloads_when_sqlite_wal_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let database_path = temp.path().join("preview.db");
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA wal_autocheckpoint = 0;
+                 CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT);
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+
+        let backend = LocalBackend::open_at(temp.path().to_path_buf());
+        let first = backend
+            .load_preview(Path::new("preview.db"), false)
+            .expect("first preview");
+        assert_eq!(database_row_count(&first, "notes"), 0);
+        let main_metadata = std::fs::metadata(&database_path).unwrap();
+        let main_modified = main_metadata.modified().unwrap();
+        let main_size = main_metadata.len();
+
+        connection
+            .execute("INSERT INTO notes(body) VALUES ('from wal')", [])
+            .unwrap();
+        let unchanged_main = std::fs::metadata(&database_path).unwrap();
+        assert_eq!(unchanged_main.modified().unwrap(), main_modified);
+        assert_eq!(unchanged_main.len(), main_size);
+        assert!(database_path.with_extension("db-wal").exists());
+
+        let second = backend
+            .load_preview(Path::new("preview.db"), false)
+            .expect("preview after wal write");
+        assert_eq!(database_row_count(&second, "notes"), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preview_cache_reloads_when_symlink_target_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("first.txt"), "first").unwrap();
+        std::fs::write(temp.path().join("second.txt"), "second").unwrap();
+        let link = temp.path().join("current.txt");
+        std::os::unix::fs::symlink("first.txt", &link).unwrap();
+        let backend = LocalBackend::open_at(temp.path().to_path_buf());
+
+        let first = backend
+            .load_preview(Path::new("current.txt"), false)
+            .expect("first preview");
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("second.txt", &link).unwrap();
+        let second = backend
+            .load_preview(Path::new("current.txt"), false)
+            .expect("retargeted preview");
+
+        assert_eq!(first.body.display_text_rows()[0], "first");
+        assert_eq!(second.body.display_text_rows()[0], "second");
+        assert!(
+            second
+                .dependency_paths()
+                .contains(&PathBuf::from("second.txt"))
+        );
+    }
+
+    #[test]
+    fn replace_file_rejects_content_above_the_size_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("large.txt");
+        std::fs::write(&path, "needle\n").unwrap();
+        let backend = LocalBackend::open_at(temp.path().to_path_buf());
+
+        let outcome = backend
+            .replace_file(
+                Path::new("large.txt"),
+                &ReplaceFileRequest {
+                    pattern: "needle".into(),
+                    replacement: b"changed".to_vec(),
+                    lines: vec![crate::ReplaceLineGuard {
+                        line_no: 0,
+                        expected_revision: crate::content_line_revision(b"needle"),
+                    }],
+                    max_file_size: 3,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome, ReplaceFileOutcome::TooLarge);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "needle\n");
+    }
 }

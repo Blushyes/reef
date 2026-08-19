@@ -144,6 +144,7 @@ mod tests {
             name: path.rsplit('/').next().unwrap_or(path).to_string(),
             depth,
             is_dir,
+            has_children: is_dir,
             is_expanded: is_dir,
             git_status: None,
         }

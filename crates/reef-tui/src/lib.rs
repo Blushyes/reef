@@ -22,6 +22,7 @@ pub mod prefs;
 pub mod quick_open;
 pub mod reveal;
 pub mod search;
+pub mod selection_context_menu;
 pub mod settings;
 pub mod shell_integration;
 pub mod ui;

@@ -51,7 +51,7 @@ pub enum AppRuntimeEvent {
     LocationJumped(JumpToLocationOutcome),
     ClearPreviewSelection,
     LspRefineJump(LspRefineOutcome),
-    ResolvePendingHighlight,
+    RetryDeferredPreviewActions,
     ClearCommitDetailSelection,
     ClearDiffSelection,
     PersistQuickOpenMru(String),

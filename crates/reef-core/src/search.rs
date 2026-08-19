@@ -1,10 +1,73 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
+use unicode_width::UnicodeWidthStr;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchMatch {
     pub row: usize,
     pub byte_range: Range<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextMatchRange {
+    pub byte_range: Range<usize>,
+    pub utf16_range: Range<usize>,
+    pub display_column_range: Range<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiteralSearchMatcher {
+    regex: regex::Regex,
+}
+
+impl LiteralSearchMatcher {
+    pub fn new(query: &str) -> Result<Self, regex::Error> {
+        let regex = regex::RegexBuilder::new(&regex::escape(query))
+            .case_insensitive(true)
+            .build()?;
+        Ok(Self { regex })
+    }
+
+    pub fn ranges(&self, text: &str) -> Vec<TextMatchRange> {
+        let mut ranges = Vec::new();
+        self.visit_ranges(text, |range| {
+            ranges.push(range);
+            true
+        });
+        ranges
+    }
+
+    pub fn visit_ranges(&self, text: &str, mut visitor: impl FnMut(TextMatchRange) -> bool) {
+        let mut byte_cursor: usize = 0;
+        let mut utf16_cursor: usize = 0;
+        let mut display_column_cursor: usize = 0;
+        for matched in self.regex.find_iter(text) {
+            if matched.start() >= matched.end() {
+                continue;
+            }
+            let byte_range = matched.start()..matched.end();
+            let prefix = &text[byte_cursor..byte_range.start];
+            let matched_text = &text[byte_range.clone()];
+            utf16_cursor = utf16_cursor.saturating_add(prefix.encode_utf16().count());
+            display_column_cursor =
+                display_column_cursor.saturating_add(UnicodeWidthStr::width(prefix));
+            let matched_utf16_length = matched_text.encode_utf16().count();
+            let matched_display_width = UnicodeWidthStr::width(matched_text);
+            let range = TextMatchRange {
+                byte_range,
+                utf16_range: utf16_cursor..utf16_cursor.saturating_add(matched_utf16_length),
+                display_column_range: display_column_cursor
+                    ..display_column_cursor.saturating_add(matched_display_width),
+            };
+            if !visitor(range) {
+                break;
+            }
+            byte_cursor = matched.end();
+            utf16_cursor = utf16_cursor.saturating_add(matched_utf16_length);
+            display_column_cursor = display_column_cursor.saturating_add(matched_display_width);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,5 +315,27 @@ mod tests {
     fn clip_range_clips_end_and_drops_out_of_bounds() {
         assert_eq!(clip_range(3..8, 5), Some(3..5));
         assert_eq!(clip_range(8..10, 5), None);
+    }
+
+    #[test]
+    fn literal_matcher_reports_utf16_and_display_coordinates() {
+        let matcher = LiteralSearchMatcher::new("配角").unwrap();
+        let ranges = matcher.ranges("a🪸配角 z 配角");
+
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].utf16_range, 3..5);
+        assert_eq!(ranges[0].display_column_range, 3..7);
+        assert_eq!(ranges[1].utf16_range, 8..10);
+        assert_eq!(ranges[1].display_column_range, 10..14);
+    }
+
+    #[test]
+    fn literal_matcher_is_unicode_case_insensitive() {
+        let matcher = LiteralSearchMatcher::new("reef").unwrap();
+        let ranges = matcher.ranges("Reef REEF reef");
+
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[0].byte_range, 0..4);
+        assert_eq!(ranges[2].byte_range, 10..14);
     }
 }

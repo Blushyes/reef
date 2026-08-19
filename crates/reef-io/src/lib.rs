@@ -16,12 +16,14 @@ use std::ffi::OsString;
 use std::io;
 use std::ops::{ControlFlow, Range};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use crossbeam_channel::Receiver;
 use reef_core::diff::DiffContent;
 pub use reef_core::file_tree::TreeEntry;
 use reef_core::git::graph::GraphRow;
-use reef_core::git::{CommitDetail, CommitInfo, FileEntry, GraphScope, RefLabel};
+use reef_core::git::{CommitDetail, CommitInfo, FileEntry, GitStatusStats, GraphScope, RefLabel};
 use reef_core::preview::PreviewDocument as PreviewContent;
 use std::collections::{HashMap, HashSet};
 
@@ -29,6 +31,7 @@ pub mod agent_deploy;
 mod file_copy;
 pub mod fs_watcher;
 pub mod local;
+pub mod prefs;
 pub mod remote;
 mod target;
 
@@ -40,6 +43,190 @@ pub use target::{
 };
 
 pub type EditorResolver = fn() -> Option<(String, Vec<String>)>;
+
+/// A debounced filesystem change observed by a backend watcher.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FsChange {
+    /// Whether a non-Git file in the workspace changed.
+    pub workspace_changed: bool,
+    /// Workspace-relative paths reported by the watcher for this change.
+    ///
+    /// An empty list means the backend cannot identify the affected paths,
+    /// so consumers must conservatively treat every open workspace document
+    /// as potentially stale.
+    pub workspace_paths: Vec<PathBuf>,
+    /// Whether Git metadata such as the index, refs, or HEAD changed.
+    pub git_metadata_changed: bool,
+    /// Whether this event changed the workdir's Git-repository capability.
+    /// Consumers use this to invalidate graph state only for `git init` or
+    /// repository removal, rather than for every worktree write.
+    pub repo_presence_changed: bool,
+}
+
+const MAX_COALESCED_WORKSPACE_PATHS: usize = 16_384;
+const MAX_COALESCED_WORKSPACE_PATH_WIRE_BYTES: usize = reef_proto::MAX_FRAME_SIZE as usize / 2;
+
+/// Combines filesystem notifications without allowing a burst of changed
+/// paths to grow without bound.
+///
+/// Once precise paths exceed the bounded notification budget, the coalesced
+/// change switches to an empty path list. [`FsChange`] defines that as a
+/// conservative whole-workspace invalidation.
+pub struct FsChangeCoalescer {
+    change: FsChange,
+    workspace_paths: HashSet<PathBuf>,
+    workspace_path_wire_bytes_upper_bound: usize,
+    max_workspace_paths: usize,
+    max_workspace_path_wire_bytes: usize,
+    workspace_paths_complete: bool,
+}
+
+impl Default for FsChangeCoalescer {
+    fn default() -> Self {
+        Self::with_limits(
+            MAX_COALESCED_WORKSPACE_PATHS,
+            MAX_COALESCED_WORKSPACE_PATH_WIRE_BYTES,
+        )
+    }
+}
+
+impl FsChangeCoalescer {
+    fn with_limits(max_workspace_paths: usize, max_workspace_path_wire_bytes: usize) -> Self {
+        Self {
+            change: FsChange::default(),
+            workspace_paths: HashSet::new(),
+            workspace_path_wire_bytes_upper_bound: 0,
+            max_workspace_paths,
+            max_workspace_path_wire_bytes,
+            workspace_paths_complete: true,
+        }
+    }
+
+    pub fn push(&mut self, change: FsChange) {
+        self.change.git_metadata_changed |= change.git_metadata_changed;
+        self.change.repo_presence_changed |= change.repo_presence_changed;
+        if !change.workspace_changed {
+            return;
+        }
+        if change.workspace_paths.is_empty() {
+            self.mark_workspace_paths_incomplete();
+            return;
+        }
+        for path in change.workspace_paths {
+            self.push_workspace_path(path);
+        }
+    }
+
+    pub fn take(&mut self) -> FsChange {
+        std::mem::take(self).change
+    }
+
+    pub(crate) fn push_workspace_path(&mut self, path: PathBuf) {
+        self.change.workspace_changed = true;
+        if !self.workspace_paths_complete || self.workspace_paths.contains(&path) {
+            return;
+        }
+
+        let wire_bytes_upper_bound = path_wire_size_upper_bound(&path);
+        if self.workspace_paths.len() >= self.max_workspace_paths
+            || self
+                .workspace_path_wire_bytes_upper_bound
+                .saturating_add(wire_bytes_upper_bound)
+                > self.max_workspace_path_wire_bytes
+        {
+            self.mark_workspace_paths_incomplete();
+            return;
+        }
+
+        self.workspace_path_wire_bytes_upper_bound += wire_bytes_upper_bound;
+        self.workspace_paths.insert(path.clone());
+        self.change.workspace_paths.push(path);
+    }
+
+    pub(crate) fn mark_git_metadata_changed(&mut self) {
+        self.change.git_metadata_changed = true;
+    }
+
+    pub(crate) fn into_change(self) -> FsChange {
+        self.change
+    }
+
+    fn mark_workspace_paths_incomplete(&mut self) {
+        self.change.workspace_changed = true;
+        self.change.workspace_paths.clear();
+        self.workspace_paths.clear();
+        self.workspace_path_wire_bytes_upper_bound = 0;
+        self.workspace_paths_complete = false;
+    }
+}
+
+fn path_wire_size_upper_bound(path: &Path) -> usize {
+    path.to_string_lossy()
+        .len()
+        .saturating_mul(6)
+        .saturating_add(3)
+}
+
+#[cfg(test)]
+mod fs_change_coalescer_tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_workspace_paths_are_coalesced_once() {
+        let mut changes = FsChangeCoalescer::default();
+        let path = PathBuf::from("src/main.rs");
+
+        changes.push(FsChange {
+            workspace_changed: true,
+            workspace_paths: vec![path.clone(), path.clone()],
+            ..FsChange::default()
+        });
+
+        assert_eq!(changes.take().workspace_paths, [path]);
+    }
+
+    #[test]
+    fn imprecise_workspace_change_remains_conservative_after_precise_change() {
+        let mut changes = FsChangeCoalescer::default();
+        changes.push(FsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from("src/main.rs")],
+            ..FsChange::default()
+        });
+        changes.push(FsChange {
+            workspace_changed: true,
+            ..FsChange::default()
+        });
+        changes.push(FsChange {
+            workspace_changed: true,
+            workspace_paths: vec![PathBuf::from("src/lib.rs")],
+            ..FsChange::default()
+        });
+
+        assert!(changes.take().workspace_paths.is_empty());
+    }
+
+    #[test]
+    fn path_limit_switches_to_whole_workspace_invalidation() {
+        let mut changes = FsChangeCoalescer::with_limits(1, usize::MAX);
+        changes.push_workspace_path(PathBuf::from("src/main.rs"));
+        changes.push_workspace_path(PathBuf::from("src/lib.rs"));
+
+        let change = changes.take();
+
+        assert!(change.workspace_changed && change.workspace_paths.is_empty());
+    }
+
+    #[test]
+    fn wire_size_limit_switches_to_whole_workspace_invalidation() {
+        let mut changes = FsChangeCoalescer::with_limits(usize::MAX, 1);
+        changes.push_workspace_path(PathBuf::from("src/main.rs"));
+
+        let change = changes.take();
+
+        assert!(change.workspace_changed && change.workspace_paths.is_empty());
+    }
+}
 
 static EDITOR_RESOLVER: OnceLock<Mutex<EditorResolver>> = OnceLock::new();
 
@@ -86,6 +273,7 @@ pub fn default_editor_command() -> Option<(String, Vec<String>)> {
 /// shows them as toasts / status messages.
 #[derive(Debug, Clone)]
 pub enum BackendError {
+    Cancelled,
     NotFound,
     Io(String),
     Git(String),
@@ -108,6 +296,7 @@ pub enum BackendError {
 impl std::fmt::Display for BackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            BackendError::Cancelled => f.write_str("cancelled"),
             BackendError::NotFound => f.write_str("not found"),
             BackendError::Io(s) => write!(f, "io: {s}"),
             BackendError::Git(s) => write!(f, "git: {s}"),
@@ -138,6 +327,7 @@ impl BackendError {
     pub fn from_wire(code: reef_proto::ErrorCode, message: String) -> Self {
         use reef_proto::ErrorCode;
         match code {
+            ErrorCode::Cancelled => BackendError::Cancelled,
             ErrorCode::NotFound => BackendError::NotFound,
             ErrorCode::Io => BackendError::Io(message),
             ErrorCode::Git => BackendError::Git(message),
@@ -157,6 +347,7 @@ impl BackendError {
     pub fn wire_code(&self) -> reef_proto::ErrorCode {
         use reef_proto::ErrorCode;
         match self {
+            BackendError::Cancelled => ErrorCode::Cancelled,
             BackendError::NotFound => ErrorCode::NotFound,
             BackendError::Io(_) => ErrorCode::Io,
             BackendError::Git(_) => ErrorCode::Git,
@@ -230,6 +421,7 @@ pub struct WalkResponse {
 pub struct DirEntry {
     pub name: String,
     pub is_dir: bool,
+    pub has_children: bool,
 }
 
 /// One content-search hit, backend-side. Mirrors `global_search::MatchHit`
@@ -242,7 +434,25 @@ pub struct ContentMatchHit {
     pub display: String,
     pub line: usize,
     pub line_text: String,
+    /// Stable revision of the complete, untruncated line bytes. UI text may
+    /// be truncated for display, so replacement must use this value for its
+    /// stale-content guard.
+    pub line_revision: u64,
     pub byte_range: Range<usize>,
+}
+
+/// Stable revision for one complete content-search line.
+///
+/// This deliberately hashes bytes rather than displayed text: search results
+/// bound `line_text`, while replace-in-files must detect edits anywhere on the
+/// original line before writing it back.
+pub fn content_line_revision(line: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    line.iter().fold(OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
+    })
 }
 
 /// Knobs for `search_content`. Mirrors `ContentSearchRequestDto`.
@@ -253,6 +463,49 @@ pub struct ContentSearchRequest {
     pub case_sensitive: Option<bool>,
     pub max_results: u32,
     pub max_line_chars: u32,
+    pub cancellation: CancellationToken,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    pub fn from_flag(flag: Arc<AtomicBool>) -> Self {
+        Self(flag)
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    pub fn shared_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplaceLineGuard {
+    pub line_no: u64,
+    pub expected_revision: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplaceFileRequest {
+    pub pattern: String,
+    pub replacement: Vec<u8>,
+    pub lines: Vec<ReplaceLineGuard>,
+    pub max_file_size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplaceFileOutcome {
+    Changed { lines_replaced: u64, stale: u64 },
+    NoMatch { stale: u64 },
+    TooLarge,
 }
 
 /// Terminal response for `search_content`. Hits themselves arrive through
@@ -319,8 +572,10 @@ pub trait Backend: Send + Sync {
         git_statuses: &HashMap<String, char>,
     ) -> Result<Vec<TreeEntry>, String>;
 
-    /// Load a file preview (relative path). Honours backend-internal size
-    /// caps (binary detection, 10k-line cap, 512KB highlight cap).
+    /// Load the base file preview (relative path). Honours backend-internal
+    /// size caps for binary detection and text rows. Syntax highlighting and
+    /// navigation parsing are attached later by the app enrichment worker so
+    /// they cannot delay the base preview.
     ///
     /// `wants_decoded_image` tells the backend whether the caller will be
     /// able to actually render pixels (i.e. a graphics protocol was
@@ -328,12 +583,7 @@ pub trait Backend: Send + Sync {
     /// return an `ImagePreview` with `image: None` for the friendly
     /// metadata card; skipping the full decode saves 50-200 ms on
     /// non-graphics terminals where the pixels would be thrown away.
-    fn load_preview(
-        &self,
-        rel_path: &Path,
-        dark: bool,
-        wants_decoded_image: bool,
-    ) -> Option<PreviewContent>;
+    fn load_preview(&self, rel_path: &Path, wants_decoded_image: bool) -> Option<PreviewContent>;
 
     /// List direct children of a directory under the backend workdir.
     /// Callers use this for collision checks and other small probes that
@@ -346,10 +596,8 @@ pub trait Backend: Send + Sync {
     fn read_file(&self, rel_path: &Path, max_bytes: u64) -> Result<Vec<u8>, BackendError>;
 
     /// Size in bytes of the regular file at `rel_path`. Lets callers
-    /// short-circuit before paying for the bytes themselves — e.g. the
-    /// global-replace worker uses this to skip files over its 50 MB cap
-    /// without round-tripping a truncated copy. `NotFound` if the path
-    /// doesn't resolve to a regular file under the workdir.
+    /// short-circuit before paying for the bytes themselves. `NotFound` if
+    /// the path doesn't resolve to a regular file under the workdir.
     fn file_size(&self, rel_path: &Path) -> Result<u64, BackendError>;
 
     /// Load one page of rows from a row-bearing object at `rel_path`.
@@ -367,6 +615,17 @@ pub trait Backend: Send + Sync {
         limit: u32,
     ) -> Result<reef_sqlite_preview::DbPage, BackendError>;
 
+    /// Load one complete cell using a locator returned by [`Self::db_load_page`].
+    /// Implementations must observe `cancellation` while the query is running.
+    fn db_load_cell(
+        &self,
+        rel_path: &Path,
+        key: &reef_sqlite_preview::DbObjectKey,
+        locator: &reef_sqlite_preview::DbRowLocator,
+        column: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<reef_sqlite_preview::SqliteValue, BackendError>;
+
     /// Detail-pane payload for an index, trigger, table, or view.
     /// Tables / views return their `CREATE` SQL; indexes return
     /// uniqueness + column order + partial-WHERE; triggers return
@@ -379,6 +638,10 @@ pub trait Backend: Send + Sync {
 
     // ─── git: status / diff / stage ─────────────────────────────────────────
     fn git_status(&self) -> Result<StatusSnapshot, BackendError>;
+    /// Compute content-level line counts independently from status
+    /// classification. Callers merge the result into a visible status
+    /// snapshot on a separate generation.
+    fn git_status_stats(&self) -> Result<GitStatusStats, BackendError>;
 
     fn staged_diff(
         &self,
@@ -392,8 +655,19 @@ pub trait Backend: Send + Sync {
     ) -> Result<Option<DiffContent>, BackendError>;
     fn untracked_diff(&self, path: &str) -> Result<Option<DiffContent>, BackendError>;
 
-    fn stage(&self, path: &str) -> Result<(), BackendError>;
-    fn unstage(&self, path: &str) -> Result<(), BackendError>;
+    /// Stage a whole batch in one backend operation. Implementations must
+    /// preserve the input paths as one logical Git mutation rather than
+    /// opening an index transaction or RPC for every path.
+    fn stage_paths(&self, paths: &[String]) -> Result<(), BackendError>;
+    /// Unstage a whole batch in one backend operation. See [`Self::stage_paths`]
+    /// for the batching contract.
+    fn unstage_paths(&self, paths: &[String]) -> Result<(), BackendError>;
+    fn stage(&self, path: &str) -> Result<(), BackendError> {
+        self.stage_paths(&[path.to_string()])
+    }
+    fn unstage(&self, path: &str) -> Result<(), BackendError> {
+        self.unstage_paths(&[path.to_string()])
+    }
     fn restore(&self, path: &str) -> Result<(), BackendError>;
     /// Combined "discard one path" op used by the Git tab's folder /
     /// section discard flows. Staged paths are first unstaged, then the
@@ -447,7 +721,7 @@ pub trait Backend: Send + Sync {
     /// Subscribe to debounced fs-change events. Each backend decides whether
     /// to spawn a local watcher (LocalBackend) or relay notifications from
     /// the remote agent (RemoteBackend).
-    fn subscribe_fs_events(&self) -> mpsc::Receiver<()>;
+    fn subscribe_fs_events(&self) -> Receiver<FsChange>;
 
     /// Best-effort editor launch hook. Remote backends may return
     /// `BackendError::Unimplemented`; callers can then use
@@ -496,12 +770,11 @@ pub trait Backend: Send + Sync {
     fn remove_file(&self, rel_path: &Path) -> Result<(), BackendError>;
     /// Recursive directory removal. `fs::remove_dir_all` semantics.
     fn remove_dir_all(&self, rel_path: &Path) -> Result<(), BackendError>;
-    /// Overwrite the regular file at `rel_path` with `content`. Used by
-    /// the global find-and-replace path. Atomic: implementations write to
-    /// a sibling tempfile and `rename` into place so a mid-write crash
-    /// leaves the original intact. The original file's mode bits are
-    /// preserved across the swap (without this every replaced file
-    /// silently chmods to the tempfile default of `0600`).
+    /// Overwrite the regular file at `rel_path` with `content`. Atomic:
+    /// implementations write to a sibling tempfile and `rename` into place
+    /// so a mid-write crash leaves the original intact. The original file's
+    /// mode bits are preserved across the swap (without this every replaced
+    /// file silently chmods to the tempfile default of `0600`).
     ///
     /// The path must already exist and resolve to a regular file under
     /// the workdir. Symlinks are followed during canonicalisation; if
@@ -510,6 +783,15 @@ pub trait Backend: Send + Sync {
     /// `BackendError::NotFound` — replace is never used to create new
     /// files.
     fn write_file(&self, rel_path: &Path, content: &[u8]) -> Result<(), BackendError>;
+    /// Replace guarded search hits inside one existing regular file. The
+    /// backend owns the complete read/transform/atomic-write operation so a
+    /// remote implementation never transfers the file through one protocol
+    /// frame.
+    fn replace_file(
+        &self,
+        rel_path: &Path,
+        request: &ReplaceFileRequest,
+    ) -> Result<ReplaceFileOutcome, BackendError>;
     /// Move each path to the OS Trash. On hosts without a trash tool the
     /// backend falls back to `fs::remove_*` and reports
     /// `TrashOutcome { used_trash: false }` so the UI can phrase the

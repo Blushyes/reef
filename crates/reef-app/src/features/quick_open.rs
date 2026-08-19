@@ -2,6 +2,7 @@ use crate::PickerState;
 use reef_core::quick_open::{QuickOpenCandidate, QuickOpenMatch};
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub type Candidate = QuickOpenCandidate;
 pub type MatchEntry = QuickOpenMatch;
@@ -9,7 +10,7 @@ pub type MatchEntry = QuickOpenMatch;
 pub struct QuickOpenState {
     pub core: PickerState,
     pub scroll: usize,
-    pub index: Vec<Candidate>,
+    pub index: Arc<[Candidate]>,
     pub index_stale: bool,
     pub matches: Vec<MatchEntry>,
     pub mru: VecDeque<PathBuf>,
@@ -20,7 +21,7 @@ impl Default for QuickOpenState {
         Self {
             core: PickerState::default(),
             scroll: 0,
-            index: Vec::new(),
+            index: Arc::from([]),
             index_stale: true,
             matches: Vec::new(),
             mru: VecDeque::new(),
@@ -28,11 +29,16 @@ impl Default for QuickOpenState {
     }
 }
 
-pub fn filter(state: &mut QuickOpenState) {
-    state.matches =
-        reef_core::quick_open::filter_candidates(&state.index, &state.core.filter, &state.mru);
+pub fn apply_matches(state: &mut QuickOpenState, matches: Vec<MatchEntry>) {
+    state.matches = matches;
     state.core.selected_idx = 0;
     state.scroll = 0;
+}
+
+pub fn filter(state: &mut QuickOpenState) {
+    let matches =
+        reef_core::quick_open::filter_candidates(&state.index, &state.core.filter, &state.mru);
+    apply_matches(state, matches);
 }
 
 pub fn mark_stale(state: &mut QuickOpenState) {

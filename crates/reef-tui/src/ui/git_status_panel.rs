@@ -15,27 +15,34 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use reef_app::{AppCommand, SearchTarget};
 use reef_app::{AppPanel as Panel, AppTab as Tab, CommitError, DiscardTarget, PushError};
-use reef_core::git::tree::{self as gtree, Node};
+use reef_core::git::tree::{self as gtree, TreeRow};
 use reef_core::git::{FileEntry, FileStatus};
 use serde_json::Value;
-use std::collections::BTreeMap;
 use unicode_width::UnicodeWidthStr;
 
 // ─── Public entry points ──────────────────────────────────────────────────────
 
 pub fn render(f: &mut Frame, app: &mut App, area: Rect, _focused: bool) {
     let theme = app.theme;
-    let rows = build_rows(app, area.width, &theme);
-    let total = rows.len();
+    let requested_scroll = app.engine.git_status().scroll;
+    let (mut rows, total) = build_rows(
+        app,
+        area.width,
+        &theme,
+        requested_scroll,
+        area.height as usize,
+    );
 
     // Clamp scroll to a valid range so content can't be scrolled past its end.
     let max_scroll = total.saturating_sub(area.height as usize);
     app.engine
         .dispatch(AppCommand::ClampGitStatusScroll(max_scroll));
     let scroll = app.engine.git_status().scroll;
+    if scroll != requested_scroll {
+        rows = build_rows(app, area.width, &theme, scroll, area.height as usize).0;
+    }
 
-    let visible = rows.iter().skip(scroll).take(area.height as usize);
-    for (i, row) in visible.enumerate() {
+    for (i, row) in rows.iter().enumerate() {
         let y = area.y + i as u16;
         let hover = crate::ui::hover::is_hover(app, area, y);
         let (ranges, cur) = match row.search_row_idx {
@@ -460,8 +467,52 @@ impl Row {
 
 // ─── Row builders ─────────────────────────────────────────────────────────────
 
-fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
-    let mut rows: Vec<Row> = Vec::new();
+struct RowWindow {
+    start: usize,
+    end: usize,
+    total: usize,
+    visible: Vec<Row>,
+}
+
+impl RowWindow {
+    fn new(start: usize, height: usize) -> Self {
+        Self {
+            start,
+            end: start.saturating_add(height),
+            total: 0,
+            visible: Vec::with_capacity(height),
+        }
+    }
+
+    fn push(&mut self, row: Row) {
+        let index = self.total;
+        self.total += 1;
+        if index >= self.start && index < self.end {
+            self.visible.push(row);
+        }
+    }
+
+    fn push_lazy(&mut self, build: impl FnOnce() -> Row) {
+        let index = self.total;
+        self.total += 1;
+        if index >= self.start && index < self.end {
+            self.visible.push(build());
+        }
+    }
+
+    fn finish(self) -> (Vec<Row>, usize) {
+        (self.visible, self.total)
+    }
+}
+
+fn build_rows(
+    app: &App,
+    width: u16,
+    theme: &Theme,
+    scroll: usize,
+    height: usize,
+) -> (Vec<Row>, usize) {
+    let mut rows = RowWindow::new(scroll, height);
     let status = &app.engine.git_status();
     // Slightly narrower budget to accommodate the ↗ open and ↺ discard buttons.
     let max_path = (width as usize).saturating_sub(12);
@@ -734,7 +785,7 @@ fn build_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
         }
     }
 
-    rows
+    rows.finish()
 }
 
 /// Returns `Some(path)` when the app's current selection is for the matching
@@ -749,7 +800,7 @@ fn selected_path_for(app: &App, is_staged: bool) -> Option<String> {
 /// staged files start at 0 and unstaged files start at `staged_files.len()`,
 /// mirroring the ordering in `crate::search::collect_rows(GitStatus)`.
 fn render_files(
-    rows: &mut Vec<Row>,
+    rows: &mut RowWindow,
     app: &App,
     files: &[FileEntry],
     is_staged: bool,
@@ -761,17 +812,15 @@ fn render_files(
     let sel_path = selected_path_for(app, is_staged);
     let pending_discard = status.confirm_discard.as_ref();
     if status.tree_mode {
-        let tree = gtree::build(files);
-        walk_tree(
+        render_tree_rows(
             rows,
-            &tree,
-            1,
+            app.engine.git_status_tree_rows(is_staged),
+            files,
             is_staged,
             max_path,
             &status.collapsed_dirs,
             &sel_path,
             theme,
-            files,
             search_base,
             pending_discard,
         );
@@ -784,75 +833,63 @@ fn render_files(
         };
         for (i, file) in files.iter().enumerate() {
             let is_sel = sel_path.as_deref() == Some(file.path.as_str());
-            rows.push(
-                file_row(file, &file.path, "  ", is_sel, &ctx).with_search_row(search_base + i),
-            );
+            rows.push_lazy(|| {
+                file_row(file, &file.path, "  ", is_sel, &ctx).with_search_row(search_base + i)
+            });
         }
     }
 }
 
-/// `flat_files` is the linear ordering used by `collect_rows(GitStatus)` —
-/// we look each file up here to compute its `search_row_idx` regardless of
-/// tree nesting.
 #[allow(clippy::too_many_arguments)]
-fn walk_tree(
-    rows: &mut Vec<Row>,
-    tree: &BTreeMap<String, Node>,
-    depth: usize,
+fn render_tree_rows(
+    rows: &mut RowWindow,
+    tree_rows: &[TreeRow],
+    files: &[FileEntry],
     is_staged: bool,
     max_path: usize,
     collapsed: &std::collections::HashSet<String>,
     selected_path: &Option<String>,
     theme: &Theme,
-    flat_files: &[FileEntry],
     search_base: usize,
     pending_discard: Option<&DiscardTarget>,
 ) {
-    for (name, node) in gtree::sorted_entries(tree) {
-        match node {
-            Node::Dir { path, children } => {
-                let key = gtree::collapsed_key(is_staged, path);
-                let is_collapsed = collapsed.contains(&key);
-                rows.push(dir_row(
-                    name,
-                    path,
-                    is_staged,
-                    depth,
-                    is_collapsed,
-                    theme,
-                    pending_discard,
-                ));
-                if !is_collapsed {
-                    walk_tree(
-                        rows,
-                        children,
-                        depth + 1,
+    for tree_row in tree_rows {
+        match tree_row {
+            TreeRow::Dir { name, path, depth } => {
+                rows.push_lazy(|| {
+                    let key = gtree::collapsed_key(is_staged, path);
+                    let is_collapsed = collapsed.contains(&key);
+                    dir_row(
+                        name,
+                        path,
+                        is_staged,
+                        *depth,
+                        is_collapsed,
+                        theme,
+                        pending_discard,
+                    )
+                });
+            }
+            TreeRow::File {
+                source_index,
+                depth,
+            } => {
+                let Some(entry) = files.get(*source_index) else {
+                    continue;
+                };
+                rows.push_lazy(|| {
+                    let is_sel = selected_path.as_deref() == Some(entry.path.as_str());
+                    let basename = entry.path.rsplit('/').next().unwrap_or(&entry.path);
+                    let indent = "  ".repeat(*depth);
+                    let ctx = FileRowCtx {
                         is_staged,
                         max_path,
-                        collapsed,
-                        selected_path,
                         theme,
-                        flat_files,
-                        search_base,
                         pending_discard,
-                    );
-                }
-            }
-            Node::File(entry) => {
-                let is_sel = selected_path.as_deref() == Some(entry.path.as_str());
-                let basename = entry.path.rsplit('/').next().unwrap_or(&entry.path);
-                let indent = "  ".repeat(depth);
-                let ctx = FileRowCtx {
-                    is_staged,
-                    max_path,
-                    theme,
-                    pending_discard,
-                };
-                let mut row = file_row(entry, basename, &indent, is_sel, &ctx);
-                if let Some(pos) = flat_files.iter().position(|f| f.path == entry.path) {
-                    row = row.with_search_row(search_base + pos);
-                }
-                rows.push(row);
+                    };
+                    file_row(entry, basename, &indent, is_sel, &ctx)
+                        .with_search_row(search_base + *source_index)
+                });
             }
         }
     }
@@ -1166,7 +1203,7 @@ fn section_header(
 ///   successive rows. Long single lines are truncated with `…` to
 ///   stay inside the sidebar width; the full buffer is preserved in
 ///   state and ships to `git commit -F -` verbatim.
-fn push_commit_box(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Theme) {
+fn push_commit_box(rows: &mut RowWindow, app: &App, max_path: usize, theme: &Theme) {
     let msg = &app.engine.git_status().commit_message;
     let editing = app.engine.git_status().commit_editing;
     let cursor = app.engine.git_status().commit_cursor.min(msg.len());
@@ -1506,4 +1543,28 @@ pub fn scroll(app: &mut App, delta: i32) {
 #[allow(dead_code)]
 pub fn is_focused(app: &App) -> bool {
     matches!(app.engine.active_panel(), Panel::Files)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::{Row, RowWindow};
+
+    #[test]
+    fn row_window_builds_only_visible_rows_and_keeps_total() {
+        let builds = Cell::new(0);
+        let mut rows = RowWindow::new(2, 2);
+        for _ in 0..6 {
+            rows.push_lazy(|| {
+                builds.set(builds.get() + 1);
+                Row::blank()
+            });
+        }
+
+        let (visible, total) = rows.finish();
+        assert_eq!(builds.get(), 2);
+        assert_eq!(visible.len(), 2);
+        assert_eq!(total, 6);
+    }
 }

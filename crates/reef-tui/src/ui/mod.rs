@@ -21,6 +21,7 @@ pub mod preview;
 pub mod quick_open_panel;
 pub mod search_tab;
 pub mod selection;
+pub mod selection_context_menu_panel;
 pub mod settings_panel;
 pub mod text;
 pub mod theme;
@@ -256,6 +257,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // check only looks at `tree_context_menu.active`.
     if snapshot.overlays.tree_context_menu {
         context_menu_panel::render(f, app, size);
+    }
+    if app.selection_context_menu.is_active() {
+        selection_context_menu_panel::render(f, app, size);
     }
     // Navigation candidates popup — same priority bucket as the
     // context menu (overlays everything except the modal). Mutually

@@ -2315,6 +2315,7 @@ name = "reef"
 version = "0.41.0"
 dependencies = [
  "criterion",
+ "crossbeam-channel",
  "crossterm",
  "git2",
  "image",
@@ -2353,8 +2354,7 @@ dependencies = [
 name = "reef-app"
 version = "0.41.0"
 dependencies = [
- "grep-matcher",
- "grep-regex",
+ "crossbeam-channel",
  "reef-core",
  "reef-io",
  "reef-sqlite-preview",
@@ -2377,6 +2377,7 @@ dependencies = [
  "reef-sqlite-preview",
  "regex",
  "rusqlite",
+ "serde",
  "serde_json",
  "syntect",
  "tempfile",
@@ -2396,6 +2397,7 @@ dependencies = [
 name = "reef-io"
 version = "0.41.0"
 dependencies = [
+ "crossbeam-channel",
  "git2",
  "grep-matcher",
  "grep-regex",

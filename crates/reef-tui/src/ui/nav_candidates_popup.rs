@@ -76,8 +76,6 @@ fn render_expanded(f: &mut Frame, app: &mut App, screen: Rect) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(inner);
-    render_header(f, app, rows[0], &popup);
-
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -85,6 +83,12 @@ fn render_expanded(f: &mut Frame, app: &mut App, screen: Rect) {
             Constraint::Percentage(100 - PREVIEW_PERCENT),
         ])
         .split(rows[1]);
+    let viewport_rows = popup.visible_rows(columns[1].height.saturating_sub(1) as usize);
+    reconcile_nav_candidates_viewport(app, &popup, viewport_rows);
+    let Some(popup) = app.engine.nav_candidates() else {
+        return;
+    };
+    render_header(f, app, rows[0], &popup);
     render_preview(f, app, columns[0], &popup);
     render_tree(f, app, columns[1], &popup);
 }
@@ -102,7 +106,10 @@ fn render_compact(f: &mut Frame, app: &mut App, screen: Rect) {
     let width = screen.width.min(COMPACT_WIDTH);
     let height = screen.height.min(max_visible as u16 + 2);
     let visible = popup.compact_visible_rows(height.saturating_sub(2) as usize);
-    app.nav_peek_visible_rows = visible.max(1);
+    reconcile_nav_candidates_viewport(app, &popup, visible);
+    let Some(popup) = app.engine.nav_candidates() else {
+        return;
+    };
     let scroll = popup.scroll.min(total.saturating_sub(visible));
     let scrollable = total > visible;
     let scrollbar_width = u16::from(scrollable);
@@ -214,6 +221,22 @@ fn render_compact(f: &mut Frame, app: &mut App, screen: Rect) {
     if scrollable {
         render_compact_scrollbar(f, app, inner, total, visible, scroll);
     }
+}
+
+fn reconcile_nav_candidates_viewport(
+    app: &mut App,
+    popup: &NavCandidatesPopup,
+    viewport_rows: usize,
+) {
+    let viewport_rows = viewport_rows.max(1);
+    app.nav_peek_visible_rows = viewport_rows;
+    let view = (popup.selected, viewport_rows);
+    if app.nav_peek_reconciled_view == Some(view) {
+        return;
+    }
+    app.engine
+        .dispatch(reef_app::AppCommand::ReconcileNavCandidatesViewport { viewport_rows });
+    app.nav_peek_reconciled_view = Some(view);
 }
 
 fn render_compact_scrollbar(
@@ -581,7 +604,6 @@ fn render_tree(f: &mut Frame, app: &mut App, area: Rect, popup: &NavCandidatesPo
     f.render_widget(frame, area);
 
     let visible = popup.visible_rows(inner.height as usize);
-    app.nav_peek_visible_rows = visible.max(1);
     let visible_start = popup
         .scroll
         .min(popup.tree_row_count().saturating_sub(visible));
@@ -683,29 +705,15 @@ fn render_candidate_row(
         Style::default().fg(th.fg_secondary).bg(background),
     )];
     let snippet = truncate_end(&candidate.snippet, snippet_width);
-    if let Some(start) = snippet.find(&popup.symbol) {
-        let end = start + popup.symbol.len();
-        spans.push(Span::styled(
-            snippet[..start].to_owned(),
-            Style::default().fg(th.fg_primary).bg(background),
-        ));
-        spans.push(Span::styled(
-            snippet[start..end].to_owned(),
-            Style::default()
-                .fg(th.accent)
-                .bg(th.search_match)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(
-            snippet[end..].to_owned(),
-            Style::default().fg(th.fg_primary).bg(background),
-        ));
-    } else {
-        spans.push(Span::styled(
-            snippet,
-            Style::default().fg(th.fg_primary).bg(background),
-        ));
-    }
+    spans.extend(exact_snippet_spans(
+        &snippet,
+        candidate.snippet_match_range.clone(),
+        Style::default().fg(th.fg_primary).bg(background),
+        Style::default()
+            .fg(th.accent)
+            .bg(th.search_match)
+            .add_modifier(Modifier::BOLD),
+    ));
     f.render_widget(Line::from(spans), Rect::new(area.x, y, area.width, 1));
     app.hit_registry.register_row(
         area.x,
@@ -713,6 +721,30 @@ fn render_candidate_row(
         area.width,
         ClickAction::NavCandidateSelect(candidate_index),
     );
+}
+
+fn exact_snippet_spans(
+    snippet: &str,
+    match_range: std::ops::Range<usize>,
+    normal_style: Style,
+    match_style: Style,
+) -> Vec<Span<'_>> {
+    if match_range.is_empty()
+        || snippet.get(match_range.clone()).is_none()
+        || !snippet.is_char_boundary(match_range.start)
+        || !snippet.is_char_boundary(match_range.end)
+    {
+        return vec![Span::styled(snippet, normal_style)];
+    }
+    let mut spans = Vec::with_capacity(3);
+    if match_range.start > 0 {
+        spans.push(Span::styled(&snippet[..match_range.start], normal_style));
+    }
+    spans.push(Span::styled(&snippet[match_range.clone()], match_style));
+    if match_range.end < snippet.len() {
+        spans.push(Span::styled(&snippet[match_range.end..], normal_style));
+    }
+    spans
 }
 
 fn truncate_end(text: &str, max_width: usize) -> String {
@@ -837,6 +869,7 @@ mod tests {
             line: 41,
             byte_range: 0..4,
             snippet: "ReefApp::new()".to_owned(),
+            snippet_match_range: 0..4,
         };
 
         let location = compact_location(&candidate, Path::new("unused.rs"));
@@ -867,6 +900,27 @@ mod tests {
                 (", Vec<", normal),
                 ("DiffLine", highlighted),
                 (">}", normal),
+            ]
+        );
+    }
+
+    #[test]
+    fn exact_snippet_spans_highlight_the_candidate_occurrence() {
+        let normal = Style::default().fg(ratatui::style::Color::White);
+        let highlighted = Style::default().fg(ratatui::style::Color::Yellow);
+        let snippet = "target(target())";
+
+        let spans = exact_snippet_spans(snippet, 7..13, normal, highlighted);
+
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| (span.content.as_ref(), span.style))
+                .collect::<Vec<_>>(),
+            vec![
+                ("target(", normal),
+                ("target", highlighted),
+                ("())", normal)
             ]
         );
     }

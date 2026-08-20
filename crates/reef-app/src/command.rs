@@ -486,6 +486,9 @@ pub enum AppCommand {
         delta: i32,
         viewport_rows: usize,
     },
+    ReconcileNavCandidatesViewport {
+        viewport_rows: usize,
+    },
     NavigatePreviewDefinitionAt {
         cursor: CursorPosition,
         dark: bool,

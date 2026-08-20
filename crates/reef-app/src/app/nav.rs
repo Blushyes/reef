@@ -160,6 +160,10 @@ impl AppState {
         popup.scroll = (popup.scroll as i32 + delta).clamp(0, max_scroll as i32) as usize;
     }
 
+    pub fn reconcile_nav_candidates_viewport(&mut self, viewport_rows: usize) {
+        self.clamp_nav_candidates_scroll(viewport_rows);
+    }
+
     pub fn toggle_nav_peek_mode(&mut self, viewport_rows: usize) {
         self.set_nav_peek_mode(self.settings.nav_peek_mode.next(), viewport_rows);
     }
@@ -468,7 +472,11 @@ impl AppState {
     }
 
     pub fn dispatch_nav_workspace_build(&mut self) {
-        if self.backend.is_remote() || self.nav_workspace_load.loading {
+        if self.backend.is_remote() {
+            self.nav_workspace_load.invalidate();
+            return;
+        }
+        if self.nav_workspace_load.loading {
             return;
         }
         let generation = self.nav_workspace_load.begin();

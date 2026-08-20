@@ -138,10 +138,15 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
   scroll bounds valid without owning terminal geometry. Renderers must render the cached navigation
   document and never read the selected file themselves.
 - Native renderers map their platform navigation modifier-click to a typed file cursor and dispatch
-  `NavigatePreviewDefinitionAt`. `reef-app` schedules the initial workspace-index build from its
-  stale async state, retains a generation/path-bound request while preview
+  `NavigatePreviewDefinitionAt`. For local backends, `reef-app` schedules the initial
+  workspace-index build from its stale async state; remote backends leave that unsupported state
+  idle. The app retains a generation/path-bound request while preview
   enrichment or the workspace index is pending, resolves definitions with the workspace index, falls through to
   references at declarations, and owns candidate confirmation plus navigation history.
+- Explicit file, search-result, Git-diff, Graph-diff, and code-definition navigation records a
+  `LocationSnapshot` before committing the destination. Renderer hosts own native cursor/scroll
+  sampling and restoration, while `reef-app` owns the bounded back/forward stacks and target jump.
+  Passive selection, caret movement, hover, and scrolling do not append history.
 - Preview snapshots expose separate content and presentation revisions. `source_revision` changes only when accepted raw preview content changes; `revision` may also change when asynchronous enrichment arrives. Content-relative state such as find, selection, and navigation uses `source_revision`, while renderer caches that include styling use `revision`.
 - OS drag-and-drop and place-mode sources use `CopyFiles`. A remote backend treats every such path
   as host-local and uploads it; workdir-internal clipboard copies use `CopyPaths`. Placement uses

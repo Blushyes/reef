@@ -249,8 +249,6 @@ fn bindings() -> &'static [KeyBinding] {
                 KeyBinding::single(Normal, Char('b'), Mods::CONTROL, ToggleSidebar),
                 KeyBinding::single(Normal, Char(','), Mods::CONTROL, OpenSettings),
                 KeyBinding::single(Normal, Char('o'), Mods::CONTROL, OpenHostsPicker),
-                KeyBinding::single(Normal, Left, Mods::ALT, LocationBack),
-                KeyBinding::single(Normal, Right, Mods::ALT, LocationForward),
                 KeyBinding::single(Normal, Left, Mods::ALT | Mods::CONTROL, LocationBack),
                 KeyBinding::single(Normal, Right, Mods::ALT | Mods::CONTROL, LocationForward),
                 KeyBinding::single(Normal, Char('/'), Mods::NONE, BeginSearchForward),
@@ -472,14 +470,11 @@ mod tests {
     }
 
     #[test]
-    fn normal_location_history_bindings_include_ctrl_alt_aliases() {
+    fn normal_location_history_bindings_require_ctrl_alt() {
         let alt_left = KeyEvent::new(KeyCode::Left, KeyModifiers::ALT);
         let ctrl_alt_left = KeyEvent::new(KeyCode::Left, KeyModifiers::ALT | KeyModifiers::CONTROL);
 
-        assert_eq!(
-            Keymap::resolve(InputScope::Normal, &alt_left),
-            Some(Command::LocationBack)
-        );
+        assert_eq!(Keymap::resolve(InputScope::Normal, &alt_left), None);
         assert_eq!(
             Keymap::resolve(InputScope::Normal, &ctrl_alt_left),
             Some(Command::LocationBack)

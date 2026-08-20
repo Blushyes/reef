@@ -205,7 +205,9 @@ impl AppState {
             if self.quick_open.core.active {
                 self.request_quick_open_index_if_needed();
             }
-            self.nav_workspace_load.mark_stale();
+            if !self.backend.is_remote() {
+                self.nav_workspace_load.mark_stale();
+            }
             self.nav_refine_cache.clear();
             self.nav_refine_epoch = self.nav_refine_epoch.wrapping_add(1);
         }

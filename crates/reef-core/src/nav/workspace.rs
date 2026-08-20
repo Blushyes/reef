@@ -57,6 +57,7 @@ pub struct SymbolLoc {
     pub line: usize,
     pub byte_range: Range<usize>,
     pub snippet: String,
+    pub snippet_match_range: Range<usize>,
     pub lang: NavLang,
 }
 
@@ -105,6 +106,7 @@ fn symbol_locs_to_locations(
             line: symbol.line,
             byte_range: symbol.byte_range.clone(),
             snippet: symbol.snippet.clone(),
+            snippet_match_range: symbol.snippet_match_range.clone(),
         })
         .collect()
 }
@@ -200,36 +202,50 @@ fn extract_symbols(
             if start.row != end.row {
                 continue;
             }
+            let snippet = snippet_for(source, start.row, start.column..end.column);
             out.entry(text.to_owned()).or_default().push(SymbolLoc {
                 path: rel_path.to_path_buf(),
                 line: start.row,
                 byte_range: start.column..end.column,
-                snippet: snippet_for(source, start.row, start.column..end.column),
+                snippet: snippet.text,
+                snippet_match_range: snippet.match_range,
                 lang,
             });
         }
     }
 }
 
-pub(crate) fn snippet_for(source: &[u8], line: usize, target_byte_range: Range<usize>) -> String {
+pub(super) struct NavigationSnippet {
+    pub text: String,
+    pub match_range: Range<usize>,
+}
+
+pub(super) fn snippet_for(
+    source: &[u8],
+    line: usize,
+    target_byte_range: Range<usize>,
+) -> NavigationSnippet {
     snippet_from_line(super::line_bytes_at(source, line), target_byte_range)
 }
 
-pub(crate) fn snippet_from_line(line: &[u8], target_byte_range: Range<usize>) -> String {
+fn snippet_from_line(line: &[u8], target_byte_range: Range<usize>) -> NavigationSnippet {
     let s = String::from_utf8_lossy(line);
     let trimmed = s.trim_start();
     if trimmed.chars().count() > SNIPPET_MAX_W {
         focused_snippet(&s, target_byte_range).unwrap_or_else(|| leading_snippet(trimmed))
     } else {
-        trimmed.to_string()
+        NavigationSnippet {
+            text: trimmed.to_string(),
+            match_range: target_range_in_trimmed(&s, target_byte_range).unwrap_or(0..0),
+        }
     }
 }
 
-fn focused_snippet(line: &str, target_byte_range: Range<usize>) -> Option<String> {
-    let leading_bytes = line.len() - line.trim_start().len();
+fn target_range_in_trimmed(line: &str, target_byte_range: Range<usize>) -> Option<Range<usize>> {
+    let trimmed = line.trim_start();
+    let leading_bytes = line.len() - trimmed.len();
     let target_start = target_byte_range.start.checked_sub(leading_bytes)?;
     let target_end = target_byte_range.end.checked_sub(leading_bytes)?;
-    let trimmed = line.trim_start();
     if target_start > target_end
         || target_end > trimmed.len()
         || !trimmed.is_char_boundary(target_start)
@@ -237,31 +253,48 @@ fn focused_snippet(line: &str, target_byte_range: Range<usize>) -> Option<String
     {
         return None;
     }
+    Some(target_start..target_end)
+}
 
-    let target_start_chars = trimmed[..target_start].chars().count();
-    let target_end_chars = target_start_chars + trimmed[target_start..target_end].chars().count();
+fn focused_snippet(line: &str, target_byte_range: Range<usize>) -> Option<NavigationSnippet> {
+    let trimmed = line.trim_start();
+    let target_range = target_range_in_trimmed(line, target_byte_range)?;
+
+    let target_start_chars = trimmed[..target_range.start].chars().count();
+    let target_end_chars = target_start_chars + trimmed[target_range.clone()].chars().count();
     let total_chars = trimmed.chars().count();
     let window_start = target_start_chars.saturating_sub(SNIPPET_LEADING_CONTEXT);
     let window_end = total_chars.min(window_start.saturating_add(SNIPPET_MAX_W));
     let window_end = window_end.max(target_end_chars);
+    let window_start_byte = char_offset(trimmed, window_start);
+    let window_end_byte = char_offset(trimmed, window_end);
     let mut snippet = String::new();
     if window_start > 0 {
         snippet.push('…');
     }
-    snippet.extend(
-        trimmed
-            .chars()
-            .skip(window_start)
-            .take(window_end - window_start),
-    );
+    let prefix_bytes = snippet.len();
+    snippet.push_str(&trimmed[window_start_byte..window_end_byte]);
     if window_end < total_chars {
         snippet.push('…');
     }
-    Some(snippet)
+    Some(NavigationSnippet {
+        text: snippet,
+        match_range: prefix_bytes + target_range.start - window_start_byte
+            ..prefix_bytes + target_range.end - window_start_byte,
+    })
 }
 
-fn leading_snippet(line: &str) -> String {
-    line.chars().take(SNIPPET_MAX_W).collect::<String>() + "…"
+fn char_offset(text: &str, index: usize) -> usize {
+    text.char_indices()
+        .nth(index)
+        .map_or(text.len(), |(offset, _)| offset)
+}
+
+fn leading_snippet(line: &str) -> NavigationSnippet {
+    NavigationSnippet {
+        text: line.chars().take(SNIPPET_MAX_W).collect::<String>() + "…",
+        match_range: 0..0,
+    }
 }
 
 /// Per-language reference query. Matches every identifier-shaped node
@@ -351,6 +384,7 @@ mod tests {
             line,
             byte_range: 1..4,
             snippet: "foo".to_string(),
+            snippet_match_range: 0..3,
             lang,
         }
     }
@@ -417,11 +451,16 @@ mod tests {
             target_start..target_start + "parse_script_v4".len(),
         );
 
-        assert!(snippet.starts_with('…'));
-        assert!(snippet.contains("parse_script_v4"));
-        let snippet_target_start = snippet.find("parse_script_v4").unwrap();
-        assert!(snippet[..snippet_target_start].chars().count() <= SNIPPET_LEADING_CONTEXT + 1);
-        assert!(snippet.chars().count() <= SNIPPET_MAX_W + 2);
+        assert!(snippet.text.starts_with('…'));
+        assert_eq!(
+            &snippet.text[snippet.match_range.clone()],
+            "parse_script_v4"
+        );
+        assert!(
+            snippet.text[..snippet.match_range.start].chars().count()
+                <= SNIPPET_LEADING_CONTEXT + 1
+        );
+        assert!(snippet.text.chars().count() <= SNIPPET_MAX_W + 2);
     }
 
     #[test]
@@ -434,6 +473,7 @@ mod tests {
             target_start..target_start + "parse_script_v4".len(),
         );
 
-        assert_eq!(snippet, "let value = parse_script_v4();");
+        assert_eq!(snippet.text, "let value = parse_script_v4();");
+        assert_eq!(&snippet.text[snippet.match_range], "parse_script_v4");
     }
 }

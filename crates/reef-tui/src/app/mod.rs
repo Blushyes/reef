@@ -290,6 +290,7 @@ pub struct TuiApp {
     pub(crate) nav_peek_preview_max_scroll: usize,
     pub(crate) nav_peek_preview_target: Option<(String, usize, usize)>,
     pub(crate) nav_peek_visible_rows: usize,
+    pub(crate) nav_peek_reconciled_view: Option<(usize, usize)>,
 
     /// Active color theme. Chosen in `main.rs` before raw-mode entry.
     pub theme: Theme,
@@ -492,6 +493,7 @@ impl App {
             nav_peek_preview_max_scroll: 0,
             nav_peek_preview_target: None,
             nav_peek_visible_rows: reef_app::NavCandidatesPopup::MAX_VISIBLE_ROWS,
+            nav_peek_reconciled_view: None,
             theme,
             space_leader_at: None,
             g_pending_at: None,
@@ -1540,6 +1542,13 @@ impl App {
     }
 
     pub fn select_file(&mut self, path: &str, is_staged: bool) {
+        if self
+            .engine
+            .selected_file()
+            .is_none_or(|selected| selected.path != path || selected.is_staged != is_staged)
+        {
+            self.push_location_before_jump();
+        }
         self.engine.dispatch(reef_app::AppCommand::SelectGitFile {
             path: path.to_string(),
             is_staged,
@@ -1762,6 +1771,15 @@ impl App {
     /// moves focus there — the user's next arrow-key pans the viewport
     /// instead of scrolling the commit metadata they were already looking at.
     pub fn load_commit_file_diff(&mut self, path: &str) {
+        if self
+            .engine
+            .commit_detail()
+            .file_diff
+            .as_ref()
+            .is_none_or(|diff| diff.path != path)
+        {
+            self.push_location_before_jump();
+        }
         self.engine
             .dispatch(reef_app::AppCommand::LoadCommitFileDiff {
                 path: path.to_string(),
@@ -2768,6 +2786,18 @@ impl App {
                 self.open_hosts_picker();
             }
             ClickAction::TreeClick(index) => {
+                let changes_preview = self
+                    .engine
+                    .file_tree_entry(index)
+                    .filter(|entry| !entry.is_dir)
+                    .is_some_and(|entry| {
+                        self.engine
+                            .preview_content_ref()
+                            .is_none_or(|preview| std::path::Path::new(&preview.path) != entry.path)
+                    });
+                if changes_preview {
+                    self.push_location_before_jump();
+                }
                 self.engine
                     .dispatch(reef_app::AppCommand::ActivateFileTreeEntryAtIndex(index));
             }

@@ -59,7 +59,9 @@ impl ReefApp {
             now: Instant::now(),
             subscribe_fs_events: config.subscribe_fs_events,
         });
-        state.nav_workspace_load.mark_stale();
+        if !state.backend.is_remote() {
+            state.nav_workspace_load.mark_stale();
+        }
         Self {
             state,
             effects: Vec::new(),
@@ -199,7 +201,8 @@ impl ReefApp {
     }
 
     fn push_location_jump_outcome(&mut self, outcome: crate::app::JumpToLocationOutcome) {
-        if outcome.restore_preview_cursor.is_some()
+        if outcome.location.is_some()
+            || outcome.restore_preview_cursor.is_some()
             || outcome.clear_commit_detail_selection
             || outcome.clear_diff_selection
         {
@@ -1143,6 +1146,9 @@ impl ReefApp {
                 delta,
                 viewport_rows,
             } => self.state.scroll_nav_candidates(delta, viewport_rows),
+            AppCommand::ReconcileNavCandidatesViewport { viewport_rows } => {
+                self.state.reconcile_nav_candidates_viewport(viewport_rows)
+            }
             AppCommand::NavigatePreviewDefinitionAt {
                 cursor,
                 dark,
@@ -2012,6 +2018,14 @@ impl ReefApp {
         self.state.selected_file.as_ref()
     }
 
+    pub fn can_go_back(&self) -> bool {
+        !self.state.location_history.is_empty()
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        !self.state.location_history.forward_is_empty()
+    }
+
     pub fn selected_file_identity(&self) -> Option<(String, bool)> {
         self.state
             .selected_file
@@ -2684,6 +2698,30 @@ mod tests {
                 .iter()
                 .all(|event| !matches!(event, AppRuntimeEvent::TabChanged(_)))
         );
+    }
+
+    #[test]
+    fn location_history_capabilities_follow_back_and_forward_stacks() {
+        let mut app = test_app();
+        let origin = global_search_origin();
+        let current = LocationSnapshot {
+            path: PathBuf::from("src/current.rs"),
+            ..origin.clone()
+        };
+
+        assert!(!app.can_go_back());
+        assert!(!app.can_go_forward());
+
+        app.dispatch(AppCommand::PushLocationHistory(origin));
+        assert!(app.can_go_back());
+
+        app.dispatch(AppCommand::LocationBack {
+            current: Some(current),
+            dark: false,
+            uses_three_col: false,
+        });
+        assert!(!app.can_go_back());
+        assert!(app.can_go_forward());
     }
 
     #[test]

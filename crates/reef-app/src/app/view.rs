@@ -321,7 +321,15 @@ impl AppState {
         dark: bool,
         uses_three_col: bool,
     ) -> JumpToLocationOutcome {
-        let mut outcome = JumpToLocationOutcome::default();
+        if let LocationSurface::GraphDiff { commit_oid, .. } = &target.surface
+            && self.git_graph.find_row_by_oid(commit_oid).is_none()
+        {
+            return JumpToLocationOutcome::default();
+        }
+        let mut outcome = JumpToLocationOutcome {
+            location: Some(target.clone()),
+            ..JumpToLocationOutcome::default()
+        };
         match target.surface.clone() {
             LocationSurface::FilePreview => {
                 self.set_active_tab(AppTab::Files);

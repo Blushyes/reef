@@ -101,7 +101,9 @@ fn render_transport(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let info = player.info();
 
-    let position = player.position();
+    let position = app
+        .video_seek_position()
+        .unwrap_or_else(|| player.position());
     let clock = match info.duration {
         Some(duration) => format!(
             "{} / {}",
@@ -149,6 +151,20 @@ fn render_transport(f: &mut Frame, app: &mut App, area: Rect) {
             ]),
             Rect::new(rule_x, area.y, rule_w, 1),
         );
+        if info
+            .duration
+            .is_some_and(|duration| duration.is_finite() && duration > 0.0)
+        {
+            app.hit_registry.register_row(
+                rule_x,
+                area.y,
+                rule_w,
+                ClickAction::SeekVideo {
+                    start: rule_x,
+                    width: rule_w,
+                },
+            );
+        }
     }
 
     f.render_widget(
@@ -209,6 +225,7 @@ fn meta_line(app: &App, info: &BinaryInfo) -> String {
 fn pending_note(app: &App) -> String {
     match app.video_status.as_ref() {
         Some(VideoUnavailable::NoFfmpeg) => t(Msg::PreviewVideoNeedsFfmpeg).to_string(),
+        Some(VideoUnavailable::NoFfplay) => t(Msg::PreviewVideoNeedsFfplay).to_string(),
         Some(VideoUnavailable::Tmux) => t(Msg::PreviewVideoTmux).to_string(),
         Some(VideoUnavailable::Remote) => t(Msg::PreviewVideoRemote).to_string(),
         Some(VideoUnavailable::Unreadable(detail)) => {

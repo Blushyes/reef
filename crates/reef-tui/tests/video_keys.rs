@@ -195,6 +195,55 @@ fn transport_button_toggles_playback_from_tree_focus() {
 }
 
 #[test]
+fn dragging_the_timeline_seeks_on_release() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(mut fixture) = app_previewing_a_clip() else {
+        return;
+    };
+    let app = &mut fixture.app;
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    terminal.draw(|frame| ui::render(frame, app)).unwrap();
+
+    let (start, width, row) = (0..30)
+        .flat_map(|row| (0..120).map(move |column| (column, row)))
+        .find_map(
+            |(column, row)| match app.hit_registry.hit_test(column, row) {
+                Some(ClickAction::SeekVideo { start, width }) => Some((start, width, row)),
+                _ => None,
+            },
+        )
+        .expect("rendered video timeline");
+    let target = start + width.saturating_sub(1) * 3 / 4;
+
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Drag(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        input::handle_mouse(
+            MouseEvent {
+                kind,
+                column: target,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            app,
+            &terminal,
+        );
+    }
+
+    wait_until(app, "timeline seek", |app| {
+        app.video
+            .as_ref()
+            .is_some_and(|player| player.position() > 2.5)
+    });
+    assert!(
+        !app.video.as_ref().unwrap().is_playing(),
+        "a paused clip stays paused after seeking"
+    );
+}
+
+#[test]
 fn p_plays_and_pauses_once_the_preview_panel_has_focus() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some(mut fixture) = app_previewing_a_clip() else {

@@ -187,6 +187,12 @@ pub enum ClickAction {
     /// Play, pause, or replay the inline video preview according to its
     /// current state. Registered on the transport button beneath the frame.
     ToggleVideoPlayback,
+    /// Begin seeking from the inline video's progress rule. The geometry is
+    /// retained so dragging can continue after the pointer leaves the rule.
+    SeekVideo {
+        start: u16,
+        width: u16,
+    },
 }
 
 #[derive(Debug, Clone)]

@@ -9,17 +9,19 @@
 //! The pipeline is deliberately transcode-free on our side:
 //!
 //! ```text
-//!   ffprobe  →  dimensions / fps / duration
+//!   ffprobe  →  dimensions / fps / duration / audio presence
 //!   ffmpeg   →  fps + scale + pad  →  rawvideo rgba on stdout
-//!   reader thread  →  read_exact(frame_bytes)  →  bounded channel
-//!   tick()   →  wrap bytes as RgbaImage  →  protocol encode  →  buffer
+//!   ffplay   →  audio device + audio-master clock on stderr
+//!   reader threads  →  frame queue + clock IPC
+//!   tick()   →  drop late frames, encode the newest due frame  →  buffer
 //! ```
 //!
 //! Frames leave ffmpeg already scaled to the exact pixel size the panel can
-//! show, so no resizing, no image decoding, and no re-encoding happens per
-//! frame. The bounded channel is the flow control: a paused player simply
-//! stops draining it, ffmpeg blocks on a full pipe, and no work is done until
-//! playback resumes.
+//! show, so no resizing or image decoding happens per frame. For clips with
+//! audio, ffplay's device clock is authoritative: frames behind it are
+//! drained without encoding and only the newest due frame reaches the
+//! terminal. Pausing stops ffplay and leaves the bounded video queue full, so
+//! neither decoder consumes resources until playback resumes.
 //!
 //! `REEF_VIDEO` is an escape hatch:
 //!   - `off` / `none` — never play inline; the card stays a still card.
@@ -27,6 +29,9 @@
 //!
 //! `REEF_VIDEO_FPS` overrides the playback frame rate (1–60).
 
+mod audio;
+
+use self::audio::AudioPlayer;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -72,6 +77,8 @@ pub enum VideoUnavailable {
     Remote,
     /// ffmpeg / ffprobe are not on `PATH`.
     NoFfmpeg,
+    /// The source has audio, but ffplay is not on `PATH`.
+    NoFfplay,
     /// ffprobe ran but the file yielded no usable video stream.
     Unreadable(String),
 }
@@ -85,6 +92,9 @@ pub struct VideoInfo {
     pub fps: Option<f64>,
     /// Duration in seconds; `None` for streams without one.
     pub duration: Option<f64>,
+    /// Whether the container has an audio stream that can be the playback
+    /// clock.
+    pub has_audio: bool,
 }
 
 /// Playback state machine for one preview panel.
@@ -106,12 +116,16 @@ pub struct VideoPlayer {
     /// The most recently encoded frame, ready for the widget to render.
     frame: Option<Protocol>,
     /// Frames consumed since the decoder started, plus wherever the decoder
-    /// was seeked to. Drives the progress readout.
+    /// was seeked to. Driven by the audio clock when the source has audio.
     position: f64,
+    /// Timestamp of the frame currently encoded for the terminal. This may
+    /// trail `position` by at most one output frame.
+    frame_position: f64,
     playing: bool,
     ended: bool,
     /// When the next frame is due. `None` while paused.
     next_due: Option<Instant>,
+    audio: Option<AudioPlayer>,
 }
 
 /// Cheap, cloneable source state used to rebuild a player off the UI thread.
@@ -131,19 +145,20 @@ struct Decoder {
 
 impl Drop for Decoder {
     fn drop(&mut self) {
-        let Some(mut child) = self.child.take() else {
+        let Some(child) = self.child.take() else {
             return;
         };
-        let _ = child.kill();
-        // Waiting can block while ffmpeg handles termination. Reap it away
-        // from the UI thread; closing the receiver after this method returns
-        // also releases the stdout reader if it was waiting on channel space.
-        let _ = std::thread::Builder::new()
-            .name("reef-video-reap".into())
-            .spawn(move || {
-                let _ = child.wait();
-            });
+        kill_and_reap(child, "reef-video-reap");
     }
+}
+
+fn kill_and_reap(mut child: Child, thread_name: &'static str) {
+    let _ = child.kill();
+    let _ = std::thread::Builder::new()
+        .name(thread_name.into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
 }
 
 impl VideoPlayer {
@@ -167,6 +182,9 @@ impl VideoPlayer {
         }
 
         let info = probe(path)?;
+        if info.has_audio {
+            audio::ensure_available()?;
+        }
         let fps = playback_fps(info.fps);
         let source = VideoSource {
             path: path.to_path_buf(),
@@ -190,6 +208,9 @@ impl VideoPlayer {
             fps,
         } = source;
         let (frame_px, area) = frame_size(info, picker, cell_area);
+        let audio = info
+            .has_audio
+            .then(|| AudioPlayer::new(path.clone(), position));
 
         let mut player = VideoPlayer {
             path,
@@ -201,9 +222,11 @@ impl VideoPlayer {
             decoder: None,
             frame: None,
             position,
+            frame_position: position,
             playing: false,
             ended: false,
             next_due: None,
+            audio,
         };
         player.start_decoder(position)?;
         // Pull the opening frame synchronously so the card never flashes an
@@ -268,29 +291,48 @@ impl VideoPlayer {
         }
     }
 
+    /// Convert a timeline ratio into a position that still has a decodable
+    /// frame. Seeking to the container's exact duration would start ffmpeg
+    /// after the final frame, so the right edge lands one output frame back.
+    pub(crate) fn seek_position(&self, ratio: f64) -> Option<f64> {
+        seek_position(self.info.duration, self.fps, ratio)
+    }
+
     /// The frame to draw, and the cell area it occupies.
     pub fn frame(&self) -> Option<(&Protocol, Rect)> {
         self.frame.as_ref().map(|frame| (frame, self.cell_area))
     }
 
-    pub(crate) fn set_playing(&mut self, playing: bool) {
-        self.playing = playing && !self.ended;
-        self.next_due = self.playing.then(|| Instant::now() + self.frame_interval());
+    pub(crate) fn set_playing(&mut self, playing: bool) -> Result<(), VideoUnavailable> {
+        let playing = playing && !self.ended;
+        if playing
+            && !self.playing
+            && let Some(audio) = self.audio.as_mut()
+        {
+            audio.play(self.position)?;
+        } else if !playing
+            && self.playing
+            && let Some(audio) = self.audio.as_mut()
+        {
+            self.position = audio.pause_at(Instant::now());
+        }
+        self.playing = playing;
+        self.next_due =
+            (self.playing && self.audio.is_none()).then(|| Instant::now() + self.frame_interval());
+        Ok(())
     }
 
-    /// Toggle play/pause without performing I/O. Returns `false` when the
-    /// clip has ended and must be rebuilt asynchronously from the beginning.
+    /// Toggle play/pause. Returns `false` when the clip has ended, or when an
+    /// audio process could not be started.
     pub fn toggle(&mut self) -> bool {
         if self.ended {
             return false;
         }
-        self.set_playing(!self.playing);
-        true
+        self.set_playing(!self.playing).is_ok()
     }
 
     pub fn pause(&mut self) {
-        self.playing = false;
-        self.next_due = None;
+        let _ = self.set_playing(false);
     }
 
     pub fn matches_area(&self, picker: &Picker, cell_area: Rect) -> bool {
@@ -304,6 +346,9 @@ impl VideoPlayer {
         if !self.playing || self.ended {
             return false;
         }
+        if self.audio.is_some() {
+            return self.tick_to_audio(now, picker);
+        }
         let Some(due) = self.next_due else {
             return false;
         };
@@ -315,6 +360,7 @@ impl VideoPlayer {
             FramePull::Frame(bytes) => {
                 self.encode(picker, bytes);
                 self.position += 1.0 / self.fps;
+                self.frame_position = self.position;
                 // Schedule from the deadline, not from `now`, so playback
                 // keeps the source's timing instead of drifting by however
                 // late this tick ran. A tick that fell far behind (panel
@@ -346,14 +392,56 @@ impl VideoPlayer {
         self.playing = false;
         self.next_due = None;
         self.decoder = None;
+        self.audio = None;
         if let Some(duration) = self.info.duration {
             self.position = duration;
+            self.frame_position = duration;
         }
         true
     }
 
     fn frame_interval(&self) -> Duration {
         Duration::from_secs_f64(1.0 / self.fps)
+    }
+
+    fn tick_to_audio(&mut self, now: Instant, picker: &Picker) -> bool {
+        let Some(audio) = self.audio.as_mut() else {
+            return false;
+        };
+        let poll = audio.poll_at(now);
+        self.position = match self.info.duration {
+            Some(duration) => poll.position.min(duration),
+            None => poll.position,
+        };
+
+        let changed = self.advance_frames_to(self.position, picker);
+        if poll.ended {
+            return self.finish();
+        }
+        changed
+    }
+
+    /// Consume every frame whose presentation time is due, but encode only
+    /// the newest one. Dropping intermediate raw frames is what lets video
+    /// catch up without delaying the audio clock.
+    fn advance_frames_to(&mut self, target: f64, picker: &Picker) -> bool {
+        let due = frames_due(self.frame_position, target, self.fps);
+        let mut latest = None;
+        for _ in 0..due {
+            match self.take_frame() {
+                FramePull::Frame(bytes) => {
+                    self.frame_position += 1.0 / self.fps;
+                    latest = Some(bytes);
+                }
+                FramePull::Pending | FramePull::Finished => break,
+            }
+        }
+        if let Some(bytes) = latest {
+            self.encode(picker, bytes);
+            true
+        } else {
+            false
+        }
     }
 
     /// Spawn ffmpeg decoding from `start_secs` at the current frame size.
@@ -374,7 +462,7 @@ impl VideoPlayer {
         command
             .arg("-i")
             .arg(&self.path)
-            // No audio path exists in a terminal, so never decode it.
+            // Audio has its own ffplay process and clock channel.
             .arg("-an")
             .args(["-vf", &filter_chain(width, height, self.fps)])
             .args(["-f", "rawvideo"])
@@ -502,6 +590,24 @@ fn read_frames(stdout: std::process::ChildStdout, frame_bytes: usize, tx: SyncSe
     }
 }
 
+fn frames_due(frame_position: f64, target: f64, fps: f64) -> usize {
+    if !fps.is_finite() || fps <= 0.0 || !target.is_finite() {
+        return 0;
+    }
+    let interval = 1.0 / fps;
+    let delta = target + interval / 2.0 - frame_position;
+    if delta < interval {
+        return 0;
+    }
+    (delta / interval).floor() as usize
+}
+
+fn seek_position(duration: Option<f64>, fps: f64, ratio: f64) -> Option<f64> {
+    let duration = duration.filter(|duration| duration.is_finite() && *duration > 0.0)?;
+    let last_frame = (duration - 1.0 / fps).max(0.0);
+    Some((duration * ratio.clamp(0.0, 1.0)).min(last_frame))
+}
+
 /// The ffmpeg filter chain: drop to playback frame rate, fit inside the
 /// frame, then pad back out to the exact size so every frame is the same
 /// number of bytes. Padding is transparent, so the letterboxed margins show
@@ -593,7 +699,26 @@ fn probe(path: &Path) -> Result<VideoInfo, VideoUnavailable> {
         let detail = String::from_utf8_lossy(&output.stderr);
         return Err(VideoUnavailable::Unreadable(first_line(&detail)));
     }
-    parse_probe(&String::from_utf8_lossy(&output.stdout))
+    let mut info = parse_probe(&String::from_utf8_lossy(&output.stdout))?;
+    info.has_audio = probe_has_audio(path)?;
+    Ok(info)
+}
+
+fn probe_has_audio(path: &Path) -> Result<bool, VideoUnavailable> {
+    let output = Command::new("ffprobe")
+        .args(["-v", "error"])
+        .args(["-select_streams", "a:0"])
+        .args(["-show_entries", "stream=index"])
+        .args(["-of", "csv=p=0"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|_| VideoUnavailable::NoFfmpeg)?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        return Err(VideoUnavailable::Unreadable(first_line(&detail)));
+    }
+    Ok(!output.stdout.iter().all(u8::is_ascii_whitespace))
 }
 
 /// Parse ffprobe's `key=value` lines. Width and height are required — a file
@@ -624,6 +749,7 @@ fn parse_probe(text: &str) -> Result<VideoInfo, VideoUnavailable> {
             height,
             fps,
             duration,
+            has_audio: false,
         }),
         _ => Err(VideoUnavailable::Unreadable("no video stream".into())),
     }
@@ -696,6 +822,7 @@ mod tests {
             height,
             fps: Some(30.0),
             duration: Some(10.0),
+            has_audio: false,
         }
     }
 
@@ -707,6 +834,7 @@ mod tests {
         assert_eq!((parsed.width, parsed.height), (1920, 1080));
         assert!((parsed.fps.unwrap() - 29.97).abs() < 0.01);
         assert_eq!(parsed.duration, Some(12.5));
+        assert!(!parsed.has_audio);
     }
 
     #[test]
@@ -727,6 +855,24 @@ mod tests {
         assert_eq!(playback_fps(Some(60.0)), DEFAULT_MAX_FPS);
         assert_eq!(playback_fps(Some(8.0)), 8.0);
         assert_eq!(playback_fps(None), DEFAULT_MAX_FPS);
+    }
+
+    #[test]
+    fn audio_target_selects_due_frames_with_half_frame_tolerance() {
+        assert_eq!(frames_due(0.0, 0.02, 15.0), 0);
+        assert_eq!(frames_due(0.0, 0.04, 15.0), 1);
+        assert_eq!(frames_due(0.0, 0.20, 15.0), 3);
+    }
+
+    #[test]
+    fn seek_position_maps_the_timeline_midpoint() {
+        assert_eq!(seek_position(Some(10.0), 15.0, 0.5), Some(5.0));
+    }
+
+    #[test]
+    fn seek_position_keeps_the_right_edge_decodable() {
+        let target = seek_position(Some(10.0), 15.0, 1.0).expect("seek target");
+        assert!((target - (10.0 - 1.0 / 15.0)).abs() < f64::EPSILON);
     }
 
     #[test]

@@ -2799,6 +2799,13 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
         return;
     }
 
+    // The video timeline owns its left-button gesture from press through
+    // release. Drag updates are cheap cached state; only release starts the
+    // asynchronous decoder rebuild at the chosen position.
+    if handle_video_seek(&mouse, app) {
+        return;
+    }
+
     // Preview drag-selection fast-path. Owns Down/Drag/Up(Left) when the
     // gesture starts inside the preview panel. Scroll wheel, right-click,
     // and Down outside the panel fall through to the normal match below.
@@ -3044,6 +3051,29 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
             app.diff_ctrl_hover = diff_hover;
         }
         _ => {}
+    }
+}
+
+fn handle_video_seek(mouse: &MouseEvent, app: &mut App) -> bool {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some(ui::mouse::ClickAction::SeekVideo { start, width }) =
+                app.hit_registry.hit_test(mouse.column, mouse.row)
+            else {
+                return false;
+            };
+            app.begin_video_seek(start, width, mouse.column);
+            true
+        }
+        MouseEventKind::Drag(MouseButton::Left) if app.video_seek_position().is_some() => {
+            app.update_video_seek(mouse.column);
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) if app.video_seek_position().is_some() => {
+            app.finish_video_seek(mouse.column);
+            true
+        }
+        _ => false,
     }
 }
 

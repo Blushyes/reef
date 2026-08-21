@@ -54,6 +54,30 @@ fn fixture_clip(dir: &Path, seconds: u32, rate: u32) -> Option<PathBuf> {
     status.status.success().then_some(path)
 }
 
+fn fixture_clip_with_silent_audio(dir: &Path, seconds: u32, rate: u32) -> Option<PathBuf> {
+    if !ffmpeg_available() {
+        return None;
+    }
+    let path = dir.join("clip-with-audio.mp4");
+    let status = Command::new("ffmpeg")
+        .arg("-y")
+        .args(["-f", "lavfi"])
+        .args([
+            "-i",
+            &format!("testsrc2=size=320x240:rate={rate}:duration={seconds}"),
+        ])
+        .args(["-f", "lavfi"])
+        .args([
+            "-i",
+            &format!("anullsrc=channel_layout=mono:sample_rate=44100:d={seconds}"),
+        ])
+        .args(["-shortest", "-pix_fmt", "yuv420p"])
+        .arg(&path)
+        .output()
+        .ok()?;
+    status.status.success().then_some(path)
+}
+
 /// Open a player, or skip the test when the environment can't support one.
 fn open_player(path: &Path, picker: &Picker, area: Rect) -> Option<VideoPlayer> {
     match VideoPlayer::open(path, 0, picker, area) {
@@ -107,6 +131,24 @@ fn opens_paused_on_the_first_frame() {
     let info = player.info();
     assert_eq!((info.width, info.height), (320, 240));
     assert_eq!(info.duration.map(|d| d.round()), Some(2.0));
+}
+
+#[test]
+fn probe_marks_a_container_with_an_audio_stream() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let Some(clip) = fixture_clip_with_silent_audio(dir.path(), 2, 15) else {
+        return;
+    };
+    let picker = kitty_picker();
+    let player = match VideoPlayer::open(&clip, 0, &picker, Rect::new(0, 0, 40, 12)) {
+        Ok(player) => player,
+        Err(VideoUnavailable::Tmux | VideoUnavailable::NoFfmpeg | VideoUnavailable::NoFfplay) => {
+            return;
+        }
+        Err(other) => panic!("opening the fixture clip failed: {other:?}"),
+    };
+
+    assert!(player.info().has_audio);
 }
 
 #[test]
@@ -241,6 +283,26 @@ fn resizing_the_panel_keeps_playing_at_the_new_size() {
 
     // The re-started decoder keeps feeding frames.
     assert!(advance(&mut player, &picker, 2) > 0);
+}
+
+#[test]
+fn rebuilding_at_a_timeline_position_seeks_the_clip() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let Some(clip) = fixture_clip(dir.path(), 4, 15) else {
+        return;
+    };
+    let picker = kitty_picker();
+    let Some(player) = open_player(&clip, &picker, Rect::new(0, 0, 40, 12)) else {
+        return;
+    };
+
+    let sought = player
+        .rebuild(&picker, Rect::new(0, 0, 40, 12), 2.0)
+        .expect("rebuild at timeline position");
+
+    assert_eq!(sought.position(), 2.0);
+    assert!(sought.frame().is_some(), "seek decodes the target frame");
+    assert!(!sought.is_playing(), "seeking preserves the paused state");
 }
 
 #[test]

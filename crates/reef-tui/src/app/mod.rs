@@ -56,6 +56,19 @@ struct PendingVideoBuild {
     area: ratatui::layout::Rect,
 }
 
+#[derive(Clone, Copy)]
+struct VideoSeekDrag {
+    start: u16,
+    width: u16,
+    ratio: f64,
+}
+
+fn video_seek_ratio(start: u16, width: u16, column: u16) -> f64 {
+    let span = width.saturating_sub(1).max(1);
+    let offset = column.saturating_sub(start).min(span);
+    f64::from(offset) / f64::from(span)
+}
+
 #[derive(Debug, Clone)]
 pub struct DbPreviewLayoutCache {
     pub path: String,
@@ -160,6 +173,7 @@ pub struct TuiApp {
     video_pending: Option<PendingVideoBuild>,
     video_request_generation: u64,
     video_should_play: bool,
+    video_seek_drag: Option<VideoSeekDrag>,
     video_build_tx: mpsc::Sender<BuiltVideo>,
     video_build_rx: mpsc::Receiver<BuiltVideo>,
 
@@ -361,6 +375,7 @@ impl App {
             video_pending: None,
             video_request_generation: 0,
             video_should_play: false,
+            video_seek_drag: None,
             video_build_tx,
             video_build_rx,
             preview_selection: None,
@@ -1804,6 +1819,7 @@ impl App {
         self.video_status = None;
         self.video_pending = None;
         self.video_should_play = false;
+        self.video_seek_drag = None;
     }
 
     fn spawn_video_build(
@@ -1875,11 +1891,17 @@ impl App {
             }
             self.video_pending = None;
             match built.result {
-                Ok(mut player) => {
-                    player.set_playing(self.video_should_play);
-                    self.video = Some(player);
-                    self.video_status = None;
-                }
+                Ok(mut player) => match player.set_playing(self.video_should_play) {
+                    Ok(()) => {
+                        self.video = Some(player);
+                        self.video_status = None;
+                    }
+                    Err(reason) => {
+                        self.video = None;
+                        self.video_status = Some(reason);
+                        self.video_should_play = false;
+                    }
+                },
                 Err(reason) => {
                     self.video = None;
                     self.video_status = Some(reason);
@@ -1957,6 +1979,7 @@ impl App {
 
     /// Play / pause the current clip.
     pub fn toggle_video_playback(&mut self) {
+        self.video_seek_drag = None;
         if self.video.as_ref().is_some_and(|player| player.has_ended()) {
             let area = self
                 .last_video_frame_area
@@ -1980,9 +2003,78 @@ impl App {
         }
 
         self.video_should_play = !self.video_should_play;
-        if let Some(player) = self.video.as_mut() {
-            player.set_playing(self.video_should_play);
+        let error = self
+            .video
+            .as_mut()
+            .and_then(|player| player.set_playing(self.video_should_play).err());
+        if let Some(reason) = error {
+            self.video = None;
+            self.video_should_play = false;
+            self.video_status = Some(reason);
         }
+    }
+
+    pub(crate) fn begin_video_seek(&mut self, start: u16, width: u16, column: u16) {
+        let Some(player) = self.video.as_mut() else {
+            return;
+        };
+        if !player
+            .info()
+            .duration
+            .is_some_and(|duration| duration.is_finite() && duration > 0.0)
+        {
+            return;
+        }
+        player.pause();
+        // A resize/open result from before this gesture must not replace the
+        // paused player and resume it halfway through dragging.
+        self.video_request_generation = self.video_request_generation.wrapping_add(1);
+        self.video_pending = None;
+        self.video_seek_drag = Some(VideoSeekDrag {
+            start,
+            width,
+            ratio: video_seek_ratio(start, width, column),
+        });
+    }
+
+    pub(crate) fn update_video_seek(&mut self, column: u16) {
+        let Some(seek) = self.video_seek_drag.as_mut() else {
+            return;
+        };
+        seek.ratio = video_seek_ratio(seek.start, seek.width, column);
+    }
+
+    pub(crate) fn finish_video_seek(&mut self, column: u16) {
+        self.update_video_seek(column);
+        let Some(seek) = self.video_seek_drag.take() else {
+            return;
+        };
+        let Some(player) = self.video.as_ref() else {
+            return;
+        };
+        let Some(position) = player.seek_position(seek.ratio) else {
+            return;
+        };
+        let area = self
+            .last_video_frame_area
+            .unwrap_or_else(|| crate::video::preview_frame_area(self.last_preview_rect));
+        let source = player.source();
+        let path = player.path().to_path_buf();
+        let source_revision = player.source_revision();
+        let _ = self.spawn_video_build(
+            self.engine.preview_generation(),
+            path,
+            source_revision,
+            area,
+            Some(source),
+            position,
+        );
+    }
+
+    pub(crate) fn video_seek_position(&self) -> Option<f64> {
+        let seek = self.video_seek_drag?;
+        let duration = self.video.as_ref()?.info().duration?;
+        Some(duration * seek.ratio)
     }
 
     fn prepare_preview_image_protocol(
@@ -2734,6 +2826,9 @@ impl App {
             ClickAction::ToggleVideoPlayback => {
                 self.toggle_video_playback();
             }
+            // Video seeking needs the pointer column and is dispatched by
+            // `input::handle_video_seek`, before generic click actions.
+            ClickAction::SeekVideo { .. } => {}
             ClickAction::HostsPickerSelect(idx) => {
                 // Mouse click on a hosts-picker row: move selection to
                 // that row.
@@ -3308,7 +3403,7 @@ pub(crate) fn shorthand_for_full_ref(full_ref: &str) -> &str {
 mod tests {
     use super::{
         App, GRAPH_RECENT_BRANCHES_MAX, PREF_GRAPH_SCOPE, PREF_GRAPH_SCOPE_RECENT,
-        load_graph_scope_pref, persist_graph_scope,
+        load_graph_scope_pref, persist_graph_scope, video_seek_ratio,
     };
     use crate::ui::theme::Theme;
     use reef_app::{AppCommand, GitGraphState, GraphPayload, MatchHit, WorkerResult};
@@ -3327,6 +3422,15 @@ mod tests {
             .state
             .apply_worker_result_core(result, Instant::now());
         app.apply_runtime_events(events);
+    }
+
+    #[test]
+    fn video_seek_ratio_maps_and_clamps_timeline_columns() {
+        assert_eq!(video_seek_ratio(10, 11, 10), 0.0);
+        assert_eq!(video_seek_ratio(10, 11, 15), 0.5);
+        assert_eq!(video_seek_ratio(10, 11, 20), 1.0);
+        assert_eq!(video_seek_ratio(10, 11, 0), 0.0);
+        assert_eq!(video_seek_ratio(10, 11, 99), 1.0);
     }
 
     fn wait_for_file_tree_entry(app: &mut App, rel: &Path) -> usize {

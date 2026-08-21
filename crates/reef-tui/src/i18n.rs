@@ -143,6 +143,8 @@ pub enum Msg {
     PreviewVideoReplayButton,
     /// Video preview: shown when ffmpeg / ffprobe are missing.
     PreviewVideoNeedsFfmpeg,
+    /// Video preview: shown when a clip has audio but ffplay is missing.
+    PreviewVideoNeedsFfplay,
     /// Video preview: shown on terminals with no protocol we can animate.
     PreviewVideoUnsupportedTerminal,
     /// Video preview: shown inside tmux, where inline graphics are off.
@@ -398,6 +400,7 @@ fn t_zh(m: Msg) -> &'static str {
         PreviewVideoPauseButton => " Ⅱ 暂停 (p) ",
         PreviewVideoReplayButton => " ↻ 重播 (p) ",
         PreviewVideoNeedsFfmpeg => "安装 ffmpeg 后可在终端内播放",
+        PreviewVideoNeedsFfplay => "安装 ffplay 后可播放带声音的视频",
         PreviewVideoUnsupportedTerminal => "当前终端不支持内联播放",
         PreviewVideoTmux => "tmux 内不支持内联播放",
         PreviewVideoRemote => "远程文件不支持内联播放",
@@ -600,6 +603,7 @@ fn t_en(m: Msg) -> &'static str {
         PreviewVideoPauseButton => " Ⅱ Pause (p) ",
         PreviewVideoReplayButton => " ↻ Replay (p) ",
         PreviewVideoNeedsFfmpeg => "install ffmpeg to play inline",
+        PreviewVideoNeedsFfplay => "install ffplay to play videos with audio",
         PreviewVideoUnsupportedTerminal => "inline playback unavailable in this terminal",
         PreviewVideoTmux => "inline playback is disabled inside tmux",
         PreviewVideoRemote => "inline playback is unavailable for remote files",

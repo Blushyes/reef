@@ -296,7 +296,7 @@ fn p_on_the_tree_panel_leaves_playback_alone() {
 }
 
 #[test]
-fn leaving_the_files_tab_pauses_playback() {
+fn engine_driven_tab_change_pauses_playback() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some(mut fixture) = app_previewing_a_clip() else {
         return;
@@ -307,7 +307,9 @@ fn leaving_the_files_tab_pauses_playback() {
     input::handle_key(key(KeyCode::Char('p')), app);
     assert!(app.video.as_ref().unwrap().is_playing());
 
-    app.set_active_tab(reef_app::AppTab::Git);
+    app.engine
+        .dispatch(reef_app::AppCommand::SetActiveTab(reef_app::AppTab::Git));
+    app.tick();
     assert!(
         !app.video.as_ref().unwrap().is_playing(),
         "a clip behind a hidden panel stops decoding"
@@ -320,6 +322,10 @@ fn selecting_another_file_tears_the_player_down() {
     let Some(mut fixture) = app_previewing_a_clip() else {
         return;
     };
+    fixture.app.cycle_active_panel(false);
+    input::handle_key(key(KeyCode::Char('p')), &mut fixture.app);
+    assert!(fixture.app.video.as_ref().unwrap().is_playing());
+
     std::fs::write(fixture.workdir.path().join("notes.txt"), "plain text\n")
         .expect("write sibling file");
     let app = &mut fixture.app;
@@ -338,6 +344,10 @@ fn selecting_another_file_tears_the_player_down() {
         .expect("notes.txt in tree");
     app.engine.state.file_tree.selected = idx;
     app.load_preview();
+    assert!(
+        !app.video.as_ref().unwrap().is_playing(),
+        "a stale player pauses as soon as another preview is requested"
+    );
     wait_until(app, "text preview", |app| {
         !app.engine.state.preview_load.loading && app.video.is_none()
     });

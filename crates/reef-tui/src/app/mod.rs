@@ -47,6 +47,64 @@ pub struct BuiltVideo {
     pub result: Result<crate::video::VideoPlayer, crate::video::VideoUnavailable>,
 }
 
+struct VideoBuildRequest {
+    preview_generation: u64,
+    request_generation: u64,
+    path: PathBuf,
+    source_revision: u64,
+    area: ratatui::layout::Rect,
+    source: Option<crate::video::VideoSource>,
+    position: f64,
+    picker: ratatui_image::picker::Picker,
+    cancellation: reef_io::CancellationToken,
+}
+
+fn spawn_video_build_worker(
+    requests: mpsc::Receiver<VideoBuildRequest>,
+    results: mpsc::Sender<BuiltVideo>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("reef-video-open".into())
+        .spawn(move || {
+            while let Ok(mut request) = requests.recv() {
+                while let Ok(newer) = requests.try_recv() {
+                    request.cancellation.cancel();
+                    request = newer;
+                }
+                if request.cancellation.is_cancelled() {
+                    continue;
+                }
+                let result = match request.source.take() {
+                    Some(source) => crate::video::VideoPlayer::open_source_cancellable(
+                        source,
+                        &request.picker,
+                        request.area,
+                        request.position,
+                        &request.cancellation,
+                    ),
+                    None => crate::video::VideoPlayer::open_cancellable(
+                        &request.path,
+                        request.source_revision,
+                        &request.picker,
+                        request.area,
+                        &request.cancellation,
+                    ),
+                };
+                if request.cancellation.is_cancelled() {
+                    continue;
+                }
+                let _ = results.send(BuiltVideo {
+                    preview_generation: request.preview_generation,
+                    request_generation: request.request_generation,
+                    path: request.path,
+                    source_revision: request.source_revision,
+                    area: request.area,
+                    result,
+                });
+            }
+        });
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingVideoBuild {
     preview_generation: u64,
@@ -174,8 +232,9 @@ pub struct TuiApp {
     video_request_generation: u64,
     video_should_play: bool,
     video_seek_drag: Option<VideoSeekDrag>,
-    video_build_tx: mpsc::Sender<BuiltVideo>,
+    video_build_tx: mpsc::Sender<VideoBuildRequest>,
     video_build_rx: mpsc::Receiver<BuiltVideo>,
+    video_build_cancellation: Option<reef_io::CancellationToken>,
 
     pub preview_selection: Option<crate::ui::selection::PreviewSelection>,
     pub selection_context_menu: crate::selection_context_menu::SelectionContextMenuState,
@@ -248,6 +307,14 @@ pub struct TuiApp {
 
     /// Same Ctrl+hover affordance, but for the diff panel.
     pub diff_ctrl_hover: Option<crate::ui::selection::DiffHover>,
+}
+
+impl Drop for TuiApp {
+    fn drop(&mut self) {
+        if let Some(cancellation) = self.video_build_cancellation.take() {
+            cancellation.cancel();
+        }
+    }
 }
 
 use self::TuiApp as App;
@@ -325,8 +392,9 @@ impl App {
         // per build request and merge the result back via this channel.
         let (preview_build_tx, preview_build_rx) = mpsc::channel::<BuiltProtocol>();
 
-        // Same one-shot-thread-per-request shape for video openers.
-        let (video_build_tx, video_build_rx) = mpsc::channel::<BuiltVideo>();
+        let (video_build_tx, video_build_requests) = mpsc::channel::<VideoBuildRequest>();
+        let (video_build_results, video_build_rx) = mpsc::channel::<BuiltVideo>();
+        spawn_video_build_worker(video_build_requests, video_build_results);
 
         let (saved_layout, saved_mode) = load_prefs();
         let (graph_scope, graph_recent_branches) = load_graph_scope_pref();
@@ -378,6 +446,7 @@ impl App {
             video_seek_drag: None,
             video_build_tx,
             video_build_rx,
+            video_build_cancellation: None,
             preview_selection: None,
             selection_context_menu:
                 crate::selection_context_menu::SelectionContextMenuState::default(),
@@ -1385,6 +1454,11 @@ impl App {
 
     pub fn load_preview(&mut self) {
         self.clear_g_chord();
+        // A new selection may keep the previous preview visible while the
+        // worker loads or reports an error, but stale media must not keep
+        // playing behind that transition.
+        self.pause_video_playback();
+        self.cancel_video_build();
         self.engine
             .dispatch(reef_app::AppCommand::LoadSelectedPreview);
     }
@@ -1814,12 +1888,19 @@ impl App {
 
     /// Drop any player and forget why the last one couldn't run.
     fn clear_preview_video(&mut self) {
+        self.cancel_video_build();
         self.video_request_generation = self.video_request_generation.wrapping_add(1);
         self.video = None;
         self.video_status = None;
-        self.video_pending = None;
         self.video_should_play = false;
         self.video_seek_drag = None;
+    }
+
+    fn cancel_video_build(&mut self) {
+        if let Some(cancellation) = self.video_build_cancellation.take() {
+            cancellation.cancel();
+        }
+        self.video_pending = None;
     }
 
     fn spawn_video_build(
@@ -1834,35 +1915,23 @@ impl App {
         let Some(picker) = self.image_picker.clone() else {
             return false;
         };
+        self.cancel_video_build();
         self.video_request_generation = self.video_request_generation.wrapping_add(1);
         let request_generation = self.video_request_generation;
-        let tx = self.video_build_tx.clone();
-        let worker_path = path.clone();
-        let spawned = std::thread::Builder::new()
-            .name("reef-video-open".into())
-            .spawn(move || {
-                let result = match source {
-                    Some(source) => {
-                        crate::video::VideoPlayer::open_source(source, &picker, area, position)
-                    }
-                    None => crate::video::VideoPlayer::open(
-                        &worker_path,
-                        source_revision,
-                        &picker,
-                        area,
-                    ),
-                };
-                let _ = tx.send(BuiltVideo {
-                    preview_generation,
-                    request_generation,
-                    path: worker_path,
-                    source_revision,
-                    area,
-                    result,
-                });
-            })
-            .is_ok();
-        if spawned {
+        let cancellation = reef_io::CancellationToken::default();
+        let request = VideoBuildRequest {
+            preview_generation,
+            request_generation,
+            path: path.clone(),
+            source_revision,
+            area,
+            source,
+            position,
+            picker,
+            cancellation: cancellation.clone(),
+        };
+        if self.video_build_tx.send(request).is_ok() {
+            self.video_build_cancellation = Some(cancellation);
             self.video_pending = Some(PendingVideoBuild {
                 preview_generation,
                 request_generation,
@@ -1870,8 +1939,10 @@ impl App {
                 source_revision,
                 area,
             });
+            true
+        } else {
+            false
         }
-        spawned
     }
 
     /// Merge finished video openers. Results for a preview the user already
@@ -1890,6 +1961,7 @@ impl App {
                 continue;
             }
             self.video_pending = None;
+            self.video_build_cancellation = None;
             match built.result {
                 Ok(mut player) => match player.set_playing(self.video_should_play) {
                     Ok(()) => {
@@ -1959,8 +2031,15 @@ impl App {
             return false;
         };
         let changed = player.tick(now, picker);
+        let playback_error = player.take_playback_error();
         if player.has_ended() && self.video_pending.is_none() {
             self.video_should_play = false;
+        }
+        if let Some(error) = playback_error {
+            self.video = None;
+            self.video_status = Some(error);
+            self.video_should_play = false;
+            return true;
         }
         changed
     }
@@ -2029,7 +2108,7 @@ impl App {
         // A resize/open result from before this gesture must not replace the
         // paused player and resume it halfway through dragging.
         self.video_request_generation = self.video_request_generation.wrapping_add(1);
-        self.video_pending = None;
+        self.cancel_video_build();
         self.video_seek_drag = Some(VideoSeekDrag {
             start,
             width,
@@ -2167,6 +2246,8 @@ impl App {
                 self.drain_engine_runtime_events();
             }
             Err(error) => {
+                self.pause_video_playback();
+                self.cancel_video_build();
                 self.engine
                     .dispatch(reef_app::AppCommand::ApplyPreviewResult {
                         generation,
@@ -2596,13 +2677,6 @@ impl App {
     }
 
     pub fn set_active_tab(&mut self, tab: Tab) {
-        // Leaving the Files tab hides the preview panel, and a clip playing
-        // behind a hidden panel is pure cost — decode, encode, and an ffmpeg
-        // process, for frames nobody sees. Pausing keeps the position, so
-        // coming back resumes where the user left off.
-        if tab != Tab::Files {
-            self.pause_video_playback();
-        }
         self.engine
             .dispatch(reef_app::AppCommand::SetActiveTab(tab));
         self.drain_engine_runtime_events();
@@ -2619,6 +2693,12 @@ impl App {
     pub(super) fn apply_tab_change_outcome(&mut self, outcome: reef_app::TabChangeOutcome) {
         if !outcome.changed {
             return;
+        }
+        // Every tab transition, including history and code-navigation jumps
+        // initiated inside reef-app, converges here. Hidden video must not
+        // keep its decoder and audio process running.
+        if self.engine.active_tab() != Tab::Files {
+            self.pause_video_playback();
         }
         self.clear_input_chords();
         if outcome.dismiss_confirm {

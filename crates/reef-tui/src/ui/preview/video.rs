@@ -231,6 +231,7 @@ fn pending_note(app: &App) -> String {
         Some(VideoUnavailable::Unreadable(detail)) => {
             format!("{}: {detail}", t(Msg::PreviewVideoUnreadable))
         }
+        Some(VideoUnavailable::Cancelled) => t(Msg::PreviewLoading).to_string(),
         // An explicit `REEF_VIDEO=off` and a terminal that simply can't do it
         // read the same way from the card: this is a still, and that's it.
         Some(VideoUnavailable::Disabled | VideoUnavailable::UnsupportedTerminal) => {

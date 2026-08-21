@@ -22,6 +22,7 @@ expensive work must not run from a renderer.
 - Hosts construct `ReefApp` from `AppConfig`; `AppState` and its construction details stay private
   to `reef-app`.
 - Keep terminal-only state in `crates/reef-tui`: ratatui layout caches, hit-test registry, terminal image protocol, text-selection geometry, mouse row/column mapping, scroll pacing, leader/chord timers, popup rects, and the live TUI theme object.
+- Keep inline-video decode and terminal protocol encoding off the TUI loop. Bound decoded frame dimensions and playback FPS by terminal wire cost before starting ffmpeg; playback ticks may drain decoded frames, submit only the newest due frame to a bounded encoder, and merge completed protocol payloads without waiting.
 - Prefer stale cached UI over blocking. Show old data plus loading/stale/error status instead of waiting during tab switches or hover/mouse movement.
 - Use generation tokens for async results. Late results from older requests must not overwrite newer selections or newer snapshots.
 - Keep each tab/panel independently refreshable. Adding a feature should not require another tab to render before data can update.

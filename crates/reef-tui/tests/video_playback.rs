@@ -26,21 +26,25 @@ fn kitty_picker() -> Picker {
     picker
 }
 
-fn ffmpeg_available() -> bool {
-    Command::new("ffmpeg")
+fn command_available(name: &str) -> bool {
+    Command::new(name)
         .arg("-version")
         .output()
         .is_ok_and(|out| out.status.success())
 }
 
+fn video_tools_available() -> bool {
+    command_available("ffmpeg") && command_available("ffprobe")
+}
+
 /// Render a short synthetic clip. Returns `None` when ffmpeg can't be run,
 /// which the callers treat as "skip".
 fn fixture_clip(dir: &Path, seconds: u32, rate: u32) -> Option<PathBuf> {
-    if !ffmpeg_available() {
+    if !video_tools_available() {
         return None;
     }
     let path = dir.join("clip.mp4");
-    let status = Command::new("ffmpeg")
+    let output = Command::new("ffmpeg")
         .arg("-y")
         .args(["-f", "lavfi"])
         .args([
@@ -50,16 +54,21 @@ fn fixture_clip(dir: &Path, seconds: u32, rate: u32) -> Option<PathBuf> {
         .args(["-pix_fmt", "yuv420p"])
         .arg(&path)
         .output()
-        .ok()?;
-    status.status.success().then_some(path)
+        .expect("ffmpeg should start after the availability check");
+    assert!(
+        output.status.success(),
+        "ffmpeg failed to create the video fixture: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Some(path)
 }
 
 fn fixture_clip_with_silent_audio(dir: &Path, seconds: u32, rate: u32) -> Option<PathBuf> {
-    if !ffmpeg_available() {
+    if !video_tools_available() {
         return None;
     }
     let path = dir.join("clip-with-audio.mp4");
-    let status = Command::new("ffmpeg")
+    let output = Command::new("ffmpeg")
         .arg("-y")
         .args(["-f", "lavfi"])
         .args([
@@ -74,8 +83,13 @@ fn fixture_clip_with_silent_audio(dir: &Path, seconds: u32, rate: u32) -> Option
         .args(["-shortest", "-pix_fmt", "yuv420p"])
         .arg(&path)
         .output()
-        .ok()?;
-    status.status.success().then_some(path)
+        .expect("ffmpeg should start after the availability check");
+    assert!(
+        output.status.success(),
+        "ffmpeg failed to create the audio fixture: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Some(path)
 }
 
 /// Open a player, or skip the test when the environment can't support one.
@@ -84,7 +98,7 @@ fn open_player(path: &Path, picker: &Picker, area: Rect) -> Option<VideoPlayer> 
         Ok(player) => Some(player),
         // tmux and a missing ffmpeg are both "this environment doesn't do
         // inline video", not a defect in the pipeline.
-        Err(VideoUnavailable::Tmux | VideoUnavailable::NoFfmpeg) => None,
+        Err(VideoUnavailable::Tmux) => None,
         Err(other) => panic!("opening the fixture clip failed: {other:?}"),
     }
 }
@@ -94,14 +108,25 @@ fn open_player(path: &Path, picker: &Picker, area: Rect) -> Option<VideoPlayer> 
 fn advance(player: &mut VideoPlayer, picker: &Picker, frames: usize) -> usize {
     let start = Instant::now();
     let mut seen = 0;
-    let mut clock = start;
-    // The synthetic clock jumps a whole frame interval per step so the test
-    // never waits on wall time, but the decoder still needs real time to
-    // produce frames — hence the wall-clock budget as the escape hatch.
-    while seen < frames && start.elapsed() < Duration::from_secs(20) {
-        clock += Duration::from_millis(80);
-        if player.tick(clock, picker) {
-            seen += 1;
+    // Move the media clock once per requested frame, then keep polling that
+    // instant while the decoder and protocol encoder finish in real time.
+    // Advancing the synthetic clock on every poll would turn encoder latency
+    // into artificial playback time.
+    while seen < frames
+        && player.is_playing()
+        && !player.has_ended()
+        && start.elapsed() < Duration::from_secs(20)
+    {
+        let clock = Instant::now() + Duration::from_secs_f64(player.position() + 0.25);
+        while start.elapsed() < Duration::from_secs(20) {
+            if player.tick(clock, picker) {
+                seen += 1;
+                break;
+            }
+            if player.has_ended() {
+                break;
+            }
+            std::thread::yield_now();
         }
     }
     seen
@@ -142,7 +167,7 @@ fn probe_marks_a_container_with_an_audio_stream() {
     let picker = kitty_picker();
     let player = match VideoPlayer::open(&clip, 0, &picker, Rect::new(0, 0, 40, 12)) {
         Ok(player) => player,
-        Err(VideoUnavailable::Tmux | VideoUnavailable::NoFfmpeg | VideoUnavailable::NoFfplay) => {
+        Err(VideoUnavailable::Tmux | VideoUnavailable::NoFfplay) => {
             return;
         }
         Err(other) => panic!("opening the fixture clip failed: {other:?}"),
@@ -193,6 +218,26 @@ fn playing_advances_frames_and_position() {
         "position tracks the frames consumed"
     );
     assert!(player.frame().is_some());
+}
+
+#[test]
+fn a_late_tick_catches_silent_video_up_to_wall_time() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let Some(clip) = fixture_clip(dir.path(), 3, 15) else {
+        return;
+    };
+    let picker = kitty_picker();
+    let Some(mut player) = open_player(&clip, &picker, Rect::new(0, 0, 40, 12)) else {
+        return;
+    };
+
+    assert!(player.toggle());
+    player.tick(Instant::now() + Duration::from_secs(1), &picker);
+
+    assert!(
+        player.position() >= 0.9,
+        "a delayed UI tick must not turn playback into slow motion"
+    );
 }
 
 #[test]
@@ -249,7 +294,7 @@ fn playback_ends_at_the_end_of_the_clip() {
 #[test]
 fn resizing_the_panel_keeps_playing_at_the_new_size() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let Some(clip) = fixture_clip(dir.path(), 4, 15) else {
+    let Some(clip) = fixture_clip(dir.path(), 30, 15) else {
         return;
     };
     let picker = kitty_picker();
@@ -339,7 +384,7 @@ fn newer_source_revision_invalidates_same_path_player() {
 #[test]
 fn a_file_that_is_not_a_video_is_reported_unreadable() {
     let dir = tempfile::tempdir().expect("tempdir");
-    if !ffmpeg_available() {
+    if !video_tools_available() {
         return;
     }
     let path = dir.path().join("not-a-video.mp4");
@@ -347,7 +392,7 @@ fn a_file_that_is_not_a_video_is_reported_unreadable() {
 
     match VideoPlayer::open(&path, 0, &kitty_picker(), Rect::new(0, 0, 40, 12)) {
         Err(VideoUnavailable::Unreadable(_)) => {}
-        Err(VideoUnavailable::Tmux | VideoUnavailable::NoFfmpeg) => {}
+        Err(VideoUnavailable::Tmux) => {}
         Err(other) => panic!("expected an unreadable verdict, got {other:?}"),
         Ok(_) => panic!("a file with no container should not open as a player"),
     }
@@ -389,7 +434,7 @@ fn wire_bytes(player: &VideoPlayer) -> String {
 fn every_frame_transmits_fresh_pixels_to_the_terminal() {
     let dir = tempfile::tempdir().expect("tempdir");
     // testsrc2 animates, so consecutive frames genuinely differ.
-    let Some(clip) = fixture_clip(dir.path(), 3, 15) else {
+    let Some(clip) = fixture_clip(dir.path(), 30, 15) else {
         return;
     };
     let picker = kitty_picker();

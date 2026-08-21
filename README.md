@@ -16,7 +16,7 @@ A single-binary terminal workbench for browsing, reviewing, and shipping — loc
 ## Features
 
 - **Files** — tree + read-only preview; syntax highlighting, inline images (Kitty / iTerm2 / halfblocks).
-- **Video preview** — open a clip to see its first frame, `p` to play it inline (Kitty / iTerm2, needs `ffmpeg`).
+- **Video preview** — open a clip to see its first frame; click Play or focus the preview and press `p` (Kitty / iTerm2, needs `ffmpeg`).
 - **SQLite browser** — open any `.db` to walk schemas, tables, views, indexes, and triggers; borderless data grid with type-tinted columns and index/trigger detail cards.
 - **Search** — ripgrep-powered workdir content search with live preview, gitignore-aware.
 - **Git** — status with `+N −M` per file or folder; stage / unstage / discard / push (including `--force-with-lease`); unified or side-by-side diff.

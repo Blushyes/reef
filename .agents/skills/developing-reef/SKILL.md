@@ -11,7 +11,7 @@ expensive work must not run from a renderer.
 
 ## Core Architecture Rules
 
-- Keep `ui::*::render` on cached state only. Do not call git, filesystem walks, diff generation, syntax highlighting, or long formatting from render.
+- Keep `ui::*::render` on cached state only. Do not call git, filesystem walks, diff generation, syntax highlighting, external processes, or long formatting from render. Renderer-specific media geometry may be cached during render; decoder open/rebuild work starts from the host tick.
 - Treat input handlers as intent dispatchers. They decode terminal input and dispatch `reef_app::AppCommand`; they must not directly own business state or do blocking host work.
 - Route expensive work through `reef-app`'s task coordinator; merge worker results from
   `ReefApp::step`.

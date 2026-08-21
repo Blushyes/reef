@@ -141,7 +141,7 @@ fn playing_advances_frames_and_position() {
     };
 
     assert_eq!(player.position(), 0.0);
-    player.toggle(&picker);
+    assert!(player.toggle());
     assert!(player.is_playing());
 
     let advanced = advance(&mut player, &picker, 5);
@@ -181,7 +181,7 @@ fn playback_ends_at_the_end_of_the_clip() {
         return;
     };
 
-    player.toggle(&picker);
+    assert!(player.toggle());
     // Ask for far more frames than the clip holds; the run stops early when
     // the stream ends.
     advance(&mut player, &picker, 60);
@@ -193,8 +193,12 @@ fn playback_ends_at_the_end_of_the_clip() {
         "the last frame stays on screen after the stream ends"
     );
 
-    // Pressing play on a finished clip starts it over.
-    player.toggle(&picker);
+    // Replay is rebuilt off-thread by the adapter; exercise the same rebuild
+    // primitive directly here, then resume it.
+    player = player
+        .rebuild(&picker, Rect::new(0, 0, 40, 12), 0.0)
+        .expect("rebuild from the beginning");
+    assert!(player.toggle());
     assert!(player.is_playing());
     assert!(!player.has_ended());
     assert_eq!(player.position(), 0.0);
@@ -211,13 +215,15 @@ fn resizing_the_panel_keeps_playing_at_the_new_size() {
         return;
     };
 
-    player.toggle(&picker);
+    assert!(player.toggle());
     advance(&mut player, &picker, 3);
     let position = player.position();
     let (_, before) = player.frame().expect("frame before resize");
 
-    let changed = player.ensure_area(&picker, Rect::new(0, 0, 20, 6));
-    assert!(changed, "a smaller panel re-sizes the decoder");
+    player = player
+        .rebuild(&picker, Rect::new(0, 0, 20, 6), position)
+        .expect("rebuild at the smaller size");
+    assert!(player.toggle());
 
     // The card reports the new geometry immediately — the old frame is
     // stretched into it — and a fresh frame at that size follows shortly.
@@ -238,21 +244,34 @@ fn resizing_the_panel_keeps_playing_at_the_new_size() {
 }
 
 #[test]
-fn a_same_size_ensure_area_is_a_no_op() {
+fn matching_area_requires_no_rebuild() {
     let dir = tempfile::tempdir().expect("tempdir");
     let Some(clip) = fixture_clip(dir.path(), 2, 15) else {
         return;
     };
     let picker = kitty_picker();
     let panel = Rect::new(0, 0, 40, 12);
-    let Some(mut player) = open_player(&clip, &picker, panel) else {
+    let Some(player) = open_player(&clip, &picker, panel) else {
         return;
     };
 
     assert!(
-        !player.ensure_area(&picker, panel),
-        "re-rendering at an unchanged size must not restart ffmpeg"
+        player.matches_area(&picker, panel),
+        "the same panel geometry must not require a decoder rebuild"
     );
+}
+
+#[test]
+fn newer_source_revision_invalidates_same_path_player() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let Some(clip) = fixture_clip(dir.path(), 2, 15) else {
+        return;
+    };
+    let picker = kitty_picker();
+    let player =
+        VideoPlayer::open(&clip, 41, &picker, Rect::new(0, 0, 40, 12)).expect("open fixture clip");
+
+    assert!(!player.matches_source(&clip, 42));
 }
 
 #[test]
@@ -330,7 +349,7 @@ fn every_frame_transmits_fresh_pixels_to_the_terminal() {
         "frames reuse one image id so the terminal replaces rather than accumulates"
     );
 
-    player.toggle(&picker);
+    assert!(player.toggle());
     let mut frames = vec![first];
     for _ in 0..3 {
         assert_eq!(advance(&mut player, &picker, 1), 1, "another frame");
@@ -347,7 +366,7 @@ fn every_frame_transmits_fresh_pixels_to_the_terminal() {
 }
 
 #[test]
-fn a_paused_clip_refreshes_itself_after_a_resize() {
+fn a_paused_clip_rebuilds_at_the_new_size() {
     let dir = tempfile::tempdir().expect("tempdir");
     let Some(clip) = fixture_clip(dir.path(), 3, 15) else {
         return;
@@ -359,20 +378,9 @@ fn a_paused_clip_refreshes_itself_after_a_resize() {
 
     let before = wire_bytes(&player);
     assert!(!player.is_playing());
-    assert!(player.ensure_area(&picker, Rect::new(0, 0, 24, 8)));
-
-    // Resizing never blocks the render pass, so the new frame arrives on a
-    // later tick — and it has to arrive even though nothing is playing,
-    // otherwise a paused card would stay stretched forever.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut refreshed = false;
-    while Instant::now() < deadline && !refreshed {
-        refreshed = player.tick(Instant::now(), &picker);
-    }
-    assert!(
-        refreshed,
-        "a paused clip picks up one frame at the new size"
-    );
+    player = player
+        .rebuild(&picker, Rect::new(0, 0, 24, 8), player.position())
+        .expect("rebuild paused clip");
     assert!(!player.is_playing(), "and stays paused");
 
     let after = wire_bytes(&player);

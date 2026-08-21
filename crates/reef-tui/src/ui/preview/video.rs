@@ -74,14 +74,9 @@ fn render_frame(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    // Hand the panel geometry to the decoder before reading the frame back.
-    // This never blocks: the frame on screen stays until `tick` picks up one
-    // at the new size.
-    if let Some(picker) = app.image_picker.clone()
-        && let Some(player) = app.video.as_mut()
-    {
-        player.ensure_area(&picker, area);
-    }
+    // Geometry is terminal-local cached layout. `tick` compares it with the
+    // current player and schedules any decoder rebuild off the render path.
+    app.last_video_frame_area = Some(area);
 
     let placed = app.video.as_ref().and_then(|player| {
         player

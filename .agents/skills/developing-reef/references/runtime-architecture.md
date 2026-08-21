@@ -7,7 +7,8 @@ Use this reference when changing app state, rendering, input dispatch, backgroun
 Render is for drawing only:
 
 - Allowed: read `AppSnapshot` / read-only `ReefApp` accessors, build `ratatui` lines/widgets, clamp terminal-local scroll to valid bounds, register hit-test regions.
-- Not allowed: `git2` calls, `std::fs::read_dir` tree walks, `std::fs::read` previews, diff generation, commit walks, syntax highlighting, shell commands, blocking sleeps, or waiting on channels.
+- Not allowed: `git2` calls, `std::fs::read_dir` tree walks, `std::fs::read` previews, diff generation, commit walks, syntax highlighting, shell commands, video decoder open/rebuild, blocking sleeps, or waiting on channels.
+- Renderers may cache terminal-local media geometry. The host tick compares that cache with the active player and schedules decoder work off-thread under a latest-request generation.
 - Hover and mouse movement must stay cheap. If moving the cursor can trigger a heavy operation, the architecture is wrong.
 
 ## Background Task Pattern

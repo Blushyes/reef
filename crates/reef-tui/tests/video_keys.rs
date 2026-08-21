@@ -27,11 +27,14 @@ fn kitty_picker() -> Picker {
 }
 
 /// Render a short clip into `dir`, or report that ffmpeg isn't available.
-fn write_clip(dir: &Path) -> bool {
+fn write_clip(dir: &Path, seconds: u32) -> bool {
     Command::new("ffmpeg")
         .arg("-y")
         .args(["-f", "lavfi"])
-        .args(["-i", "testsrc2=size=320x240:rate=15:duration=4"])
+        .args([
+            "-i",
+            &format!("testsrc2=size=320x240:rate=15:duration={seconds}"),
+        ])
         .args(["-pix_fmt", "yuv420p"])
         .arg(dir.join("clip.mp4"))
         .output()
@@ -51,7 +54,15 @@ fn wait_until(app: &mut App, label: &str, mut ready: impl FnMut(&App) -> bool) {
         }
         thread::sleep(Duration::from_millis(10));
     }
-    panic!("timed out waiting for {label}");
+    panic!(
+        "timed out waiting for {label}; video={:?}, status={:?}",
+        app.video.as_ref().map(|player| (
+            player.position(),
+            player.is_playing(),
+            player.has_ended()
+        )),
+        app.video_status
+    );
 }
 
 /// An app previewing a clip, plus everything that has to outlive it: the
@@ -68,9 +79,13 @@ struct Fixture {
 /// Bring up an app previewing a real video clip, with the player open and
 /// paused on its first frame. Returns `None` when ffmpeg is unavailable.
 fn app_previewing_a_clip() -> Option<Fixture> {
+    app_previewing_a_clip_for(4)
+}
+
+fn app_previewing_a_clip_for(seconds: u32) -> Option<Fixture> {
     force_en_lang();
     let (tmp, _raw) = tempdir_repo();
-    if !write_clip(tmp.path()) {
+    if !write_clip(tmp.path(), seconds) {
         return None;
     }
     let home = tempfile::TempDir::new().expect("home tempdir");
@@ -223,4 +238,30 @@ fn selecting_another_file_tears_the_player_down() {
 
     assert!(!app.preview_is_video());
     assert!(app.video_status.is_none());
+}
+
+#[test]
+fn replay_request_returns_before_decoder_reopens() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(mut fixture) = app_previewing_a_clip_for(1) else {
+        return;
+    };
+    let app = &mut fixture.app;
+    app.cycle_active_panel(false);
+    input::handle_key(key(KeyCode::Char('p')), app);
+    wait_until(app, "video end", |app| {
+        app.video.as_ref().is_some_and(|player| player.has_ended())
+    });
+
+    let started = Instant::now();
+    input::handle_key(key(KeyCode::Char('p')), app);
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "the input handler must only enqueue replay work"
+    );
+    wait_until(app, "replay", |app| {
+        app.video
+            .as_ref()
+            .is_some_and(|player| player.is_playing() && !player.has_ended())
+    });
 }

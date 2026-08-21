@@ -39,10 +39,21 @@ pub struct BuiltProtocol {
 /// while the user is arrowing through a file tree — so it happens off-thread
 /// under the same `generation` staleness rule as `BuiltProtocol`.
 pub struct BuiltVideo {
-    pub generation: u64,
+    pub preview_generation: u64,
+    pub request_generation: u64,
     pub path: PathBuf,
-    pub source_bytes: u64,
+    pub source_revision: u64,
+    pub area: ratatui::layout::Rect,
     pub result: Result<crate::video::VideoPlayer, crate::video::VideoUnavailable>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingVideoBuild {
+    preview_generation: u64,
+    request_generation: u64,
+    path: PathBuf,
+    source_revision: u64,
+    area: ratatui::layout::Rect,
 }
 
 #[derive(Debug, Clone)]
@@ -146,9 +157,9 @@ pub struct TuiApp {
     /// Why the current video is not playing inline. Rendered on the card so
     /// a still frame never looks like a bug.
     pub video_status: Option<crate::video::VideoUnavailable>,
-    /// Path and size of the clip currently being opened off-thread, so a
-    /// re-selection of the same file doesn't spawn a second opener.
-    video_pending: Option<(PathBuf, u64)>,
+    video_pending: Option<PendingVideoBuild>,
+    video_request_generation: u64,
+    video_should_play: bool,
     video_build_tx: mpsc::Sender<BuiltVideo>,
     video_build_rx: mpsc::Receiver<BuiltVideo>,
 
@@ -156,6 +167,7 @@ pub struct TuiApp {
     pub selection_context_menu: crate::selection_context_menu::SelectionContextMenuState,
     pending_preview_nav: Option<PendingPreviewNav>,
     pub last_preview_rect: Option<ratatui::layout::Rect>,
+    pub(crate) last_video_frame_area: Option<ratatui::layout::Rect>,
     pub db_preview_layout: Option<DbPreviewLayoutCache>,
     /// Wrapped + colored lines for the opened SQLite cell, rebuilt
     /// when the cell or the pane width changes.
@@ -347,6 +359,8 @@ impl App {
             video: None,
             video_status: None,
             video_pending: None,
+            video_request_generation: 0,
+            video_should_play: false,
             video_build_tx,
             video_build_rx,
             preview_selection: None,
@@ -354,6 +368,7 @@ impl App {
                 crate::selection_context_menu::SelectionContextMenuState::default(),
             pending_preview_nav: None,
             last_preview_rect: None,
+            last_video_frame_area: None,
             db_preview_layout: None,
             db_cell_view: None,
             last_db_cell_rect: None,
@@ -1729,13 +1744,7 @@ impl App {
             .dispatch(reef_app::AppCommand::RunPush { force });
     }
 
-    /// Start, keep, or tear down inline video playback to match the preview
-    /// that just loaded.
-    ///
-    /// Re-selecting the clip that is already open is a no-op, so scrolling
-    /// back to a paused video finds it exactly where it was left. Everything
-    /// else — a different file, a non-video preview, a terminal that can't
-    /// animate — drops the player, which kills its ffmpeg.
+    /// Start or tear down inline video playback to match an accepted preview.
     fn prepare_preview_video(
         &mut self,
         generation: u64,
@@ -1744,15 +1753,9 @@ impl App {
         let source = content
             .as_ref()
             .filter(|document| reef_app::preview_is_video(document))
-            .map(|document| {
-                (
-                    document.local_path.clone(),
-                    document.path.clone(),
-                    document.bytes_on_disk,
-                )
-            });
+            .map(|document| (document.local_path.clone(), document.path.clone()));
 
-        let Some((local_path, display_path, source_bytes)) = source else {
+        let Some((local_path, display_path)) = source else {
             self.clear_preview_video();
             return;
         };
@@ -1765,49 +1768,29 @@ impl App {
             return;
         };
 
-        // Already playing (or already opening) this exact file — leave it be,
-        // so scrolling back to a paused clip finds it where it was left.
-        // A file rewritten on disk fails the size check and gets reopened.
+        // Binary preview revisions advance on every accepted reload. Using
+        // that identity makes same-size rewrites invalidate the decoder too.
         if self
             .video
             .as_ref()
-            .is_some_and(|player| player.matches_source(&local_path, source_bytes))
-            || self
-                .video_pending
-                .as_ref()
-                .is_some_and(|(path, bytes)| path == &local_path && *bytes == source_bytes)
+            .is_some_and(|player| player.matches_source(&local_path, generation))
+            || self.video_pending.as_ref().is_some_and(|pending| {
+                pending.path == local_path && pending.source_revision == generation
+            })
         {
             return;
         }
 
         self.clear_preview_video();
+        self.video_should_play = false;
 
-        let Some(picker) = self.image_picker.clone() else {
+        if self.image_picker.is_none() {
             self.video_status = Some(crate::video::VideoUnavailable::UnsupportedTerminal);
             return;
-        };
+        }
 
-        // Size the decoder against the panel rect the last frame used. It is
-        // the right answer whenever the layout is stable, and `ensure_area`
-        // corrects it on the first render if it isn't.
         let area = crate::video::preview_frame_area(self.last_preview_rect);
-        let tx = self.video_build_tx.clone();
-        let path = local_path.clone();
-        let spawned = std::thread::Builder::new()
-            .name("reef-video-open".into())
-            .spawn(move || {
-                let result = crate::video::VideoPlayer::open(&path, source_bytes, &picker, area);
-                let _ = tx.send(BuiltVideo {
-                    generation,
-                    path,
-                    source_bytes,
-                    result,
-                });
-            })
-            .is_ok();
-        if spawned {
-            self.video_pending = Some((local_path, source_bytes));
-        } else {
+        if !self.spawn_video_build(generation, local_path, generation, area, None, 0.0) {
             self.video_status = Some(crate::video::VideoUnavailable::Unreadable(format!(
                 "could not open {display_path}"
             )));
@@ -1816,9 +1799,63 @@ impl App {
 
     /// Drop any player and forget why the last one couldn't run.
     fn clear_preview_video(&mut self) {
+        self.video_request_generation = self.video_request_generation.wrapping_add(1);
         self.video = None;
         self.video_status = None;
         self.video_pending = None;
+        self.video_should_play = false;
+    }
+
+    fn spawn_video_build(
+        &mut self,
+        preview_generation: u64,
+        path: PathBuf,
+        source_revision: u64,
+        area: ratatui::layout::Rect,
+        source: Option<crate::video::VideoSource>,
+        position: f64,
+    ) -> bool {
+        let Some(picker) = self.image_picker.clone() else {
+            return false;
+        };
+        self.video_request_generation = self.video_request_generation.wrapping_add(1);
+        let request_generation = self.video_request_generation;
+        let tx = self.video_build_tx.clone();
+        let worker_path = path.clone();
+        let spawned = std::thread::Builder::new()
+            .name("reef-video-open".into())
+            .spawn(move || {
+                let result = match source {
+                    Some(source) => {
+                        crate::video::VideoPlayer::open_source(source, &picker, area, position)
+                    }
+                    None => crate::video::VideoPlayer::open(
+                        &worker_path,
+                        source_revision,
+                        &picker,
+                        area,
+                    ),
+                };
+                let _ = tx.send(BuiltVideo {
+                    preview_generation,
+                    request_generation,
+                    path: worker_path,
+                    source_revision,
+                    area,
+                    result,
+                });
+            })
+            .is_ok();
+        if spawned {
+            self.video_pending = Some(PendingVideoBuild {
+                preview_generation,
+                request_generation,
+                path,
+                source_revision,
+                area,
+            });
+        }
+        spawned
     }
 
     /// Merge finished video openers. Results for a preview the user already
@@ -1826,16 +1863,20 @@ impl App {
     fn drain_preview_video_builds(&mut self) -> bool {
         let mut changed = false;
         while let Ok(built) = self.video_build_rx.try_recv() {
-            let matches_pending = self
-                .video_pending
-                .as_ref()
-                .is_some_and(|(path, bytes)| path == &built.path && *bytes == built.source_bytes);
-            if built.generation != self.engine.preview_generation() || !matches_pending {
+            let matches_pending = self.video_pending.as_ref().is_some_and(|pending| {
+                pending.preview_generation == built.preview_generation
+                    && pending.request_generation == built.request_generation
+                    && pending.path == built.path
+                    && pending.source_revision == built.source_revision
+                    && pending.area == built.area
+            });
+            if built.preview_generation != self.engine.preview_generation() || !matches_pending {
                 continue;
             }
             self.video_pending = None;
             match built.result {
-                Ok(player) => {
+                Ok(mut player) => {
+                    player.set_playing(self.video_should_play);
                     self.video = Some(player);
                     self.video_status = None;
                 }
@@ -1849,6 +1890,44 @@ impl App {
         changed
     }
 
+    fn schedule_preview_video_resize(&mut self) {
+        let Some(area) = self.last_video_frame_area else {
+            return;
+        };
+        let Some(picker) = self.image_picker.as_ref() else {
+            return;
+        };
+        let Some(player) = self.video.as_ref() else {
+            return;
+        };
+        if player.has_ended() || player.matches_area(picker, area) {
+            return;
+        }
+        // Keep one decoder rebuild in flight. If the terminal is still being
+        // resized, the next tick compares the completed player with the most
+        // recent cached area and coalesces directly to that geometry.
+        if self.video_pending.is_some() {
+            return;
+        }
+
+        let source = player.source();
+        let path = player.path().to_path_buf();
+        let source_revision = player.source_revision();
+        let position = player.position();
+        let preview_generation = self.engine.preview_generation();
+        if self.spawn_video_build(
+            preview_generation,
+            path,
+            source_revision,
+            area,
+            Some(source),
+            position,
+        ) && let Some(player) = self.video.as_mut()
+        {
+            player.pause();
+        }
+    }
+
     /// Advance the playing clip by however many frames are due.
     fn tick_video(&mut self, now: Instant) -> bool {
         let Some(picker) = self.image_picker.as_ref() else {
@@ -1857,7 +1936,11 @@ impl App {
         let Some(player) = self.video.as_mut() else {
             return false;
         };
-        player.tick(now, picker)
+        let changed = player.tick(now, picker);
+        if player.has_ended() && self.video_pending.is_none() {
+            self.video_should_play = false;
+        }
+        changed
     }
 
     /// Whether the preview currently on screen is a video card — the guard
@@ -1874,11 +1957,31 @@ impl App {
 
     /// Play / pause the current clip.
     pub fn toggle_video_playback(&mut self) {
-        let Some(picker) = self.image_picker.as_ref() else {
+        if self.video.as_ref().is_some_and(|player| player.has_ended()) {
+            let area = self
+                .last_video_frame_area
+                .unwrap_or_else(|| crate::video::preview_frame_area(self.last_preview_rect));
+            let Some(player) = self.video.as_ref() else {
+                return;
+            };
+            let source = player.source();
+            let path = player.path().to_path_buf();
+            let source_revision = player.source_revision();
+            self.video_should_play = true;
+            let _ = self.spawn_video_build(
+                self.engine.preview_generation(),
+                path,
+                source_revision,
+                area,
+                Some(source),
+                0.0,
+            );
             return;
-        };
+        }
+
+        self.video_should_play = !self.video_should_play;
         if let Some(player) = self.video.as_mut() {
-            player.toggle(picker);
+            player.set_playing(self.video_should_play);
         }
     }
 
@@ -2415,6 +2518,7 @@ impl App {
 
     /// Stop playback without discarding the player.
     pub fn pause_video_playback(&mut self) {
+        self.video_should_play = false;
         if let Some(player) = self.video.as_mut() {
             player.pause();
         }
@@ -3056,6 +3160,7 @@ impl App {
         changed |= self.drain_preview_resize_responses();
         changed |= self.drain_preview_protocol_builds();
         changed |= self.drain_preview_video_builds();
+        self.schedule_preview_video_resize();
         changed |= self.tick_video(now);
         self.tick_place_mode_auto_expand();
         self.tick_tree_drag_auto_expand();

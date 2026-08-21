@@ -30,7 +30,7 @@
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
 use std::time::{Duration, Instant};
 
 use image::{DynamicImage, RgbaImage};
@@ -90,10 +90,10 @@ pub struct VideoInfo {
 /// Playback state machine for one preview panel.
 pub struct VideoPlayer {
     path: PathBuf,
-    /// Size of the file when it was opened. The watcher re-loads a preview
-    /// whenever the file changes on disk, and comparing this catches a clip
-    /// that was rewritten under a player still showing the old frames.
-    source_bytes: u64,
+    /// Renderer-neutral preview revision that produced this player. Binary
+    /// previews advance it on every accepted reload, including same-size
+    /// rewrites that cannot be identified from file metadata alone.
+    source_revision: u64,
     info: VideoInfo,
     /// Playback frame rate — the source rate clamped to `DEFAULT_MAX_FPS`.
     fps: f64,
@@ -112,25 +112,37 @@ pub struct VideoPlayer {
     ended: bool,
     /// When the next frame is due. `None` while paused.
     next_due: Option<Instant>,
-    /// Set when the decoder restarted and the frame on screen is still the
-    /// old size. Lets a paused clip pick up one frame at the new geometry
-    /// without waiting for the user to press play.
-    awaiting_resize: bool,
+}
+
+/// Cheap, cloneable source state used to rebuild a player off the UI thread.
+#[derive(Clone)]
+pub(crate) struct VideoSource {
+    path: PathBuf,
+    source_revision: u64,
+    info: VideoInfo,
+    fps: f64,
 }
 
 /// A running ffmpeg process and the thread draining its stdout.
 struct Decoder {
-    child: Child,
+    child: Option<Child>,
     frames: Receiver<Vec<u8>>,
 }
 
 impl Drop for Decoder {
     fn drop(&mut self) {
-        // Kill before the receiver drops so the reader thread's blocked
-        // `read_exact` unblocks on a closed pipe rather than waiting on a
-        // process nobody is reading from any more.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let _ = child.kill();
+        // Waiting can block while ffmpeg handles termination. Reap it away
+        // from the UI thread; closing the receiver after this method returns
+        // also releases the stdout reader if it was waiting on channel space.
+        let _ = std::thread::Builder::new()
+            .name("reef-video-reap".into())
+            .spawn(move || {
+                let _ = child.wait();
+            });
     }
 }
 
@@ -140,7 +152,7 @@ impl VideoPlayer {
     /// video shows its opening frame, and playback is an explicit key away.
     pub fn open(
         path: &Path,
-        source_bytes: u64,
+        source_revision: u64,
         picker: &Picker,
         cell_area: Rect,
     ) -> Result<VideoPlayer, VideoUnavailable> {
@@ -156,27 +168,47 @@ impl VideoPlayer {
 
         let info = probe(path)?;
         let fps = playback_fps(info.fps);
+        let source = VideoSource {
+            path: path.to_path_buf(),
+            source_revision,
+            info,
+            fps,
+        };
+        Self::open_source(source, picker, cell_area, 0.0)
+    }
+
+    pub(crate) fn open_source(
+        source: VideoSource,
+        picker: &Picker,
+        cell_area: Rect,
+        position: f64,
+    ) -> Result<VideoPlayer, VideoUnavailable> {
+        let VideoSource {
+            path,
+            source_revision,
+            info,
+            fps,
+        } = source;
         let (frame_px, area) = frame_size(info, picker, cell_area);
 
         let mut player = VideoPlayer {
-            path: path.to_path_buf(),
-            source_bytes,
+            path,
+            source_revision,
             info,
             fps,
             cell_area: area,
             frame_px,
             decoder: None,
             frame: None,
-            position: 0.0,
+            position,
             playing: false,
             ended: false,
             next_due: None,
-            awaiting_resize: false,
         };
-        player.start_decoder(0.0)?;
+        player.start_decoder(position)?;
         // Pull the opening frame synchronously so the card never flashes an
         // empty box between selection and first paint.
-        player.await_first_frame(picker);
+        player.await_first_frame(picker)?;
         Ok(player)
     }
 
@@ -190,8 +222,34 @@ impl VideoPlayer {
 
     /// Whether this player is still showing the file the preview describes.
     /// A rewritten clip needs a new player, not a resumed one.
-    pub fn matches_source(&self, path: &Path, source_bytes: u64) -> bool {
-        self.path == path && self.source_bytes == source_bytes
+    pub fn matches_source(&self, path: &Path, source_revision: u64) -> bool {
+        self.path == path && self.source_revision == source_revision
+    }
+
+    pub(crate) fn source(&self) -> VideoSource {
+        VideoSource {
+            path: self.path.clone(),
+            source_revision: self.source_revision,
+            info: self.info,
+            fps: self.fps,
+        }
+    }
+
+    pub(crate) fn source_revision(&self) -> u64 {
+        self.source_revision
+    }
+
+    /// Build a replacement player at `position` and `cell_area`.
+    ///
+    /// This probes no source metadata, but it starts ffmpeg and waits for its
+    /// first frame. Callers must run it on a worker thread.
+    pub fn rebuild(
+        &self,
+        picker: &Picker,
+        cell_area: Rect,
+        position: f64,
+    ) -> Result<VideoPlayer, VideoUnavailable> {
+        Self::open_source(self.source(), picker, cell_area, position)
     }
 
     pub fn is_playing(&self) -> bool {
@@ -215,15 +273,19 @@ impl VideoPlayer {
         self.frame.as_ref().map(|frame| (frame, self.cell_area))
     }
 
-    /// Play / pause. Toggling a finished clip restarts it from the top —
-    /// the natural reading of pressing play on something that has stopped.
-    pub fn toggle(&mut self, picker: &Picker) {
-        if self.ended {
-            self.restart(picker);
-            return;
-        }
-        self.playing = !self.playing;
+    pub(crate) fn set_playing(&mut self, playing: bool) {
+        self.playing = playing && !self.ended;
         self.next_due = self.playing.then(|| Instant::now() + self.frame_interval());
+    }
+
+    /// Toggle play/pause without performing I/O. Returns `false` when the
+    /// clip has ended and must be rebuilt asynchronously from the beginning.
+    pub fn toggle(&mut self) -> bool {
+        if self.ended {
+            return false;
+        }
+        self.set_playing(!self.playing);
+        true
     }
 
     pub fn pause(&mut self) {
@@ -231,61 +293,14 @@ impl VideoPlayer {
         self.next_due = None;
     }
 
-    /// Re-size the decoder when the panel geometry changed, keeping the
-    /// current playback position. Returns whether anything changed.
-    ///
-    /// The picker is read for its cell size, not for encoding: this method
-    /// hands the new geometry to the decoder and returns, and `tick` renders
-    /// whatever comes back.
-    pub fn ensure_area(&mut self, picker: &Picker, cell_area: Rect) -> bool {
+    pub fn matches_area(&self, picker: &Picker, cell_area: Rect) -> bool {
         let (frame_px, area) = frame_size(self.info, picker, cell_area);
-        if frame_px == self.frame_px && area == self.cell_area {
-            return false;
-        }
-        self.frame_px = frame_px;
-        self.cell_area = area;
-        // A finished clip has nothing left to decode; it keeps showing its
-        // last frame at the old size until the user replays it.
-        if self.ended {
-            return false;
-        }
-        let resume_at = self.position;
-        if self.start_decoder(resume_at).is_err() {
-            self.ended = true;
-            return true;
-        }
-        // Deliberately does not wait for the restarted decoder: `ensure_area`
-        // runs inside the render pass, and blocking there would stall the UI
-        // for as long as ffmpeg takes to seek — which a window drag would do
-        // on every intermediate size. The old frame keeps showing, scaled
-        // into the new box, until `tick` picks up a frame at the new size.
-        self.awaiting_resize = true;
-        true
+        frame_px == self.frame_px && area == self.cell_area
     }
 
     /// Advance playback. Returns whether the visible frame changed, which the
     /// caller turns into a redraw.
     pub fn tick(&mut self, now: Instant, picker: &Picker) -> bool {
-        // A resize restarts the decoder without waiting for it. Take its
-        // first frame as soon as one is ready, whether or not the clip is
-        // playing, so a paused card re-fills the panel on its own.
-        if self.awaiting_resize {
-            match self.take_frame() {
-                FramePull::Frame(bytes) => {
-                    self.encode(picker, bytes);
-                    self.awaiting_resize = false;
-                    return true;
-                }
-                // The restarted decoder had nothing to give — a resize that
-                // resumed past the last frame. Settle as finished rather
-                // than polling a dead decoder forever.
-                FramePull::Finished => {
-                    self.awaiting_resize = false;
-                    return self.finish();
-                }
-                FramePull::Pending => {}
-            }
-        }
         if !self.playing || self.ended {
             return false;
         }
@@ -335,20 +350,6 @@ impl VideoPlayer {
             self.position = duration;
         }
         true
-    }
-
-    /// Restart a finished clip from the beginning.
-    fn restart(&mut self, picker: &Picker) {
-        self.position = 0.0;
-        self.ended = false;
-        if self.start_decoder(0.0).is_err() {
-            self.ended = true;
-            return;
-        }
-        self.await_first_frame(picker);
-        self.awaiting_resize = false;
-        self.playing = true;
-        self.next_due = Some(Instant::now() + self.frame_interval());
     }
 
     fn frame_interval(&self) -> Duration {
@@ -403,25 +404,27 @@ impl VideoPlayer {
             .spawn(move || read_frames(stdout, frame_bytes, tx))
             .map_err(|e| VideoUnavailable::Unreadable(e.to_string()))?;
 
-        self.decoder = Some(Decoder { child, frames: rx });
+        self.decoder = Some(Decoder {
+            child: Some(child),
+            frames: rx,
+        });
         Ok(())
     }
 
     /// Block briefly for the decoder's first frame so a newly opened or
     /// resized player has something to show immediately.
-    fn await_first_frame(&mut self, picker: &Picker) {
+    fn await_first_frame(&mut self, picker: &Picker) -> Result<(), VideoUnavailable> {
         let Some(decoder) = self.decoder.as_ref() else {
-            return;
+            return Err(VideoUnavailable::Unreadable("decoder unavailable".into()));
         };
-        match decoder.frames.recv_timeout(FIRST_FRAME_TIMEOUT) {
-            Ok(bytes) => self.encode(picker, bytes),
-            // A stream that ends before its first frame is either empty or
-            // seeked past its end; either way there is nothing left to play.
-            Err(_) => {
-                self.ended = true;
-                self.playing = false;
-                self.decoder = None;
-            }
+        let bytes = first_frame_bytes(decoder.frames.recv_timeout(FIRST_FRAME_TIMEOUT))?;
+        self.encode(picker, bytes);
+        if self.frame.is_some() {
+            Ok(())
+        } else {
+            Err(VideoUnavailable::Unreadable(
+                "could not encode first frame".into(),
+            ))
         }
     }
 
@@ -460,6 +463,19 @@ impl VideoPlayer {
             self.frame = Some(encoded);
         }
     }
+}
+
+fn first_frame_bytes(
+    result: Result<Vec<u8>, RecvTimeoutError>,
+) -> Result<Vec<u8>, VideoUnavailable> {
+    result.map_err(|error| match error {
+        RecvTimeoutError::Timeout => {
+            VideoUnavailable::Unreadable("timed out waiting for first frame".into())
+        }
+        RecvTimeoutError::Disconnected => {
+            VideoUnavailable::Unreadable("ffmpeg produced no frames".into())
+        }
+    })
 }
 
 enum FramePull {
@@ -635,8 +651,8 @@ const CARD_CHROME_ROWS: u16 = 5;
 
 /// The frame area inside a preview panel of `rect`, used to size a decoder
 /// before the card has ever been rendered. Falls back to a small but usable
-/// box when no panel rect is known yet; `VideoPlayer::ensure_area` corrects
-/// any mismatch on the first render.
+/// box when no panel rect is known yet; the adapter schedules a rebuild after
+/// the first rendered layout is cached.
 pub fn preview_frame_area(rect: Option<Rect>) -> Rect {
     const FALLBACK: Rect = Rect {
         x: 0,
@@ -772,5 +788,25 @@ mod tests {
         assert!(protocol_can_animate(ProtocolType::Iterm2));
         assert!(!protocol_can_animate(ProtocolType::Sixel));
         assert!(!protocol_can_animate(ProtocolType::Halfblocks));
+    }
+
+    #[test]
+    fn disconnected_first_frame_is_unreadable() {
+        assert_eq!(
+            first_frame_bytes(Err(RecvTimeoutError::Disconnected)),
+            Err(VideoUnavailable::Unreadable(
+                "ffmpeg produced no frames".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn timed_out_first_frame_is_unreadable() {
+        assert_eq!(
+            first_frame_bytes(Err(RecvTimeoutError::Timeout)),
+            Err(VideoUnavailable::Unreadable(
+                "timed out waiting for first frame".into()
+            ))
+        );
     }
 }

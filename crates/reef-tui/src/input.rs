@@ -798,6 +798,12 @@ fn handle_key_focused_preview(key: KeyEvent, app: &mut App) -> bool {
             app.quit();
             return true;
         }
+        Some(Command::ToggleVideoPlayback)
+            if app.space_leader_at.is_none() && app.preview_is_video() =>
+        {
+            app.toggle_video_playback();
+            return true;
+        }
         _ => {}
     }
 
@@ -1720,6 +1726,17 @@ fn handle_key_files(key: KeyEvent, app: &mut App) {
     if app.engine.active_panel() == Panel::Files
         && handle_key_files_clipboard(key, app, ctrl, shift)
     {
+        return;
+    }
+
+    if app.engine.active_panel() == Panel::Diff
+        && app.preview_is_video()
+        && matches!(
+            Keymap::resolve(InputScope::VideoPreview, &key),
+            Some(Command::ToggleVideoPlayback)
+        )
+    {
+        app.toggle_video_playback();
         return;
     }
 
@@ -2781,6 +2798,13 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
         return;
     }
 
+    // The video timeline owns its left-button gesture from press through
+    // release. Drag updates are cheap cached state; only release starts the
+    // asynchronous decoder rebuild at the chosen position.
+    if handle_video_seek(&mouse, app) {
+        return;
+    }
+
     // Preview drag-selection fast-path. Owns Down/Drag/Up(Left) when the
     // gesture starts inside the preview panel. Scroll wheel, right-click,
     // and Down outside the panel fall through to the normal match below.
@@ -3026,6 +3050,29 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
             app.diff_ctrl_hover = diff_hover;
         }
         _ => {}
+    }
+}
+
+fn handle_video_seek(mouse: &MouseEvent, app: &mut App) -> bool {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some(ui::mouse::ClickAction::SeekVideo { start, width }) =
+                app.hit_registry.hit_test(mouse.column, mouse.row)
+            else {
+                return false;
+            };
+            app.begin_video_seek(start, width, mouse.column);
+            true
+        }
+        MouseEventKind::Drag(MouseButton::Left) if app.video_seek_position().is_some() => {
+            app.update_video_seek(mouse.column);
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) if app.video_seek_position().is_some() => {
+            app.finish_video_seek(mouse.column);
+            true
+        }
+        _ => false,
     }
 }
 

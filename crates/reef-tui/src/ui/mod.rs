@@ -55,6 +55,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // `last_preview_rect` pointing at a now-hidden region and the mouse
     // handler would treat clicks on other panels as selection gestures.
     app.last_preview_rect = None;
+    app.last_video_frame_area = None;
     app.last_preview_content_origin = None;
     app.last_markdown_content_origin = None;
     // Same story for the diff panel — both Git tab Diff and Graph tab's
@@ -955,6 +956,7 @@ fn render_help(f: &mut Frame, app: &App, screen: Rect) {
         ("d → y", t(Msg::HelpDiscard)),
         ("m", t(Msg::HelpDiffLayout)),
         ("f", t(Msg::HelpDiffMode)),
+        ("p", t(Msg::HelpVideoPlayPause)),
         ("t", t(Msg::HelpToggleView)),
         ("r", t(Msg::HelpRefresh)),
         ("h", t(Msg::HelpShowHelp)),

@@ -51,6 +51,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.os }}
+      # The inline video preview decodes through ffmpeg. Its tests skip
+      # themselves when ffmpeg is absent — the feature degrades the same way —
+      # so without this step they pass in milliseconds without exercising
+      # anything. Installed on Linux only: apt is cheap where brew costs
+      # minutes, and one platform actually running them is what matters.
+      # Non-interactive and time-boxed: an apt that stops to ask a question
+      # would otherwise hang the job until the six-hour ceiling.
+      - name: Install ffmpeg (exercises the video preview tests)
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 5
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          NEEDRESTART_MODE: a
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -1
       - name: Run tests
         run: cargo test --workspace --all-features
       - name: Run doctests

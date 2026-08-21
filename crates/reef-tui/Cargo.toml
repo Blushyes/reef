@@ -24,6 +24,10 @@ serde_json    = { workspace = true }
 terminal-colorsaurus = "1.0.3"
 # Image preview protocol rendering in the TUI. Decoding lives in reef-core.
 ratatui-image = { version = "10.0.6", default-features = false, features = ["crossterm"] }
+# Inline video playback wraps raw ffmpeg frames into the `DynamicImage` that
+# `ratatui-image` protocols encode from. No decoders are enabled: frames arrive
+# already decoded as RGBA, so only the in-memory buffer types are needed.
+image         = { version = "0.25", default-features = false }
 reef-sqlite-preview = { path = "../reef-sqlite-preview" }
 
 [dev-dependencies]

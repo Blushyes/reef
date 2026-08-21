@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 pub enum InputScope {
     Normal,
     FocusedPreview,
+    VideoPreview,
     Settings,
     QuickOpen,
     GlobalSearch,
@@ -38,6 +39,7 @@ pub enum Command {
     OpenGlobalSearch,
     OpenGlobalReplace,
     ToggleFocusedPreview,
+    ToggleVideoPlayback,
     LocationBack,
     LocationForward,
     GotoDefinition,
@@ -301,6 +303,8 @@ fn bindings() -> &'static [KeyBinding] {
                 KeyBinding::single(FocusedPreview, Esc, Mods::NONE, Close),
                 KeyBinding::single(FocusedPreview, Char('q'), Mods::NONE, Quit),
                 KeyBinding::single(FocusedPreview, Char('c'), Mods::CONTROL, Quit),
+                KeyBinding::single(FocusedPreview, Char('p'), Mods::NONE, ToggleVideoPlayback),
+                KeyBinding::single(VideoPreview, Char('p'), Mods::NONE, ToggleVideoPlayback),
                 KeyBinding::single(Settings, Esc, Mods::NONE, Close),
                 KeyBinding::single(Settings, Char('q'), Mods::NONE, Quit),
                 KeyBinding::single(Settings, Char('c'), Mods::CONTROL, Quit),
@@ -528,6 +532,21 @@ mod tests {
             Keymap::resolve(InputScope::FindWidget, &shift_enter),
             Some(Command::Confirm)
         );
+    }
+
+    #[test]
+    fn video_playback_key_is_scoped_to_visible_video_surfaces() {
+        let p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE);
+
+        assert_eq!(
+            Keymap::resolve(InputScope::VideoPreview, &p),
+            Some(Command::ToggleVideoPlayback)
+        );
+        assert_eq!(
+            Keymap::resolve(InputScope::FocusedPreview, &p),
+            Some(Command::ToggleVideoPlayback)
+        );
+        assert_eq!(Keymap::resolve(InputScope::Normal, &p), None);
     }
 
     #[test]

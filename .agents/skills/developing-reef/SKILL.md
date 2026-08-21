@@ -11,7 +11,7 @@ expensive work must not run from a renderer.
 
 ## Core Architecture Rules
 
-- Keep `ui::*::render` on cached state only. Do not call git, filesystem walks, diff generation, syntax highlighting, or long formatting from render.
+- Keep `ui::*::render` on cached state only. Do not call git, filesystem walks, diff generation, syntax highlighting, external processes, or long formatting from render. Renderer-specific media geometry may be cached during render; decoder open/rebuild work starts from the host tick.
 - Treat input handlers as intent dispatchers. They decode terminal input and dispatch `reef_app::AppCommand`; they must not directly own business state or do blocking host work.
 - Route expensive work through `reef-app`'s task coordinator; merge worker results from
   `ReefApp::step`.
@@ -22,6 +22,7 @@ expensive work must not run from a renderer.
 - Hosts construct `ReefApp` from `AppConfig`; `AppState` and its construction details stay private
   to `reef-app`.
 - Keep terminal-only state in `crates/reef-tui`: ratatui layout caches, hit-test registry, terminal image protocol, text-selection geometry, mouse row/column mapping, scroll pacing, leader/chord timers, popup rects, and the live TUI theme object.
+- Keep inline-video decode and terminal protocol encoding off the TUI loop. Bound decoded frame dimensions and playback FPS by terminal wire cost before starting ffmpeg; playback ticks may drain decoded frames, submit only the newest due frame to a bounded encoder, and merge completed protocol payloads without waiting.
 - Prefer stale cached UI over blocking. Show old data plus loading/stale/error status instead of waiting during tab switches or hover/mouse movement.
 - Use generation tokens for async results. Late results from older requests must not overwrite newer selections or newer snapshots.
 - Keep each tab/panel independently refreshable. Adding a feature should not require another tab to render before data can update.

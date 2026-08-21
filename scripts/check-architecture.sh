@@ -94,3 +94,8 @@ if rg -n 'ratatui|crossterm|ratatui_image' crates/reef-app/Cargo.toml crates/ree
   printf 'reef-app must stay renderer-neutral; terminal dependencies belong in reef-tui.\n' >&2
   exit 1
 fi
+
+if rg -n 'VideoPlayer::(open|open_source)|\.rebuild\(' crates/reef-tui/src/ui >&2; then
+  printf 'TUI renderers must not start or rebuild video decoders; cache layout and schedule work from TuiApp::tick.\n' >&2
+  exit 1
+fi

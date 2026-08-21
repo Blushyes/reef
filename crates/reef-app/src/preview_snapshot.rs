@@ -531,6 +531,22 @@ fn is_mermaid_path(path: &str) -> bool {
     path.ends_with(".mmd") || path.ends_with(".mermaid")
 }
 
+/// Whether a preview document is a video file the renderer may offer to
+/// play. Videos land in [`PreviewBody::Binary`] because nothing decodes them
+/// during preview loading — the kind is recovered from the mime type and
+/// extension, and this is the single place that decision is made.
+pub fn preview_is_video(document: &PreviewDocument) -> bool {
+    if !matches!(document.body, PreviewBody::Binary(_)) {
+        return false;
+    }
+    let path = document.path.to_ascii_lowercase();
+    let ext = Path::new(&path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("");
+    is_video_source(ext, document.mime.as_deref())
+}
+
 fn is_video_source(ext: &str, mime: Option<&str>) -> bool {
     mime.is_some_and(|mime| mime.starts_with("video/"))
         || matches!(ext, "mp4" | "m4v" | "mov" | "webm" | "mkv" | "avi")

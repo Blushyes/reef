@@ -4,6 +4,7 @@ pub mod image;
 pub mod markdown;
 pub mod structured;
 pub mod text;
+pub mod video;
 
 use crate::TuiApp as App;
 use crate::i18n::{Msg, t};
@@ -40,6 +41,12 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
             markdown::render(f, app, inner, &preview, markdown, focused);
         }
         PreviewBody::Image(img) => image::render(f, app, inner, &preview.path, img, focused),
+        // Videos load as binaries — nothing decodes them during preview
+        // build — so the video card is selected on the detected kind rather
+        // than on a distinct body variant.
+        PreviewBody::Binary(info) if reef_app::preview_is_video(&preview) => {
+            video::render(f, app, inner, &preview.path, info, focused);
+        }
         PreviewBody::Binary(info) => binary::render(f, app, inner, &preview.path, info, focused),
         PreviewBody::Database(info) => {
             crate::ui::db_preview::render(f, app, inner, &preview.path, info, focused);

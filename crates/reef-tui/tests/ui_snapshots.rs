@@ -580,6 +580,57 @@ fn snapshot_binary_info_pdf() {
 }
 
 #[test]
+fn snapshot_video_card_without_inline_playback() {
+    // Video card layout on a terminal that can't animate: header +
+    // separator + metadata line + blank + the reason in place of a frame.
+    // Halfblocks is such a terminal, so `VideoPlayer::open` refuses before
+    // it ever reaches ffmpeg — which keeps this snapshot deterministic and
+    // independent of whether ffmpeg is installed. The playing path is
+    // covered end-to-end in `tests/video_playback.rs`.
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    force_en_lang();
+    let (tmp, _raw) = tempdir_repo();
+    // Content is irrelevant — the card is selected on the extension, and
+    // nothing decodes the file on this path.
+    std::fs::write(tmp.path().join("clip.mp4"), b"\x00\x00\x00\x18ftypmp42").unwrap();
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _h = HomeGuard::enter(home.path());
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), Some(Picker::halfblocks()));
+    app.refresh_file_tree();
+    wait_for_file_tree(&mut app);
+    let idx = app
+        .engine
+        .state
+        .file_tree
+        .entries
+        .iter()
+        .position(|e| e.name == "clip.mp4")
+        .expect("clip.mp4 in tree");
+    app.engine.state.file_tree.selected = idx;
+    app.load_preview();
+    wait_for_preview(&mut app);
+
+    // The opener runs off-thread; spin until its verdict lands so the card
+    // shows the reason rather than "loading…".
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline && app.video_status.is_none() {
+        app.tick();
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        app.video_status.is_some(),
+        "the opener should report why playback is unavailable"
+    );
+
+    let output = render_app(&mut app, 80, 20);
+    with_filters(&[], || {
+        insta::assert_snapshot!("video_card_no_playback", output)
+    });
+}
+
+#[test]
 fn snapshot_markdown_preview() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     force_en_lang();

@@ -133,6 +133,26 @@ pub enum Msg {
     NavReferences,
     NavPreviewLoading,
     NavPreviewUnavailable,
+    /// Help popup: the video preview play / pause key.
+    HelpVideoPlayPause,
+    /// Video preview: button on a paused clip, before playback starts.
+    PreviewVideoPlayButton,
+    /// Video preview: button while a clip is playing.
+    PreviewVideoPauseButton,
+    /// Video preview: button on a clip that reached its end.
+    PreviewVideoReplayButton,
+    /// Video preview: shown when ffmpeg / ffprobe are missing.
+    PreviewVideoNeedsFfmpeg,
+    /// Video preview: shown when a clip has audio but ffplay is missing.
+    PreviewVideoNeedsFfplay,
+    /// Video preview: shown on terminals with no protocol we can animate.
+    PreviewVideoUnsupportedTerminal,
+    /// Video preview: shown inside tmux, where inline graphics are off.
+    PreviewVideoTmux,
+    /// Video preview: shown for a file on the remote side of an SSH session.
+    PreviewVideoRemote,
+    /// Video preview: shown when ffprobe found no playable video stream.
+    PreviewVideoUnreadable,
     /// SQLite preview: header for the left-side tables list column.
     DbTablesHeader,
     /// SQLite preview: shown when the database has zero user tables.
@@ -375,6 +395,16 @@ fn t_zh(m: Msg) -> &'static str {
         NavReferences => "引用",
         NavPreviewLoading => "正在加载预览…",
         NavPreviewUnavailable => "预览不可用",
+        HelpVideoPlayPause => "播放 / 暂停视频预览（预览区聚焦时）",
+        PreviewVideoPlayButton => " ▶ 播放 ",
+        PreviewVideoPauseButton => " Ⅱ 暂停 ",
+        PreviewVideoReplayButton => " ↻ 重播 ",
+        PreviewVideoNeedsFfmpeg => "安装 ffmpeg 后可在终端内播放",
+        PreviewVideoNeedsFfplay => "安装 ffplay 后可播放带声音的视频",
+        PreviewVideoUnsupportedTerminal => "当前终端不支持内联播放",
+        PreviewVideoTmux => "tmux 内不支持内联播放",
+        PreviewVideoRemote => "远程文件不支持内联播放",
+        PreviewVideoUnreadable => "无法读取视频流",
         DbTablesHeader => "表",
         DbEmpty => "(空数据库)",
         DbNoRows => "(无数据)",
@@ -568,6 +598,16 @@ fn t_en(m: Msg) -> &'static str {
         NavReferences => "references",
         NavPreviewLoading => "Loading preview…",
         NavPreviewUnavailable => "Preview unavailable",
+        HelpVideoPlayPause => "play / pause video (preview focused)",
+        PreviewVideoPlayButton => " ▶ Play ",
+        PreviewVideoPauseButton => " Ⅱ Pause ",
+        PreviewVideoReplayButton => " ↻ Replay ",
+        PreviewVideoNeedsFfmpeg => "install ffmpeg to play inline",
+        PreviewVideoNeedsFfplay => "install ffplay to play videos with audio",
+        PreviewVideoUnsupportedTerminal => "inline playback unavailable in this terminal",
+        PreviewVideoTmux => "inline playback is disabled inside tmux",
+        PreviewVideoRemote => "inline playback is unavailable for remote files",
+        PreviewVideoUnreadable => "no readable video stream",
         DbTablesHeader => "tables",
         DbEmpty => "(empty database)",
         DbNoRows => "(no rows)",

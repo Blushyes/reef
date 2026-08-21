@@ -14,15 +14,14 @@ const BASE64_ALPHABET: &[u8; 64] =
 
 pub fn base64_encode(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    let mut chunks = input.chunks_exact(3);
-    for chunk in &mut chunks {
+    let (chunks, rem) = input.as_chunks::<3>();
+    for chunk in chunks {
         let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
         out.push(BASE64_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
         out.push(BASE64_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
         out.push(BASE64_ALPHABET[((n >> 6) & 0x3f) as usize] as char);
         out.push(BASE64_ALPHABET[(n & 0x3f) as usize] as char);
     }
-    let rem = chunks.remainder();
     match rem.len() {
         0 => {}
         1 => {

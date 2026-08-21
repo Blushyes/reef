@@ -16,6 +16,7 @@ AI 写代码之后，IDE 九成的功能都不需要了。Reef 是剩下的一�
 ## 功能
 
 - **Files**：文件树 + 只读预览；代码语法高亮、图片内联渲染（Kitty / iTerm2 / 半块字符自动检测）。
+- **视频预览**：选中视频看首帧；点击播放，或聚焦预览区后按 `p`（Kitty / iTerm2，需要 `ffmpeg`）。
 - **SQLite 浏览器**：打开任意 `.db` 文件，浏览 schemas、tables、views、indexes、triggers；无框线现代化数据网格，列名按类型着色，index / trigger 有结构详情卡片。
 - **Search**：基于 ripgrep 的工作目录内容搜索，右栏活预览，遵循 `.gitignore`。
 - **Git**：每文件 / 每文件夹的 `+N −M` 统计；暂存 / 取消暂存 / 还原 / 推送（含 `--force-with-lease`）；unified 或 side-by-side diff。

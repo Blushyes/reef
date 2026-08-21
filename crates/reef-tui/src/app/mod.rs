@@ -3377,6 +3377,7 @@ impl App {
         changed |= self.drain_preview_video_builds();
         self.schedule_preview_video_resize();
         changed |= self.tick_video(now);
+        changed |= self.reconcile_nav_candidates_viewport();
         self.tick_place_mode_auto_expand();
         self.tick_tree_drag_auto_expand();
         crate::input::tick_drag_autoscroll(self);
@@ -3385,6 +3386,24 @@ impl App {
             || self.engine.place_mode_active()
             || self.engine.tree_drag_active()
             || self.last_drag_mouse.is_some()
+    }
+
+    fn reconcile_nav_candidates_viewport(&mut self) -> bool {
+        if self.nav_peek_tree_rect.is_none() {
+            return false;
+        }
+        let Some(popup) = self.engine.nav_candidates() else {
+            return false;
+        };
+        let viewport_rows = self.nav_peek_visible_rows.max(1);
+        let view = (popup.selected, viewport_rows);
+        if self.nav_peek_reconciled_view == Some(view) {
+            return false;
+        }
+        self.engine
+            .dispatch(reef_app::AppCommand::ReconcileNavCandidatesViewport { viewport_rows });
+        self.nav_peek_reconciled_view = Some(view);
+        true
     }
 
     fn tick_options(&self) -> reef_app::TickOptions {

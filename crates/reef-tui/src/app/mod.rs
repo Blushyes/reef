@@ -1542,6 +1542,8 @@ impl App {
     }
 
     pub fn select_file(&mut self, path: &str, is_staged: bool) {
+        self.engine
+            .dispatch(reef_app::AppCommand::SetCommitEditing(false));
         if self
             .engine
             .selected_file()
@@ -1767,9 +1769,8 @@ impl App {
     /// or commit range. Routes to range-file-diff plumbing when a range is
     /// active so the diff baseline matches the file list.
     ///
-    /// In 3-col mode the right column owns the diff, so picking a file also
-    /// moves focus there — the user's next arrow-key pans the viewport
-    /// instead of scrolling the commit metadata they were already looking at.
+    /// In 3-col mode a click in the Changed-files column keeps that column
+    /// focused so subsequent arrow keys can continue navigating sibling files.
     pub fn load_commit_file_diff(&mut self, path: &str) {
         if self
             .engine
@@ -1780,12 +1781,18 @@ impl App {
         {
             self.push_location_before_jump();
         }
+        let preserve_commit_focus =
+            self.engine.active_tab() == Tab::Graph && self.engine.active_panel() == Panel::Commit;
         self.engine
             .dispatch(reef_app::AppCommand::LoadCommitFileDiff {
                 path: path.to_string(),
                 dark: self.theme.is_dark,
                 uses_three_col: self.graph_uses_three_col(),
             });
+        if preserve_commit_focus {
+            self.engine
+                .dispatch(reef_app::AppCommand::SetActivePanel(Panel::Commit));
+        }
         self.drain_engine_runtime_events();
     }
 

@@ -238,6 +238,7 @@ pub struct RangeDetail {
 pub struct CommitDetailState {
     pub detail: Option<CommitDetail>,
     pub range_detail: Option<RangeDetail>,
+    pub selected_file: Option<String>,
     pub file_diff: Option<CommitFileDiff>,
     pub diff_layout: DiffLayout,
     pub diff_mode: DiffMode,
@@ -258,6 +259,7 @@ impl Default for CommitDetailState {
         Self {
             detail: None,
             range_detail: None,
+            selected_file: None,
             file_diff: None,
             diff_layout: DiffLayout::Unified,
             diff_mode: DiffMode::Compact,
@@ -1082,6 +1084,21 @@ fn navigable_git_files(
     items
 }
 
+fn navigable_commit_files(
+    files: &[FileEntry],
+    collapsed: &HashSet<String>,
+    tree_mode: bool,
+) -> Vec<String> {
+    if !tree_mode {
+        return files.iter().map(|file| file.path.clone()).collect();
+    }
+    let collapsed = collapsed
+        .iter()
+        .map(|path| reef_core::git::tree::collapsed_key(false, path))
+        .collect();
+    reef_core::git::tree::visible_file_paths(files, false, &collapsed)
+}
+
 fn next_panel(current: AppPanel, three_col: bool, reverse: bool) -> AppPanel {
     if three_col {
         match (current, reverse) {
@@ -1264,6 +1281,22 @@ mod tests {
                 ("README.md".to_string(), false),
                 ("z.txt".to_string(), false)
             ]
+        );
+    }
+
+    #[test]
+    fn navigable_commit_files_tree_mode_skips_collapsed_dirs() {
+        let files = vec![
+            git_entry("src/a.rs"),
+            git_entry("README.md"),
+            git_entry("src/z.rs"),
+            git_entry("z.txt"),
+        ];
+        let collapsed = HashSet::from(["src".to_string()]);
+
+        assert_eq!(
+            navigable_commit_files(&files, &collapsed, true),
+            vec!["README.md".to_string(), "z.txt".to_string()]
         );
     }
 

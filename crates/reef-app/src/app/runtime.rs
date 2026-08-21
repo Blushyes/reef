@@ -181,6 +181,7 @@ impl AppState {
             self.git_graph.selection_anchor = None;
             self.commit_detail.detail = None;
             self.commit_detail.range_detail = None;
+            self.commit_detail.selected_file = None;
             self.commit_detail.file_diff = None;
             if has_repo {
                 self.git_status_load.mark_stale();

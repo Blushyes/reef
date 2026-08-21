@@ -745,7 +745,7 @@ fn build_rows(app: &App, width: u16, display_w: u16, theme: &Theme) -> Vec<Row> 
     ]));
 
     let ctx = CommitFilesCtx {
-        selected_file: cd.file_diff.as_ref().map(|d| d.path.as_str()),
+        selected_file: cd.selected_file.as_deref(),
         sel_bg: theme.selection_bg,
         max_path,
         commit_oid: stable_oid,

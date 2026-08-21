@@ -326,6 +326,11 @@ pub enum AppCommand {
         dark: bool,
         uses_three_col: bool,
     },
+    NavigateCommitFiles {
+        delta: i32,
+        dark: bool,
+        uses_three_col: bool,
+    },
     ReloadCommitFileDiff {
         dark: bool,
         uses_three_col: bool,

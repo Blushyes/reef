@@ -197,6 +197,7 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
 ### Graph
 
 - Graph refresh walks commits/refs in the graph-refresh worker.
+- Graph Changed-files selection lives in `reef-app`. Renderers dispatch navigation deltas; the app follows the visible flat/tree order, skips files under collapsed directories, publishes the selected path before the asynchronous diff completes, and preserves the renderer's active panel so repeated arrows continue navigating files.
 - The graph-refresh queue coalesces pending requests to the newest generation before each commit
   walk.
 - Commit detail and per-file commit diffs run on the separate graph-content worker, so a periodic

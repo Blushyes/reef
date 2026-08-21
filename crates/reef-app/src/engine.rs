@@ -893,6 +893,16 @@ impl ReefApp {
                     .load_commit_file_diff(&path, dark, uses_three_col);
                 self.push_commit_file_diff_outcome(outcome);
             }
+            AppCommand::NavigateCommitFiles {
+                delta,
+                dark,
+                uses_three_col,
+            } => {
+                let outcome = self
+                    .state
+                    .navigate_commit_files(delta, dark, uses_three_col);
+                self.push_commit_file_diff_outcome(outcome);
+            }
             AppCommand::ReloadCommitFileDiff {
                 dark,
                 uses_three_col,

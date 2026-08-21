@@ -184,6 +184,9 @@ pub enum ClickAction {
     OpenMarkdownLink(String),
     SetStructuredPreviewMode(reef_app::StructuredPreviewMode),
     ToggleStructuredPreviewNode(String),
+    /// Play, pause, or replay the inline video preview according to its
+    /// current state. Registered on the transport button beneath the frame.
+    ToggleVideoPlayback,
 }
 
 #[derive(Debug, Clone)]

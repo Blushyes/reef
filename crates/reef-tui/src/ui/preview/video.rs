@@ -9,6 +9,7 @@
 
 use crate::TuiApp as App;
 use crate::i18n::{Msg, t};
+use crate::ui::mouse::ClickAction;
 use crate::ui::preview::chrome::render_card_header;
 use crate::video::{VideoUnavailable, format_timecode};
 use ratatui::Frame;
@@ -90,9 +91,10 @@ fn render_frame(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-/// The transport line: position over duration, a progress rule, and the key
-/// hint for whatever pressing `p` would do next.
-fn render_transport(f: &mut Frame, app: &App, area: Rect) {
+/// The transport line: position over duration, a progress rule, and a
+/// clickable play/pause/replay button. The button stays visible when the row
+/// narrows; the progress rule gives up its space first.
+fn render_transport(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let Some(player) = app.video.as_ref() else {
         return;
@@ -108,48 +110,59 @@ fn render_transport(f: &mut Frame, app: &App, area: Rect) {
         ),
         None => format_timecode(position),
     };
-    let hint = t(if player.has_ended() {
-        Msg::PreviewVideoReplayHint
+    let button = t(if player.has_ended() {
+        Msg::PreviewVideoReplayButton
     } else if player.is_playing() {
-        Msg::PreviewVideoPauseHint
+        Msg::PreviewVideoPauseButton
     } else {
-        Msg::PreviewVideoPlayHint
+        Msg::PreviewVideoPlayButton
     });
 
-    let clock_w = UnicodeWidthStr::width(clock.as_str()) as u16;
-    let hint_w = UnicodeWidthStr::width(hint) as u16;
-    // Two single-space gaps around the rule; without room for all three
-    // pieces the rule is dropped rather than squeezed to nothing.
-    let rule_w = area
-        .width
-        .saturating_sub(clock_w)
-        .saturating_sub(hint_w)
-        .saturating_sub(4);
+    let button_w = (UnicodeWidthStr::width(button) as u16).min(area.width);
+    let button_x = area.x + area.width.saturating_sub(button_w);
+    let clock_w =
+        (UnicodeWidthStr::width(clock.as_str()) as u16).min(button_x.saturating_sub(area.x));
 
-    let mut spans = vec![Span::styled(
-        clock,
-        Style::default()
-            .fg(th.fg_secondary)
-            .add_modifier(Modifier::BOLD),
-    )];
+    f.render_widget(
+        Line::from(Span::styled(
+            clock,
+            Style::default()
+                .fg(th.fg_secondary)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Rect::new(area.x, area.y, clock_w, 1),
+    );
+
+    // Keep two cells of breathing room on each side of the progress rule.
+    let rule_x = area.x.saturating_add(clock_w).saturating_add(2);
+    let rule_end = button_x.saturating_sub(2);
+    let rule_w = rule_end.saturating_sub(rule_x);
     if rule_w > 0 {
         let filled = progress_cells(position, info.duration, rule_w);
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            "━".repeat(filled as usize),
-            Style::default().fg(th.accent),
-        ));
-        spans.push(Span::styled(
-            "─".repeat((rule_w - filled) as usize),
-            Style::default().fg(th.fg_secondary),
-        ));
-        spans.push(Span::raw("  "));
-    } else {
-        spans.push(Span::raw(" "));
+        f.render_widget(
+            Line::from(vec![
+                Span::styled("━".repeat(filled as usize), Style::default().fg(th.accent)),
+                Span::styled(
+                    "─".repeat((rule_w - filled) as usize),
+                    Style::default().fg(th.fg_secondary),
+                ),
+            ]),
+            Rect::new(rule_x, area.y, rule_w, 1),
+        );
     }
-    spans.push(Span::styled(hint, Style::default().fg(th.fg_secondary)));
 
-    f.render_widget(Line::from(spans), area);
+    f.render_widget(
+        Line::from(Span::styled(
+            button,
+            Style::default()
+                .fg(th.accent)
+                .bg(th.selection_bg)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Rect::new(button_x, area.y, button_w, 1),
+    );
+    app.hit_registry
+        .register_row(button_x, area.y, button_w, ClickAction::ToggleVideoPlayback);
 }
 
 /// How many of `width` cells the progress rule should fill. A source without

@@ -2731,6 +2731,9 @@ impl App {
                     .dispatch(reef_app::AppCommand::ToggleStructuredPreviewNode(node_id));
                 self.clear_preview_selection();
             }
+            ClickAction::ToggleVideoPlayback => {
+                self.toggle_video_playback();
+            }
             ClickAction::HostsPickerSelect(idx) => {
                 // Mouse click on a hosts-picker row: move selection to
                 // that row.

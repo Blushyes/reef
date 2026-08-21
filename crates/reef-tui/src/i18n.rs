@@ -135,12 +135,12 @@ pub enum Msg {
     NavPreviewUnavailable,
     /// Help popup: the video preview play / pause key.
     HelpVideoPlayPause,
-    /// Video preview: hint on a paused clip, before playback starts.
-    PreviewVideoPlayHint,
-    /// Video preview: hint while a clip is playing.
-    PreviewVideoPauseHint,
-    /// Video preview: hint on a clip that reached its end.
-    PreviewVideoReplayHint,
+    /// Video preview: button on a paused clip, before playback starts.
+    PreviewVideoPlayButton,
+    /// Video preview: button while a clip is playing.
+    PreviewVideoPauseButton,
+    /// Video preview: button on a clip that reached its end.
+    PreviewVideoReplayButton,
     /// Video preview: shown when ffmpeg / ffprobe are missing.
     PreviewVideoNeedsFfmpeg,
     /// Video preview: shown on terminals with no protocol we can animate.
@@ -394,9 +394,9 @@ fn t_zh(m: Msg) -> &'static str {
         NavPreviewLoading => "正在加载预览…",
         NavPreviewUnavailable => "预览不可用",
         HelpVideoPlayPause => "播放 / 暂停视频预览",
-        PreviewVideoPlayHint => "p 播放",
-        PreviewVideoPauseHint => "p 暂停",
-        PreviewVideoReplayHint => "p 重播",
+        PreviewVideoPlayButton => " ▶ 播放 (p) ",
+        PreviewVideoPauseButton => " Ⅱ 暂停 (p) ",
+        PreviewVideoReplayButton => " ↻ 重播 (p) ",
         PreviewVideoNeedsFfmpeg => "安装 ffmpeg 后可在终端内播放",
         PreviewVideoUnsupportedTerminal => "当前终端不支持内联播放",
         PreviewVideoTmux => "tmux 内不支持内联播放",
@@ -596,9 +596,9 @@ fn t_en(m: Msg) -> &'static str {
         NavPreviewLoading => "Loading preview…",
         NavPreviewUnavailable => "Preview unavailable",
         HelpVideoPlayPause => "play / pause a video preview",
-        PreviewVideoPlayHint => "p to play",
-        PreviewVideoPauseHint => "p to pause",
-        PreviewVideoReplayHint => "p to replay",
+        PreviewVideoPlayButton => " ▶ Play (p) ",
+        PreviewVideoPauseButton => " Ⅱ Pause (p) ",
+        PreviewVideoReplayButton => " ↻ Replay (p) ",
         PreviewVideoNeedsFfmpeg => "install ffmpeg to play inline",
         PreviewVideoUnsupportedTerminal => "inline playback unavailable in this terminal",
         PreviewVideoTmux => "inline playback is disabled inside tmux",

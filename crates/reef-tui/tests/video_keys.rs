@@ -1,14 +1,18 @@
-//! Keyboard wiring for inline video playback, driven through the real key
-//! dispatcher against a real clip.
+//! Keyboard and mouse wiring for inline video playback, driven through the
+//! real dispatchers against a real clip.
 //!
 //! The player itself is covered in `video_playback.rs`; what these check is
-//! the path a keystroke takes to reach it — which panel has to hold focus,
-//! and that `p` doesn't get eaten by the bindings it shares a letter with.
+//! the path an interaction takes to reach it — which panel has to hold focus
+//! for `p`, and that the button remains available from tree focus.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 use ratatui_image::picker::{Picker, ProtocolType};
 use reef::TuiApp as App;
 use reef::input;
+use reef::ui;
+use reef::ui::mouse::ClickAction;
 use reef::ui::theme::Theme;
 use std::path::Path;
 use std::process::Command;
@@ -135,6 +139,59 @@ fn run_for(app: &mut App, duration: Duration) {
         app.tick();
         thread::sleep(Duration::from_millis(5));
     }
+}
+
+#[test]
+fn transport_button_toggles_playback_from_tree_focus() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(mut fixture) = app_previewing_a_clip() else {
+        return;
+    };
+    let app = &mut fixture.app;
+    assert_eq!(app.engine.active_panel(), reef_app::AppPanel::Files);
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    terminal.draw(|frame| ui::render(frame, app)).unwrap();
+    let button = (0..30)
+        .flat_map(|row| (0..120).map(move |column| (column, row)))
+        .find(|&(column, row)| {
+            matches!(
+                app.hit_registry.hit_test(column, row),
+                Some(ClickAction::ToggleVideoPlayback)
+            )
+        })
+        .expect("rendered video transport button");
+
+    input::handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: button.0,
+            row: button.1,
+            modifiers: KeyModifiers::NONE,
+        },
+        app,
+        &terminal,
+    );
+
+    assert!(
+        app.video.as_ref().unwrap().is_playing(),
+        "the button plays even while keyboard focus starts on the tree"
+    );
+
+    input::handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: button.0,
+            row: button.1,
+            modifiers: KeyModifiers::NONE,
+        },
+        app,
+        &terminal,
+    );
+    assert!(
+        !app.video.as_ref().unwrap().is_playing(),
+        "clicking the transport button again pauses playback"
+    );
 }
 
 #[test]

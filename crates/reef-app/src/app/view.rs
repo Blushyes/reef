@@ -321,9 +321,7 @@ impl AppState {
         dark: bool,
         uses_three_col: bool,
     ) -> JumpToLocationOutcome {
-        if let LocationSurface::GraphDiff { commit_oid, .. } = &target.surface
-            && self.git_graph.find_row_by_oid(commit_oid).is_none()
-        {
+        if !self.can_jump_to_location(&target) {
             return JumpToLocationOutcome::default();
         }
         let mut outcome = JumpToLocationOutcome {
@@ -376,6 +374,17 @@ impl AppState {
             }
         }
         outcome
+    }
+
+    pub fn can_jump_to_location(&self, target: &LocationSnapshot) -> bool {
+        match &target.surface {
+            LocationSurface::GraphDiff { commit_oid, .. } => {
+                self.git_graph.find_row_by_oid(commit_oid).is_some()
+            }
+            LocationSurface::FilePreview
+            | LocationSurface::SearchPreview
+            | LocationSurface::GitDiff { .. } => true,
+        }
     }
 
     pub fn normalize_active_panel(&mut self, uses_three_col: bool) -> NormalizeActivePanelOutcome {

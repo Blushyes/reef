@@ -1194,7 +1194,12 @@ impl ReefApp {
                 dark,
                 uses_three_col,
             } => {
-                if let Some(target) = self.state.location_history.back(current) {
+                let can_jump = self
+                    .state
+                    .location_history
+                    .back_item()
+                    .is_some_and(|target| self.state.can_jump_to_location(target));
+                if can_jump && let Some(target) = self.state.location_history.back(current) {
                     self.jump_to_location_command(target, dark, uses_three_col);
                 }
             }
@@ -1203,7 +1208,12 @@ impl ReefApp {
                 dark,
                 uses_three_col,
             } => {
-                if let Some(target) = self.state.location_history.forward(current) {
+                let can_jump = self
+                    .state
+                    .location_history
+                    .forward_item()
+                    .is_some_and(|target| self.state.can_jump_to_location(target));
+                if can_jump && let Some(target) = self.state.location_history.forward(current) {
                     self.jump_to_location_command(target, dark, uses_three_col);
                 }
             }
@@ -2732,6 +2742,72 @@ mod tests {
         });
         assert!(!app.can_go_back());
         assert!(app.can_go_forward());
+    }
+
+    #[test]
+    fn missing_graph_history_target_preserves_back_and_forward_stacks() {
+        let mut app = test_app();
+        let target = LocationSnapshot {
+            surface: crate::LocationSurface::GraphDiff {
+                commit_oid: "missing".to_string(),
+                file_path: "src/lib.rs".to_string(),
+            },
+            path: PathBuf::from("src/lib.rs"),
+            cursor: crate::CursorPosition {
+                line: 12,
+                byte_col: 0,
+            },
+            scroll: crate::ScrollPosition {
+                vertical: 12,
+                horizontal: 3,
+            },
+        };
+        app.dispatch(AppCommand::PushLocationHistory(target.clone()));
+
+        app.dispatch(AppCommand::LocationBack {
+            current: Some(global_search_origin()),
+            dark: false,
+            uses_three_col: true,
+        });
+
+        assert_eq!(app.state.location_history.back_items(), &[target]);
+        assert!(app.state.location_history.forward_is_empty());
+    }
+
+    #[test]
+    fn missing_graph_history_target_preserves_forward_stack() {
+        let mut app = test_app();
+        let target = LocationSnapshot {
+            surface: crate::LocationSurface::GraphDiff {
+                commit_oid: "missing".to_string(),
+                file_path: "src/lib.rs".to_string(),
+            },
+            path: PathBuf::from("src/lib.rs"),
+            cursor: crate::CursorPosition {
+                line: 12,
+                byte_col: 0,
+            },
+            scroll: crate::ScrollPosition {
+                vertical: 12,
+                horizontal: 3,
+            },
+        };
+        let origin = global_search_origin();
+        app.dispatch(AppCommand::PushLocationHistory(origin.clone()));
+        app.dispatch(AppCommand::LocationBack {
+            current: Some(target),
+            dark: false,
+            uses_three_col: true,
+        });
+
+        app.dispatch(AppCommand::LocationForward {
+            current: Some(origin),
+            dark: false,
+            uses_three_col: true,
+        });
+
+        assert!(app.state.location_history.is_empty());
+        assert_eq!(app.state.location_history.forward_len(), 1);
     }
 
     #[test]

@@ -321,7 +321,13 @@ impl AppState {
         dark: bool,
         uses_three_col: bool,
     ) -> JumpToLocationOutcome {
-        let mut outcome = JumpToLocationOutcome::default();
+        if !self.can_jump_to_location(&target) {
+            return JumpToLocationOutcome::default();
+        }
+        let mut outcome = JumpToLocationOutcome {
+            location: Some(target.clone()),
+            ..JumpToLocationOutcome::default()
+        };
         match target.surface.clone() {
             LocationSurface::FilePreview => {
                 self.set_active_tab(AppTab::Files);
@@ -368,6 +374,17 @@ impl AppState {
             }
         }
         outcome
+    }
+
+    pub fn can_jump_to_location(&self, target: &LocationSnapshot) -> bool {
+        match &target.surface {
+            LocationSurface::GraphDiff { commit_oid, .. } => {
+                self.git_graph.find_row_by_oid(commit_oid).is_some()
+            }
+            LocationSurface::FilePreview
+            | LocationSurface::SearchPreview
+            | LocationSurface::GitDiff { .. } => true,
+        }
     }
 
     pub fn normalize_active_panel(&mut self, uses_three_col: bool) -> NormalizeActivePanelOutcome {

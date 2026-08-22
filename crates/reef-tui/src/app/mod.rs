@@ -290,6 +290,7 @@ pub struct TuiApp {
     pub(crate) nav_peek_preview_max_scroll: usize,
     pub(crate) nav_peek_preview_target: Option<(String, usize, usize)>,
     pub(crate) nav_peek_visible_rows: usize,
+    pub(crate) nav_peek_reconciled_view: Option<(usize, usize)>,
 
     /// Active color theme. Chosen in `main.rs` before raw-mode entry.
     pub theme: Theme,
@@ -492,6 +493,7 @@ impl App {
             nav_peek_preview_max_scroll: 0,
             nav_peek_preview_target: None,
             nav_peek_visible_rows: reef_app::NavCandidatesPopup::MAX_VISIBLE_ROWS,
+            nav_peek_reconciled_view: None,
             theme,
             space_leader_at: None,
             g_pending_at: None,
@@ -1540,6 +1542,15 @@ impl App {
     }
 
     pub fn select_file(&mut self, path: &str, is_staged: bool) {
+        self.engine
+            .dispatch(reef_app::AppCommand::SetCommitEditing(false));
+        if self
+            .engine
+            .selected_file()
+            .is_none_or(|selected| selected.path != path || selected.is_staged != is_staged)
+        {
+            self.push_location_before_jump();
+        }
         self.engine.dispatch(reef_app::AppCommand::SelectGitFile {
             path: path.to_string(),
             is_staged,
@@ -1758,16 +1769,30 @@ impl App {
     /// or commit range. Routes to range-file-diff plumbing when a range is
     /// active so the diff baseline matches the file list.
     ///
-    /// In 3-col mode the right column owns the diff, so picking a file also
-    /// moves focus there — the user's next arrow-key pans the viewport
-    /// instead of scrolling the commit metadata they were already looking at.
+    /// In 3-col mode a click in the Changed-files column keeps that column
+    /// focused so subsequent arrow keys can continue navigating sibling files.
     pub fn load_commit_file_diff(&mut self, path: &str) {
+        if self
+            .engine
+            .commit_detail()
+            .file_diff
+            .as_ref()
+            .is_none_or(|diff| diff.path != path)
+        {
+            self.push_location_before_jump();
+        }
+        let preserve_commit_focus =
+            self.engine.active_tab() == Tab::Graph && self.engine.active_panel() == Panel::Commit;
         self.engine
             .dispatch(reef_app::AppCommand::LoadCommitFileDiff {
                 path: path.to_string(),
                 dark: self.theme.is_dark,
                 uses_three_col: self.graph_uses_three_col(),
             });
+        if preserve_commit_focus {
+            self.engine
+                .dispatch(reef_app::AppCommand::SetActivePanel(Panel::Commit));
+        }
         self.drain_engine_runtime_events();
     }
 
@@ -2768,6 +2793,18 @@ impl App {
                 self.open_hosts_picker();
             }
             ClickAction::TreeClick(index) => {
+                let changes_preview = self
+                    .engine
+                    .file_tree_entry(index)
+                    .filter(|entry| !entry.is_dir)
+                    .is_some_and(|entry| {
+                        self.engine
+                            .preview_content_ref()
+                            .is_none_or(|preview| std::path::Path::new(&preview.path) != entry.path)
+                    });
+                if changes_preview {
+                    self.push_location_before_jump();
+                }
                 self.engine
                     .dispatch(reef_app::AppCommand::ActivateFileTreeEntryAtIndex(index));
             }
@@ -3340,6 +3377,7 @@ impl App {
         changed |= self.drain_preview_video_builds();
         self.schedule_preview_video_resize();
         changed |= self.tick_video(now);
+        changed |= self.reconcile_nav_candidates_viewport();
         self.tick_place_mode_auto_expand();
         self.tick_tree_drag_auto_expand();
         crate::input::tick_drag_autoscroll(self);
@@ -3348,6 +3386,24 @@ impl App {
             || self.engine.place_mode_active()
             || self.engine.tree_drag_active()
             || self.last_drag_mouse.is_some()
+    }
+
+    fn reconcile_nav_candidates_viewport(&mut self) -> bool {
+        if self.nav_peek_tree_rect.is_none() {
+            return false;
+        }
+        let Some(popup) = self.engine.nav_candidates() else {
+            return false;
+        };
+        let viewport_rows = self.nav_peek_visible_rows.max(1);
+        let view = (popup.selected, viewport_rows);
+        if self.nav_peek_reconciled_view == Some(view) {
+            return false;
+        }
+        self.engine
+            .dispatch(reef_app::AppCommand::ReconcileNavCandidatesViewport { viewport_rows });
+        self.nav_peek_reconciled_view = Some(view);
+        true
     }
 
     fn tick_options(&self) -> reef_app::TickOptions {

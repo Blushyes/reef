@@ -45,7 +45,7 @@ fn render_popup_surface(f: &mut Frame, area: Rect, block: Block<'_>, background:
 }
 
 fn render_expanded(f: &mut Frame, app: &mut App, screen: Rect) {
-    let Some(popup) = app.engine.nav_candidates() else {
+    let Some(mut popup) = app.engine.nav_candidates() else {
         return;
     };
     if popup.candidates.is_empty() {
@@ -76,8 +76,6 @@ fn render_expanded(f: &mut Frame, app: &mut App, screen: Rect) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(inner);
-    render_header(f, app, rows[0], &popup);
-
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -85,12 +83,16 @@ fn render_expanded(f: &mut Frame, app: &mut App, screen: Rect) {
             Constraint::Percentage(100 - PREVIEW_PERCENT),
         ])
         .split(rows[1]);
+    let viewport_rows = popup.visible_rows(columns[1].height.saturating_sub(1) as usize);
+    app.nav_peek_visible_rows = viewport_rows.max(1);
+    popup.clamp_scroll(viewport_rows);
+    render_header(f, app, rows[0], &popup);
     render_preview(f, app, columns[0], &popup);
     render_tree(f, app, columns[1], &popup);
 }
 
 fn render_compact(f: &mut Frame, app: &mut App, screen: Rect) {
-    let Some(popup) = app.engine.nav_candidates() else {
+    let Some(mut popup) = app.engine.nav_candidates() else {
         return;
     };
     if popup.candidates.is_empty() || screen.width < 4 || screen.height < 3 {
@@ -103,6 +105,7 @@ fn render_compact(f: &mut Frame, app: &mut App, screen: Rect) {
     let height = screen.height.min(max_visible as u16 + 2);
     let visible = popup.compact_visible_rows(height.saturating_sub(2) as usize);
     app.nav_peek_visible_rows = visible.max(1);
+    popup.clamp_compact_scroll(visible);
     let scroll = popup.scroll.min(total.saturating_sub(visible));
     let scrollable = total > visible;
     let scrollbar_width = u16::from(scrollable);
@@ -167,11 +170,12 @@ fn render_compact(f: &mut Frame, app: &mut App, screen: Rect) {
         };
         let location = compact_location(candidate, &popup.current_path);
         let location_width = location.width() + 3;
-        let snippet = truncate_end(
+        let snippet = visible_snippet(
             &candidate.snippet,
+            candidate.snippet_match_range.clone(),
             (body_width as usize).saturating_sub(location_width),
         );
-        let used = location_width + snippet.width();
+        let used = location_width + snippet.text.width();
         let padding = (body_width as usize).saturating_sub(used);
         let snippet_style = Style::default()
             .fg(th.fg_primary)
@@ -193,7 +197,7 @@ fn render_compact(f: &mut Frame, app: &mut App, screen: Rect) {
                 .add_modifier(Modifier::BOLD),
         )];
         spans.extend(compact_snippet_spans(
-            &snippet,
+            &snippet.text,
             &popup.symbol,
             snippet_style,
             symbol_style,
@@ -581,7 +585,6 @@ fn render_tree(f: &mut Frame, app: &mut App, area: Rect, popup: &NavCandidatesPo
     f.render_widget(frame, area);
 
     let visible = popup.visible_rows(inner.height as usize);
-    app.nav_peek_visible_rows = visible.max(1);
     let visible_start = popup
         .scroll
         .min(popup.tree_row_count().saturating_sub(visible));
@@ -682,30 +685,20 @@ fn render_candidate_row(
         line_number,
         Style::default().fg(th.fg_secondary).bg(background),
     )];
-    let snippet = truncate_end(&candidate.snippet, snippet_width);
-    if let Some(start) = snippet.find(&popup.symbol) {
-        let end = start + popup.symbol.len();
-        spans.push(Span::styled(
-            snippet[..start].to_owned(),
-            Style::default().fg(th.fg_primary).bg(background),
-        ));
-        spans.push(Span::styled(
-            snippet[start..end].to_owned(),
-            Style::default()
-                .fg(th.accent)
-                .bg(th.search_match)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(
-            snippet[end..].to_owned(),
-            Style::default().fg(th.fg_primary).bg(background),
-        ));
-    } else {
-        spans.push(Span::styled(
-            snippet,
-            Style::default().fg(th.fg_primary).bg(background),
-        ));
-    }
+    let snippet = visible_snippet(
+        &candidate.snippet,
+        candidate.snippet_match_range.clone(),
+        snippet_width,
+    );
+    spans.extend(exact_snippet_spans(
+        &snippet.text,
+        snippet.match_range,
+        Style::default().fg(th.fg_primary).bg(background),
+        Style::default()
+            .fg(th.accent)
+            .bg(th.search_match)
+            .add_modifier(Modifier::BOLD),
+    ));
     f.render_widget(Line::from(spans), Rect::new(area.x, y, area.width, 1));
     app.hit_registry.register_row(
         area.x,
@@ -713,6 +706,147 @@ fn render_candidate_row(
         area.width,
         ClickAction::NavCandidateSelect(candidate_index),
     );
+}
+
+struct VisibleSnippet {
+    text: String,
+    match_range: std::ops::Range<usize>,
+}
+
+fn visible_snippet(
+    text: &str,
+    match_range: std::ops::Range<usize>,
+    max_width: usize,
+) -> VisibleSnippet {
+    let valid_match = !match_range.is_empty()
+        && text.get(match_range.clone()).is_some()
+        && text.is_char_boundary(match_range.start)
+        && text.is_char_boundary(match_range.end);
+    if !valid_match {
+        return VisibleSnippet {
+            text: truncate_end(text, max_width),
+            match_range: 0..0,
+        };
+    }
+    if UnicodeWidthStr::width(text) <= max_width {
+        return VisibleSnippet {
+            text: text.to_owned(),
+            match_range,
+        };
+    }
+
+    let matched = &text[match_range.clone()];
+    let match_width = UnicodeWidthStr::width(matched);
+    if match_width + 1 > max_width {
+        return truncate_match(matched, max_width);
+    }
+
+    // The line is wider than the viewport, so reserve one cell for an
+    // ellipsis on whichever side remains omitted after taking context.
+    let context_budget = max_width - match_width - 1;
+    let left_budget = context_budget / 2;
+    let right_budget = context_budget - left_budget;
+    let (mut start, left_width) = suffix_start(text, match_range.start, left_budget);
+    let (mut end, right_width) = prefix_end(text, match_range.end, right_budget);
+    let mut remaining = context_budget - left_width - right_width;
+
+    let (extended_start, added_left) = suffix_start(text, start, remaining);
+    start = extended_start;
+    remaining -= added_left;
+    let (extended_end, _) = prefix_end(text, end, remaining);
+    end = extended_end;
+
+    let mut visible = String::new();
+    if start > 0 {
+        visible.push('…');
+    }
+    visible.push_str(&text[start..match_range.start]);
+    let visible_match_start = visible.len();
+    visible.push_str(matched);
+    let visible_match_end = visible.len();
+    visible.push_str(&text[match_range.end..end]);
+    if start == 0 && end < text.len() {
+        visible.push('…');
+    }
+
+    VisibleSnippet {
+        text: visible,
+        match_range: visible_match_start..visible_match_end,
+    }
+}
+
+fn truncate_match(matched: &str, max_width: usize) -> VisibleSnippet {
+    if max_width == 0 {
+        return VisibleSnippet {
+            text: String::new(),
+            match_range: 0..0,
+        };
+    }
+    if UnicodeWidthStr::width(matched) <= max_width {
+        return VisibleSnippet {
+            text: matched.to_owned(),
+            match_range: 0..matched.len(),
+        };
+    }
+
+    let content_width = max_width - 1;
+    let (end, _) = prefix_end(matched, 0, content_width);
+    let mut text = matched[..end].to_owned();
+    let match_range = 0..text.len();
+    text.push('…');
+    VisibleSnippet { text, match_range }
+}
+
+fn suffix_start(text: &str, end: usize, max_width: usize) -> (usize, usize) {
+    let mut start = end;
+    let mut width = 0;
+    for (index, character) in text[..end].char_indices().rev() {
+        let character_width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+        if width + character_width > max_width {
+            break;
+        }
+        start = index;
+        width += character_width;
+    }
+    (start, width)
+}
+
+fn prefix_end(text: &str, start: usize, max_width: usize) -> (usize, usize) {
+    let mut end = start;
+    let mut width = 0;
+    for (offset, character) in text[start..].char_indices() {
+        let character_width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+        if width + character_width > max_width {
+            break;
+        }
+        end = start + offset + character.len_utf8();
+        width += character_width;
+    }
+    (end, width)
+}
+
+fn exact_snippet_spans(
+    snippet: &str,
+    match_range: std::ops::Range<usize>,
+    normal_style: Style,
+    match_style: Style,
+) -> Vec<Span<'_>> {
+    if match_range.is_empty()
+        || snippet.get(match_range.clone()).is_none()
+        || !snippet.is_char_boundary(match_range.start)
+        || !snippet.is_char_boundary(match_range.end)
+    {
+        return vec![Span::styled(snippet, normal_style)];
+    }
+    let mut spans = Vec::with_capacity(3);
+    if match_range.start > 0 {
+        spans.push(Span::styled(&snippet[..match_range.start], normal_style));
+    }
+    spans.push(Span::styled(&snippet[match_range.clone()], match_style));
+    if match_range.end < snippet.len() {
+        spans.push(Span::styled(&snippet[match_range.end..], normal_style));
+    }
+    spans
 }
 
 fn truncate_end(text: &str, max_width: usize) -> String {
@@ -837,6 +971,7 @@ mod tests {
             line: 41,
             byte_range: 0..4,
             snippet: "ReefApp::new()".to_owned(),
+            snippet_match_range: 0..4,
         };
 
         let location = compact_location(&candidate, Path::new("unused.rs"));
@@ -869,5 +1004,48 @@ mod tests {
                 (">}", normal),
             ]
         );
+    }
+
+    #[test]
+    fn exact_snippet_spans_highlight_the_candidate_occurrence() {
+        let normal = Style::default().fg(ratatui::style::Color::White);
+        let highlighted = Style::default().fg(ratatui::style::Color::Yellow);
+        let snippet = "target(target())";
+
+        let spans = exact_snippet_spans(snippet, 7..13, normal, highlighted);
+
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| (span.content.as_ref(), span.style))
+                .collect::<Vec<_>>(),
+            vec![
+                ("target(", normal),
+                ("target", highlighted),
+                ("())", normal)
+            ]
+        );
+    }
+
+    #[test]
+    fn narrow_snippet_keeps_the_exact_target_visible() {
+        let text = "012345678901234567890123456789012target() trailing context";
+        let target_start = text.find("target").expect("target");
+
+        let visible = visible_snippet(text, target_start..target_start + 6, 17);
+
+        assert!(UnicodeWidthStr::width(visible.text.as_str()) <= 17);
+        assert_eq!(&visible.text[visible.match_range], "target");
+    }
+
+    #[test]
+    fn narrow_snippet_preserves_utf8_target_range() {
+        let text = "前置内容前置内容目标后置内容";
+        let target_start = text.find("目标").expect("target");
+
+        let visible = visible_snippet(text, target_start..target_start + "目标".len(), 10);
+
+        assert!(UnicodeWidthStr::width(visible.text.as_str()) <= 10);
+        assert_eq!(&visible.text[visible.match_range], "目标");
     }
 }

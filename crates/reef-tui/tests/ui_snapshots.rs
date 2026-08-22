@@ -930,12 +930,14 @@ pub fn load_theme() -> bool {
             line: 24,
             byte_range: 4..15,
             snippet: "parse_theme(stored)".to_owned(),
+            snippet_match_range: 0..11,
         },
         reef_core::nav::Location {
             path: Some(PathBuf::from("src/main.rs")),
             line: 3,
             byte_range: 22..33,
             snippet: "let dark = theme::parse_theme(\"light\");".to_owned(),
+            snippet_match_range: 18..29,
         },
     ];
     app.nav_peek_anchor_col = 44;

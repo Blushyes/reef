@@ -63,6 +63,9 @@ pub struct Location {
     /// newlines).
     pub byte_range: Range<usize>,
     pub snippet: String,
+    /// UTF-8 byte range of this target inside `snippet`. This stays exact
+    /// when a long source line is cropped around the target.
+    pub snippet_match_range: Range<usize>,
 }
 
 /// Parse `source` for `lang`. Returns `None` if the parser refused

@@ -181,6 +181,7 @@ impl AppState {
             self.git_graph.selection_anchor = None;
             self.commit_detail.detail = None;
             self.commit_detail.range_detail = None;
+            self.commit_detail.selected_file = None;
             self.commit_detail.file_diff = None;
             if has_repo {
                 self.git_status_load.mark_stale();
@@ -205,7 +206,9 @@ impl AppState {
             if self.quick_open.core.active {
                 self.request_quick_open_index_if_needed();
             }
-            self.nav_workspace_load.mark_stale();
+            if !self.backend.is_remote() {
+                self.nav_workspace_load.mark_stale();
+            }
             self.nav_refine_cache.clear();
             self.nav_refine_epoch = self.nav_refine_epoch.wrapping_add(1);
         }

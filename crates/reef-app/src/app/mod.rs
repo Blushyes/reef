@@ -238,6 +238,7 @@ pub struct RangeDetail {
 pub struct CommitDetailState {
     pub detail: Option<CommitDetail>,
     pub range_detail: Option<RangeDetail>,
+    pub selected_file: Option<String>,
     pub file_diff: Option<CommitFileDiff>,
     pub diff_layout: DiffLayout,
     pub diff_mode: DiffMode,
@@ -258,6 +259,7 @@ impl Default for CommitDetailState {
         Self {
             detail: None,
             range_detail: None,
+            selected_file: None,
             file_diff: None,
             diff_layout: DiffLayout::Unified,
             diff_mode: DiffMode::Compact,
@@ -854,6 +856,7 @@ pub struct PreviewMergeOutcome {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JumpToLocationOutcome {
+    pub location: Option<LocationSnapshot>,
     pub restore_preview_cursor: Option<LocationSnapshot>,
     pub clear_commit_detail_selection: bool,
     pub clear_diff_selection: bool,
@@ -1081,6 +1084,21 @@ fn navigable_git_files(
     items
 }
 
+fn navigable_commit_files(
+    files: &[FileEntry],
+    collapsed: &HashSet<String>,
+    tree_mode: bool,
+) -> Vec<String> {
+    if !tree_mode {
+        return files.iter().map(|file| file.path.clone()).collect();
+    }
+    let collapsed = collapsed
+        .iter()
+        .map(|path| reef_core::git::tree::collapsed_key(false, path))
+        .collect();
+    reef_core::git::tree::visible_file_paths(files, false, &collapsed)
+}
+
 fn next_panel(current: AppPanel, three_col: bool, reverse: bool) -> AppPanel {
     if three_col {
         match (current, reverse) {
@@ -1263,6 +1281,22 @@ mod tests {
                 ("README.md".to_string(), false),
                 ("z.txt".to_string(), false)
             ]
+        );
+    }
+
+    #[test]
+    fn navigable_commit_files_tree_mode_skips_collapsed_dirs() {
+        let files = vec![
+            git_entry("src/a.rs"),
+            git_entry("README.md"),
+            git_entry("src/z.rs"),
+            git_entry("z.txt"),
+        ];
+        let collapsed = HashSet::from(["src".to_string()]);
+
+        assert_eq!(
+            navigable_commit_files(&files, &collapsed, true),
+            vec!["README.md".to_string(), "z.txt".to_string()]
         );
     }
 
@@ -2503,6 +2537,24 @@ mod tests {
     }
 
     #[test]
+    fn reconciling_a_shorter_nav_viewport_keeps_selection_visible() {
+        let mut app = minimal_app_state();
+        let mut popup = nav_popup(
+            (0..20)
+                .map(|line| nav_location("src/current.rs", line))
+                .collect(),
+        );
+        popup.select(15);
+        app.open_nav_candidates(popup, true, 12);
+
+        app.reconcile_nav_candidates_viewport(4);
+
+        let popup = app.nav_candidates.as_ref().unwrap();
+        let selected_row = popup.selected_tree_row();
+        assert!((popup.scroll..popup.scroll + popup.visible_rows(4)).contains(&selected_row));
+    }
+
+    #[test]
     fn expanded_nav_candidates_request_selected_preview() {
         let mut app = minimal_app_state();
 
@@ -2573,6 +2625,33 @@ mod tests {
         assert_eq!(app.location_history.back_items().len(), 1);
     }
 
+    #[test]
+    fn missing_graph_history_commit_does_not_report_a_jump() {
+        let mut app = minimal_app_state();
+        let initial_tab = app.active_tab;
+        let target = LocationSnapshot {
+            surface: LocationSurface::GraphDiff {
+                commit_oid: "missing".to_owned(),
+                file_path: "src/lib.rs".to_owned(),
+            },
+            path: PathBuf::from("src/lib.rs"),
+            cursor: crate::CursorPosition {
+                line: 12,
+                byte_col: 0,
+            },
+            scroll: crate::ScrollPosition {
+                vertical: 12,
+                horizontal: 3,
+            },
+        };
+
+        let outcome = app.jump_to_location(target, false, true);
+
+        assert_eq!(outcome, JumpToLocationOutcome::default());
+        assert_eq!(app.active_tab, initial_tab);
+        assert!(!app.commit_file_diff_load.loading);
+    }
+
     fn nav_popup(candidates: Vec<reef_core::nav::Location>) -> NavCandidatesPopup {
         NavCandidatesPopup::new(
             candidates,
@@ -2600,6 +2679,7 @@ mod tests {
             line,
             byte_range: 0..6,
             snippet: "target();".to_owned(),
+            snippet_match_range: 0..6,
         }
     }
 

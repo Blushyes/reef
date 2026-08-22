@@ -30,6 +30,14 @@ impl<T> History<T> {
         self.forward.is_empty()
     }
 
+    pub fn back_item(&self) -> Option<&T> {
+        self.back.last()
+    }
+
+    pub fn forward_item(&self) -> Option<&T> {
+        self.forward.last()
+    }
+
     pub fn push(&mut self, item: T)
     where
         T: PartialEq,

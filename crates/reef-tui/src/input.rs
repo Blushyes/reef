@@ -1357,15 +1357,22 @@ fn graph_diff_column_start(app: &App, total_width: u16) -> Option<u16> {
 /// Route a vertical-scroll delta to whichever Graph-tab panel currently
 /// owns focus. Panel::Files (the graph sidebar) is handled by the caller
 /// — its delta is tied to visual-mode extend vs graph navigation and
-/// doesn't reduce to a plain scroll. Panel::Commit always scrolls the
-/// commit-detail row list (metadata + files). Panel::Diff scrolls the
+/// doesn't reduce to a plain scroll. Panel::Commit navigates the selected
+/// commit's changed-file list. Panel::Diff scrolls the
 /// standalone diff column in 3-col mode, or the whole commit-detail
 /// panel in 2-col fallback (where the diff is rendered inline).
 fn graph_scroll_right_panel(app: &mut App, delta: i32) {
     use ui::commit_detail_panel;
     match app.engine.active_panel() {
         Panel::Files => {}
-        Panel::Commit => commit_detail_panel::scroll(app, delta),
+        Panel::Commit => {
+            app.engine.dispatch(AppCommand::NavigateCommitFiles {
+                delta,
+                dark: app.theme.is_dark,
+                uses_three_col: app.graph_uses_three_col(),
+            });
+            app.drain_engine_runtime_events();
+        }
         Panel::Diff => {
             if app.graph_uses_three_col() {
                 app.engine

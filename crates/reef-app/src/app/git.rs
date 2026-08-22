@@ -585,6 +585,7 @@ impl AppState {
         self.git_graph.selected_commit = None;
         self.commit_detail.detail = None;
         self.commit_detail.range_detail = None;
+        self.commit_detail.selected_file = None;
         self.commit_detail.file_diff = None;
         self.commit_detail_load.invalidate();
         self.commit_file_diff_load.invalidate();
@@ -595,6 +596,7 @@ impl AppState {
     }
 
     pub fn load_commit_detail(&mut self) {
+        self.commit_detail.selected_file = None;
         self.commit_detail.file_diff = None;
         self.commit_detail.diff_h_scroll = 0;
         self.commit_detail.sbs_left_h_scroll = 0;
@@ -613,6 +615,7 @@ impl AppState {
     }
 
     pub fn load_commit_range_detail(&mut self) {
+        self.commit_detail.selected_file = None;
         self.commit_detail.file_diff = None;
         self.commit_detail.diff_h_scroll = 0;
         self.commit_detail.sbs_left_h_scroll = 0;
@@ -672,6 +675,8 @@ impl AppState {
         dark: bool,
         uses_three_col: bool,
     ) -> CommitFileDiffLoadOutcome {
+        let is_new_file = self.commit_detail.selected_file.as_deref() != Some(path);
+        self.commit_detail.selected_file = Some(path.to_string());
         if self.active_tab == AppTab::Graph && uses_three_col {
             self.active_panel = AppPanel::Diff;
         }
@@ -683,12 +688,6 @@ impl AppState {
             self.commit_detail.file_diff = None;
             return CommitFileDiffLoadOutcome::default();
         }
-        let is_new_file = self
-            .commit_detail
-            .file_diff
-            .as_ref()
-            .map(|d| d.path.as_str() != path)
-            .unwrap_or(true);
         let mut outcome = CommitFileDiffLoadOutcome::default();
         if is_new_file {
             outcome.clear_commit_detail_selection = true;
@@ -732,6 +731,53 @@ impl AppState {
             context,
             dark,
         );
+        outcome
+    }
+
+    pub fn navigate_commit_files(
+        &mut self,
+        delta: i32,
+        dark: bool,
+        uses_three_col: bool,
+    ) -> CommitFileDiffLoadOutcome {
+        let files = self
+            .commit_detail
+            .range_detail
+            .as_ref()
+            .map(|detail| detail.files.as_slice())
+            .or_else(|| {
+                self.commit_detail
+                    .detail
+                    .as_ref()
+                    .map(|detail| detail.files.as_slice())
+            })
+            .unwrap_or_default();
+        let paths = navigable_commit_files(
+            files,
+            &self.commit_detail.files_collapsed,
+            self.commit_detail.files_tree_mode,
+        );
+        if paths.is_empty() {
+            return CommitFileDiffLoadOutcome::default();
+        }
+        let current = self
+            .commit_detail
+            .selected_file
+            .as_ref()
+            .and_then(|selected| paths.iter().position(|path| path == selected));
+        let next = match current {
+            Some(current) if delta < 0 => current.saturating_sub(delta.unsigned_abs() as usize),
+            Some(current) => (current + delta as usize).min(paths.len() - 1),
+            None if delta < 0 => paths.len() - 1,
+            None => 0,
+        };
+        let path = paths[next].clone();
+        if self.commit_detail.selected_file.as_deref() == Some(path.as_str()) {
+            return CommitFileDiffLoadOutcome::default();
+        }
+        let active_panel = self.active_panel;
+        let outcome = self.load_commit_file_diff(&path, dark, uses_three_col);
+        self.active_panel = active_panel;
         outcome
     }
 

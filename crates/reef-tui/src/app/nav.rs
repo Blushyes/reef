@@ -108,6 +108,7 @@ impl App {
                 line: loc.line as usize,
                 byte_range,
                 snippet: String::new(),
+                snippet_match_range: 0..0,
             },
         );
         // Defer the column→byte resolution until the destination preview
@@ -281,6 +282,7 @@ impl App {
                 line: loc.line as usize,
                 byte_range: self.lsp_byte_range(&loc),
                 snippet: String::new(),
+                snippet_match_range: 0..0,
             });
         let from_cache = refined.is_some();
 
@@ -373,6 +375,7 @@ impl App {
                 };
                 (self.nav_peek_anchor_col, self.nav_peek_anchor_row) =
                     self.compute_nav_popup_anchor(anchor);
+                self.nav_peek_reconciled_view = None;
                 self.engine.dispatch(AppCommand::OpenNavCandidates {
                     popup: NavCandidatesPopup::new(
                         candidates,
@@ -841,6 +844,7 @@ impl App {
         self.nav_peek_preview_max_scroll = 0;
         self.nav_peek_preview_target = None;
         self.nav_peek_visible_rows = reef_app::NavCandidatesPopup::MAX_VISIBLE_ROWS;
+        self.nav_peek_reconciled_view = None;
     }
 
     /// Resolve the per-language Settings row state.
@@ -959,6 +963,7 @@ impl App {
 
         (self.nav_peek_anchor_col, self.nav_peek_anchor_row) =
             self.compute_nav_popup_anchor(anchor);
+        self.nav_peek_reconciled_view = None;
         let Some(origin) = self.snapshot_location() else {
             return;
         };
@@ -1091,6 +1096,7 @@ impl App {
                 };
                 self.nav_peek_anchor_col = c.anchor_col;
                 self.nav_peek_anchor_row = c.anchor_row;
+                self.nav_peek_reconciled_view = None;
                 self.engine.dispatch(AppCommand::OpenNavCandidates {
                     popup: NavCandidatesPopup::new(
                         candidates,
@@ -1132,6 +1138,7 @@ impl App {
         };
         self.nav_peek_anchor_col = c.anchor_col;
         self.nav_peek_anchor_row = c.anchor_row;
+        self.nav_peek_reconciled_view = None;
         self.engine.dispatch(AppCommand::OpenNavCandidates {
             popup: NavCandidatesPopup::new(
                 candidates,

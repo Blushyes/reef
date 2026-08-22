@@ -38,6 +38,7 @@ npm install -g @reef-tui/cli     # 或全局安装
 
 ```bash
 reef                             # 打开当前目录
+rf                               # 简短别名
 reef --ssh user@host             # 远端 $HOME（agent 自动安装）
 reef --ssh user@host:/path       # 远端 /path
 ```

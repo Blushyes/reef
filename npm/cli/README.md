@@ -14,6 +14,8 @@ npx @reef-tui/cli
 
 ```sh
 reef
+# or
+rf
 ```
 
 See the [project README](https://github.com/Blushyes/reef#readme) for full documentation.

@@ -3,7 +3,8 @@
   "version": "0.0.0",
   "description": "Reef — a terminal UI for Git and code review",
   "bin": {
-    "reef": "bin/reef.js"
+    "reef": "bin/reef.js",
+    "rf": "bin/reef.js"
   },
   "files": [
     "bin",

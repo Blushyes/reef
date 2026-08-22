@@ -38,6 +38,7 @@ Supported: macOS (arm64, x64), Linux (arm64, x64), Windows (x64). Or `cargo buil
 
 ```bash
 reef                             # current directory
+rf                               # short alias
 reef --ssh user@host             # remote $HOME (agent auto-installed)
 reef --ssh user@host:/path       # remote /path
 ```

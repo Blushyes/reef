@@ -186,7 +186,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match reef_io::resolve_local_target(raw)? {
             ResolvedLocalTarget::Dir(workdir) => {
                 std::env::set_current_dir(&workdir)?;
-                Arc::new(LocalBackend::open_at(workdir))
+                Arc::new(LocalBackend::open_at_with_external_previews(workdir))
             }
             ResolvedLocalTarget::File { workdir, rel } => {
                 // Quick-look path: anchor at the enclosing repo root
@@ -196,7 +196,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // the file in its repo context, not just a subdir.
                 std::env::set_current_dir(&workdir)?;
                 pending_preview_file = Some(rel);
-                Arc::new(LocalBackend::open_at(workdir))
+                Arc::new(LocalBackend::open_at_with_external_previews(workdir))
             }
         }
     } else {

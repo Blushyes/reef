@@ -147,6 +147,7 @@ impl PreviewCache {
 /// Local filesystem + libgit2 backend.
 pub struct LocalBackend {
     workdir: PathBuf,
+    allow_external_preview_targets: bool,
     has_repo: Arc<AtomicBool>,
     repo_monitor_active: Arc<AtomicBool>,
     /// Cached `fs::canonicalize(workdir)`. Populated lazily on the first
@@ -170,21 +171,26 @@ impl LocalBackend {
     /// the cwd is not a git repo (the Files tab still works).
     pub fn open_cwd() -> std::io::Result<Self> {
         let workdir = std::env::current_dir()?;
-        let has_repo = GitRepo::open_at(&workdir).is_ok();
-        Ok(Self {
-            workdir,
-            has_repo: Arc::new(AtomicBool::new(has_repo)),
-            repo_monitor_active: Arc::new(AtomicBool::new(false)),
-            canon_workdir: OnceLock::new(),
-            preview_cache: Mutex::new(PreviewCache::default()),
-        })
+        Ok(Self::new(workdir, true))
     }
 
-    /// Open at an explicit workdir. Used by `reef-agent --workdir`.
+    /// Opens at an explicit workdir with every read bounded to that workdir.
+    /// Used by `reef-agent --workdir` and other untrusted request boundaries.
     pub fn open_at(workdir: PathBuf) -> Self {
+        Self::new(workdir, false)
+    }
+
+    /// Opens a trusted local workdir whose previews may follow external symlink targets.
+    /// Other read and write operations remain bounded to the workdir.
+    pub fn open_at_with_external_previews(workdir: PathBuf) -> Self {
+        Self::new(workdir, true)
+    }
+
+    fn new(workdir: PathBuf, allow_external_preview_targets: bool) -> Self {
         let has_repo = GitRepo::open_at(&workdir).is_ok();
         Self {
             workdir,
+            allow_external_preview_targets,
             has_repo: Arc::new(AtomicBool::new(has_repo)),
             repo_monitor_active: Arc::new(AtomicBool::new(false)),
             canon_workdir: OnceLock::new(),
@@ -217,6 +223,16 @@ impl LocalBackend {
             .canon_workdir
             .get()
             .expect("just populated via OnceLock::set"))
+    }
+
+    fn preview_target(&self, rel_path: &Path) -> Result<PathBuf, BackendError> {
+        let canon_root = self.canonical_workdir()?;
+        if self.allow_external_preview_targets {
+            let joined = resolve_rel_within(canon_root, rel_path)?;
+            canonicalize_or_backend_err(&joined, "canonicalize preview target")
+        } else {
+            canonical_child_within(canon_root, rel_path)
+        }
     }
 }
 
@@ -602,7 +618,7 @@ impl Backend for LocalBackend {
 
     fn load_preview(&self, rel_path: &Path, wants_decoded_image: bool) -> Option<PreviewContent> {
         let canon_root = self.canonical_workdir().ok()?;
-        let canon_target = canonical_child_within(canon_root, rel_path).ok()?;
+        let canon_target = self.preview_target(rel_path).ok()?;
 
         if let Ok(mut cache) = self.preview_cache.lock() {
             if let Some(cached) = cache.get(rel_path, &canon_target, wants_decoded_image) {

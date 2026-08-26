@@ -78,6 +78,10 @@ Read `references/runtime-architecture.md` before changing `crates/reef-app/src/*
   establishes the boundary. Schema expansion,
   object selection, paging, typed rows, and details must not be reimplemented by a renderer adapter.
 - `reef-app` must not depend on `ratatui`, `crossterm`, or `ratatui-image`.
+- Trusted interactive hosts construct `LocalBackend` with
+  `open_at_with_external_previews`, allowing preview-only reads to follow a workspace entry's
+  symlink target outside the workspace. `reef-agent` and other untrusted request boundaries use
+  `open_at`; all non-preview reads and every write remain workspace-bound.
 - Worker result merge paths belong in `reef-app`; TUI may adapt terminal-only payloads such as image protocol state before dispatching the merge command.
 - `scripts/check-architecture.sh` is the cheap CI tripwire. If it blocks a legitimate change, prefer changing the whitelist with a short explanation over adding another bypass.
 

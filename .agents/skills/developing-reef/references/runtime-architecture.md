@@ -124,6 +124,11 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
   rebuilding the tree. Commands that originate outside the visible tree, such as Quick Open and
   navigation history, use the reveal path so their target can be materialized first.
 - Git decorations update visible entries in place; they must not rebuild the tree by themselves.
+  File-tree splices identify the preceding structural `base_revision` and resulting `revision`.
+  Content-only revisions between those endpoints preserve row order and count. Content
+  updates retain the latest splice; a new structure change replaces it and a reset clears it.
+  Hosts may apply it when their last rendered revision is in that half-open interval, even
+  if presentation events were coalesced, and must synchronize when earlier structure was missed.
   Subtree workers return structure only; accepted children are decorated from the current cached
   status map in O(inserted rows), rather than cloning or rebuilding the repository-wide status
   snapshot for every expansion.

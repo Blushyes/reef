@@ -16,6 +16,9 @@ pub struct TreeEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileTreeRowsSplice {
+    /// Last structural revision before this replacement. Intermediate revisions
+    /// only changed row presentation, so they can all apply this splice.
+    pub base_revision: u64,
     pub revision: u64,
     pub start: usize,
     pub delete_count: usize,
@@ -29,6 +32,7 @@ pub struct FileTreeState {
     expanded: HashSet<PathBuf>,
     git_statuses: HashMap<String, char>,
     rows_revision: u64,
+    rows_structure_revision: u64,
     rows_splice: Option<FileTreeRowsSplice>,
 }
 
@@ -41,6 +45,7 @@ impl FileTreeState {
             expanded: HashSet::new(),
             git_statuses: HashMap::new(),
             rows_revision,
+            rows_structure_revision: rows_revision,
             rows_splice: None,
         }
     }
@@ -53,14 +58,20 @@ impl FileTreeState {
         self.rows_splice
     }
 
-    fn advance_rows_revision(&mut self, splice: Option<(usize, usize, usize)>) {
+    fn advance_rows_revision(&mut self) {
         self.rows_revision = self.rows_revision.wrapping_add(1).max(1);
+    }
+
+    fn change_row_structure(&mut self, splice: Option<(usize, usize, usize)>) {
+        self.advance_rows_revision();
         self.rows_splice = splice.map(|(start, delete_count, insert_count)| FileTreeRowsSplice {
+            base_revision: self.rows_structure_revision,
             revision: self.rows_revision,
             start,
             delete_count,
             insert_count,
         });
+        self.rows_structure_revision = self.rows_revision;
     }
 
     pub fn expanded(&self) -> &HashSet<PathBuf> {
@@ -83,7 +94,7 @@ impl FileTreeState {
                 self.expanded.insert(path);
                 entry.is_expanded = true;
             }
-            self.advance_rows_revision(None);
+            self.advance_rows_revision();
         }
     }
 
@@ -112,7 +123,7 @@ impl FileTreeState {
         }
         self.selected = 0;
         if rows_changed {
-            self.advance_rows_revision(None);
+            self.change_row_structure(None);
         }
     }
 
@@ -136,7 +147,7 @@ impl FileTreeState {
             self.selected -= removed;
         }
         self.entries.drain(index + 1..end);
-        self.advance_rows_revision(Some((index + 1, removed, 0)));
+        self.change_row_structure(Some((index + 1, removed, 0)));
     }
 
     pub fn replace_visible_descendants(&mut self, parent_path: &Path, children: Vec<TreeEntry>) {
@@ -167,7 +178,7 @@ impl FileTreeState {
             self.entries[parent_idx].has_children = true;
         }
         self.entries.splice(parent_idx + 1..end, children);
-        self.advance_rows_revision(Some((parent_idx + 1, delete_count, insert_count)));
+        self.change_row_structure(Some((parent_idx + 1, delete_count, insert_count)));
         self.selected = selected_path
             .as_ref()
             .and_then(|path| self.entries.iter().position(|entry| &entry.path == path))
@@ -230,7 +241,7 @@ impl FileTreeState {
             self.selected = selected_idx.min(self.entries.len() - 1);
         }
         if rows_changed {
-            self.advance_rows_revision(None);
+            self.change_row_structure(None);
         }
     }
 
@@ -271,7 +282,7 @@ impl FileTreeState {
             }
         }
         if self.apply_git_statuses_to_entries() {
-            self.advance_rows_revision(None);
+            self.advance_rows_revision();
         }
     }
 
@@ -415,6 +426,34 @@ mod tests {
     }
 
     #[test]
+    fn splices_span_presentation_revisions_but_not_other_structure_changes() {
+        let mut tree = FileTreeState::with_entries(vec![dummy_dir("src")]);
+        let initial_revision = tree.rows_revision();
+        tree.toggle_expand(0);
+        let mut child = dummy_entry("src/a.rs");
+        child.depth = 1;
+        tree.replace_visible_descendants(Path::new("src"), vec![child]);
+        let expansion = tree.rows_splice().unwrap();
+        assert_eq!(expansion.base_revision, initial_revision);
+        assert_eq!(expansion.revision, initial_revision + 2);
+
+        tree.toggle_expand(0);
+        assert_eq!(tree.rows_splice(), Some(expansion));
+        tree.collapse_visible_descendants(0);
+        let collapse = tree.rows_splice().unwrap();
+        assert_eq!(collapse.base_revision, expansion.revision);
+        assert_eq!(collapse.revision, expansion.revision + 2);
+        assert_eq!(collapse.delete_count, 1);
+
+        tree.replace_entries(vec![dummy_dir("tests")], 0);
+        assert_eq!(tree.rows_splice(), None);
+        let reset_revision = tree.rows_revision();
+        tree.toggle_expand(0);
+        tree.replace_visible_descendants(Path::new("tests"), vec![]);
+        assert_eq!(tree.rows_splice().unwrap().base_revision, reset_revision);
+    }
+
+    #[test]
     fn collapse_visible_descendants_removes_only_parent_subtree() {
         let mut src = dummy_dir("src");
         src.is_expanded = true;
@@ -439,6 +478,7 @@ mod tests {
         assert_eq!(
             tree.rows_splice(),
             Some(FileTreeRowsSplice {
+                base_revision: 1,
                 revision: tree.rows_revision(),
                 start: 1,
                 delete_count: 2,
@@ -466,6 +506,7 @@ mod tests {
         assert_eq!(
             tree.rows_splice(),
             Some(FileTreeRowsSplice {
+                base_revision: 1,
                 revision: tree.rows_revision(),
                 start: 1,
                 delete_count: 1,

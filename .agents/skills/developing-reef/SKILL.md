@@ -58,6 +58,10 @@ Read `references/runtime-architecture.md` before changing `crates/reef-app/src/*
 - `crates/reef-tui/src/input.rs` owns key/mouse routing; use `AppCommand` / `TuiApp::set_active_tab` instead of assigning `active_tab` directly.
 - `crates/reef-tui/src/input_edit{,_multi}.rs` and `crates/reef-tui/src/picker_core.rs` own the shared text-input vocabulary. Don't hand-roll a key table; embed one of the three layers (see "Text Input Stack" below).
 - `crates/reef-core/src/file_tree.rs` owns pure file-tree ordering/navigation helpers; `crates/reef-app/src/features/file_tree.rs` owns renderer-neutral file-tree state. `reef-tui` renders snapshots and dispatches commands only.
+- File-tree row splices carry `base_revision` (the preceding structure change) and `revision`
+  (the resulting change). Intermediate revisions only change presentation. Retain the latest
+  splice across content updates and clear it on structure reset, so hosts can apply an exact
+  delta after coalescing content events without replaying skipped structure changes.
 - `crates/reef-tui/src/keymap.rs` owns shortcut bindings by scope; handlers should dispatch commands, not duplicate key matching tables.
 
 ## App Boundary Guardrails

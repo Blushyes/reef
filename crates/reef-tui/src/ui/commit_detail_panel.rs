@@ -524,6 +524,32 @@ pub fn scroll(app: &mut App, delta: i32) {
         .dispatch(reef_app::AppCommand::ScrollCommitDetailVertical(delta));
 }
 
+/// Reveal a keyboard-selected file using the same metadata and tree rows as the
+/// renderer. Only selection commands call this, so wheel scrolling stays free.
+pub fn reveal_selected_file(app: &mut App) {
+    let Some(area) = app.last_commit_detail_rect else {
+        return;
+    };
+    if area.height == 0 {
+        return;
+    }
+    let rows = build_file_rows(app, area.width, &app.theme);
+    let Some(row) = rows.iter().position(|row| row.selected_file) else {
+        return;
+    };
+    let scroll = app.engine.commit_detail().scroll;
+    let height = usize::from(area.height);
+    let next = if row < scroll {
+        row
+    } else if row >= scroll + height {
+        row + 1 - height
+    } else {
+        return;
+    };
+    app.engine
+        .dispatch(AppCommand::SetCommitDetailVerticalScroll(next));
+}
+
 // ─── Row model ────────────────────────────────────────────────────────────────
 
 /// Lazy/tagged span text. The original `String` field forced every
@@ -592,6 +618,7 @@ impl Default for RowSpan {
 
 #[derive(Debug, Default)]
 struct Row {
+    selected_file: bool,
     spans: Vec<RowSpan>,
     row_click: Option<(String, Value)>,
     /// Effective content width excluding trailing pad / decorative fill.
@@ -637,6 +664,7 @@ impl Row {
             .map(|s| UnicodeWidthStr::width(s.text.as_str()))
             .sum();
         Self {
+            selected_file: false,
             spans,
             row_click: None,
             content_width,
@@ -691,13 +719,8 @@ fn from_ratatui_span(span: Span<'static>) -> RowSpan {
 
 // ─── Row construction ─────────────────────────────────────────────────────────
 
-/// `width` is the *virtual* width (viewport + h_scroll) — it controls how
-/// far pad/decoration extends to the right so `clip_spans` can reveal more
-/// content as `h_scroll` grows. `display_w` is the *real* viewport width,
-/// stable across frames; SBS's `half` / `│` position must use it (not
-/// `width`) or the separator drifts every frame as the user over-scrolls
-/// past max_h, producing visible jitter at the right edge.
-fn build_rows(app: &App, width: u16, display_w: u16, theme: &Theme) -> Vec<Row> {
+/// Commit metadata and visible file rows, shared by rendering and selection reveal.
+fn build_file_rows(app: &App, width: u16, theme: &Theme) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
     let cd = &app.engine.commit_detail();
     let max_msg = (width as usize).saturating_sub(4);
@@ -762,6 +785,21 @@ fn build_rows(app: &App, width: u16, display_w: u16, theme: &Theme) -> Vec<Row> 
         }
     }
 
+    rows
+}
+
+/// `width` is the *virtual* width (viewport + h_scroll) — it controls how
+/// far pad/decoration extends to the right so `clip_spans` can reveal more
+/// content as `h_scroll` grows. `display_w` is the *real* viewport width,
+/// stable across frames; SBS's `half` / `│` position must use it (not
+/// `width`) or the separator drifts every frame as the user over-scrolls
+/// past max_h, producing visible jitter at the right edge.
+fn build_rows(app: &App, width: u16, display_w: u16, theme: &Theme) -> Vec<Row> {
+    let mut rows = build_file_rows(app, width, theme);
+    let cd = app.engine.commit_detail();
+    if cd.detail.is_none() && cd.range_detail.is_none() {
+        return rows;
+    }
     // 3-col mode owns the diff in its standalone column — skipping here
     // keeps `scroll`'s clamp tight and avoids a stale duplicate row list.
     if !app.graph_uses_three_col()
@@ -970,12 +1008,14 @@ fn commit_file_row(
         RowSpan::styled(display, apply_bg(Style::default().fg(ctx.fg), base_bg)),
     ];
 
-    Row::new(spans)
+    let mut row = Row::new(spans)
         .on_click(
             "git.selectCommitFile",
             serde_json::json!({ "oid": ctx.commit_oid, "path": file.path }),
         )
-        .with_content_width(indent_w + 2 + full_display_w)
+        .with_content_width(indent_w + 2 + full_display_w);
+    row.selected_file = is_selected;
+    row
 }
 
 fn render_commit_file_tree(

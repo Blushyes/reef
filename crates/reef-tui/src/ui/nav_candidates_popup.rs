@@ -45,7 +45,7 @@ fn render_popup_surface(f: &mut Frame, area: Rect, block: Block<'_>, background:
 }
 
 fn render_expanded(f: &mut Frame, app: &mut App, screen: Rect) {
-    let Some(mut popup) = app.engine.nav_candidates() else {
+    let Some(popup) = app.engine.nav_candidates() else {
         return;
     };
     if popup.candidates.is_empty() {
@@ -85,14 +85,13 @@ fn render_expanded(f: &mut Frame, app: &mut App, screen: Rect) {
         .split(rows[1]);
     let viewport_rows = popup.visible_rows(columns[1].height.saturating_sub(1) as usize);
     app.nav_peek_visible_rows = viewport_rows.max(1);
-    popup.clamp_scroll(viewport_rows);
     render_header(f, app, rows[0], &popup);
     render_preview(f, app, columns[0], &popup);
     render_tree(f, app, columns[1], &popup);
 }
 
 fn render_compact(f: &mut Frame, app: &mut App, screen: Rect) {
-    let Some(mut popup) = app.engine.nav_candidates() else {
+    let Some(popup) = app.engine.nav_candidates() else {
         return;
     };
     if popup.candidates.is_empty() || screen.width < 4 || screen.height < 3 {
@@ -105,7 +104,6 @@ fn render_compact(f: &mut Frame, app: &mut App, screen: Rect) {
     let height = screen.height.min(max_visible as u16 + 2);
     let visible = popup.compact_visible_rows(height.saturating_sub(2) as usize);
     app.nav_peek_visible_rows = visible.max(1);
-    popup.clamp_compact_scroll(visible);
     let scroll = popup.scroll.min(total.saturating_sub(visible));
     let scrollable = total > visible;
     let scrollbar_width = u16::from(scrollable);

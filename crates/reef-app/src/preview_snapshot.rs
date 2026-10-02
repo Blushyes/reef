@@ -36,6 +36,7 @@ pub enum PreviewDetectedKindSnapshot {
     Image,
     Video,
     Database,
+    Spreadsheet,
     StructuredData,
     Diff,
     Mermaid,
@@ -81,6 +82,11 @@ pub enum PreviewBodySnapshot {
         default_object: Option<DatabaseObjectKeySnapshot>,
         initial_page: DatabasePageSnapshot,
         bytes_on_disk: u64,
+    },
+    Spreadsheet {
+        sheets: Vec<String>,
+        selected_sheet: usize,
+        sheet: Option<reef_core::preview::spreadsheet::WorksheetPreview>,
     },
     StructuredData {
         format: StructuredDataFormatSnapshot,
@@ -205,12 +211,25 @@ pub struct DatabasePageSnapshot {
 
 impl PreviewDocumentSnapshot {
     pub fn from_document(document: &PreviewDocument, revision: u64, source_revision: u64) -> Self {
+        Self::from_document_with_sheet(document, revision, source_revision, 0)
+    }
+
+    pub(crate) fn from_document_with_sheet(
+        document: &PreviewDocument,
+        revision: u64,
+        source_revision: u64,
+        sheet: usize,
+    ) -> Self {
         let detected_kind = detected_kind(document);
+        let body = match &document.body {
+            PreviewBody::Spreadsheet(workbook) => PreviewBodySnapshot::spreadsheet(workbook, sheet),
+            _ => PreviewBodySnapshot::from_document(document, detected_kind),
+        };
         Self {
             revision,
             source_revision,
             source: PreviewSourceSnapshot::from_document(document, detected_kind),
-            body: PreviewBodySnapshot::from_document(document, detected_kind),
+            body,
         }
     }
 }
@@ -248,6 +267,21 @@ impl PreviewSourceSnapshot {
 }
 
 impl PreviewBodySnapshot {
+    pub(crate) fn spreadsheet(
+        workbook: &reef_core::preview::spreadsheet::WorkbookPreview,
+        selected_sheet: usize,
+    ) -> Self {
+        Self::Spreadsheet {
+            sheets: workbook
+                .sheets
+                .iter()
+                .map(|sheet| sheet.name.clone())
+                .collect(),
+            selected_sheet,
+            sheet: workbook.sheets.get(selected_sheet).cloned(),
+        }
+    }
+
     fn from_document(
         document: &PreviewDocument,
         detected_kind: PreviewDetectedKindSnapshot,
@@ -288,6 +322,7 @@ impl PreviewBodySnapshot {
             }
             PreviewBody::Binary(info) => binary_body_snapshot(info),
             PreviewBody::Database(database) => database_body_snapshot(database),
+            PreviewBody::Spreadsheet(workbook) => Self::spreadsheet(workbook, 0),
         }
     }
 }
@@ -465,6 +500,7 @@ fn detected_kind(document: &PreviewDocument) -> PreviewDetectedKindSnapshot {
     match &document.body {
         PreviewBody::Image(_) => PreviewDetectedKindSnapshot::Image,
         PreviewBody::Database(_) => PreviewDetectedKindSnapshot::Database,
+        PreviewBody::Spreadsheet(_) => PreviewDetectedKindSnapshot::Spreadsheet,
         PreviewBody::Markdown(_) if is_report_path(&path) => PreviewDetectedKindSnapshot::Report,
         PreviewBody::Markdown(_) if is_mermaid_path(&path) => PreviewDetectedKindSnapshot::Mermaid,
         PreviewBody::Markdown(_) => PreviewDetectedKindSnapshot::Markdown,

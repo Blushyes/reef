@@ -31,6 +31,25 @@ expensive work must not run from a renderer.
 - When a renderer needs preview content beyond the bounded display projection, expose that content through a typed, renderer-neutral `PreviewBodySnapshot`; do not make a host reparse source content while selecting or rendering a preview.
 - Preserve complete structured source separately from its bounded visible-line projection. Reef must not identify or name third-party formats; renderer-specific recognition belongs to the renderer that consumes this generic source.
 
+## Spreadsheet previews
+
+- `reef-core::preview::spreadsheet` parses xlsx/xls/xlsm/xlsb/ods into a typed workbook on
+  the preview worker. Local and remote backends use the same parser; remote reads request
+  complete workbook bytes within the 10 MiB input limit.
+- xlsx/xlsm/xlsb use two streaming cell passes: determine the actual nonempty used
+  range, then fill only the bounded projection. Never construct a dense range from
+  distant cell coordinates. xls/ods retain Calamine's eager readers; their input and
+  projection limits do not bound parser memory.
+- Each worksheet preserves its used-range origin, original dimensions, column addresses,
+  and display values. Preview data is bounded to 10,000 rows, 256 columns and 100,000 cells
+  per sheet, with explicit truncation. Formula values are the file's cached results;
+  formulas and macros are never executed.
+- `reef-app` owns `SelectSpreadsheetSheet` and the selected sheet index. Its preview snapshot
+  contains worksheet names and only the selected worksheet. Switching sheets changes the
+  presentation revision and resets preview scroll, while the source revision stays stable.
+- Hosts own native/terminal cell selection and geometry. TUI uses the spreadsheet keymap
+  scope and virtualized visible cells; spreadsheet parsing and source I/O stay off render.
+
 ## Runtime Data Flow
 
 1. User input in `reef-tui` becomes an `AppCommand`.

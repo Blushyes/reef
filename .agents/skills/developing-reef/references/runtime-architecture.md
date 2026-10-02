@@ -174,6 +174,16 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
   changed source content, `reef-app` preserves a still-valid object selection but schedules a fresh
   page or detail load; path equality alone must never keep rows from an older database snapshot.
 
+- Spreadsheet workbooks are parsed by the preview worker using the shared core reader.
+  The accepted workbook owns bounded worksheet projections; sheet selection is a shared
+  `SelectSpreadsheetSheet` command. Snapshots serialize only the selected worksheet plus
+  sheet names. Selection changes presentation revision, not source revision, and resets scroll.
+  Local and remote reads share format parsing and the 10 MiB workbook input limit. Hosts own
+  cell selection and draw only visible rows/cells; they never reopen workbooks.
+  xlsx/xlsm/xlsb readers scan cells for actual used bounds, then stream again into a
+  bounded projection without allocating the full dense rectangle. xls/ods retain
+  eager parsing; the input and projection caps do not constrain their parser memory.
+
 ### Git
 
 - Git status, ahead/behind, branch label, and mutations use the general Git worker. Interactive

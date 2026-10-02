@@ -602,6 +602,7 @@ impl ReefApp {
             }
             AppCommand::OpenDbGoto => self.state.open_db_goto(),
             AppCommand::CloseDbGoto => self.state.close_db_goto(),
+            AppCommand::SelectSpreadsheetSheet(index) => self.state.select_spreadsheet_sheet(index),
             AppCommand::DbNavigate(action) => self.state.db_navigate(action),
             AppCommand::DbToggleSchema(name) => self.state.db_toggle_schema(&name),
             AppCommand::DbSelectObject(key) => self.state.db_select_object(key),
@@ -2099,6 +2100,14 @@ impl ReefApp {
 
     pub fn commit_in_flight(&self) -> bool {
         self.state.commit_load.loading
+    }
+
+    pub fn preview_source_revision(&self) -> u64 {
+        self.state.preview_source_revision
+    }
+
+    pub fn spreadsheet_sheet(&self) -> usize {
+        self.state.spreadsheet_sheet
     }
 
     pub fn preview_scroll(&self) -> usize {

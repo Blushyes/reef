@@ -152,6 +152,7 @@ pub enum AppCommand {
     SetCommitDetailFileDiffVerticalScroll(usize),
     OpenDbGoto,
     CloseDbGoto,
+    SelectSpreadsheetSheet(usize),
     DbNavigate(DbNav),
     DbToggleSchema(String),
     DbSelectObject(reef_sqlite_preview::DbObjectKey),

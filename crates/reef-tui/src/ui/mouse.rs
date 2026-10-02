@@ -123,6 +123,10 @@ pub enum ClickAction {
     /// loaded page's rows, `column` into the object's columns. Opens
     /// the value pane and requests the cell's complete value — grid
     /// cells carry only a bounded prefix.
+    SpreadsheetSelectCell {
+        row: usize,
+        column: usize,
+    },
     DbSelectCell {
         row: usize,
         column: usize,

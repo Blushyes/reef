@@ -266,3 +266,6 @@ pub fn write_striped_png(
     img.save_with_format(&full, image::ImageFormat::Png)
         .expect("write striped PNG fixture");
 }
+
+mod spreadsheet;
+pub use spreadsheet::{spreadsheet_fixtures, xlsx_with_sheet};

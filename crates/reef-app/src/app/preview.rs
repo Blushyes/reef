@@ -174,6 +174,12 @@ impl AppState {
         if !same_file {
             self.structured_preview = None;
         }
+        if !same_file
+            || !matches!(content.as_ref().map(|p| &p.body),
+            Some(reef_core::preview::PreviewBody::Spreadsheet(workbook)) if self.spreadsheet_sheet < workbook.sheets.len())
+        {
+            self.spreadsheet_sheet = 0;
+        }
         self.preview_content = content.map(Arc::new);
         if source_changed {
             self.preview_source_revision = generation;
@@ -311,13 +317,30 @@ impl AppState {
         self.bump_preview_content_revision();
     }
 
+    pub fn select_spreadsheet_sheet(&mut self, index: usize) {
+        let Some(preview) = self.preview_content.as_deref() else {
+            return;
+        };
+        let reef_core::preview::PreviewBody::Spreadsheet(workbook) = &preview.body else {
+            return;
+        };
+        if index >= workbook.sheets.len() || index == self.spreadsheet_sheet {
+            return;
+        }
+        self.spreadsheet_sheet = index;
+        self.preview_scroll = 0;
+        self.preview_h_scroll = 0;
+        self.bump_preview_content_revision();
+    }
+
     fn bump_preview_content_revision(&mut self) {
         self.preview_content_revision = self.preview_content_revision.wrapping_add(1).max(1);
         self.preview_snapshot = self.preview_content.as_deref().map(|preview| {
-            Arc::new(crate::PreviewDocumentSnapshot::from_document(
+            Arc::new(crate::PreviewDocumentSnapshot::from_document_with_sheet(
                 preview,
                 self.preview_content_revision,
                 self.preview_source_revision,
+                self.spreadsheet_sheet,
             ))
         });
     }
@@ -417,6 +440,10 @@ fn preview_source_unchanged(
         {
             match (&previous.body, &next.body) {
                 (
+                    reef_core::preview::PreviewBody::Spreadsheet(previous),
+                    reef_core::preview::PreviewBody::Spreadsheet(next),
+                ) => previous == next,
+                (
                     reef_core::preview::PreviewBody::Text(previous),
                     reef_core::preview::PreviewBody::Text(next),
                 ) => previous.lines == next.lines && previous.source == next.source,
@@ -445,6 +472,57 @@ mod tests {
     };
 
     use crate::app::{AppPrefs, AppState, AppStateConfig, StructuredPreviewMode};
+
+    #[test]
+    fn spreadsheet_selection_is_projected_and_stale_load_cannot_replace_it() {
+        let backend = Arc::new(LocalBackend::open_at(PathBuf::from(".")));
+        let mut state = AppState::new(AppStateConfig {
+            backend,
+            prefs: AppPrefs::default(),
+            now: Instant::now(),
+            subscribe_fs_events: false,
+        });
+        let fixtures = test_support::spreadsheet_fixtures();
+        let (_, bytes) = &fixtures[0];
+        let preview = PreviewDocument {
+            path: "book.xlsx".into(),
+            resolved_path: None,
+            local_path: None,
+            bytes_on_disk: bytes.len() as u64,
+            mime: None,
+            body: reef_core::preview::spreadsheet::preview_body(bytes, bytes.len() as u64),
+        };
+        let generation = state.preview_load.begin();
+        state.apply_preview_content(generation, Some(preview.clone()), 20);
+        let revision = state.preview_source_revision;
+        state.select_spreadsheet_sheet(1);
+        let crate::PreviewBodySnapshot::Spreadsheet {
+            selected_sheet,
+            sheet: Some(sheet),
+            ..
+        } = &state.preview_snapshot.as_ref().unwrap().body
+        else {
+            panic!("expected spreadsheet snapshot");
+        };
+        assert_eq!(*selected_sheet, 1);
+        assert_eq!(sheet.rows[0], ["Second sheet"]);
+        assert_eq!(state.preview_source_revision, revision);
+        state.select_spreadsheet_sheet(99);
+        assert_eq!(state.spreadsheet_sheet, 1);
+        let latest = state.preview_load.begin();
+        assert!(
+            !state
+                .apply_preview_content(generation, Some(preview.clone()), 20)
+                .accepted
+        );
+        assert_eq!(state.spreadsheet_sheet, 1);
+        state.apply_preview_content(latest, Some(preview), 20);
+        assert_eq!(state.spreadsheet_sheet, 1);
+        assert_eq!(state.preview_source_revision, revision);
+        let generation = state.preview_load.begin();
+        state.apply_preview_content(generation, Some(text_preview("other.txt")), 20);
+        assert_eq!(state.spreadsheet_sheet, 0);
+    }
 
     #[test]
     fn preview_error_keeps_previous_content_and_exposes_error() {

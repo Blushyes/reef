@@ -93,6 +93,7 @@ pub enum PreviewKindSnapshot {
     Image,
     Binary,
     Database,
+    Spreadsheet,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,6 +296,7 @@ impl PreviewKindSnapshot {
             reef_core::preview::PreviewBody::Image(_) => Self::Image,
             reef_core::preview::PreviewBody::Binary(_) => Self::Binary,
             reef_core::preview::PreviewBody::Database(_) => Self::Database,
+            reef_core::preview::PreviewBody::Spreadsheet(_) => Self::Spreadsheet,
         }
     }
 }

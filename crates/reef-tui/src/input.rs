@@ -390,6 +390,10 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         LeaderVerdict::None => {}
     }
 
+    if !in_input_mode && crate::ui::preview::spreadsheet::handle_key(key, app) {
+        return;
+    }
+
     // vim `gg` / `G` — jump the active preview to top / bottom. Sits
     // between the Space-leader chord and the global keymap so the chord
     // works in both Main and FocusedPreview without each per-tab handler
@@ -783,6 +787,10 @@ fn handle_key_focused_preview(key: KeyEvent, app: &mut App) -> bool {
         && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('r'))
     {
         return false;
+    }
+
+    if crate::ui::preview::spreadsheet::handle_key(key, app) {
+        return true;
     }
 
     // Explicit handling for FocusedPreview-specific actions.
@@ -2752,6 +2760,7 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
             action,
             ui::mouse::ClickAction::SetStructuredPreviewMode(_)
                 | ui::mouse::ClickAction::ToggleStructuredPreviewNode(_)
+                | ui::mouse::ClickAction::SpreadsheetSelectCell { .. }
         )
     {
         app.handle_action(action);

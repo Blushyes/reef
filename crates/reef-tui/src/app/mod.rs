@@ -236,6 +236,7 @@ pub struct TuiApp {
     video_build_rx: mpsc::Receiver<BuiltVideo>,
     video_build_cancellation: Option<reef_io::CancellationToken>,
 
+    pub(crate) spreadsheet_view: crate::ui::preview::spreadsheet::SpreadsheetViewState,
     pub preview_selection: Option<crate::ui::selection::PreviewSelection>,
     pub selection_context_menu: crate::selection_context_menu::SelectionContextMenuState,
     pending_preview_nav: Option<PendingPreviewNav>,
@@ -448,6 +449,7 @@ impl App {
             video_build_tx,
             video_build_rx,
             video_build_cancellation: None,
+            spreadsheet_view: Default::default(),
             preview_selection: None,
             selection_context_menu:
                 crate::selection_context_menu::SelectionContextMenuState::default(),
@@ -2979,6 +2981,10 @@ impl App {
             }
             ClickAction::DbToggleSchema(name) => {
                 self.db_toggle_schema(&name);
+            }
+            ClickAction::SpreadsheetSelectCell { row, column } => {
+                self.set_active_panel(Panel::Diff);
+                crate::ui::preview::spreadsheet::select_cell(self, row, column);
             }
             ClickAction::DbSelectCell { row, column } => {
                 self.engine

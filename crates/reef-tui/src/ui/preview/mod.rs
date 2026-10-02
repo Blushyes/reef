@@ -2,6 +2,7 @@ pub mod binary;
 pub mod chrome;
 pub mod image;
 pub mod markdown;
+pub mod spreadsheet;
 pub mod structured;
 pub mod text;
 pub mod video;
@@ -48,6 +49,9 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
             video::render(f, app, inner, &preview.path, info, focused);
         }
         PreviewBody::Binary(info) => binary::render(f, app, inner, &preview.path, info, focused),
+        PreviewBody::Spreadsheet(workbook) => {
+            spreadsheet::render(f, app, inner, &preview, workbook, focused)
+        }
         PreviewBody::Database(info) => {
             crate::ui::db_preview::render(f, app, inner, &preview.path, info, focused);
         }

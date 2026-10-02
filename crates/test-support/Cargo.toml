@@ -14,3 +14,4 @@ tempfile      = "3"
 # Generate tiny image fixtures on the fly so tests for the image-preview
 # branch don't ship binary PNG blobs in the repo.
 image         = { version = "0.25", default-features = false, features = ["png"] }
+zip = { version = "8.6", default-features = false }

@@ -1,6 +1,7 @@
 pub mod binary;
 pub mod image;
 pub mod loader;
+pub mod spreadsheet;
 
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -34,6 +35,7 @@ pub enum PreviewBody {
     Image(ImagePreview),
     Binary(BinaryInfo),
     Database(reef_sqlite_preview::DatabaseInfoV2),
+    Spreadsheet(spreadsheet::WorkbookPreview),
 }
 
 #[derive(Debug, Clone)]

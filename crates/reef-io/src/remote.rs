@@ -749,7 +749,10 @@ impl Backend for RemoteBackend {
             });
         }
         let source_required = reef_core::preview::structured_data_source_required(&rel_str);
-        let read_limit = if source_required {
+        let spreadsheet = reef_core::preview::spreadsheet::is_spreadsheet(rel_path);
+        let read_limit = if spreadsheet {
+            reef_core::preview::spreadsheet::MAX_WORKBOOK_BYTES
+        } else if source_required {
             reef_core::preview::MAX_TEXT_PREVIEW_BYTES
         } else {
             READ_FILE_MAX_BYTES
@@ -766,6 +769,17 @@ impl Backend for RemoteBackend {
         let resolved_path = resp.resolved_path.map(PathBuf::from);
         let raw = resp.bytes;
         let bytes_on_disk = resp.size;
+
+        if spreadsheet {
+            return Some(PreviewContent {
+                path: rel_str,
+                resolved_path,
+                local_path: None,
+                bytes_on_disk,
+                mime: None,
+                body: reef_core::preview::spreadsheet::preview_body(&raw, bytes_on_disk),
+            });
+        }
 
         if source_required && bytes_on_disk > read_limit {
             return Some(PreviewContent {

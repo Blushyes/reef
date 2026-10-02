@@ -69,6 +69,19 @@ pub fn load_preview_from_path(
 
     let mime: Option<&'static str> = infer::get(&probe).map(|kind| kind.mime_type());
 
+    if super::spreadsheet::is_spreadsheet(rel_path) {
+        let mut raw = probe;
+        if file_size <= super::spreadsheet::MAX_WORKBOOK_BYTES {
+            file.read_to_end(&mut raw).ok()?;
+        }
+        return Some(preview_document(
+            &rel_str,
+            file_size,
+            mime,
+            super::spreadsheet::preview_body(&raw, file_size),
+        ));
+    }
+
     if reef_sqlite_preview::has_sqlite_extension(rel_path)
         && reef_sqlite_preview::has_sqlite_magic(&probe)
     {

@@ -45,6 +45,7 @@ enum BodyShape {
     BinaryDecodeError,
     Image,
     Database,
+    Spreadsheet,
 }
 
 fn shape_of(body: &PreviewBody) -> BodyShape {
@@ -53,6 +54,7 @@ fn shape_of(body: &PreviewBody) -> BodyShape {
         PreviewBody::Markdown(_) => BodyShape::Markdown,
         PreviewBody::Image(_) => BodyShape::Image,
         PreviewBody::Database(_) => BodyShape::Database,
+        PreviewBody::Spreadsheet(_) => BodyShape::Spreadsheet,
         PreviewBody::Binary(info) => match &info.reason {
             BinaryReason::Empty => BodyShape::BinaryEmpty,
             BinaryReason::NullBytes => BodyShape::BinaryNullBytes,
@@ -446,4 +448,27 @@ fn load_preview_missing_file_returns_none_on_both() {
             .load_preview(Path::new("no-such.txt"), true)
             .is_none()
     );
+}
+
+#[test]
+fn spreadsheet_formats_match_between_local_and_remote() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, _) = tempdir_repo();
+    for (extension, bytes) in test_support::spreadsheet_fixtures() {
+        std::fs::write(tmp.path().join(format!("sample.{extension}")), bytes).unwrap();
+    }
+    let local = LocalBackend::open_at(tmp.path().to_path_buf());
+    let remote = spawn_remote(tmp.path());
+    for (extension, _) in test_support::spreadsheet_fixtures() {
+        let name = format!("sample.{extension}");
+        let local = local.load_preview(Path::new(&name), false).unwrap();
+        let remote = remote.load_preview(Path::new(&name), false).unwrap();
+        let (PreviewBody::Spreadsheet(left), PreviewBody::Spreadsheet(right)) =
+            (local.body, remote.body)
+        else {
+            panic!("expected spreadsheet previews for {extension}");
+        };
+        assert_eq!(left, right, "{extension}");
+        assert_eq!(left.sheets.len(), 3);
+    }
 }

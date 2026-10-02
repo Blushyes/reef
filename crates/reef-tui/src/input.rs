@@ -1380,6 +1380,7 @@ fn graph_scroll_right_panel(app: &mut App, delta: i32) {
                 uses_three_col: app.graph_uses_three_col(),
             });
             app.drain_engine_runtime_events();
+            commit_detail_panel::reveal_selected_file(app);
         }
         Panel::Diff => {
             if app.graph_uses_three_col() {

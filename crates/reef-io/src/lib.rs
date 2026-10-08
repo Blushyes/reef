@@ -668,10 +668,13 @@ pub trait Backend: Send + Sync {
     fn unstage(&self, path: &str) -> Result<(), BackendError> {
         self.unstage_paths(&[path.to_string()])
     }
+    /// Restore the workdir path from the index without changing staged content.
+    /// Files absent from the index are deleted.
     fn restore(&self, path: &str) -> Result<(), BackendError>;
     /// Combined "discard one path" op used by the Git tab's folder /
     /// section discard flows. Staged paths are first unstaged, then the
-    /// workdir restored to HEAD; unstaged paths only get workdir restore.
+    /// workdir restored from the resulting index; unstaged paths are restored
+    /// from the current index, preserving staged content.
     /// Collapsed into a single trait method so `RemoteBackend` can reach
     /// the agent-side `git2::Repository` in one round-trip.
     fn revert_path(&self, path: &str, is_staged: bool) -> Result<(), BackendError>;

@@ -460,8 +460,8 @@ impl GitRepo {
         })
     }
 
-    /// Restore a working-tree file to its HEAD state (like `git restore <file>`).
-    /// For untracked files that have no HEAD counterpart, the file is deleted.
+    /// Restore a working-tree file to its index state (like `git restore <file>`).
+    /// Files absent from the index are deleted.
     /// Does not touch the index.
     pub fn restore_file(&self, path: &str) -> Result<(), git2::Error> {
         let workdir = self
@@ -469,21 +469,17 @@ impl GitRepo {
             .workdir()
             .ok_or_else(|| git2::Error::from_str("no workdir"))?;
 
-        let in_head = self
-            .repo
-            .head()
-            .ok()
-            .and_then(|h| h.peel_to_commit().ok())
-            .and_then(|c| c.tree().ok())
-            .and_then(|t| t.get_path(Path::new(path)).ok())
-            .is_some();
+        let mut index = self.repo.index()?;
+        // Include conflict stages so unmerged paths go through Git's checkout handling.
+        let in_index = (0..=3).any(|stage| index.get_path(Path::new(path), stage).is_some());
 
-        if in_head {
-            let head_tree = self.repo.head()?.peel_to_commit()?.tree()?;
+        if in_index {
             let mut opts = git2::build::CheckoutBuilder::new();
-            opts.force().update_index(false).path(path);
-            self.repo
-                .checkout_tree(head_tree.as_object(), Some(&mut opts))
+            opts.force()
+                .update_index(false)
+                .disable_pathspec_match(true)
+                .path(path);
+            self.repo.checkout_index(Some(&mut index), Some(&mut opts))
         } else {
             std::fs::remove_file(workdir.join(path))
                 .map_err(|e| git2::Error::from_str(&e.to_string()))

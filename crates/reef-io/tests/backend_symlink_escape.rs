@@ -89,6 +89,27 @@ fn local_load_preview_refuses_symlink_escape() {
 }
 
 #[test]
+fn trusted_local_preview_follows_external_video_symlink() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let outside = TempDir::new().expect("outside tempdir");
+    let video = outside.path().join("clip.mp4");
+    std::fs::write(&video, b"\x00\x00\x00\x18ftypmp42").unwrap();
+    let workdir = TempDir::new().expect("workdir tempdir");
+    symlink(&video, workdir.path().join("clip.mp4")).unwrap();
+    let video = std::fs::canonicalize(video).unwrap();
+
+    let backend = LocalBackend::open_at_with_external_previews(workdir.path().to_path_buf());
+    let preview = backend
+        .load_preview(Path::new("clip.mp4"), false)
+        .expect("external video symlink preview");
+
+    assert_eq!(
+        (preview.mime.as_deref(), preview.local_path.as_deref()),
+        (Some("video/mp4"), Some(video.as_path()))
+    );
+}
+
+#[test]
 fn remote_read_file_rejects_symlink_escape() {
     // Same guarantee, but over the RPC boundary — an escape on the
     // agent side must surface as `PathEscape` at the RemoteBackend,

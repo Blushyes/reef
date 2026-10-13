@@ -495,6 +495,7 @@ impl ReefApp {
                     repo_presence_changed,
                 });
             }
+            AppCommand::SetFileTreeSort(sort) => self.state.set_file_tree_sort(sort),
             AppCommand::RefreshFileTree => self.state.refresh_file_tree(),
             AppCommand::RefreshFileTreeWithTarget(target) => {
                 self.state.refresh_file_tree_with_target(target);
@@ -602,6 +603,7 @@ impl ReefApp {
             }
             AppCommand::OpenDbGoto => self.state.open_db_goto(),
             AppCommand::CloseDbGoto => self.state.close_db_goto(),
+            AppCommand::SelectSpreadsheetSheet(index) => self.state.select_spreadsheet_sheet(index),
             AppCommand::DbNavigate(action) => self.state.db_navigate(action),
             AppCommand::DbToggleSchema(name) => self.state.db_toggle_schema(&name),
             AppCommand::DbSelectObject(key) => self.state.db_select_object(key),
@@ -1276,6 +1278,9 @@ impl ReefApp {
                 anchor,
             } => self.state.open_tree_context_menu(target_entry_idx, anchor),
             AppCommand::CloseTreeContextMenu => self.state.close_tree_context_menu(),
+            AppCommand::OpenTreeSortMenu => self.state.tree_context_menu.open_sort(),
+            AppCommand::BackTreeContextMenu => self.state.tree_context_menu.back(),
+            AppCommand::HoverTreeContextMenuItem(item) => self.state.tree_context_menu.hover(&item),
             AppCommand::RequestTreeDeleteConfirm { path, is_dir, hard } => {
                 self.state.request_tree_delete_confirm(path, is_dir, hard);
             }
@@ -1849,6 +1854,10 @@ impl ReefApp {
         &self.state.file_tree.entries
     }
 
+    pub fn file_tree_sort(&self) -> reef_core::file_tree::FileTreeSort {
+        self.state.file_tree.sort
+    }
+
     pub fn file_tree_rows_revision(&self) -> u64 {
         self.state.file_tree.rows_revision()
     }
@@ -1895,19 +1904,23 @@ impl ReefApp {
     }
 
     pub fn tree_context_menu_items_len(&self) -> usize {
-        self.state.tree_context_menu.items.len()
+        reef_core::menu::menu_items(&self.state.tree_context_menu.entries).count()
     }
 
     pub fn tree_context_menu_anchor(&self) -> (u16, u16) {
         self.state.tree_context_menu.anchor
     }
 
-    pub fn tree_context_menu_items(&self) -> Vec<ContextMenuItem> {
-        self.state.tree_context_menu.items.clone()
+    pub fn tree_context_menu_entries(&self) -> &[reef_core::menu::MenuEntry<ContextMenuItem>] {
+        &self.state.tree_context_menu.entries
     }
 
     pub fn tree_context_menu_selected(&self) -> usize {
         self.state.tree_context_menu.selected
+    }
+
+    pub fn tree_context_menu_sort_selected(&self) -> Option<usize> {
+        self.state.tree_context_menu.sort_selected
     }
 
     pub fn file_clipboard_empty(&self) -> bool {
@@ -2099,6 +2112,14 @@ impl ReefApp {
 
     pub fn commit_in_flight(&self) -> bool {
         self.state.commit_load.loading
+    }
+
+    pub fn preview_source_revision(&self) -> u64 {
+        self.state.preview_source_revision
+    }
+
+    pub fn spreadsheet_sheet(&self) -> usize {
+        self.state.spreadsheet_sheet
     }
 
     pub fn preview_scroll(&self) -> usize {

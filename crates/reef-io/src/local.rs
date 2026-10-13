@@ -147,6 +147,7 @@ impl PreviewCache {
 /// Local filesystem + libgit2 backend.
 pub struct LocalBackend {
     workdir: PathBuf,
+    allow_external_preview_targets: bool,
     has_repo: Arc<AtomicBool>,
     repo_monitor_active: Arc<AtomicBool>,
     /// Cached `fs::canonicalize(workdir)`. Populated lazily on the first
@@ -170,21 +171,26 @@ impl LocalBackend {
     /// the cwd is not a git repo (the Files tab still works).
     pub fn open_cwd() -> std::io::Result<Self> {
         let workdir = std::env::current_dir()?;
-        let has_repo = GitRepo::open_at(&workdir).is_ok();
-        Ok(Self {
-            workdir,
-            has_repo: Arc::new(AtomicBool::new(has_repo)),
-            repo_monitor_active: Arc::new(AtomicBool::new(false)),
-            canon_workdir: OnceLock::new(),
-            preview_cache: Mutex::new(PreviewCache::default()),
-        })
+        Ok(Self::new(workdir, true))
     }
 
-    /// Open at an explicit workdir. Used by `reef-agent --workdir`.
+    /// Opens at an explicit workdir with every read bounded to that workdir.
+    /// Used by `reef-agent --workdir` and other untrusted request boundaries.
     pub fn open_at(workdir: PathBuf) -> Self {
+        Self::new(workdir, false)
+    }
+
+    /// Opens a trusted local workdir whose previews may follow external symlink targets.
+    /// Other read and write operations remain bounded to the workdir.
+    pub fn open_at_with_external_previews(workdir: PathBuf) -> Self {
+        Self::new(workdir, true)
+    }
+
+    fn new(workdir: PathBuf, allow_external_preview_targets: bool) -> Self {
         let has_repo = GitRepo::open_at(&workdir).is_ok();
         Self {
             workdir,
+            allow_external_preview_targets,
             has_repo: Arc::new(AtomicBool::new(has_repo)),
             repo_monitor_active: Arc::new(AtomicBool::new(false)),
             canon_workdir: OnceLock::new(),
@@ -217,6 +223,16 @@ impl LocalBackend {
             .canon_workdir
             .get()
             .expect("just populated via OnceLock::set"))
+    }
+
+    fn preview_target(&self, rel_path: &Path) -> Result<PathBuf, BackendError> {
+        let canon_root = self.canonical_workdir()?;
+        if self.allow_external_preview_targets {
+            let joined = resolve_rel_within(canon_root, rel_path)?;
+            canonicalize_or_backend_err(&joined, "canonicalize preview target")
+        } else {
+            canonical_child_within(canon_root, rel_path)
+        }
     }
 }
 
@@ -596,13 +612,14 @@ impl Backend for LocalBackend {
         &self,
         expanded: &HashSet<PathBuf>,
         git_statuses: &HashMap<String, char>,
+        sort: reef_core::file_tree::FileTreeSort,
     ) -> Result<Vec<TreeEntry>, String> {
-        Ok(build_entries(&self.workdir, expanded, git_statuses))
+        Ok(build_entries(&self.workdir, expanded, git_statuses, sort))
     }
 
     fn load_preview(&self, rel_path: &Path, wants_decoded_image: bool) -> Option<PreviewContent> {
         let canon_root = self.canonical_workdir().ok()?;
-        let canon_target = canonical_child_within(canon_root, rel_path).ok()?;
+        let canon_target = self.preview_target(rel_path).ok()?;
 
         if let Ok(mut cache) = self.preview_cache.lock() {
             if let Some(cached) = cache.get(rel_path, &canon_target, wants_decoded_image) {
@@ -641,6 +658,7 @@ impl Backend for LocalBackend {
             entries.push(crate::DirEntry {
                 name,
                 is_dir,
+                modified_millis: entry_modified_millis(&entry),
                 // Child directories are resolved lazily when expanded. Probing
                 // each one here turns a single directory listing into N+1
                 // `read_dir` calls and makes expansion latency proportional to
@@ -648,11 +666,7 @@ impl Backend for LocalBackend {
                 has_children: is_dir,
             });
         }
-        entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        });
+        reef_core::file_tree::FileTreeSort::default().sort_entries(&mut entries);
         Ok(entries)
     }
 
@@ -1046,9 +1060,10 @@ pub fn build_entries(
     root: &Path,
     expanded: &HashSet<PathBuf>,
     git_statuses: &HashMap<String, char>,
+    sort: reef_core::file_tree::FileTreeSort,
 ) -> Vec<TreeEntry> {
     let mut entries = Vec::new();
-    walk_dir(root, root, expanded, git_statuses, &mut entries, 0);
+    walk_dir(root, root, expanded, git_statuses, &mut entries, 0, sort);
     entries
 }
 
@@ -1059,8 +1074,9 @@ fn walk_dir(
     git_statuses: &HashMap<String, char>,
     out: &mut Vec<TreeEntry>,
     depth: usize,
+    sort: reef_core::file_tree::FileTreeSort,
 ) {
-    let mut children: Vec<(String, PathBuf, bool)> = Vec::new();
+    let mut children = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => return,
@@ -1071,18 +1087,23 @@ fn walk_dir(
         if name == ".git" {
             continue;
         }
-        let path = entry.path();
         let is_dir = dir_entry_is_dir(&entry);
-        children.push((name, path, is_dir));
+        children.push((
+            crate::DirEntry {
+                name,
+                is_dir,
+                has_children: is_dir,
+                modified_millis: entry_modified_millis(&entry),
+            },
+            entry.path(),
+        ));
     }
 
-    children.sort_by(|a, b| match (a.2, b.2) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
-    });
+    children.sort_by(|left, right| sort.compare(&left.0, &right.0));
 
-    for (name, full_path, is_dir) in children {
+    for (child, full_path) in children {
+        let name = child.name;
+        let is_dir = child.is_dir;
         let rel = full_path
             .strip_prefix(root)
             .unwrap_or(&full_path)
@@ -1102,9 +1123,30 @@ fn walk_dir(
         });
 
         if is_dir && is_expanded {
-            walk_dir(root, &full_path, expanded, git_statuses, out, depth + 1);
+            walk_dir(
+                root,
+                &full_path,
+                expanded,
+                git_statuses,
+                out,
+                depth + 1,
+                sort,
+            );
         }
     }
+}
+
+// A dangling link or a filesystem without timestamps still has a directory entry.
+fn entry_modified_millis(entry: &std::fs::DirEntry) -> Option<u64> {
+    let modified = entry
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()?;
+    let millis = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    u64::try_from(millis).ok()
 }
 
 fn dir_entry_is_dir(entry: &std::fs::DirEntry) -> bool {
@@ -1509,7 +1551,12 @@ mod tests {
         std::fs::create_dir_all(temp.path().join("non-empty")).unwrap();
         std::fs::write(temp.path().join("non-empty").join("child.txt"), "x").unwrap();
 
-        let entries = build_entries(temp.path(), &HashSet::new(), &HashMap::new());
+        let entries = build_entries(
+            temp.path(),
+            &HashSet::new(),
+            &HashMap::new(),
+            Default::default(),
+        );
         let empty = entries.iter().find(|entry| entry.name == "empty").unwrap();
         let non_empty = entries
             .iter()

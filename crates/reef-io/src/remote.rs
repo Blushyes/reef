@@ -707,9 +707,18 @@ impl Backend for RemoteBackend {
         &self,
         expanded: &HashSet<PathBuf>,
         git_statuses: &HashMap<String, char>,
+        sort: reef_core::file_tree::FileTreeSort,
     ) -> Result<Vec<TreeEntry>, String> {
         let mut out = Vec::new();
-        walk_remote(self, Path::new(""), expanded, git_statuses, &mut out, 0)?;
+        walk_remote(
+            self,
+            Path::new(""),
+            expanded,
+            git_statuses,
+            &mut out,
+            0,
+            sort,
+        )?;
         Ok(out)
     }
 
@@ -749,7 +758,10 @@ impl Backend for RemoteBackend {
             });
         }
         let source_required = reef_core::preview::structured_data_source_required(&rel_str);
-        let read_limit = if source_required {
+        let spreadsheet = reef_core::preview::spreadsheet::is_spreadsheet(rel_path);
+        let read_limit = if spreadsheet {
+            reef_core::preview::spreadsheet::MAX_WORKBOOK_BYTES
+        } else if source_required {
             reef_core::preview::MAX_TEXT_PREVIEW_BYTES
         } else {
             READ_FILE_MAX_BYTES
@@ -766,6 +778,17 @@ impl Backend for RemoteBackend {
         let resolved_path = resp.resolved_path.map(PathBuf::from);
         let raw = resp.bytes;
         let bytes_on_disk = resp.size;
+
+        if spreadsheet {
+            return Some(PreviewContent {
+                path: rel_str,
+                resolved_path,
+                local_path: None,
+                bytes_on_disk,
+                mime: None,
+                body: reef_core::preview::spreadsheet::preview_body(&raw, bytes_on_disk),
+            });
+        }
 
         if source_required && bytes_on_disk > read_limit {
             return Some(PreviewContent {
@@ -835,6 +858,7 @@ impl Backend for RemoteBackend {
                 name: entry.name,
                 is_dir: entry.is_dir,
                 has_children: entry.has_children,
+                modified_millis: entry.modified_millis,
             })
             .collect())
     }
@@ -1539,19 +1563,11 @@ fn walk_remote(
     git_statuses: &HashMap<String, char>,
     out: &mut Vec<TreeEntry>,
     depth: usize,
+    sort: reef_core::file_tree::FileTreeSort,
 ) -> Result<(), String> {
-    let dir_str = dir.to_string_lossy().to_string();
-    let entries: Vec<DirEntryDto> = backend
-        .request(Request::ReadDir {
-            path: dir_str.clone(),
-        })
-        .map_err(|e| format!("ReadDir {dir_str:?}: {e}"))?;
-    let mut entries: Vec<DirEntryDto> = entries.into_iter().filter(|e| e.name != ".git").collect();
-    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-    });
+    let mut entries = backend.list_dir(dir).map_err(|error| error.to_string())?;
+    entries.retain(|entry| entry.name != ".git");
+    sort.sort_entries(&mut entries);
 
     for entry in entries {
         let rel = if dir.as_os_str().is_empty() {
@@ -1574,7 +1590,7 @@ fn walk_remote(
         });
 
         if entry.is_dir && is_expanded {
-            walk_remote(backend, &rel, expanded, git_statuses, out, depth + 1)?;
+            walk_remote(backend, &rel, expanded, git_statuses, out, depth + 1, sort)?;
         }
     }
     Ok(())

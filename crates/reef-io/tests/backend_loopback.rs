@@ -185,3 +185,58 @@ fn remote_list_dir_matches_local() {
 
     assert_eq!(local_entries, remote_entries);
 }
+
+#[test]
+fn modified_sort_matches_local_for_files_and_directories() {
+    use reef_core::file_tree::{FileTreeSort, FileTreeSortDirection, FileTreeSortField};
+    use std::collections::{HashMap, HashSet};
+    use std::fs::{File, FileTimes};
+    use std::path::Path;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let _lock = BACKEND_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let (tmp, raw) = tempdir_repo();
+    write_file(&raw, "src/a.rs", "a");
+    write_file(&raw, "src/z.rs", "z");
+    write_file(&raw, "README.md", "readme");
+    for (path, seconds) in [
+        ("src", 40),
+        ("README.md", 30),
+        ("src/a.rs", 20),
+        ("src/z.rs", 10),
+    ] {
+        File::open(tmp.path().join(path))
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(seconds)))
+            .unwrap();
+    }
+    let local = LocalBackend::open_at(tmp.path().to_path_buf());
+    let remote = spawn_remote(tmp.path());
+    let sort = FileTreeSort {
+        field: FileTreeSortField::Modified,
+        direction: FileTreeSortDirection::Ascending,
+        folders_first: false,
+    };
+    let expanded = HashSet::from([Path::new("src").to_path_buf()]);
+    let local_rows = local
+        .build_file_tree(&expanded, &HashMap::new(), sort)
+        .unwrap();
+    let remote_rows = remote
+        .build_file_tree(&expanded, &HashMap::new(), sort)
+        .unwrap();
+    assert_eq!(local_rows, remote_rows);
+    assert_eq!(
+        local_rows
+            .iter()
+            .map(|row| row.path.as_path())
+            .collect::<Vec<_>>(),
+        [
+            Path::new("README.md"),
+            Path::new("src"),
+            Path::new("src/z.rs"),
+            Path::new("src/a.rs")
+        ]
+    );
+}

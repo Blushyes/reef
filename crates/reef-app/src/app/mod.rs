@@ -671,6 +671,7 @@ pub struct AppState {
     pub prefetch_schedule: Option<Instant>,
     pub preview_in_flight_path: Option<PathBuf>,
     pub tree_scroll: usize,
+    pub spreadsheet_sheet: usize,
     pub preview_scroll: usize,
     pub preview_h_scroll: usize,
     pub db_goto_input: Option<String>,
@@ -760,6 +761,7 @@ pub struct AppState {
 }
 
 pub struct AppPrefs {
+    pub file_tree_sort: reef_core::file_tree::FileTreeSort,
     pub diff_layout: DiffLayout,
     pub diff_mode: DiffMode,
     pub status_tree_mode: bool,
@@ -776,6 +778,7 @@ pub struct AppPrefs {
 impl Default for AppPrefs {
     fn default() -> Self {
         Self {
+            file_tree_sort: Default::default(),
             diff_layout: DiffLayout::Unified,
             diff_mode: DiffMode::Compact,
             status_tree_mode: false,
@@ -876,7 +879,8 @@ impl AppState {
         let workdir = backend.workdir_path();
         let workdir_name = backend.workdir_name();
         let branch_name = backend.branch_name();
-        let file_tree = FileTree::new(&workdir);
+        let mut file_tree = FileTree::new(&workdir);
+        file_tree.sort = prefs.file_tree_sort;
         let fs_watcher_rx = subscribe_fs_events.then(|| backend.subscribe_fs_events());
         Self {
             backend,
@@ -913,6 +917,7 @@ impl AppState {
             prefetch_schedule: None,
             preview_in_flight_path: None,
             tree_scroll: 0,
+            spreadsheet_sheet: 0,
             preview_scroll: 0,
             preview_h_scroll: 0,
             db_goto_input: None,
@@ -1784,6 +1789,53 @@ mod tests {
     }
 
     #[test]
+    fn sort_change_rejects_old_rebuild_and_subtree_results() {
+        use crate::tasks::{FileTreePayload, FileTreeSubtreePayload};
+        use reef_core::file_tree::{FileTreeSort, FileTreeSortDirection};
+
+        let mut app = minimal_app_state();
+        app.file_tree.state = crate::FileTreeState::with_entries(vec![tree_entry("src", 0, true)]);
+        app.file_tree.toggle_expand(0);
+        let old_generation = app.file_tree_load.begin();
+        let old_revision = app.file_tree_revision;
+        app.file_tree_subtree_requests
+            .insert(PathBuf::from("src"), 1);
+        app.set_file_tree_sort(FileTreeSort {
+            direction: FileTreeSortDirection::Descending,
+            ..Default::default()
+        });
+        let current_generation = app.file_tree_load.generation;
+        app.apply_worker_result_core(
+            WorkerResult::FileTree {
+                generation: old_generation,
+                tree_revision: old_revision,
+                result: Ok(FileTreePayload {
+                    entries: vec![tree_entry("old", 0, false)],
+                    selected_idx: 0,
+                }),
+            },
+            Instant::now(),
+        );
+        app.apply_worker_result_core(
+            WorkerResult::FileTreeSubtree {
+                request_id: 1,
+                parent_path: PathBuf::from("src"),
+                result: Ok(FileTreeSubtreePayload {
+                    parent_path: PathBuf::from("src"),
+                    entries: vec![tree_entry("src/old", 1, false)],
+                }),
+            },
+            Instant::now(),
+        );
+        assert_eq!(app.file_tree.entries.len(), 1);
+        assert_eq!(app.file_tree.entries[0].path, Path::new("src"));
+        assert!(app.file_tree.entries[0].is_expanded);
+        assert_eq!(app.file_tree_load.generation, current_generation);
+        assert!(app.file_tree_load.loading);
+        assert!(app.file_tree_subtree_requests.is_empty());
+    }
+
+    #[test]
     fn collapse_during_tree_load_rejects_pre_collapse_payload() {
         use crate::FileTreeState;
         use crate::tasks::FileTreePayload;
@@ -1991,6 +2043,7 @@ mod tests {
         let app = AppState::new(AppStateConfig {
             backend: Arc::new(LocalBackend::open_at(PathBuf::from("."))),
             prefs: AppPrefs {
+                file_tree_sort: Default::default(),
                 diff_layout: DiffLayout::SideBySide,
                 diff_mode: DiffMode::FullFile,
                 status_tree_mode: true,

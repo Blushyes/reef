@@ -1,0 +1,28 @@
+---
+source: crates/reef-tui/tests/ui_snapshots.rs
+expression: output
+---
+ reef  [TMPDIR]  ⎇ master
+ 📁  Files │ 🔎  Search │ ⎇ Git │ ⑂ Graph        ⊟  1:Files 2:Search 3:Git 4:Graph
+ +   +   ⊟             │
+ ▸ src ●               │
+   README.md           │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │                  Select a file to preview
+                       │                                  ┌────────────────────┐
+                       │              ┌───────────────────┐  Paste             │
+                       │              │  ✓ Name           │  New File          │
+                       │              │    Kind           │  New Folder        │
+                       │              │    Date Modified  │  ────────────────  │
+                       │              │  ───────────────  │  Sort By ▸         │
+                       │              │  ✓ Ascending      │  ────────────────  │
+                       │              │    Descending     │  Reveal in Finder  │
+                       │              │  ───────────────  │────────────────────┘
+                       │              │  ✓ Folders First  │
+ SSH           ⚙  q:quit Tab:switch s:└───────────────────┘resh h:help  [Files]

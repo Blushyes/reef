@@ -1,4 +1,5 @@
 use reef_core::diff::DiffSide;
+use reef_core::menu::{MenuEntry, menu_items, navigate_menu};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectionContextTarget {
@@ -13,7 +14,10 @@ pub enum SelectionContextMenuItem {
 }
 
 impl SelectionContextMenuItem {
-    pub const ALL: [Self; 2] = [Self::Copy, Self::SelectAll];
+    pub const ALL: [MenuEntry<Self>; 2] = [
+        MenuEntry::Item(Self::Copy),
+        MenuEntry::Item(Self::SelectAll),
+    ];
 }
 
 #[derive(Debug, Default)]
@@ -52,12 +56,14 @@ impl SelectionContextMenuState {
     }
 
     pub fn navigate(&mut self, delta: i32) {
-        let len = SelectionContextMenuItem::ALL.len() as i32;
-        self.selected = (self.selected as i32 + delta).rem_euclid(len) as usize;
+        self.selected = navigate_menu(&SelectionContextMenuItem::ALL, self.selected, delta);
     }
 
     pub fn current(&self) -> SelectionContextMenuItem {
-        SelectionContextMenuItem::ALL[self.selected]
+        menu_items(&SelectionContextMenuItem::ALL)
+            .nth(self.selected)
+            .copied()
+            .expect("selection identifies a menu item")
     }
 }
 

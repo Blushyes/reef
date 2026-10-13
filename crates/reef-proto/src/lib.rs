@@ -121,7 +121,8 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 ///        the latest request.
 /// - v23: adds `AbortGitPathMutation`, allowing a client to discard accumulated
 ///        stage/unstage chunks when the logical batch cannot be completed.
-pub const PROTOCOL_VERSION: u32 = 23;
+/// - v24: directory entries carry modification timestamps for shared tree ordering.
+pub const PROTOCOL_VERSION: u32 = 24;
 
 /// Encode a single envelope-level value to `writer` using the
 /// length-prefixed framing. The caller is expected to flush.
@@ -589,6 +590,7 @@ pub struct DirEntryDto {
     pub name: String,
     pub is_dir: bool,
     pub has_children: bool,
+    pub modified_millis: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

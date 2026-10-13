@@ -1,5 +1,6 @@
 pub mod commit_detail_panel;
 pub mod confirm_modal;
+pub(crate) mod context_menu;
 pub mod context_menu_panel;
 pub mod db_preview;
 pub mod diff_panel;

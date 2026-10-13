@@ -77,6 +77,25 @@ fn revert_unstaged_file_parity() {
 }
 
 #[test]
+fn revert_unstaged_changes_preserves_staged_content_on_both_backends() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (l_tmp, r_tmp) = seed_pair();
+    let l = LocalBackend::open_at(l_tmp.path().to_path_buf());
+    let r = spawn_remote(r_tmp.path());
+
+    for (tmp, backend) in [(&l_tmp, &l as &dyn Backend), (&r_tmp, &r as &dyn Backend)] {
+        std::fs::write(tmp.path().join("a.txt"), "v3\n").unwrap();
+        backend.revert_path("a.txt", false).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+            "v2\n"
+        );
+        assert_eq!(porcelain(tmp.path()), [" M b.txt", "?? c.txt", "M  a.txt"]);
+    }
+}
+
+#[test]
 fn revert_staged_file_parity() {
     let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (l_tmp, r_tmp) = seed_pair();
@@ -87,6 +106,13 @@ fn revert_staged_file_parity() {
     r.revert_path("a.txt", true).unwrap();
 
     assert_eq!(porcelain(l_tmp.path()), porcelain(r_tmp.path()));
+    for tmp in [&l_tmp, &r_tmp] {
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+            "v1\n"
+        );
+        assert_eq!(porcelain(tmp.path()), [" M b.txt", "?? c.txt"]);
+    }
 }
 
 #[test]

@@ -38,6 +38,7 @@ Supported: macOS (arm64, x64), Linux (arm64, x64), Windows (x64). Or `cargo buil
 
 ```bash
 reef                             # current directory
+rf                               # short alias
 reef --ssh user@host             # remote $HOME (agent auto-installed)
 reef --ssh user@host:/path       # remote /path
 ```
@@ -45,3 +46,12 @@ reef --ssh user@host:/path       # remote /path
 ## Status
 
 Alpha. Single Rust binary, no plugins. Local and remote are feature-parity.
+
+### Spreadsheet previews
+
+Reef previews `.xlsx`, `.xls`, `.xlsm`, `.xlsb` and `.ods` workbooks locally and over SSH.
+Focus the preview to select cells with the arrow keys, switch sheets with `[` / `]`, and copy
+one cell with `y`. The value pane shows the selected cell. Formula cells show saved results;
+formatting, charts, formula recalculation and editing are not supported.
+Workbook input is limited to 10 MiB. Each sheet previews up to 10,000 rows, 256 columns and
+100,000 cells of its used range; larger sheets show a truncation notice.

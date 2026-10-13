@@ -103,6 +103,26 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
 
 - Tree structure changes from filesystem events or external reveal requests use the full-tree
   rebuild worker. Its queued rebuilds coalesce to the newest generation.
+- `SetFileTreeSort` updates renderer-neutral sort state, invalidates previous rebuild and subtree
+  requests, and schedules a full rebuild while retaining visible rows. Both worker paths use
+  `reef-core::file_tree::FileTreeSort` on each sibling list. Hosts restore the typed settings
+  from `file_tree.sort`, project them alongside tree rows, and persist explicit changes. Sorting
+  retains directory hierarchy and expanded paths. The default-enabled folders-first option
+  keeps directories before files in either direction, sorting each group by the selected field.
+  With the option disabled, siblings sort together. Directories use their own filesystem
+  modification times. `DirectoryEntry` carries the optional modification timestamp supplied
+  by local/remote directory listings; the remote `ReadDir` protocol carries the same timestamp.
+  Missing timestamps sort last within their group in either direction.
+  The tree context menu retains separate parent and sort-submenu selections. Enter/Right
+  opens sorting, Left/Escape returns to the parent, and mouse hover/click uses typed menu
+  commands. TUI positions the submenu beside its parent, flips it left at the screen edge,
+  and captures all pointer input while the menu is open. Choosing a sort option dispatches
+  `SetFileTreeSort`, sharing persistence and worker invalidation with other hosts.
+- Context-menu definitions contain typed `reef-core::menu::MenuEntry` items and separators.
+  File-tree and text-menu state use the shared item iterator and wraparound navigation;
+  selection indices count only items. TUI's `ui/context_menu.rs` maps those indices to
+  visible rows and owns separator drawing, scrolling, placement, and inert separator hit regions.
+  Feature panels translate the declarations into labels and typed actions for this component.
 - Interactive directory expansion uses a separate bounded subtree worker pool. Each parent path
   owns an independent request ID, so expanding one directory never cancels or waits behind a
   sibling expansion. Collapsing or re-expanding a parent invalidates only that parent's old result.
@@ -124,6 +144,11 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
   rebuilding the tree. Commands that originate outside the visible tree, such as Quick Open and
   navigation history, use the reveal path so their target can be materialized first.
 - Git decorations update visible entries in place; they must not rebuild the tree by themselves.
+  File-tree splices identify the preceding structural `base_revision` and resulting `revision`.
+  Content-only revisions between those endpoints preserve row order and count. Content
+  updates retain the latest splice; a new structure change replaces it and a reset clears it.
+  Hosts may apply it when their last rendered revision is in that half-open interval, even
+  if presentation events were coalesced, and must synchronize when earlier structure was missed.
   Subtree workers return structure only; accepted children are decorated from the current cached
   status map in O(inserted rows), rather than cloning or rebuilding the repository-wide status
   snapshot for every expansion.
@@ -168,6 +193,16 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
 - Database preview state records the accepted preview source revision. When the same path receives
   changed source content, `reef-app` preserves a still-valid object selection but schedules a fresh
   page or detail load; path equality alone must never keep rows from an older database snapshot.
+
+- Spreadsheet workbooks are parsed by the preview worker using the shared core reader.
+  The accepted workbook owns bounded worksheet projections; sheet selection is a shared
+  `SelectSpreadsheetSheet` command. Snapshots serialize only the selected worksheet plus
+  sheet names. Selection changes presentation revision, not source revision, and resets scroll.
+  Local and remote reads share format parsing and the 10 MiB workbook input limit. Hosts own
+  cell selection and draw only visible rows/cells; they never reopen workbooks.
+  xlsx/xlsm/xlsb readers scan cells for actual used bounds, then stream again into a
+  bounded projection without allocating the full dense rectangle. xls/ods retain
+  eager parsing; the input and projection caps do not constrain their parser memory.
 
 ### Git
 

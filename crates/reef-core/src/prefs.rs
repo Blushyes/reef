@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 pub const DIFF_LAYOUT: &str = "diff.layout";
 pub const DIFF_MODE: &str = "diff.mode";
+pub const FILE_TREE_SORT: &str = "file_tree.sort";
 pub const STATUS_TREE_MODE: &str = "status.tree_mode";
 pub const COMMIT_DIFF_LAYOUT: &str = "commit.diff_layout";
 pub const COMMIT_DIFF_MODE: &str = "commit.diff_mode";

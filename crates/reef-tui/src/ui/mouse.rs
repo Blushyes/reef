@@ -92,6 +92,8 @@ pub enum ClickAction {
     /// left-click that misses a menu row falls through to this and
     /// just closes the menu.
     TreeContextMenuClose,
+    /// Inert separator inside a context menu; captures clicks without dismissing it.
+    ContextMenuSeparator,
     /// Pick from a read-only Preview or Diff text context menu.
     SelectionContextMenuItem(crate::selection_context_menu::SelectionContextMenuItem),
     /// Registered screen-wide beneath the text-selection context menu.
@@ -123,6 +125,10 @@ pub enum ClickAction {
     /// loaded page's rows, `column` into the object's columns. Opens
     /// the value pane and requests the cell's complete value — grid
     /// cells carry only a bounded prefix.
+    SpreadsheetSelectCell {
+        row: usize,
+        column: usize,
+    },
     DbSelectCell {
         row: usize,
         column: usize,

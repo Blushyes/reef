@@ -31,6 +31,25 @@ expensive work must not run from a renderer.
 - When a renderer needs preview content beyond the bounded display projection, expose that content through a typed, renderer-neutral `PreviewBodySnapshot`; do not make a host reparse source content while selecting or rendering a preview.
 - Preserve complete structured source separately from its bounded visible-line projection. Reef must not identify or name third-party formats; renderer-specific recognition belongs to the renderer that consumes this generic source.
 
+## Spreadsheet previews
+
+- `reef-core::preview::spreadsheet` parses xlsx/xls/xlsm/xlsb/ods into a typed workbook on
+  the preview worker. Local and remote backends use the same parser; remote reads request
+  complete workbook bytes within the 10 MiB input limit.
+- xlsx/xlsm/xlsb use two streaming cell passes: determine the actual nonempty used
+  range, then fill only the bounded projection. Never construct a dense range from
+  distant cell coordinates. xls/ods retain Calamine's eager readers; their input and
+  projection limits do not bound parser memory.
+- Each worksheet preserves its used-range origin, original dimensions, column addresses,
+  and display values. Preview data is bounded to 10,000 rows, 256 columns and 100,000 cells
+  per sheet, with explicit truncation. Formula values are the file's cached results;
+  formulas and macros are never executed.
+- `reef-app` owns `SelectSpreadsheetSheet` and the selected sheet index. Its preview snapshot
+  contains worksheet names and only the selected worksheet. Switching sheets changes the
+  presentation revision and resets preview scroll, while the source revision stays stable.
+- Hosts own native/terminal cell selection and geometry. TUI uses the spreadsheet keymap
+  scope and virtualized visible cells; spreadsheet parsing and source I/O stay off render.
+
 ## Runtime Data Flow
 
 1. User input in `reef-tui` becomes an `AppCommand`.
@@ -58,6 +77,28 @@ Read `references/runtime-architecture.md` before changing `crates/reef-app/src/*
 - `crates/reef-tui/src/input.rs` owns key/mouse routing; use `AppCommand` / `TuiApp::set_active_tab` instead of assigning `active_tab` directly.
 - `crates/reef-tui/src/input_edit{,_multi}.rs` and `crates/reef-tui/src/picker_core.rs` own the shared text-input vocabulary. Don't hand-roll a key table; embed one of the three layers (see "Text Input Stack" below).
 - `crates/reef-core/src/file_tree.rs` owns pure file-tree ordering/navigation helpers; `crates/reef-app/src/features/file_tree.rs` owns renderer-neutral file-tree state. `reef-tui` renders snapshots and dispatches commands only.
+- `SetFileTreeSort` owns sibling ordering at every tree depth. The core `FileTreeSort`
+  comparator supports name, extension-based kind, and modification time with an independent
+  direction and default-enabled folders-first setting. When enabled, directories precede
+  files and both groups follow the selected ordering; otherwise siblings sort together.
+  Directory timestamps are their own filesystem modification times. Full-tree and subtree workers capture the same typed settings.
+  Sort changes invalidate older rebuild/subtree requests and preserve expansion and selection.
+  Hosts seed `AppPrefs.file_tree_sort` from the shared `file_tree.sort` preference. Backend
+  directory entries carry optional modification timestamps; unavailable timestamps sort last.
+  The TUI exposes these settings through the file-tree context menu's `Sort By` submenu,
+  including checked field/direction and Folders First rows. Menu navigation stays in
+  `ContextMenuState`; TUI keyboard/mouse adapters dispatch commands, and render only lays out
+  the parent/submenu and hit regions. Sort choices dispatch the shared `SetFileTreeSort` command.
+- Grouped menus use `reef_core::menu::MenuEntry<T>` with explicit `Item` and `Separator`
+  entries. Features declare their order and grouping in one list; `menu_items` and
+  `navigate_menu` share item-only selection semantics across file-tree and text menus.
+  `reef-tui/src/ui/context_menu.rs` owns reusable drawing, placement, scrolling, and hit regions.
+  The file-tree and text-menu panels adapt labels, enabled/checked state, and typed actions.
+  Separators consume layout height and capture clicks while remaining outside keyboard selection.
+- File-tree row splices carry `base_revision` (the preceding structure change) and `revision`
+  (the resulting change). Intermediate revisions only change presentation. Retain the latest
+  splice across content updates and clear it on structure reset, so hosts can apply an exact
+  delta after coalescing content events without replaying skipped structure changes.
 - `crates/reef-tui/src/keymap.rs` owns shortcut bindings by scope; handlers should dispatch commands, not duplicate key matching tables.
 
 ## App Boundary Guardrails
@@ -78,6 +119,10 @@ Read `references/runtime-architecture.md` before changing `crates/reef-app/src/*
   establishes the boundary. Schema expansion,
   object selection, paging, typed rows, and details must not be reimplemented by a renderer adapter.
 - `reef-app` must not depend on `ratatui`, `crossterm`, or `ratatui-image`.
+- Trusted interactive hosts construct `LocalBackend` with
+  `open_at_with_external_previews`, allowing preview-only reads to follow a workspace entry's
+  symlink target outside the workspace. `reef-agent` and other untrusted request boundaries use
+  `open_at`; all non-preview reads and every write remain workspace-bound.
 - Worker result merge paths belong in `reef-app`; TUI may adapt terminal-only payloads such as image protocol state before dispatching the merge command.
 - `scripts/check-architecture.sh` is the cheap CI tripwire. If it blocks a legitimate change, prefer changing the whitelist with a short explanation over adding another bypass.
 

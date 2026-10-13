@@ -193,7 +193,7 @@ fn unstage_paths_without_head_removes_index_entries() {
 }
 
 #[test]
-fn restore_file_reverts_workdir_to_head() {
+fn restore_file_without_staged_changes_reverts_workdir_to_head() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, raw) = tempdir_repo();
     commit_file(&raw, "a.txt", "v1", "init");
@@ -206,6 +206,123 @@ fn restore_file_reverts_workdir_to_head() {
     let (staged, unstaged) = repo.get_status();
     assert!(staged.is_empty());
     assert!(unstaged.is_empty());
+}
+
+#[test]
+fn restore_file_preserves_staged_version() {
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "a.txt", "HEAD\n", "init");
+    write_file(&raw, "a.txt", "staged\n");
+    stage_paths_at(tmp.path(), &["a.txt".to_string()]).unwrap();
+    write_file(&raw, "a.txt", "unstaged\n");
+    let index_before = fs::read(raw.path().join("index")).unwrap();
+    let repo = GitRepo::open_at(tmp.path()).unwrap();
+
+    repo.restore_file("a.txt").unwrap();
+
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+        "staged\n"
+    );
+    assert_eq!(fs::read(raw.path().join("index")).unwrap(), index_before);
+    assert_eq!(
+        raw.status_file(std::path::Path::new("a.txt")).unwrap(),
+        git2::Status::INDEX_MODIFIED
+    );
+}
+
+#[test]
+fn restore_file_with_pathspec_characters_only_restores_selected_path() {
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "a[1].txt", "HEAD\n", "init");
+    commit_file(&raw, "a1.txt", "other\n", "add other");
+    write_file(&raw, "a[1].txt", "staged\n");
+    stage_paths_at(tmp.path(), &["a[1].txt".to_string()]).unwrap();
+    write_file(&raw, "a[1].txt", "unstaged\n");
+    write_file(&raw, "a1.txt", "keep\n");
+    let repo = GitRepo::open_at(tmp.path()).unwrap();
+
+    repo.restore_file("a[1].txt").unwrap();
+
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("a[1].txt")).unwrap(),
+        "staged\n"
+    );
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("a1.txt")).unwrap(),
+        "keep\n"
+    );
+}
+
+#[test]
+fn restore_file_preserves_staged_addition_without_head() {
+    let (tmp, raw) = tempdir_repo();
+    write_file(&raw, "new.txt", "staged\n");
+    stage_paths_at(tmp.path(), &["new.txt".to_string()]).unwrap();
+    write_file(&raw, "new.txt", "unstaged\n");
+    let repo = GitRepo::open_at(tmp.path()).unwrap();
+
+    repo.restore_file("new.txt").unwrap();
+
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("new.txt")).unwrap(),
+        "staged\n"
+    );
+    assert_eq!(
+        raw.status_file(std::path::Path::new("new.txt")).unwrap(),
+        git2::Status::INDEX_NEW
+    );
+}
+
+#[test]
+fn restore_file_after_workdir_deletion_restores_staged_version() {
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "a.txt", "HEAD\n", "init");
+    write_file(&raw, "a.txt", "staged\n");
+    stage_paths_at(tmp.path(), &["a.txt".to_string()]).unwrap();
+    fs::remove_file(tmp.path().join("a.txt")).unwrap();
+    let repo = GitRepo::open_at(tmp.path()).unwrap();
+
+    repo.restore_file("a.txt").unwrap();
+
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+        "staged\n"
+    );
+    assert_eq!(
+        raw.status_file(std::path::Path::new("a.txt")).unwrap(),
+        git2::Status::INDEX_MODIFIED
+    );
+}
+
+#[test]
+fn restore_file_recreated_after_staged_deletion_preserves_deletion() {
+    let (tmp, raw) = tempdir_repo();
+    commit_file(&raw, "a.txt", "HEAD\n", "init");
+    fs::remove_file(tmp.path().join("a.txt")).unwrap();
+    stage_paths_at(tmp.path(), &["a.txt".to_string()]).unwrap();
+    write_file(&raw, "a.txt", "recreated\n");
+    let repo = GitRepo::open_at(tmp.path()).unwrap();
+
+    repo.restore_file("a.txt").unwrap();
+
+    assert!(!tmp.path().join("a.txt").exists());
+    assert_eq!(
+        raw.status_file(std::path::Path::new("a.txt")).unwrap(),
+        git2::Status::INDEX_DELETED
+    );
+}
+
+#[test]
+fn restore_file_removes_untracked_file() {
+    let (tmp, raw) = tempdir_repo();
+    write_file(&raw, "new.txt", "untracked\n");
+    let repo = GitRepo::open_at(tmp.path()).unwrap();
+
+    repo.restore_file("new.txt").unwrap();
+
+    assert!(!tmp.path().join("new.txt").exists());
+    assert!(raw.index().unwrap().is_empty());
 }
 
 #[test]

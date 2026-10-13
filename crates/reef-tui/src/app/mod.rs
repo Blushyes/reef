@@ -404,6 +404,7 @@ impl App {
             engine: reef_app::ReefApp::new(reef_app::AppConfig {
                 backend,
                 prefs: AppPrefs {
+                    file_tree_sort: reef_io::prefs::file_tree_sort(),
                     diff_layout: saved_layout,
                     diff_mode: saved_mode,
                     status_tree_mode: crate::prefs::get_bool("status.tree_mode"),
@@ -1167,6 +1168,15 @@ impl App {
             .dispatch(reef_app::AppCommand::CloseTreeContextMenu);
     }
 
+    fn set_file_tree_sort(&mut self, sort: reef_core::file_tree::FileTreeSort) {
+        self.engine
+            .dispatch(reef_app::AppCommand::SetFileTreeSort(sort));
+        crate::prefs::set(
+            reef_core::prefs::FILE_TREE_SORT,
+            &serde_json::to_string(&sort).expect("file-tree sort settings serialize"),
+        );
+    }
+
     /// Translate a picked `ContextMenuItem` into the corresponding
     /// App action. Called from `input` when the user clicks / keys
     /// on a menu row.
@@ -1181,7 +1191,9 @@ impl App {
             return;
         }
         let target_idx = self.engine.selected_tree_context_menu_target();
-        self.close_tree_context_menu();
+        if item != I::SortBy {
+            self.close_tree_context_menu();
+        }
         // The right-click menu stamps `target_entry_idx` independently
         // of `file_tree.selected`. For clipboard / path actions we
         // want them to operate on the right-clicked row, even if the
@@ -1190,6 +1202,24 @@ impl App {
         // active multi-selection containing the row.
         let anchor_paths = |this: &Self| this.engine.context_menu_action_paths(target_idx);
         match item {
+            I::SortBy => {
+                self.engine.dispatch(reef_app::AppCommand::OpenTreeSortMenu);
+            }
+            I::SortField(field) => {
+                let mut sort = self.engine.file_tree_sort();
+                sort.field = field;
+                self.set_file_tree_sort(sort);
+            }
+            I::SortDirection(direction) => {
+                let mut sort = self.engine.file_tree_sort();
+                sort.direction = direction;
+                self.set_file_tree_sort(sort);
+            }
+            I::FoldersFirst => {
+                let mut sort = self.engine.file_tree_sort();
+                sort.folders_first = !sort.folders_first;
+                self.set_file_tree_sort(sort);
+            }
             I::Cut => {
                 let paths = anchor_paths(self);
                 self.mark_cut(paths);
@@ -2907,6 +2937,7 @@ impl App {
             ClickAction::TreeContextMenuClose => {
                 self.close_tree_context_menu();
             }
+            ClickAction::ContextMenuSeparator => {}
             ClickAction::SelectionContextMenuItem(item) => {
                 self.dispatch_selection_context_menu_item(item);
             }

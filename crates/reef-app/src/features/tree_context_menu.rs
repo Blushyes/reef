@@ -14,6 +14,13 @@
 //! The menu is cheap overlay state. Input adapters decide whether a click
 //! picks an item or closes the menu.
 
+use reef_core::file_tree::{FileTreeSortDirection, FileTreeSortField};
+use reef_core::menu::{
+    MenuEntry,
+    MenuEntry::{Item, Separator},
+    menu_items, navigate_menu,
+};
+
 /// A single action offered by the right-click menu. Most items carry
 /// enough context on themselves that the dispatch side doesn't need
 /// to look at the menu's anchor — but the anchor still matters for
@@ -50,6 +57,11 @@ pub enum ContextMenuItem {
     CopyPath,
     /// "Copy Relative Path" — same as `CopyPath` but workdir-relative.
     CopyRelativePath,
+    /// Opens the sibling-ordering submenu.
+    SortBy,
+    SortField(FileTreeSortField),
+    SortDirection(FileTreeSortDirection),
+    FoldersFirst,
     /// "Reveal in Finder / File Explorer" — shells out to the platform
     /// file manager. Unsupported hosts report a toast instead.
     RevealInFinder,
@@ -59,30 +71,46 @@ impl ContextMenuItem {
     /// Fixed ordering for rendering — matches VSCode's menu grouping
     /// (clipboard ops first, then create, then modify, then path
     /// helpers, then reveal).
-    pub const ALL_FOR_ENTRY: &'static [ContextMenuItem] = &[
-        ContextMenuItem::Cut,
-        ContextMenuItem::Copy,
-        ContextMenuItem::Paste,
-        ContextMenuItem::Duplicate,
-        ContextMenuItem::NewFile,
-        ContextMenuItem::NewFolder,
-        ContextMenuItem::Rename,
-        ContextMenuItem::Delete,
-        ContextMenuItem::CopyPath,
-        ContextMenuItem::CopyRelativePath,
-        ContextMenuItem::RevealInFinder,
+    pub const ALL_FOR_ENTRY: &'static [MenuEntry<ContextMenuItem>] = &[
+        Item(Self::Cut),
+        Item(Self::Copy),
+        Item(Self::Paste),
+        Item(Self::Duplicate),
+        Separator,
+        Item(Self::NewFile),
+        Item(Self::NewFolder),
+        Separator,
+        Item(Self::Rename),
+        Item(Self::Delete),
+        Separator,
+        Item(Self::CopyPath),
+        Item(Self::CopyRelativePath),
+        Separator,
+        Item(Self::SortBy),
+        Separator,
+        Item(Self::RevealInFinder),
     ];
 
-    /// Menu items offered when the user right-clicks empty space or
-    /// the project root. No specific entry is anchored, so per-entry
-    /// actions (Cut / Copy / Rename / Delete / Duplicate / paths) are
-    /// not offered. Paste *is* offered — clipboard contents drop into
-    /// the project root.
-    pub const ALL_FOR_ROOT: &'static [ContextMenuItem] = &[
-        ContextMenuItem::Paste,
-        ContextMenuItem::NewFile,
-        ContextMenuItem::NewFolder,
-        ContextMenuItem::RevealInFinder,
+    /// Empty-space menus offer workspace creation, paste, sorting, and reveal.
+    pub const ALL_FOR_ROOT: &'static [MenuEntry<ContextMenuItem>] = &[
+        Item(Self::Paste),
+        Item(Self::NewFile),
+        Item(Self::NewFolder),
+        Separator,
+        Item(Self::SortBy),
+        Separator,
+        Item(Self::RevealInFinder),
+    ];
+
+    pub const SORT_ITEMS: &'static [MenuEntry<ContextMenuItem>] = &[
+        Item(Self::SortField(FileTreeSortField::Name)),
+        Item(Self::SortField(FileTreeSortField::Kind)),
+        Item(Self::SortField(FileTreeSortField::Modified)),
+        Separator,
+        Item(Self::SortDirection(FileTreeSortDirection::Ascending)),
+        Item(Self::SortDirection(FileTreeSortDirection::Descending)),
+        Separator,
+        Item(Self::FoldersFirst),
     ];
 
     /// Whether this menu item is currently actionable. `Paste` is the
@@ -98,11 +126,9 @@ impl ContextMenuItem {
 
 #[derive(Debug, Default)]
 pub struct ContextMenuState {
-    /// `true` while the menu is visible and owns input. Input
-    /// dispatch short-circuits: `↑`/`↓` move selection, `Enter`
-    /// fires the highlighted item, `Esc` closes, any other key
-    /// closes (best-guess of user intent — VSCode also dismisses
-    /// the menu on unrelated input).
+    /// `true` while the menu owns input. Up/Down move selection,
+    /// Enter activates an item, Right enters sorting, and Left/Escape
+    /// returns to the parent or dismisses the root menu.
     pub active: bool,
 
     /// Anchor in renderer cells — top-left of the menu popup. Set by
@@ -120,13 +146,13 @@ pub struct ContextMenuState {
 
     /// Items offered — `ALL_FOR_ENTRY` when an entry was clicked,
     /// `ALL_FOR_ROOT` when the click missed all rows.
-    pub items: Vec<ContextMenuItem>,
+    pub entries: Vec<MenuEntry<ContextMenuItem>>,
 
-    /// Index into `items` of the keyboard-highlighted row. Mouse
-    /// hover updates this on every frame via the hit registry +
-    /// render-time recompute (the menu is redrawn each frame, so
-    /// we can afford to reset from hover each render).
+    /// Item index of the highlighted parent row, excluding separators.
     pub selected: usize,
+
+    /// Highlighted sort row while the submenu owns keyboard input.
+    pub sort_selected: Option<usize>,
 }
 
 impl ContextMenuState {
@@ -137,12 +163,13 @@ impl ContextMenuState {
         self.active = true;
         self.anchor = anchor;
         self.target_entry_idx = target_entry_idx;
-        self.items = if target_entry_idx.is_some() {
+        self.entries = if target_entry_idx.is_some() {
             ContextMenuItem::ALL_FOR_ENTRY.to_vec()
         } else {
             ContextMenuItem::ALL_FOR_ROOT.to_vec()
         };
         self.selected = 0;
+        self.sort_selected = None;
     }
 
     pub fn close(&mut self) {
@@ -152,18 +179,55 @@ impl ContextMenuState {
     /// Wrap-around navigation on `↑`/`↓` — matches quick-open and
     /// global-search palette behaviour.
     pub fn navigate(&mut self, delta: i32) {
-        if self.items.is_empty() {
-            return;
-        }
-        let n = self.items.len() as i32;
-        let mut idx = self.selected as i32 + delta;
-        // Rust `%` follows sign of the lhs; clamp manually.
-        idx = idx.rem_euclid(n);
-        self.selected = idx as usize;
+        let (selected, entries) = match self.sort_selected.as_mut() {
+            Some(selected) => (selected, ContextMenuItem::SORT_ITEMS),
+            None => (&mut self.selected, self.entries.as_slice()),
+        };
+        *selected = navigate_menu(entries, *selected, delta);
     }
 
     pub fn current(&self) -> Option<ContextMenuItem> {
-        self.items.get(self.selected).cloned()
+        match self.sort_selected {
+            Some(selected) => menu_items(ContextMenuItem::SORT_ITEMS)
+                .nth(selected)
+                .cloned(),
+            None => menu_items(&self.entries).nth(self.selected).cloned(),
+        }
+    }
+
+    pub fn open_sort(&mut self) {
+        if self.active
+            && let Some(index) =
+                menu_items(&self.entries).position(|item| *item == ContextMenuItem::SortBy)
+        {
+            self.selected = index;
+            self.sort_selected = Some(0);
+        }
+    }
+
+    pub fn back(&mut self) {
+        if self.sort_selected.take().is_none() {
+            self.close();
+        }
+    }
+
+    pub fn hover(&mut self, item: &ContextMenuItem) {
+        if !self.active {
+            return;
+        }
+        if let Some(index) = menu_items(&self.entries).position(|candidate| candidate == item) {
+            self.selected = index;
+            if *item == ContextMenuItem::SortBy {
+                self.sort_selected.get_or_insert(0);
+            } else {
+                self.sort_selected = None;
+            }
+        } else if self.sort_selected.is_some()
+            && let Some(index) =
+                menu_items(ContextMenuItem::SORT_ITEMS).position(|candidate| candidate == item)
+        {
+            self.sort_selected = Some(index);
+        }
     }
 }
 
@@ -175,7 +239,7 @@ mod tests {
     fn default_is_closed() {
         let m = ContextMenuState::default();
         assert!(!m.active);
-        assert!(m.items.is_empty());
+        assert!(m.entries.is_empty());
     }
 
     #[test]
@@ -185,7 +249,7 @@ mod tests {
         assert!(m.active);
         assert_eq!(m.anchor, (10, 5));
         assert_eq!(m.target_entry_idx, Some(3));
-        assert_eq!(m.items.len(), ContextMenuItem::ALL_FOR_ENTRY.len());
+        assert_eq!(m.entries.len(), ContextMenuItem::ALL_FOR_ENTRY.len());
         // Cut comes first under the VSCode-style ordering.
         assert_eq!(m.current(), Some(ContextMenuItem::Cut));
     }
@@ -194,15 +258,15 @@ mod tests {
     fn open_without_entry_shows_root_menu() {
         let mut m = ContextMenuState::default();
         m.open((0, 0), None);
-        assert_eq!(m.items.len(), ContextMenuItem::ALL_FOR_ROOT.len());
+        assert_eq!(m.entries.len(), ContextMenuItem::ALL_FOR_ROOT.len());
         // Per-entry actions must NOT be offered on the root context.
-        assert!(!m.items.contains(&ContextMenuItem::Rename));
-        assert!(!m.items.contains(&ContextMenuItem::Delete));
-        assert!(!m.items.contains(&ContextMenuItem::Cut));
-        assert!(!m.items.contains(&ContextMenuItem::Copy));
-        assert!(!m.items.contains(&ContextMenuItem::Duplicate));
+        assert!(!m.entries.contains(&Item(ContextMenuItem::Rename)));
+        assert!(!m.entries.contains(&Item(ContextMenuItem::Delete)));
+        assert!(!m.entries.contains(&Item(ContextMenuItem::Cut)));
+        assert!(!m.entries.contains(&Item(ContextMenuItem::Copy)));
+        assert!(!m.entries.contains(&Item(ContextMenuItem::Duplicate)));
         // Paste is offered at the root — clipboard targets project root.
-        assert!(m.items.contains(&ContextMenuItem::Paste));
+        assert!(m.entries.contains(&Item(ContextMenuItem::Paste)));
     }
 
     #[test]
@@ -219,23 +283,26 @@ mod tests {
     fn entry_menu_grouping_matches_vscode() {
         // First four are clipboard ops; lock the order so a stray
         // refactor that reorders the const surfaces here.
-        let entry = ContextMenuItem::ALL_FOR_ENTRY;
+        let entry: Vec<_> = menu_items(ContextMenuItem::ALL_FOR_ENTRY)
+            .cloned()
+            .collect();
         assert_eq!(entry[0], ContextMenuItem::Cut);
         assert_eq!(entry[1], ContextMenuItem::Copy);
         assert_eq!(entry[2], ContextMenuItem::Paste);
         assert_eq!(entry[3], ContextMenuItem::Duplicate);
-        // Path-copy actions sit just before Reveal at the bottom.
+        // Path-copy actions are followed by sorting and reveal.
         let n = entry.len();
         assert_eq!(entry[n - 1], ContextMenuItem::RevealInFinder);
-        assert_eq!(entry[n - 2], ContextMenuItem::CopyRelativePath);
-        assert_eq!(entry[n - 3], ContextMenuItem::CopyPath);
+        assert_eq!(entry[n - 2], ContextMenuItem::SortBy);
+        assert_eq!(entry[n - 3], ContextMenuItem::CopyRelativePath);
+        assert_eq!(entry[n - 4], ContextMenuItem::CopyPath);
     }
 
     #[test]
     fn navigate_wraps_around() {
         let mut m = ContextMenuState::default();
         m.open((0, 0), Some(0));
-        let last = m.items.len() - 1;
+        let last = menu_items(&m.entries).count() - 1;
         m.navigate(-1);
         assert_eq!(m.selected, last);
         m.navigate(1);
@@ -248,7 +315,7 @@ mod tests {
         m.open((10, 5), Some(2));
         m.close();
         assert!(!m.active);
-        assert!(m.items.is_empty());
+        assert!(m.entries.is_empty());
         assert_eq!(m.selected, 0);
         assert!(m.target_entry_idx.is_none());
     }

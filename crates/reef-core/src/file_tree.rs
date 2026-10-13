@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 
 use crate::git::FileEntry;
 
+mod sort;
+pub use sort::{DirectoryEntry, FileTreeSort, FileTreeSortDirection, FileTreeSortField};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeEntry {
     pub path: PathBuf,

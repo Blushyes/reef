@@ -92,6 +92,8 @@ pub enum ClickAction {
     /// left-click that misses a menu row falls through to this and
     /// just closes the menu.
     TreeContextMenuClose,
+    /// Inert separator inside a context menu; captures clicks without dismissing it.
+    ContextMenuSeparator,
     /// Pick from a read-only Preview or Diff text context menu.
     SelectionContextMenuItem(crate::selection_context_menu::SelectionContextMenuItem),
     /// Registered screen-wide beneath the text-selection context menu.

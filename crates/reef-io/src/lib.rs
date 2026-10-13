@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crossbeam_channel::Receiver;
 use reef_core::diff::DiffContent;
-pub use reef_core::file_tree::TreeEntry;
+pub use reef_core::file_tree::{DirectoryEntry as DirEntry, FileTreeSort, TreeEntry};
 use reef_core::git::graph::GraphRow;
 use reef_core::git::{CommitDetail, CommitInfo, FileEntry, GitStatusStats, GraphScope, RefLabel};
 use reef_core::preview::PreviewDocument as PreviewContent;
@@ -416,14 +416,6 @@ pub struct WalkResponse {
     pub truncated: bool,
 }
 
-/// One direct child entry returned by `Backend::list_dir`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DirEntry {
-    pub name: String,
-    pub is_dir: bool,
-    pub has_children: bool,
-}
-
 /// One content-search hit, backend-side. Mirrors `global_search::MatchHit`
 /// but the latter lives in the UI layer and carries UI invariants
 /// (truncated `line_text`). We keep the shapes identical so conversion is
@@ -570,6 +562,7 @@ pub trait Backend: Send + Sync {
         &self,
         expanded: &HashSet<PathBuf>,
         git_statuses: &HashMap<String, char>,
+        sort: reef_core::file_tree::FileTreeSort,
     ) -> Result<Vec<TreeEntry>, String>;
 
     /// Load the base file preview (relative path). Honours backend-internal

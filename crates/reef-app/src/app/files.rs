@@ -313,6 +313,16 @@ impl AppState {
         outcome
     }
 
+    pub fn set_file_tree_sort(&mut self, sort: reef_core::file_tree::FileTreeSort) {
+        if self.file_tree.sort == sort {
+            return;
+        }
+        self.file_tree.sort = sort;
+        self.file_tree_revision = self.file_tree_revision.wrapping_add(1).max(1);
+        self.file_tree_subtree_requests.clear();
+        self.refresh_file_tree();
+    }
+
     pub fn refresh_file_tree(&mut self) {
         self.refresh_file_tree_with_target(self.file_tree.selected_path());
     }
@@ -323,6 +333,7 @@ impl AppState {
             FileTreeRebuildIdentity {
                 generation,
                 tree_revision: self.file_tree_revision,
+                sort: self.file_tree.sort,
             },
             Arc::clone(&self.backend),
             self.file_tree.expanded_paths(),
@@ -346,6 +357,7 @@ impl AppState {
             parent_path,
             parent_depth,
             self.file_tree.expanded_paths(),
+            self.file_tree.sort,
         );
     }
 

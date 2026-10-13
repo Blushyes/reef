@@ -6,6 +6,7 @@ pub mod highlight;
 pub mod history;
 pub mod hosts;
 pub mod markdown;
+pub mod menu;
 pub mod nav;
 pub mod prefs;
 pub mod preview;

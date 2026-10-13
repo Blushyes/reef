@@ -193,7 +193,18 @@ fn snapshot_tree_edit_row_new_file() {
     // Kick off a NewFile edit anchored on the first top-level folder so
     // the editable row renders indented one deeper than the folder.
     let parent_dir = std::path::PathBuf::from("src");
-    app.begin_tree_edit(reef_app::TreeEditMode::NewFile, parent_dir, None, Some(0));
+    let parent_index = app
+        .engine
+        .file_tree_entries()
+        .iter()
+        .position(|entry| entry.path == parent_dir)
+        .unwrap();
+    app.begin_tree_edit(
+        reef_app::TreeEditMode::NewFile,
+        parent_dir,
+        None,
+        Some(parent_index),
+    );
 
     let output = render_app(&mut app, 80, 20);
     with_filters(&[], || {
@@ -229,6 +240,17 @@ fn snapshot_tree_context_menu() {
 
     let output = render_app(&mut app, 80, 20);
     with_filters(&[], || insta::assert_snapshot!("tree_context_menu", output));
+
+    app.dispatch_context_menu_item(reef_app::ContextMenuItem::SortBy);
+    let output = render_app(&mut app, 80, 24);
+    with_filters(&[], || insta::assert_snapshot!("tree_sort_submenu", output));
+
+    app.open_tree_context_menu(None, (78, 22));
+    app.dispatch_context_menu_item(reef_app::ContextMenuItem::SortBy);
+    let output = render_app(&mut app, 80, 24);
+    with_filters(&[], || {
+        insta::assert_snapshot!("tree_sort_submenu_left", output)
+    });
 }
 
 /// Wait for the graph worker to populate `rows` and then for the initial

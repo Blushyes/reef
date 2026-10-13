@@ -102,6 +102,7 @@ pub enum AppCommand {
         git_metadata_changed: bool,
         repo_presence_changed: bool,
     },
+    SetFileTreeSort(reef_core::file_tree::FileTreeSort),
     RefreshFileTree,
     RefreshFileTreeWithTarget(Option<PathBuf>),
     RevealFileTreePath(PathBuf),
@@ -552,6 +553,9 @@ pub enum AppCommand {
         anchor: (u16, u16),
     },
     CloseTreeContextMenu,
+    OpenTreeSortMenu,
+    BackTreeContextMenu,
+    HoverTreeContextMenuItem(crate::ContextMenuItem),
     RequestTreeDeleteConfirm {
         path: PathBuf,
         is_dir: bool,

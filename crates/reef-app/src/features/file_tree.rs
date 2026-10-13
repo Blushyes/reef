@@ -4,6 +4,7 @@ pub use reef_core::file_tree::{FileTreeRowsSplice, FileTreeState, TreeEntry};
 
 pub struct FileTree {
     pub root: PathBuf,
+    pub sort: reef_core::file_tree::FileTreeSort,
     pub state: FileTreeState,
 }
 
@@ -11,6 +12,7 @@ impl FileTree {
     pub fn new(workdir: &Path) -> Self {
         Self {
             root: workdir.to_path_buf(),
+            sort: Default::default(),
             state: FileTreeState::default(),
         }
     }

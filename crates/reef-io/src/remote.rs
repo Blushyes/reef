@@ -707,9 +707,18 @@ impl Backend for RemoteBackend {
         &self,
         expanded: &HashSet<PathBuf>,
         git_statuses: &HashMap<String, char>,
+        sort: reef_core::file_tree::FileTreeSort,
     ) -> Result<Vec<TreeEntry>, String> {
         let mut out = Vec::new();
-        walk_remote(self, Path::new(""), expanded, git_statuses, &mut out, 0)?;
+        walk_remote(
+            self,
+            Path::new(""),
+            expanded,
+            git_statuses,
+            &mut out,
+            0,
+            sort,
+        )?;
         Ok(out)
     }
 
@@ -849,6 +858,7 @@ impl Backend for RemoteBackend {
                 name: entry.name,
                 is_dir: entry.is_dir,
                 has_children: entry.has_children,
+                modified_millis: entry.modified_millis,
             })
             .collect())
     }
@@ -1553,19 +1563,11 @@ fn walk_remote(
     git_statuses: &HashMap<String, char>,
     out: &mut Vec<TreeEntry>,
     depth: usize,
+    sort: reef_core::file_tree::FileTreeSort,
 ) -> Result<(), String> {
-    let dir_str = dir.to_string_lossy().to_string();
-    let entries: Vec<DirEntryDto> = backend
-        .request(Request::ReadDir {
-            path: dir_str.clone(),
-        })
-        .map_err(|e| format!("ReadDir {dir_str:?}: {e}"))?;
-    let mut entries: Vec<DirEntryDto> = entries.into_iter().filter(|e| e.name != ".git").collect();
-    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-    });
+    let mut entries = backend.list_dir(dir).map_err(|error| error.to_string())?;
+    entries.retain(|entry| entry.name != ".git");
+    sort.sort_entries(&mut entries);
 
     for entry in entries {
         let rel = if dir.as_os_str().is_empty() {
@@ -1588,7 +1590,7 @@ fn walk_remote(
         });
 
         if entry.is_dir && is_expanded {
-            walk_remote(backend, &rel, expanded, git_statuses, out, depth + 1)?;
+            walk_remote(backend, &rel, expanded, git_statuses, out, depth + 1, sort)?;
         }
     }
     Ok(())

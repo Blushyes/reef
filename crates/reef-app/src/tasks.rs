@@ -480,9 +480,11 @@ struct FileTreeRebuildTask {
 pub struct FileTreeRebuildIdentity {
     pub generation: u64,
     pub tree_revision: u64,
+    pub sort: reef_core::file_tree::FileTreeSort,
 }
 
 struct FileTreeSubtreeTask {
+    sort: reef_core::file_tree::FileTreeSort,
     request_id: u64,
     backend: Arc<dyn Backend>,
     parent_path: PathBuf,
@@ -953,8 +955,10 @@ impl TaskCoordinator {
         parent_path: PathBuf,
         parent_depth: usize,
         expanded: Vec<PathBuf>,
+        sort: reef_core::file_tree::FileTreeSort,
     ) {
         let _ = self.file_tree_subtree_tx.send(FileTreeSubtreeTask {
+            sort,
             request_id,
             backend,
             parent_path,
@@ -1433,6 +1437,7 @@ fn spawn_file_tree_rebuild_worker(
                     task.git_statuses,
                     task.selected_path,
                     task.fallback_selected,
+                    task.identity.sort,
                 );
                 let _ = result_tx.send(WorkerResult::FileTree {
                     generation: task.identity.generation,
@@ -1472,6 +1477,7 @@ fn spawn_file_tree_subtree_workers(
                         task.parent_path,
                         task.parent_depth,
                         task.expanded,
+                        task.sort,
                     );
                     let _ = result_tx.send(WorkerResult::FileTreeSubtree {
                         request_id: task.request_id,
@@ -3149,9 +3155,10 @@ fn build_file_tree_payload(
     git_statuses: HashMap<String, char>,
     selected_path: Option<PathBuf>,
     fallback_selected: usize,
+    sort: reef_core::file_tree::FileTreeSort,
 ) -> Result<FileTreePayload, String> {
     let expanded: std::collections::HashSet<PathBuf> = expanded.into_iter().collect();
-    let entries = backend.build_file_tree(&expanded, &git_statuses)?;
+    let entries = backend.build_file_tree(&expanded, &git_statuses, sort)?;
     let selected_idx = selected_path
         .as_ref()
         .and_then(|path| entries.iter().position(|entry| &entry.path == path))
@@ -3167,6 +3174,7 @@ fn build_file_tree_subtree_payload(
     parent_path: PathBuf,
     parent_depth: usize,
     expanded: Vec<PathBuf>,
+    sort: reef_core::file_tree::FileTreeSort,
 ) -> Result<FileTreeSubtreePayload, String> {
     let expanded: HashSet<PathBuf> = expanded.into_iter().collect();
     let mut entries = Vec::new();
@@ -3176,6 +3184,7 @@ fn build_file_tree_subtree_payload(
         parent_depth + 1,
         &expanded,
         &mut entries,
+        sort,
     )?;
     Ok(FileTreeSubtreePayload {
         parent_path,
@@ -3189,16 +3198,13 @@ fn collect_file_tree_subtree(
     depth: usize,
     expanded: &HashSet<PathBuf>,
     entries: &mut Vec<TreeEntry>,
+    sort: reef_core::file_tree::FileTreeSort,
 ) -> Result<(), String> {
     let mut children = backend
         .list_dir(parent_path)
         .map_err(|error| error.to_string())?;
     children.retain(|entry| entry.name != ".git");
-    children.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-    });
+    sort.sort_entries(&mut children);
 
     for child in children {
         let path = parent_path.join(&child.name);
@@ -3213,7 +3219,7 @@ fn collect_file_tree_subtree(
             git_status: None,
         });
         if is_expanded {
-            collect_file_tree_subtree(backend, &path, depth + 1, expanded, entries)?;
+            collect_file_tree_subtree(backend, &path, depth + 1, expanded, entries, sort)?;
         }
     }
     Ok(())
@@ -3242,6 +3248,7 @@ mod file_tree_subtree_tests {
             PathBuf::from("src"),
             0,
             vec![PathBuf::from("src"), PathBuf::from("src/nested")],
+            Default::default(),
         )
         .unwrap();
 
@@ -3275,6 +3282,7 @@ mod file_tree_worker_coalescing_tests {
             identity: FileTreeRebuildIdentity {
                 generation,
                 tree_revision: generation,
+                sort: Default::default(),
             },
             backend: backend(),
             expanded: Vec::new(),

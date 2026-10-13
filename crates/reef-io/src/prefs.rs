@@ -45,6 +45,13 @@ pub fn get(key: &str) -> Option<String> {
     read_all().get(key).cloned()
 }
 
+/// Restores the shared tree ordering; absent or invalid preferences use the default.
+pub fn file_tree_sort() -> reef_core::file_tree::FileTreeSort {
+    get(reef_core::prefs::FILE_TREE_SORT)
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default()
+}
+
 /// Returns `true` only when the persisted value is the literal `"true"`.
 pub fn get_bool(key: &str) -> bool {
     reef_core::prefs::bool_value(&read_all(), key)

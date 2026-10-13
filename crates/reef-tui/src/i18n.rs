@@ -1209,6 +1209,7 @@ pub fn tree_reveal_unsupported_platform() -> String {
 /// `ContextMenuItem` so the render loop can map 1:1.
 pub fn tree_context_menu_label(item: &reef_app::ContextMenuItem) -> &'static str {
     use reef_app::ContextMenuItem as I;
+    use reef_core::file_tree::{FileTreeSortDirection as D, FileTreeSortField as F};
     match (lang(), item) {
         (Lang::Zh, I::Cut) => "剪切",
         (Lang::En, I::Cut) => "Cut",
@@ -1230,6 +1231,20 @@ pub fn tree_context_menu_label(item: &reef_app::ContextMenuItem) -> &'static str
         (Lang::En, I::CopyPath) => "Copy Path",
         (Lang::Zh, I::CopyRelativePath) => "复制相对路径",
         (Lang::En, I::CopyRelativePath) => "Copy Relative Path",
+        (Lang::Zh, I::SortBy) => "排序方式 ▸",
+        (Lang::En, I::SortBy) => "Sort By ▸",
+        (Lang::Zh, I::SortField(F::Name)) => "名称",
+        (Lang::En, I::SortField(F::Name)) => "Name",
+        (Lang::Zh, I::SortField(F::Kind)) => "类型",
+        (Lang::En, I::SortField(F::Kind)) => "Kind",
+        (Lang::Zh, I::SortField(F::Modified)) => "修改时间",
+        (Lang::En, I::SortField(F::Modified)) => "Date Modified",
+        (Lang::Zh, I::SortDirection(D::Ascending)) => "升序",
+        (Lang::En, I::SortDirection(D::Ascending)) => "Ascending",
+        (Lang::Zh, I::SortDirection(D::Descending)) => "降序",
+        (Lang::En, I::SortDirection(D::Descending)) => "Descending",
+        (Lang::Zh, I::FoldersFirst) => "目录优先",
+        (Lang::En, I::FoldersFirst) => "Folders First",
         (Lang::Zh, I::RevealInFinder) => "在 Finder 中显示",
         (Lang::En, I::RevealInFinder) => "Reveal in Finder",
     }

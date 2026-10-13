@@ -2030,8 +2030,18 @@ fn handle_key_tree_edit(key: KeyEvent, app: &mut App) {
 
 /// Keyboard navigation for the right-click context menu popup.
 fn handle_key_tree_context_menu(key: KeyEvent, app: &mut App) {
+    app.hover_row = None;
+    app.hover_col = None;
     match Keymap::resolve(InputScope::TreeContextMenu, &key) {
-        Some(Command::Close) | Some(Command::Quit) => app.close_tree_context_menu(),
+        Some(Command::Close) | Some(Command::MoveLeft) => {
+            app.engine.dispatch(AppCommand::BackTreeContextMenu);
+        }
+        Some(Command::Quit) => app.close_tree_context_menu(),
+        Some(Command::MoveRight) => {
+            if app.engine.tree_context_menu_current() == Some(reef_app::ContextMenuItem::SortBy) {
+                app.engine.dispatch(AppCommand::OpenTreeSortMenu);
+            }
+        }
         Some(Command::MoveUp) => {
             app.engine.dispatch(AppCommand::NavigateTreeContextMenu(-1));
         }
@@ -2510,6 +2520,7 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
             MouseEventKind::Down(MouseButton::Left) => {
                 match app.hit_registry.hit_test(mouse.column, mouse.row) {
                     Some(action @ ui::mouse::ClickAction::SelectionContextMenuItem(_))
+                    | Some(action @ ui::mouse::ClickAction::ContextMenuSeparator)
                     | Some(action @ ui::mouse::ClickAction::SelectionContextMenuClose) => {
                         app.handle_action(action);
                     }
@@ -2517,6 +2528,40 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
                 }
             }
             MouseEventKind::Down(MouseButton::Right) => app.close_selection_context_menu(),
+            _ => {}
+        }
+        return;
+    }
+
+    if app.engine.tree_context_menu_active() {
+        match mouse.kind {
+            MouseEventKind::Moved => {
+                app.hover_row = Some(mouse.row);
+                app.hover_col = Some(mouse.column);
+                if let Some(ui::mouse::ClickAction::TreeContextMenuItem(item)) =
+                    app.hit_registry.hit_test(mouse.column, mouse.row)
+                {
+                    app.engine
+                        .dispatch(AppCommand::HoverTreeContextMenuItem(item));
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                match app.hit_registry.hit_test(mouse.column, mouse.row) {
+                    Some(action @ ui::mouse::ClickAction::TreeContextMenuItem(_))
+                    | Some(action @ ui::mouse::ClickAction::ContextMenuSeparator)
+                    | Some(action @ ui::mouse::ClickAction::TreeContextMenuClose) => {
+                        app.handle_action(action)
+                    }
+                    _ => app.close_tree_context_menu(),
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) => app.close_tree_context_menu(),
+            MouseEventKind::ScrollUp => {
+                app.engine.dispatch(AppCommand::NavigateTreeContextMenu(-1));
+            }
+            MouseEventKind::ScrollDown => {
+                app.engine.dispatch(AppCommand::NavigateTreeContextMenu(1));
+            }
             _ => {}
         }
         return;
@@ -2603,12 +2648,6 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
             && !app.engine.tree_edit_active()
             && app.engine.confirm_request().is_none()
         {
-            // Second right-click while the menu is already open
-            // dismisses it (Finder / VSCode behaviour).
-            if app.engine.tree_context_menu_active() {
-                app.close_tree_context_menu();
-                return;
-            }
             let opens_menu = match app.hit_registry.hit_test(mouse.column, mouse.row) {
                 Some(ui::mouse::ClickAction::TreeClick(idx)) => Some(Some(idx)),
                 Some(ui::mouse::ClickAction::TreeClearSelection) => Some(None),
@@ -2620,12 +2659,6 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
             return;
         }
     }
-
-    // Clicks while the context menu is open: left-click outside the
-    // menu closes it; hit_registry routing to `TreeContextMenuItem`
-    // happens through the normal path below.
-    // (The fallthrough-close region is registered by the menu renderer
-    // underneath the menu panel, so it goes through handle_action.)
 
     // Find widget mouse intercept: when the user clicks a widget hit
     // zone (close `×`, prev/next arrows, Aa/ab/.* toggles), route

@@ -77,6 +77,24 @@ Read `references/runtime-architecture.md` before changing `crates/reef-app/src/*
 - `crates/reef-tui/src/input.rs` owns key/mouse routing; use `AppCommand` / `TuiApp::set_active_tab` instead of assigning `active_tab` directly.
 - `crates/reef-tui/src/input_edit{,_multi}.rs` and `crates/reef-tui/src/picker_core.rs` own the shared text-input vocabulary. Don't hand-roll a key table; embed one of the three layers (see "Text Input Stack" below).
 - `crates/reef-core/src/file_tree.rs` owns pure file-tree ordering/navigation helpers; `crates/reef-app/src/features/file_tree.rs` owns renderer-neutral file-tree state. `reef-tui` renders snapshots and dispatches commands only.
+- `SetFileTreeSort` owns sibling ordering at every tree depth. The core `FileTreeSort`
+  comparator supports name, extension-based kind, and modification time with an independent
+  direction and default-enabled folders-first setting. When enabled, directories precede
+  files and both groups follow the selected ordering; otherwise siblings sort together.
+  Directory timestamps are their own filesystem modification times. Full-tree and subtree workers capture the same typed settings.
+  Sort changes invalidate older rebuild/subtree requests and preserve expansion and selection.
+  Hosts seed `AppPrefs.file_tree_sort` from the shared `file_tree.sort` preference. Backend
+  directory entries carry optional modification timestamps; unavailable timestamps sort last.
+  The TUI exposes these settings through the file-tree context menu's `Sort By` submenu,
+  including checked field/direction and Folders First rows. Menu navigation stays in
+  `ContextMenuState`; TUI keyboard/mouse adapters dispatch commands, and render only lays out
+  the parent/submenu and hit regions. Sort choices dispatch the shared `SetFileTreeSort` command.
+- Grouped menus use `reef_core::menu::MenuEntry<T>` with explicit `Item` and `Separator`
+  entries. Features declare their order and grouping in one list; `menu_items` and
+  `navigate_menu` share item-only selection semantics across file-tree and text menus.
+  `reef-tui/src/ui/context_menu.rs` owns reusable drawing, placement, scrolling, and hit regions.
+  The file-tree and text-menu panels adapt labels, enabled/checked state, and typed actions.
+  Separators consume layout height and capture clicks while remaining outside keyboard selection.
 - File-tree row splices carry `base_revision` (the preceding structure change) and `revision`
   (the resulting change). Intermediate revisions only change presentation. Retain the latest
   splice across content updates and clear it on structure reset, so hosts can apply an exact

@@ -472,6 +472,7 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
                         name: entry.name,
                         is_dir: entry.is_dir,
                         has_children: entry.has_children,
+                        modified_millis: entry.modified_millis,
                     })
                     .collect::<Vec<_>>(),
             )

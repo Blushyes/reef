@@ -202,7 +202,7 @@ fn extract_symbols(
             if start.row != end.row {
                 continue;
             }
-            let snippet = snippet_for(source, start.row, start.column..end.column);
+            let snippet = snippet_for(parse, start.row, start.column..end.column);
             out.entry(text.to_owned()).or_default().push(SymbolLoc {
                 path: rel_path.to_path_buf(),
                 line: start.row,
@@ -221,11 +221,11 @@ pub(super) struct NavigationSnippet {
 }
 
 pub(super) fn snippet_for(
-    source: &[u8],
+    parse: &super::FileParse,
     line: usize,
     target_byte_range: Range<usize>,
 ) -> NavigationSnippet {
-    snippet_from_line(super::line_bytes_at(source, line), target_byte_range)
+    snippet_from_line(parse.line_bytes(line), target_byte_range)
 }
 
 fn snippet_from_line(line: &[u8], target_byte_range: Range<usize>) -> NavigationSnippet {
@@ -377,6 +377,43 @@ const GO_REF_QUERY: &str = r#"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_workspace_file_preserves_symbol_locations_and_snippets() {
+        let line_count = 4_000;
+        let source_line = "    fn café() { café(); }\r\n";
+        let source = source_line.repeat(line_count);
+        assert!(source.len() as u64 <= MAX_FILE_BYTES_INDEX);
+        let index = build_workspace_index(
+            PathBuf::new(),
+            [WorkspaceIndexFile {
+                path: PathBuf::from("large.rs"),
+                source: Arc::from(source.into_bytes()),
+            }],
+        );
+
+        assert_eq!(index.file_count, 1);
+        let definitions = &index.defs_by_name["café"];
+        let references = &index.refs_by_name["café"];
+        assert_eq!(definitions.len(), line_count);
+        assert_eq!(references.len(), line_count * 2);
+        for (line, definition) in definitions.iter().enumerate() {
+            assert_eq!(definition.line, line);
+            assert_eq!(definition.byte_range, 7..12);
+        }
+        for (offset, reference) in references.iter().enumerate() {
+            assert_eq!(reference.line, offset / 2);
+            assert_eq!(
+                reference.byte_range,
+                if offset % 2 == 0 { 7..12 } else { 17..22 }
+            );
+        }
+        for symbol in definitions.iter().chain(references) {
+            assert_eq!(symbol.path, Path::new("large.rs"));
+            assert_eq!(symbol.snippet, "fn café() { café(); }\r");
+            assert_eq!(&symbol.snippet[symbol.snippet_match_range.clone()], "café");
+        }
+    }
 
     fn symbol(path: &str, line: usize, lang: NavLang) -> SymbolLoc {
         SymbolLoc {

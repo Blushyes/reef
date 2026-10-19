@@ -38,6 +38,7 @@ pub struct FileParse {
     pub language: NavLang,
     pub tree: tree_sitter::Tree,
     pub source: Arc<[u8]>,
+    line_starts: Vec<usize>,
 }
 
 impl FileParse {
@@ -45,6 +46,19 @@ impl FileParse {
     /// slice into a node's range without cloning the Arc.
     pub fn source(&self) -> &[u8] {
         &self.source
+    }
+
+    /// Look up a source line in constant time using the offsets built with
+    /// the parse. Excludes the newline and preserves all other source bytes.
+    fn line_bytes(&self, line: usize) -> &[u8] {
+        let Some(&start) = self.line_starts.get(line) else {
+            return &[];
+        };
+        let end = self
+            .line_starts
+            .get(line + 1)
+            .map_or(self.source.len(), |next| next - 1);
+        &self.source[start..end]
     }
 }
 
@@ -78,10 +92,17 @@ pub fn parse_file_if_supported(lang: NavLang, source: Arc<[u8]>) -> Option<FileP
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&lang.language()).ok()?;
     let tree = parser.parse(&*source, None)?;
+    let mut line_starts = vec![0];
+    for (offset, byte) in source.iter().enumerate() {
+        if *byte == b'\n' {
+            line_starts.push(offset + 1);
+        }
+    }
     Some(FileParse {
         language: lang,
         tree,
         source,
+        line_starts,
     })
 }
 
@@ -342,6 +363,26 @@ mod tests {
     fn line_bytes_at_out_of_range_is_empty() {
         let src = b"only\n";
         assert_eq!(line_bytes_at(src, 9), b"");
+    }
+
+    #[test]
+    fn parsed_file_lines_preserve_source_bytes_and_endings() {
+        let sources: &[&[u8]] = &[
+            b"",
+            b"\n",
+            b"alpha\n\nbeta\n",
+            "café\r\n中文\nlast".as_bytes(),
+            b"\xff\nend",
+        ];
+        for &source in sources {
+            let parse = parse_file_if_supported(NavLang::Rust, Arc::from(source)).unwrap();
+            let expected: Vec<&[u8]> = source.split(|byte| *byte == b'\n').collect();
+            for (line, &bytes) in expected.iter().enumerate().rev() {
+                assert_eq!(parse.line_bytes(line), bytes);
+            }
+            assert_eq!(parse.line_bytes(expected.len()), b"");
+            assert_eq!(parse.line_bytes(usize::MAX), b"");
+        }
     }
 
     #[test]

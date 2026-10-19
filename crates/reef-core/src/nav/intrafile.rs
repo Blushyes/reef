@@ -17,6 +17,7 @@ use std::sync::OnceLock;
 
 use tree_sitter::{Query, QueryCursor, StreamingIterator};
 
+use super::workspace::snippet_for;
 use super::{Cursor, FileParse, Location, NavLang};
 
 /// Find every same-file definition whose name matches the identifier
@@ -64,7 +65,7 @@ pub fn resolve_definition_intrafile(parse: &FileParse, cursor: Cursor) -> Vec<Lo
             {
                 continue;
             }
-            let snippet = snippet_for(source, start.row, start.column..end.column);
+            let snippet = snippet_for(parse, start.row, start.column..end.column);
             out.push(Location {
                 path: None,
                 line: start.row,
@@ -81,14 +82,6 @@ pub fn resolve_definition_intrafile(parse: &FileParse, cursor: Cursor) -> Vec<Lo
     out.sort_by_key(|loc| (loc.line, loc.byte_range.start));
     out.dedup_by(|a, b| a.line == b.line && a.byte_range.start == b.byte_range.start);
     out
-}
-
-fn snippet_for(
-    source: &[u8],
-    line: usize,
-    target_byte_range: std::ops::Range<usize>,
-) -> super::workspace::NavigationSnippet {
-    super::workspace::snippet_for(source, line, target_byte_range)
 }
 
 /// Sibling-module wrapper so `crate::nav::workspace` can share the

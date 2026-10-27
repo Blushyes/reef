@@ -5,7 +5,7 @@ description: How to cut a reef release — version bump, tag push, and the GitHu
 
 # Releasing reef
 
-Reef releases are driven by **git tags matching `v*`**. Pushing such a tag is the single trigger for `.github/workflows/release.yml`, which does the rest automatically: `reef` + `reef-agent` binaries for five targets, npm publish of `@reef-tui/cli` + five platform subpackages, GitHub Release with assets. You never run `cargo publish`, never `npm publish` by hand, never upload binaries manually. The contract is **bump Cargo.toml, commit, tag, push**.
+Reef releases are driven by **git tags matching `v*`**. Pushing such a tag is the single trigger for `.github/workflows/release.yml`, which does the rest automatically: `reef` + `reef-agent` binaries for five targets, npm publish of `@reef-tui/cli` + five platform subpackages, GitHub Release with assets, and a Homebrew tap update for stable tags. You never run `cargo publish`, never `npm publish` by hand, never upload binaries manually. The contract is **bump Cargo.toml, commit, tag, push**.
 
 ## What a `v*` tag push actually runs
 
@@ -23,10 +23,21 @@ Reef releases are driven by **git tags matching `v*`**. Pushing such a tag is th
    - Attaches ten archives — `reef-{darwin-arm64,darwin-x64,linux-arm64,linux-x64}.tar.gz` + `reef-win32-x64.zip`, and the same set prefixed `reef-agent-`. The standalone agent archives are for users running it outside the upload-fallback path (e.g. preseeding it on a remote host).
    - Has `generate_release_notes: true` — this **appends** auto-generated `## What's Changed` notes to whatever body the release already has; it does not overwrite a pre-existing body.
 
+5. **Homebrew tap** — after `github-release` succeeds, stable tags call
+   `.github/workflows/homebrew.yml`. It downloads the four macOS/Linux Reef archives,
+   computes their SHA-256 checksums with `scripts/homebrew-formula.py`, and commits
+   `Formula/reef.rb` to `Blushyes/homebrew-tap`. The formula installs `reef` and the
+   `rf` alias. Tags containing `-` skip this job.
+
 Implications:
 - The source `package.json` versions (`0.0.0`) are placeholders — the tag is authoritative for npm.
 - Deleting a tag after push does **not** unpublish npm packages. You have a 72h unpublish window on npm; beyond that, cut a patch release.
 - `NPM_TOKEN` repo secret must be valid. Expired token → silent failure on npm steps while the GitHub Release still succeeds.
+- `HOMEBREW_TAP_DEPLOY_KEY` is a private SSH key stored as a Reef repository secret;
+  its public key must be a write-enabled deploy key on `Blushyes/homebrew-tap`.
+  Homebrew synchronization can be retried independently with
+  `gh workflow run homebrew.yml -f tag=vX.Y.Z`. This downloads the existing release
+  assets and updates only the tap; an unchanged formula produces no commit.
 
 ## Prerequisites
 
@@ -150,6 +161,9 @@ gh run watch --exit-status                         # wait for release.yml to fin
 gh release view "${NEW}"                           # binaries all listed?
 npm view @reef-tui/cli version                     # matches ${NEW#v}?
 npm view @reef-tui/cli-darwin-arm64 version        # and subpackages
+gh run list --repo Blushyes/homebrew-tap --limit 3 # formula installation checks
+brew update
+brew info blushyes/tap/reef                        # version matches the release
 ```
 
 Expected assets on the Release (**10 total**):

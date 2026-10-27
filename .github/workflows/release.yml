@@ -112,6 +112,16 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  publish-homebrew:
+    name: Publish Homebrew formula
+    needs: github-release
+    if: ${{ !contains(github.ref_name, '-') }}
+    uses: ./.github/workflows/homebrew.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets:
+      HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+
   publish-platform-packages:
     name: Publish @reef-tui/cli-${{ matrix.platform }}
     needs: build

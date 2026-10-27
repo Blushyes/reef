@@ -29,6 +29,14 @@ AI 写代码之后，IDE 九成的功能都不需要了。Reef 是剩下的一�
 
 ## 安装
 
+Homebrew（macOS 和 Linux）：
+
+```bash
+brew install blushyes/tap/reef
+```
+
+也可以使用 npm：
+
 ```bash
 npx @reef-tui/cli                # 直接运行
 npm install -g @reef-tui/cli     # 或全局安装

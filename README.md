@@ -29,6 +29,14 @@ Keyboard-first, mouse where it earns its keep. Press `h` in-app for the full key
 
 ## Install
 
+Homebrew (macOS and Linux):
+
+```bash
+brew install blushyes/tap/reef
+```
+
+Or use npm:
+
 ```bash
 npx @reef-tui/cli                # one-off
 npm install -g @reef-tui/cli     # or global

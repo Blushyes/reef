@@ -44,6 +44,17 @@ npm install -g @reef-tui/cli     # 或全局安装
 
 支持：macOS (arm64, x64)、Linux (arm64, x64)、Windows (x64)。也可以 `cargo build --release` 从源码构建。
 
+更新 Homebrew 或 npm 全局安装的版本：
+
+```bash
+reef update
+```
+
+Homebrew 安装会刷新软件包信息，再通过原安装位置的 Homebrew 升级；npm 全局安装通过 npm
+启动器更新。项目内安装请在对应项目运行 `npm install @reef-tui/cli@latest`；临时运行请使用
+`npx @reef-tui/cli@latest`。源码构建和手动下载的二进制需要按原方式重新构建或替换。
+详细说明见 `reef update --help`。打开名为 `update` 的路径请使用 `reef ./update` 或 `reef -- update`。
+
 ```bash
 reef                             # 打开当前目录
 rf                               # 简短别名

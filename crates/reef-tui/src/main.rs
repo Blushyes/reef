@@ -1,3 +1,6 @@
+mod cli;
+mod update;
+
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -23,98 +26,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Minimal argv parsing. Flags recognised:
-///   <PATH>                    Positional: open this local directory instead
-///                             of the current working directory. Supports
-///                             leading `~/` expansion. Mutually exclusive
-///                             with `--ssh` / `--agent-exec`.
-///   --agent-exec <COMMAND>    Spawn the given shell-split command as a
-///                             reef-agent subprocess and drive the UI through
-///                             it. Typical value: `ssh host reef-agent --stdio`.
-///                             This is the power-user / test hook.
-///   --ssh <TARGET>            High-level shortcut. `TARGET` is
-///                             `[user@]host[:remote_path]` — reef will:
-///                             (a) establish an ssh ControlMaster session,
-///                             (b) run the install script to ensure
-///                                 `reef-agent` matching this reef's
-///                                 version lives on the remote, and
-///                             (c) connect to it.
-///   --help / -h               Print usage and exit.
-fn parse_args() -> Result<AppArgs, String> {
-    let mut args = std::env::args().skip(1);
-    let mut agent_exec: Option<String> = None;
-    let mut ssh_target: Option<String> = None;
-    let mut path: Option<String> = None;
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--help" | "-h" => {
-                print_usage();
-                std::process::exit(0);
-            }
-            "--agent-exec" => {
-                agent_exec = Some(
-                    args.next()
-                        .ok_or_else(|| "--agent-exec requires a value".to_string())?,
-                );
-            }
-            "--ssh" => {
-                ssh_target = Some(
-                    args.next()
-                        .ok_or_else(|| "--ssh requires a [user@]host[:path] value".to_string())?,
-                );
-            }
-            other if other.starts_with('-') => {
-                return Err(format!("unknown argument: {other}"));
-            }
-            other => {
-                if path.is_some() {
-                    return Err(format!("unexpected extra path argument: {other}"));
-                }
-                path = Some(other.to_string());
-            }
-        }
-    }
-    let modes = [agent_exec.is_some(), ssh_target.is_some(), path.is_some()]
-        .into_iter()
-        .filter(|b| *b)
-        .count();
-    if modes > 1 {
-        return Err("--agent-exec, --ssh, and <PATH> are mutually exclusive".into());
-    }
-    Ok(AppArgs {
-        agent_exec,
-        ssh_target,
-        path,
-    })
-}
-
-fn print_usage() {
-    eprintln!("reef — terminal UI for git");
-    eprintln!();
-    eprintln!("USAGE:");
-    eprintln!("    reef                            # open cwd with local backend");
-    eprintln!("    reef <DIR>                      # open DIR (supports ~/)");
-    eprintln!(
-        "    reef <FILE>                     # open FILE's parent dir, drop straight into 纯预览"
-    );
-    eprintln!(
-        "    reef --ssh user@host            # open remote HOME on host (agent auto-installed)"
-    );
-    eprintln!("    reef --ssh user@host:/path      # open /path on host");
-    eprintln!(
-        "    reef --agent-exec \"CMD...\"      # advanced: drive reef through a custom agent pipe"
-    );
-    eprintln!();
-    eprintln!("The --agent-exec value is whitespace-split into argv. Typical remote:");
-    eprintln!("    reef --agent-exec \"ssh user@host reef-agent --stdio --workdir /path\"");
-}
-
-struct AppArgs {
-    agent_exec: Option<String>,
-    ssh_target: Option<String>,
-    path: Option<String>,
-}
-
 /// Split a `[user@]host[:path]` target. Returns `(host_with_user, path)`;
 /// `path` defaults to `"."` so the agent opens the remote `$HOME`.
 ///
@@ -130,8 +41,19 @@ fn split_ssh_target(target: &str) -> (String, String) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let parsed = match cli::parse_args(std::env::args().skip(1))? {
+        cli::CliCommand::Open(args) => args,
+        cli::CliCommand::Update => return update::run().map_err(Into::into),
+        cli::CliCommand::Help => {
+            cli::print_usage();
+            return Ok(());
+        }
+        cli::CliCommand::UpdateHelp => {
+            cli::print_update_usage();
+            return Ok(());
+        }
+    };
     editor::install_editor_resolver();
-    let parsed = parse_args()?;
 
     // Set up panic hook to restore terminal
     let original_hook = panic::take_hook();

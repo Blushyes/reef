@@ -67,6 +67,11 @@ Read `references/runtime-architecture.md` before changing `crates/reef-app/src/*
 
 ## File/Module Habits
 
+- Startup CLI parsing lives in `crates/reef-tui/src/cli.rs`; `main.rs` dispatches
+  non-interactive commands before installing terminal hooks or probing the terminal.
+  `update.rs` verifies Homebrew ownership and delegates to the owning package manager.
+  The npm launcher's `bin/update.js` handles global npm updates before starting the
+  native executable, allowing Windows to replace it. These commands do not use app state.
 - `crates/reef-app/src/engine.rs` owns the public mutable app boundary. New mutable business entry points must be represented as `AppCommand`; if a new public `&mut self` method is truly needed, update `scripts/check-architecture.sh` and explain why in the PR.
 - `crates/reef-app/src/app/**` owns renderer-neutral app state orchestration: tab state, async state, result merging, and command side effects.
 - `crates/reef-core/src/**` owns UI-independent git, diff, highlight, markdown, nav/LSP, preview loading, file-op, host parsing, and history logic.
@@ -184,6 +189,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-features
 cargo test --workspace --doc
+node --test npm/cli/test/update.test.js
 ```
 
 Failure modes that keep catching people:

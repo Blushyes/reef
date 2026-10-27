@@ -3,6 +3,10 @@
 
 const { spawnSync } = require('child_process');
 
+if (process.argv.length === 3 && process.argv[2] === 'update') {
+  process.exit(require('./update').runUpdate());
+}
+
 const PLATFORMS = {
   'darwin-arm64': { pkg: '@reef-tui/cli-darwin-arm64', bin: 'reef' },
   'darwin-x64':   { pkg: '@reef-tui/cli-darwin-x64',   bin: 'reef' },

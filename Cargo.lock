@@ -2368,7 +2368,7 @@ dependencies = [
 
 [[package]]
 name = "reef"
-version = "0.44.1"
+version = "0.45.0"
 dependencies = [
  "criterion",
  "crossbeam-channel",
@@ -2452,7 +2452,7 @@ dependencies = [
 
 [[package]]
 name = "reef-io"
-version = "0.44.1"
+version = "0.45.0"
 dependencies = [
  "crossbeam-channel",
  "git2",

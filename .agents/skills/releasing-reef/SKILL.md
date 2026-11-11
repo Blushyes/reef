@@ -17,6 +17,7 @@ Reef releases are driven by **git tags matching `v*`**. Pushing such a tag is th
    - `x86_64-pc-windows-msvc`
 
    Each row uploads two artifacts: `reef-<platform>` and `reef-agent-<platform>`.
+   macOS builds use `macos-15` for Apple Silicon and `macos-15-intel` for Intel.
 2. **npm platform subpackages** — publishes `@reef-tui/cli-{darwin-arm64,darwin-x64,linux-arm64,linux-x64,win32-x64}`. Each subpackage bundles **only the `reef` binary** (the agent is embedded inside it). Each subpackage's `package.json` version is overwritten at publish time to `${TAG#v}`.
 3. **npm main package** — publishes `@reef-tui/cli` with `optionalDependencies` pinned to the same version.
 4. **GitHub Release** — via `softprops/action-gh-release@v2`:
@@ -206,7 +207,7 @@ If you push the tag and walk away, the workflow creates the Release itself (~3 m
 
 ### macOS `dtolnay/rust-toolchain@stable` DNS flakes
 
-The `Install Rust toolchain` step on `macos-14` sometimes fails with `failed to lookup address information` resolving `static.rust-lang.org`. Transient. Rerun just the failed job:
+The `Install Rust toolchain` step on macOS runners can fail with `failed to lookup address information` resolving `static.rust-lang.org`. Transient. Rerun just the failed job:
 
 ```bash
 gh run rerun <run_id> --failed

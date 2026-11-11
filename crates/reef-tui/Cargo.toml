@@ -17,7 +17,7 @@ crossterm     = "0.29.0"
 reef-app     = { path = "../reef-app" }
 reef-core    = { path = "../reef-core" }
 reef-io      = { path = "../reef-io" }
-ratatui       = "0.30.0"
+ratatui       = "0.30.2"
 unicode-width = "0.2.2"
 serde         = { workspace = true }
 serde_json    = { workspace = true }
@@ -41,7 +41,7 @@ image         = { version = "0.25", default-features = false, features = ["png",
 # Used only to seed `.db` fixtures in integration tests for the SQLite
 # preview parity. Same `bundled` flag as `reef-sqlite-preview` so the
 # vendored SQLite C source is shared (no duplicate compile).
-rusqlite     = { version = "0.32", default-features = false, features = ["bundled"] }
+rusqlite     = { version = "0.41", default-features = false, features = ["bundled"] }
 reef-proto   = { path = "../reef-proto" }
 tempfile     = "3"
 

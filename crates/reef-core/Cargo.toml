@@ -9,11 +9,11 @@ publish = false
 workspace = true
 
 [dependencies]
-calamine = "0.36.1"
+calamine = "0.38.0"
 git2 = { version = "0.21.0", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 infer = { version = "0.16", default-features = false }
-pulldown-cmark = { version = "0.13.4", default-features = false }
+pulldown-cmark = { version = "0.13.6", default-features = false }
 reef-sqlite-preview = { path = "../reef-sqlite-preview" }
 regex = "1"
 serde = { workspace = true }
@@ -32,6 +32,6 @@ nucleo-matcher = "0.3"
 
 [dev-dependencies]
 proptest = "1"
-rusqlite = { version = "0.32", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.41", default-features = false, features = ["bundled"] }
 test-support = { path = "../test-support" }
 tempfile = "3"

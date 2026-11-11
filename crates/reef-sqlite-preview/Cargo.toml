@@ -9,11 +9,9 @@ publish = false
 workspace = true
 
 [dependencies]
-# `bundled` compiles SQLite C source in-tree — no system libsqlite linkage,
-# matches the project's avoid-system-C-libs stance (see top-level Cargo.toml
-# notes on sixel/chafa). `default-features = false` drops `modern_sqlite`
-# auto-feature-detect probes we don't need for read-only previews.
-rusqlite = { version = "0.32", default-features = false, features = ["bundled", "hooks"] }
+# `bundled` compiles SQLite C source in-tree without system libsqlite linkage.
+# Enable only the bundled engine and progress hooks used by read-only previews.
+rusqlite = { version = "0.41", default-features = false, features = ["bundled", "hooks"] }
 
 [dev-dependencies]
 tempfile = "3"

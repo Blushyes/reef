@@ -79,7 +79,7 @@ pub enum PreviewError {
     NotSqlite,
     /// File is bigger than [`MAX_PREVIEW_BYTES`].
     TooLarge { size: u64 },
-    /// `rusqlite::Connection::open_with_flags_and_vfs` failed. Common
+    /// Opening or configuring a `rusqlite::Connection` failed. Common
     /// real-world causes: encrypted DB (SQLCipher / Chrome cookies),
     /// truncated file, FS errors. The string is the rusqlite-rendered
     /// message — call site shouldn't parse it, just display verbatim
@@ -769,12 +769,13 @@ pub fn load_cell_qualified(
     if !probe_magic(path)? {
         return Err(PreviewError::NotSqlite);
     }
-    let conn = open_readonly(path)?;
+    let mut conn = open_readonly(path)?;
     let progress_cancellation = Arc::clone(&cancellation);
     conn.progress_handler(
         1_000,
         Some(move || progress_cancellation.load(Ordering::Acquire)),
-    );
+    )
+    .map_err(|e| PreviewError::OpenFailed(e.to_string()))?;
     let key = DbObjectKey {
         schema: schema.to_string(),
         name: name.to_string(),

@@ -25,6 +25,8 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel as mpsc;
 
+mod nav_index;
+
 #[derive(Debug)]
 pub struct GitStatusPayload {
     pub staged: Vec<FileEntry>,
@@ -347,7 +349,7 @@ pub enum WorkerResult {
     /// dropped via `nav_workspace_load`'s generation token.
     NavWorkspaceBuilt {
         generation: u64,
-        result: Result<reef_core::nav::WorkspaceIndex, String>,
+        index: Arc<reef_core::nav::WorkspaceIndex>,
     },
     /// LSP refinement. `rel_location` is already workdir-relative when the
     /// server returned an in-workspace definition; `None` means either no
@@ -819,6 +821,7 @@ pub struct TaskCoordinator {
     db_cell_tx: mpsc::Sender<DbCellTask>,
     preview_enrichment_tx: mpsc::Sender<PreviewEnrichmentTask>,
     nav_preview_tx: mpsc::Sender<NavPreviewTask>,
+    nav_index_cancellation: reef_io::CancellationToken,
     git_tx: mpsc::Sender<GitTask>,
     git_diff_tx: mpsc::Sender<GitDiffTask>,
     git_status_stats_tx: mpsc::Sender<GitStatusStatsTask>,
@@ -847,6 +850,12 @@ impl WorkerResultSender {
     }
 }
 
+impl Drop for TaskCoordinator {
+    fn drop(&mut self) {
+        self.nav_index_cancellation.cancel();
+    }
+}
+
 impl TaskCoordinator {
     pub fn new() -> Self {
         let (result_tx, result_rx) = mpsc::unbounded();
@@ -869,6 +878,7 @@ impl TaskCoordinator {
             db_cell_tx: spawn_db_cell_worker(result_tx.clone()),
             preview_enrichment_tx: spawn_preview_enrichment_worker(result_tx.clone()),
             nav_preview_tx: spawn_nav_preview_worker(result_tx.clone()),
+            nav_index_cancellation: reef_io::CancellationToken::default(),
             git_tx: spawn_git_worker(result_tx.clone()),
             git_diff_tx: spawn_git_diff_worker(result_tx.clone()),
             git_status_stats_tx: spawn_git_status_stats_worker(result_tx.clone()),
@@ -882,13 +892,23 @@ impl TaskCoordinator {
         }
     }
 
-    pub fn build_nav_workspace(&self, generation: u64, backend: Arc<dyn Backend>) {
+    pub fn build_nav_workspace(
+        &self,
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        previous: Option<Arc<reef_core::nav::WorkspaceIndex>>,
+        change: reef_io::FsChange,
+    ) {
         let result_tx = self.result_tx.clone();
+        let cancellation = self.nav_index_cancellation.clone();
         let _ = thread::Builder::new()
             .name("reef-nav-index".into())
             .spawn(move || {
-                let result = build_nav_workspace_index(backend.as_ref());
-                let _ = result_tx.send(WorkerResult::NavWorkspaceBuilt { generation, result });
+                if let Some(index) =
+                    nav_index::update(backend.as_ref(), previous, change, &cancellation)
+                {
+                    let _ = result_tx.send(WorkerResult::NavWorkspaceBuilt { generation, index });
+                }
             });
     }
 
@@ -3314,34 +3334,6 @@ mod file_tree_worker_coalescing_tests {
 
         assert_eq!(task.identity.generation, 4);
     }
-}
-
-fn build_nav_workspace_index(
-    backend: &dyn Backend,
-) -> Result<reef_core::nav::WorkspaceIndex, String> {
-    let root = backend.workdir_path();
-    let walk = backend
-        .walk_repo_paths(&WalkOpts {
-            include_hidden: true,
-            respect_gitignore: true,
-            max_files: None,
-        })
-        .map_err(|e| e.to_string())?;
-    let files = walk.paths.into_iter().filter_map(|path| {
-        let rel = PathBuf::from(path);
-        let _lang = reef_core::nav::NavLang::from_path(&rel)?;
-        let bytes = backend
-            .read_file(&rel, reef_core::nav::workspace::MAX_FILE_BYTES_INDEX + 1)
-            .ok()?;
-        if bytes.len() as u64 > reef_core::nav::workspace::MAX_FILE_BYTES_INDEX {
-            return None;
-        }
-        Some(reef_core::nav::WorkspaceIndexFile {
-            path: rel,
-            source: Arc::from(bytes.into_boxed_slice()),
-        })
-    });
-    Ok(reef_core::nav::build_workspace_index(root, files))
 }
 
 /// `true` if `target` (a fully-qualified ref like `refs/heads/main`)

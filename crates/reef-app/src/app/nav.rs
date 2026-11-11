@@ -480,8 +480,12 @@ impl AppState {
             return;
         }
         let generation = self.nav_workspace_load.begin();
-        self.tasks
-            .build_nav_workspace(generation, Arc::clone(&self.backend));
+        self.tasks.build_nav_workspace(
+            generation,
+            Arc::clone(&self.backend),
+            self.nav_workspace.clone(),
+            self.nav_workspace_changes.take(),
+        );
     }
 
     pub fn navigate_files(&mut self, delta: i32) {

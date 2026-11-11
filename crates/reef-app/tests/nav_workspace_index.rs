@@ -46,10 +46,10 @@ fn index_finds_rust_function_across_files() {
     let index = build_index_via_backend(tmp.path());
 
     // Defs side: `helper` only declared in a.rs.
-    let defs = index.defs_by_name.get("helper").expect("helper indexed");
+    let defs = index.definitions_for("helper", NavLang::Rust, None);
     assert!(
         defs.iter()
-            .any(|d| d.path.ends_with("a.rs") && d.lang == NavLang::Rust),
+            .any(|d| d.path.as_deref().is_some_and(|p| p.ends_with("a.rs"))),
         "expected helper def in a.rs, got {:?}",
         defs
     );
@@ -57,9 +57,15 @@ fn index_finds_rust_function_across_files() {
     // Refs side: `helper` appears in BOTH files (decl token also
     // counts as a reference by tree-sitter; we filter at query time
     // by clicking on the call site, not the decl).
-    let refs = index.refs_by_name.get("helper").expect("helper referenced");
-    assert!(refs.iter().any(|r| r.path.ends_with("b.rs")));
-    assert!(refs.iter().any(|r| r.path.ends_with("a.rs")));
+    let refs = index.references_for("helper", NavLang::Rust);
+    assert!(
+        refs.iter()
+            .any(|r| r.path.as_deref().is_some_and(|p| p.ends_with("b.rs")))
+    );
+    assert!(
+        refs.iter()
+            .any(|r| r.path.as_deref().is_some_and(|p| p.ends_with("a.rs")))
+    );
 }
 
 #[test]
@@ -73,11 +79,9 @@ fn index_filters_by_language() {
 
     let index = build_index_via_backend(tmp.path());
 
-    let defs = index.defs_by_name.get("shared").expect("shared indexed");
-    // Both should be present BUT with distinct lang tags so callers
-    // can filter at query time.
-    assert!(defs.iter().any(|d| d.lang == NavLang::Rust));
-    assert!(defs.iter().any(|d| d.lang == NavLang::Python));
+    for lang in [NavLang::Rust, NavLang::Python] {
+        assert_eq!(index.definitions_for("shared", lang, None).len(), 1);
+    }
 }
 
 #[test]
@@ -97,9 +101,15 @@ fn index_respects_gitignore() {
     .unwrap();
 
     let index = build_index_via_backend(tmp.path());
-    assert!(index.defs_by_name.contains_key("visible"));
     assert!(
-        !index.defs_by_name.contains_key("hidden"),
+        !index
+            .definitions_for("visible", NavLang::Rust, None)
+            .is_empty()
+    );
+    assert!(
+        index
+            .definitions_for("hidden", NavLang::Rust, None)
+            .is_empty(),
         "gitignored file should not appear in the index"
     );
 }
@@ -126,10 +136,18 @@ fn vue_files_parse_without_panicking_even_with_no_queries() {
     let index = build_index_via_backend(tmp.path());
     // Rust file picked up normally — proves the walker isn't crashing
     // on the Vue file mid-walk.
-    assert!(index.defs_by_name.contains_key("rust_marker"));
+    assert!(
+        !index
+            .definitions_for("rust_marker", NavLang::Rust, None)
+            .is_empty()
+    );
     // Vue scripts contribute zero defs/refs by design.
-    assert!(!index.defs_by_name.contains_key("greet"));
-    assert!(!index.defs_by_name.contains_key("msg"));
+    assert!(
+        index
+            .definitions_for("greet", NavLang::Vue, None)
+            .is_empty()
+    );
+    assert!(index.references_for("msg", NavLang::Vue).is_empty());
 }
 
 #[test]
@@ -139,7 +157,10 @@ fn empty_workspace_yields_empty_index() {
     let _g = CwdGuard::enter(tmp.path());
 
     let index = build_index_via_backend(tmp.path());
-    assert_eq!(index.file_count, 0);
-    assert!(index.defs_by_name.is_empty());
-    assert!(index.refs_by_name.is_empty());
+    assert_eq!(index.file_count(), 0);
+    assert!(
+        index
+            .definitions_for("missing", NavLang::Rust, None)
+            .is_empty()
+    );
 }

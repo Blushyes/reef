@@ -2437,6 +2437,79 @@ mod tests {
         assert!(app.nav_workspace().is_some());
     }
 
+    #[test]
+    fn navigation_changes_during_indexing_are_applied_by_the_followup_job() {
+        let (temp, repo) = test_support::tempdir_repo();
+        test_support::write_file(&repo, "a.rs", "fn old_a() {}");
+        test_support::write_file(&repo, "b.rs", "fn old_b() {}");
+        let mut app = ReefApp::new(AppConfig {
+            backend: Arc::new(LocalBackend::open_at(temp.path().to_path_buf())),
+            prefs: AppPrefs::default(),
+            subscribe_fs_events: false,
+        });
+        let options = TickOptions {
+            dark: false,
+            wants_decoded_image: false,
+            uses_three_col: false,
+        };
+        let wake = app.worker_wake_receiver();
+        let wait = |app: &mut ReefApp| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                app.step(Instant::now(), options);
+                if !app.state.nav_workspace_load.loading && !app.state.nav_workspace_load.stale {
+                    break;
+                }
+                wake.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .expect("navigation update wake");
+            }
+        };
+        wait(&mut app);
+        let before = app.nav_workspace().unwrap();
+        let notify = |app: &mut ReefApp, path: &str| {
+            app.dispatch(AppCommand::ApplyFsChange {
+                workspace_changed: true,
+                workspace_paths: vec![path.into()],
+                git_metadata_changed: false,
+                repo_presence_changed: false,
+            });
+        };
+        test_support::write_file(&repo, "a.rs", "fn new_a() {}");
+        notify(&mut app, "a.rs");
+        app.step(Instant::now(), options);
+        assert!(app.state.nav_workspace_load.loading);
+        test_support::write_file(&repo, "b.rs", "fn new_b() {}");
+        notify(&mut app, "b.rs");
+        assert!(app.state.nav_workspace_load.stale);
+        wait(&mut app);
+        let after = app.nav_workspace().unwrap();
+        for name in ["new_a", "new_b"] {
+            assert_eq!(
+                after
+                    .definitions_for(name, reef_core::nav::NavLang::Rust, None)
+                    .len(),
+                1
+            );
+        }
+        for name in ["old_a", "old_b"] {
+            assert!(
+                after
+                    .definitions_for(name, reef_core::nav::NavLang::Rust, None)
+                    .is_empty()
+            );
+            assert_eq!(
+                before
+                    .definitions_for(name, reef_core::nav::NavLang::Rust, None)
+                    .len(),
+                1
+            );
+        }
+        test_support::write_file(&repo, "notes.json", "{}");
+        notify(&mut app, "notes.json");
+        wait(&mut app);
+        assert!(Arc::ptr_eq(&after, &app.nav_workspace().unwrap()));
+    }
+
     fn global_search_hit(path: &str) -> MatchHit {
         MatchHit {
             path: PathBuf::from(path),

@@ -18,6 +18,14 @@ expensive work must not run from a renderer.
 - Put UI-independent logic in `crates/reef-core`; shared host filesystem services such as the unified preference store belong in `crates/reef-io`; keep ratatui/crossterm rendering and input orchestration in `crates/reef-tui`.
 - Put renderer-neutral app state, async scheduling, worker-result merge, settings state, nav/history, preview/search/git/graph orchestration in `crates/reef-app`.
 - Renderer hosts dispatch preview definition requests with a typed source cursor and viewport budget. For local backends, `reef-app` marks the initial workspace index stale and schedules its build from `step`; remote backends keep that unsupported work idle. `reef-app` owns enrichment- and workspace-index-bound retry, definition/reference resolution, candidate state, selected-candidate preview, history, and committed jumps; hosts own only coordinate mapping and popup geometry.
+- Navigation indexes are immutable snapshots of shared per-file symbol partitions. Local watcher
+  paths update only affected files/subtrees using the scoped, ignore-aware walker in `reef-io`;
+  changes received during a build are coalesced for one follow-up update. Non-code/ignored-only
+  changes preserve the index snapshot. Initial loads, unknown-path notifications and repository
+  capability changes reconcile the full workspace; `.gitignore`/`.ignore` edits reconcile their
+  containing subtree. Dropping the task coordinator cancels its navigation build between files.
+- Navigation snippet text is decoded and trimmed once per source line. Cropping walks a bounded
+  character window around the target byte range and preserves UTF-8 boundaries and exact matches.
 - Navigation locations retain the exact source line and UTF-8 byte range for jumps and highlights. Their bounded display snippets are cropped around that target range so every renderer can keep the matched identifier visible without reading candidate files or reconstructing source lines.
 - Location history is renderer-neutral and stores the active surface, path, UTF-8 cursor, and vertical/horizontal scroll. Hosts sample their current native position only when dispatching an explicit navigation and pass it to the shared back/forward commands; ordinary cursor movement and scrolling do not create history entries.
 - Graph Changed-files selection is renderer-neutral. Hosts dispatch file-navigation commands; `reef-app` follows the visible list/tree order, skips collapsed descendants, updates selection immediately, and schedules the matching commit diff without moving focus away from the Changed-files panel.

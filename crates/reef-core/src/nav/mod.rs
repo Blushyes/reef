@@ -8,7 +8,7 @@
 //! answers first. SSH mode bypasses the LSP tier entirely.
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub mod grammars;
 pub mod intrafile;
@@ -39,6 +39,7 @@ pub struct FileParse {
     pub tree: tree_sitter::Tree,
     pub source: Arc<[u8]>,
     line_starts: Vec<usize>,
+    line_snippets: Vec<OnceLock<workspace::SnippetLine>>,
 }
 
 impl FileParse {
@@ -46,6 +47,12 @@ impl FileParse {
     /// slice into a node's range without cloning the Arc.
     pub fn source(&self) -> &[u8] {
         &self.source
+    }
+
+    fn snippet_line(&self, line: usize) -> Option<&workspace::SnippetLine> {
+        self.line_snippets
+            .get(line)
+            .map(|cache| cache.get_or_init(|| workspace::SnippetLine::new(self.line_bytes(line))))
     }
 
     /// Look up a source line in constant time using the offsets built with
@@ -102,6 +109,7 @@ pub fn parse_file_if_supported(lang: NavLang, source: Arc<[u8]>) -> Option<FileP
         language: lang,
         tree,
         source,
+        line_snippets: (0..line_starts.len()).map(|_| OnceLock::new()).collect(),
         line_starts,
     })
 }

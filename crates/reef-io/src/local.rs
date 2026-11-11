@@ -6,7 +6,7 @@
 //! any `Mutex` around `Repository` (which is non-Send).
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1187,7 +1187,16 @@ pub(crate) fn copy_dir_recursive_inner(src: &Path, dst: &Path) -> std::io::Resul
 /// `MAX_WALK_PATHS` is the hard ceiling — exceeding it sets
 /// `truncated=true` and the remainder of the walk is discarded.
 pub(crate) fn walk_paths(root: &Path, opts: &WalkOpts) -> WalkResponse {
+    walk_paths_in(root, opts, Vec::new())
+}
+
+/// Walk affected workspace-relative files or subtrees using the same ignore
+/// rules as a full walk. An empty scope walks the entire workspace.
+/// Ancestors are visited to load nested ignore rules; unrelated subtrees are pruned.
+pub fn walk_paths_in(root: &Path, opts: &WalkOpts, paths: Vec<PathBuf>) -> WalkResponse {
     use ignore::WalkBuilder;
+    let scopes: BTreeSet<PathBuf> = paths.into_iter().collect();
+    let scope_root = root.to_path_buf();
     let hard_cap: u64 = reef_proto::MAX_WALK_PATHS;
     let cap = match opts.max_files {
         Some(n) => n.min(hard_cap),
@@ -1206,7 +1215,22 @@ pub(crate) fn walk_paths(root: &Path, opts: &WalkOpts) -> WalkResponse {
         // plain directories too, and callers expect the same ignore
         // semantics for quick-open and nav indexing.
         .require_git(false)
-        .filter_entry(|dent| dent.file_name() != ".git")
+        .filter_entry(move |dent| {
+            if dent.file_name() == ".git" {
+                return false;
+            }
+            let Ok(relative) = dent.path().strip_prefix(&scope_root) else {
+                return false;
+            };
+            scopes.is_empty()
+                || relative
+                    .ancestors()
+                    .any(|ancestor| scopes.contains(ancestor))
+                || scopes
+                    .range(relative.to_path_buf()..)
+                    .next()
+                    .is_some_and(|scope| scope.starts_with(relative))
+        })
         .build();
 
     for result in walker {

@@ -207,6 +207,7 @@ impl AppState {
                 self.request_quick_open_index_if_needed();
             }
             if !self.backend.is_remote() {
+                self.nav_workspace_changes.push(change.clone());
                 self.nav_workspace_load.mark_stale();
             }
             self.nav_refine_cache.clear();
@@ -722,11 +723,11 @@ impl AppState {
                 }
                 events.push(AppRuntimeEvent::ReplaceDone { result });
             }
-            WorkerResult::NavWorkspaceBuilt { generation, result } => {
+            WorkerResult::NavWorkspaceBuilt { generation, index } => {
                 if !self.nav_workspace_load.complete_ok(generation) {
                     return events;
                 }
-                self.nav_workspace = result.ok().map(Arc::new);
+                self.nav_workspace = Some(index);
                 self.retry_pending_preview_definition();
             }
             WorkerResult::NavPreview {

@@ -714,6 +714,7 @@ pub struct AppState {
     pub ctrl_hover_target: Option<(usize, Range<usize>)>,
     pub nav_workspace: Option<Arc<reef_core::nav::WorkspaceIndex>>,
     pub nav_workspace_load: AsyncState,
+    pub nav_workspace_changes: reef_io::FsChangeCoalescer,
     pub lsp_states: HashMap<reef_core::nav::NavLang, reef_core::nav::LspBadge>,
     pub lsp_installed: HashMap<reef_core::nav::NavLang, bool>,
     pub nav_refine_cache: HashMap<(reef_core::nav::NavLang, String), reef_core::nav::LspLocation>,
@@ -969,6 +970,7 @@ impl AppState {
             ctrl_hover_target: None,
             nav_workspace: None,
             nav_workspace_load: AsyncState::default(),
+            nav_workspace_changes: reef_io::FsChangeCoalescer::default(),
             lsp_states: HashMap::new(),
             lsp_installed: HashMap::new(),
             nav_refine_cache: HashMap::new(),
@@ -2830,7 +2832,7 @@ mod tests {
         app.apply_worker_result_core(
             WorkerResult::NavWorkspaceBuilt {
                 generation,
-                result: Ok(workspace),
+                index: Arc::new(workspace),
             },
             Instant::now(),
         );

@@ -168,6 +168,16 @@ Use this pattern for git status, diffs, file preview/highlighting, file-tree reb
   idle. The app retains a generation/path-bound request while preview
   enrichment or the workspace index is pending, resolves definitions with the workspace index, falls through to
   references at declarations, and owns candidate confirmation plus navigation history.
+- Navigation indexing runs on its worker and publishes an immutable snapshot whose per-file symbol
+  partitions share unchanged data. `FsChangeCoalescer` retains changes received during an active
+  build for the next generation. Precise paths scope the ignore-aware local walk and replacement
+  of index partitions; a directory scope includes its descendants, including removals and renames.
+  Non-code or ignored-only changes reuse the existing snapshot. Empty watcher paths, initial loads
+  and repository capability changes reconcile the full workspace. Ignore-rule edits reconcile the
+  containing subtree. The task coordinator cancels navigation work on drop; workers check between
+  files and do not publish cancelled results. Hosts consume the same navigation projection.
+- Source-line offsets and lazily decoded/trimmed text belong to `FileParse`. Every symbol on a line
+  shares that text; snippet cropping visits only a bounded neighborhood of its target byte range.
 - Explicit file, search-result, Git-diff, Graph-diff, and code-definition navigation records a
   `LocationSnapshot` before committing the destination. Renderer hosts own native cursor/scroll
   sampling and restoration, while `reef-app` owns the bounded back/forward stacks and target jump.

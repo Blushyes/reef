@@ -3,8 +3,8 @@
 //!
 //! Strategy: name-based, not type-based. We tree-sitter-parse every
 //! file with a supported grammar and extract identifier-position pairs
-//! into a `HashMap<String, Vec<SymbolLoc>>`. Lookups are O(1) on the
-//! identifier name, results are filtered by language at query time.
+//! into per-file identifier maps. Snapshots share unchanged file partitions;
+//! lookups visit those maps and filter by language at query time.
 //! Less precise than stack-graphs (no scope resolution, false
 //! positives across unrelated files with same-name symbols) but it
 //! covers all four bundled languages — `tree-sitter-stack-graphs-rust`
@@ -20,7 +20,7 @@
 //! paths plus source bytes, keeping `reef-core` independent from local
 //! filesystem walking.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -39,15 +39,18 @@ pub const MAX_FILE_BYTES_INDEX: u64 = 512 * 1024;
 pub(crate) const SNIPPET_MAX_W: usize = 80;
 const SNIPPET_LEADING_CONTEXT: usize = 16;
 
-/// In-memory workspace symbol index. Keyed by identifier text; each
-/// value is the list of definition sites across the workspace.
-#[derive(Debug)]
+/// Immutable file partitions share unchanged symbols between workspace snapshots.
+/// Each partition is keyed by identifier; lookups visit the indexed files.
+#[derive(Debug, Clone)]
 pub struct WorkspaceIndex {
     pub root: PathBuf,
-    pub defs_by_name: HashMap<String, Vec<SymbolLoc>>,
-    pub refs_by_name: HashMap<String, Vec<SymbolLoc>>,
-    /// File count for status-bar reporting (`indexed 412 files`).
-    pub file_count: usize,
+    files: BTreeMap<PathBuf, Arc<FileSymbols>>,
+}
+
+#[derive(Debug, Default)]
+struct FileSymbols {
+    definitions: HashMap<String, Vec<SymbolLoc>>,
+    references: HashMap<String, Vec<SymbolLoc>>,
 }
 
 /// A definition or reference site.
@@ -68,23 +71,74 @@ pub struct WorkspaceIndexFile {
 }
 
 impl WorkspaceIndex {
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
     pub fn definitions_for(
         &self,
         name: &str,
         lang: NavLang,
         skip_site: Option<(&Path, Option<usize>)>,
     ) -> Vec<super::Location> {
-        self.defs_by_name
-            .get(name)
-            .map(|defs| symbol_locs_to_locations(defs, lang, skip_site))
-            .unwrap_or_default()
+        self.files
+            .values()
+            .filter_map(|file| file.definitions.get(name))
+            .flat_map(|symbols| symbol_locs_to_locations(symbols, lang, skip_site))
+            .collect()
     }
 
     pub fn references_for(&self, name: &str, lang: NavLang) -> Vec<super::Location> {
-        self.refs_by_name
-            .get(name)
-            .map(|refs| symbol_locs_to_locations(refs, lang, None))
-            .unwrap_or_default()
+        self.files
+            .values()
+            .filter_map(|file| file.references.get(name))
+            .flat_map(|symbols| symbol_locs_to_locations(symbols, lang, None))
+            .collect()
+    }
+
+    pub fn contains_path(&self, path: &Path) -> bool {
+        self.files
+            .range(path.to_path_buf()..)
+            .next()
+            .is_some_and(|(file, _)| file.starts_with(path))
+    }
+
+    /// Replace the affected files/subtrees, retaining all other file partitions.
+    /// Missing, ignored, oversized and binary files are removed by omitting them
+    /// from `files`. IO and ignore-rule evaluation belong to the caller.
+    pub fn update_files(
+        &mut self,
+        changed_paths: &[PathBuf],
+        files: impl IntoIterator<Item = WorkspaceIndexFile>,
+    ) {
+        for path in changed_paths {
+            let removed: Vec<_> = self
+                .files
+                .range(path.clone()..)
+                .take_while(|(file, _)| file.starts_with(path))
+                .map(|(file, _)| file.clone())
+                .collect();
+            for file in removed {
+                self.files.remove(&file);
+            }
+        }
+        for file in files {
+            let Some(lang) = NavLang::from_path(&file.path) else {
+                continue;
+            };
+            if file.source.len() as u64 > MAX_FILE_BYTES_INDEX
+                || file.source.iter().take(8192).any(|b| *b == 0)
+            {
+                continue;
+            }
+            let Some(parse) = super::parse_file_if_supported(lang, file.source) else {
+                continue;
+            };
+            let mut symbols = FileSymbols::default();
+            extract_definitions(&parse, &file.path, lang, &mut symbols.definitions);
+            extract_references(&parse, &file.path, lang, &mut symbols.references);
+            self.files.insert(file.path, Arc::new(symbols));
+        }
     }
 }
 
@@ -118,38 +172,12 @@ pub fn build_workspace_index(
     root: PathBuf,
     files: impl IntoIterator<Item = WorkspaceIndexFile>,
 ) -> WorkspaceIndex {
-    let mut defs_by_name: HashMap<String, Vec<SymbolLoc>> = HashMap::new();
-    let mut refs_by_name: HashMap<String, Vec<SymbolLoc>> = HashMap::new();
-    let mut file_count = 0usize;
-
-    for file in files {
-        let rel_path = file.path;
-        let Some(lang) = NavLang::from_path(&rel_path) else {
-            continue;
-        };
-        if file.source.len() as u64 > MAX_FILE_BYTES_INDEX {
-            continue;
-        }
-        // Skip apparent binaries: tree-sitter parsers happily accept
-        // garbage and emit useless ERROR nodes; the index would gain
-        // noise without value.
-        if file.source.iter().take(8192).any(|b| *b == 0) {
-            continue;
-        }
-        let Some(parse) = super::parse_file_if_supported(lang, file.source) else {
-            continue;
-        };
-        file_count += 1;
-        extract_definitions(&parse, &rel_path, lang, &mut defs_by_name);
-        extract_references(&parse, &rel_path, lang, &mut refs_by_name);
-    }
-
-    WorkspaceIndex {
+    let mut index = WorkspaceIndex {
         root,
-        defs_by_name,
-        refs_by_name,
-        file_count,
-    }
+        files: BTreeMap::new(),
+    };
+    index.update_files(&[], files);
+    index
 }
 
 fn extract_definitions(
@@ -215,9 +243,75 @@ fn extract_symbols(
     }
 }
 
+#[derive(Default)]
 pub(super) struct NavigationSnippet {
     pub text: String,
     pub match_range: Range<usize>,
+}
+
+/// Decode and trim each source line once, shared by every symbol on that line.
+#[derive(Debug)]
+pub(super) struct SnippetLine {
+    text: String,
+    leading_bytes: usize,
+}
+
+impl SnippetLine {
+    pub(super) fn new(line: &[u8]) -> Self {
+        let text = String::from_utf8_lossy(line);
+        let trimmed = text.trim_start();
+        Self {
+            leading_bytes: text.len() - trimmed.len(),
+            text: trimmed.to_owned(),
+        }
+    }
+
+    fn snippet(&self, target: Range<usize>) -> NavigationSnippet {
+        let Some(target) = self.target_range(target) else {
+            return NavigationSnippet {
+                text: self.text.chars().take(SNIPPET_MAX_W).collect::<String>() + "…",
+                match_range: 0..0,
+            };
+        };
+        // Inspect at most one display window to distinguish a short line.
+        if self.text.chars().nth(SNIPPET_MAX_W).is_none() {
+            return NavigationSnippet {
+                text: self.text.clone(),
+                match_range: target,
+            };
+        }
+        // Walk backwards from the target, not forwards from the line's start.
+        let start = self.text[..target.start]
+            .char_indices()
+            .rev()
+            .nth(SNIPPET_LEADING_CONTEXT - 1)
+            .map_or(0, |(offset, _)| offset);
+        let end = self.text[start..]
+            .char_indices()
+            .nth(SNIPPET_MAX_W)
+            .map_or(self.text.len(), |(offset, _)| start + offset)
+            .max(target.end);
+        let mut text = String::new();
+        if start > 0 {
+            text.push('…');
+        }
+        let prefix = text.len();
+        text.push_str(&self.text[start..end]);
+        if end < self.text.len() {
+            text.push('…');
+        }
+        NavigationSnippet {
+            text,
+            match_range: prefix + target.start - start..prefix + target.end - start,
+        }
+    }
+
+    fn target_range(&self, target: Range<usize>) -> Option<Range<usize>> {
+        let start = target.start.checked_sub(self.leading_bytes)?;
+        let end = target.end.checked_sub(self.leading_bytes)?;
+        self.text.get(start..end)?;
+        Some(start..end)
+    }
 }
 
 pub(super) fn snippet_for(
@@ -225,76 +319,10 @@ pub(super) fn snippet_for(
     line: usize,
     target_byte_range: Range<usize>,
 ) -> NavigationSnippet {
-    snippet_from_line(parse.line_bytes(line), target_byte_range)
-}
-
-fn snippet_from_line(line: &[u8], target_byte_range: Range<usize>) -> NavigationSnippet {
-    let s = String::from_utf8_lossy(line);
-    let trimmed = s.trim_start();
-    if trimmed.chars().count() > SNIPPET_MAX_W {
-        focused_snippet(&s, target_byte_range).unwrap_or_else(|| leading_snippet(trimmed))
-    } else {
-        NavigationSnippet {
-            text: trimmed.to_string(),
-            match_range: target_range_in_trimmed(&s, target_byte_range).unwrap_or(0..0),
-        }
-    }
-}
-
-fn target_range_in_trimmed(line: &str, target_byte_range: Range<usize>) -> Option<Range<usize>> {
-    let trimmed = line.trim_start();
-    let leading_bytes = line.len() - trimmed.len();
-    let target_start = target_byte_range.start.checked_sub(leading_bytes)?;
-    let target_end = target_byte_range.end.checked_sub(leading_bytes)?;
-    if target_start > target_end
-        || target_end > trimmed.len()
-        || !trimmed.is_char_boundary(target_start)
-        || !trimmed.is_char_boundary(target_end)
-    {
-        return None;
-    }
-    Some(target_start..target_end)
-}
-
-fn focused_snippet(line: &str, target_byte_range: Range<usize>) -> Option<NavigationSnippet> {
-    let trimmed = line.trim_start();
-    let target_range = target_range_in_trimmed(line, target_byte_range)?;
-
-    let target_start_chars = trimmed[..target_range.start].chars().count();
-    let target_end_chars = target_start_chars + trimmed[target_range.clone()].chars().count();
-    let total_chars = trimmed.chars().count();
-    let window_start = target_start_chars.saturating_sub(SNIPPET_LEADING_CONTEXT);
-    let window_end = total_chars.min(window_start.saturating_add(SNIPPET_MAX_W));
-    let window_end = window_end.max(target_end_chars);
-    let window_start_byte = char_offset(trimmed, window_start);
-    let window_end_byte = char_offset(trimmed, window_end);
-    let mut snippet = String::new();
-    if window_start > 0 {
-        snippet.push('…');
-    }
-    let prefix_bytes = snippet.len();
-    snippet.push_str(&trimmed[window_start_byte..window_end_byte]);
-    if window_end < total_chars {
-        snippet.push('…');
-    }
-    Some(NavigationSnippet {
-        text: snippet,
-        match_range: prefix_bytes + target_range.start - window_start_byte
-            ..prefix_bytes + target_range.end - window_start_byte,
-    })
-}
-
-fn char_offset(text: &str, index: usize) -> usize {
-    text.char_indices()
-        .nth(index)
-        .map_or(text.len(), |(offset, _)| offset)
-}
-
-fn leading_snippet(line: &str) -> NavigationSnippet {
-    NavigationSnippet {
-        text: line.chars().take(SNIPPET_MAX_W).collect::<String>() + "…",
-        match_range: 0..0,
-    }
+    parse
+        .snippet_line(line)
+        .map(|line| line.snippet(target_byte_range))
+        .unwrap_or_default()
 }
 
 /// Per-language reference query. Matches every identifier-shaped node
@@ -392,9 +420,9 @@ mod tests {
             }],
         );
 
-        assert_eq!(index.file_count, 1);
-        let definitions = &index.defs_by_name["café"];
-        let references = &index.refs_by_name["café"];
+        assert_eq!(index.file_count(), 1);
+        let definitions = index.definitions_for("café", NavLang::Rust, None);
+        let references = index.references_for("café", NavLang::Rust);
         assert_eq!(definitions.len(), line_count);
         assert_eq!(references.len(), line_count * 2);
         for (line, definition) in definitions.iter().enumerate() {
@@ -408,71 +436,106 @@ mod tests {
                 if offset % 2 == 0 { 7..12 } else { 17..22 }
             );
         }
-        for symbol in definitions.iter().chain(references) {
-            assert_eq!(symbol.path, Path::new("large.rs"));
+        for symbol in definitions.iter().chain(references.iter()) {
+            assert_eq!(symbol.path.as_deref(), Some(Path::new("large.rs")));
             assert_eq!(symbol.snippet, "fn café() { café(); }\r");
             assert_eq!(&symbol.snippet[symbol.snippet_match_range.clone()], "café");
         }
     }
 
-    fn symbol(path: &str, line: usize, lang: NavLang) -> SymbolLoc {
-        SymbolLoc {
-            path: PathBuf::from(path),
-            line,
-            byte_range: 1..4,
-            snippet: "foo".to_string(),
-            snippet_match_range: 0..3,
-            lang,
+    #[test]
+    fn definitions_for_filters_lang_and_skip_site() {
+        let index = build_workspace_index(
+            PathBuf::new(),
+            [
+                file("src/a.rs", "fn foo() {}\nfn foo() {}"),
+                file("src/b.rs", "fn foo() {}"),
+                file("src/a.py", "def foo(): pass"),
+            ],
+        );
+        let defs =
+            index.definitions_for("foo", NavLang::Rust, Some((Path::new("src/a.rs"), Some(0))));
+        assert_eq!(defs.len(), 2);
+        assert_eq!(defs[0].line, 1);
+        let defs = index.definitions_for("foo", NavLang::Rust, Some((Path::new("src/a.rs"), None)));
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].path.as_deref(), Some(Path::new("src/b.rs")));
+    }
+
+    fn file(path: &str, source: &str) -> WorkspaceIndexFile {
+        WorkspaceIndexFile {
+            path: path.into(),
+            source: Arc::from(source.as_bytes()),
+        }
+    }
+
+    fn snippet_from_line(line: &[u8], target: Range<usize>) -> NavigationSnippet {
+        SnippetLine::new(line).snippet(target)
+    }
+
+    #[test]
+    fn file_updates_share_unchanged_symbols_and_preserve_old_snapshot() {
+        let original = build_workspace_index(
+            PathBuf::new(),
+            [
+                file("a.rs", "fn before() {}"),
+                file("nested/b.rs", "fn untouched() {}"),
+            ],
+        );
+        let mut updated = original.clone();
+        updated.update_files(&["a.rs".into()], [file("a.rs", "fn after() {}")]);
+        assert!(Arc::ptr_eq(
+            &original.files[Path::new("nested/b.rs")],
+            &updated.files[Path::new("nested/b.rs")]
+        ));
+        assert_eq!(
+            original
+                .definitions_for("before", NavLang::Rust, None)
+                .len(),
+            1
+        );
+        assert!(
+            updated
+                .definitions_for("before", NavLang::Rust, None)
+                .is_empty()
+        );
+        assert_eq!(
+            updated.definitions_for("after", NavLang::Rust, None).len(),
+            1
+        );
+        updated.update_files(&["nested".into()], []);
+        assert_eq!(updated.file_count(), 1);
+        assert!(
+            updated
+                .references_for("untouched", NavLang::Rust)
+                .is_empty()
+        );
+        assert_eq!(original.file_count(), 2);
+    }
+
+    #[test]
+    fn long_single_line_indexes_every_unicode_symbol_with_exact_snippets() {
+        let count = 4_000;
+        let source = "fn café() { café(); } ".repeat(count);
+        let index = build_workspace_index(PathBuf::new(), [file("long.rs", &source)]);
+        let refs = index.references_for("café", NavLang::Rust);
+        assert_eq!(refs.len(), count * 2);
+        for symbol in refs {
+            assert_eq!(symbol.line, 0);
+            assert_eq!(&source[symbol.byte_range], "café");
+            assert_eq!(&symbol.snippet[symbol.snippet_match_range], "café");
+            assert!(symbol.snippet.chars().count() <= SNIPPET_MAX_W + 2);
         }
     }
 
     #[test]
-    fn definitions_for_filters_lang_and_skip_site() {
-        let mut defs_by_name = HashMap::new();
-        defs_by_name.insert(
-            "foo".to_string(),
-            vec![
-                symbol("src/a.rs", 1, NavLang::Rust),
-                symbol("src/b.rs", 2, NavLang::Rust),
-                symbol("src/a.py", 1, NavLang::Python),
-            ],
-        );
-        let index = WorkspaceIndex {
-            root: PathBuf::new(),
-            defs_by_name,
-            refs_by_name: HashMap::new(),
-            file_count: 0,
-        };
-
-        let defs =
-            index.definitions_for("foo", NavLang::Rust, Some((Path::new("src/a.rs"), Some(1))));
-
-        assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0].path.as_deref(), Some(Path::new("src/b.rs")));
-    }
-
-    #[test]
-    fn definitions_for_can_skip_whole_path() {
-        let mut defs_by_name = HashMap::new();
-        defs_by_name.insert(
-            "foo".to_string(),
-            vec![
-                symbol("src/a.rs", 1, NavLang::Rust),
-                symbol("src/a.rs", 2, NavLang::Rust),
-                symbol("src/b.rs", 3, NavLang::Rust),
-            ],
-        );
-        let index = WorkspaceIndex {
-            root: PathBuf::new(),
-            defs_by_name,
-            refs_by_name: HashMap::new(),
-            file_count: 0,
-        };
-
-        let defs = index.definitions_for("foo", NavLang::Rust, Some((Path::new("src/a.rs"), None)));
-
-        assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0].path.as_deref(), Some(Path::new("src/b.rs")));
+    fn snippets_keep_utf8_boundaries_at_start_middle_and_end() {
+        let line = "  ".to_owned() + &"汉🙂café ".repeat(100);
+        for (start, name) in line.match_indices("café") {
+            let snippet = snippet_from_line(line.as_bytes(), start..start + name.len());
+            assert_eq!(&snippet.text[snippet.match_range], name);
+            assert!(snippet.text.chars().count() <= SNIPPET_MAX_W + 2);
+        }
     }
 
     #[test]
